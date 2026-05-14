@@ -1,0 +1,12 @@
+[package]
+name = "zendb-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Core type system for ZeninDB — HLC, Cell, Value, Op, Path, Delta, and the Type/ContainerType traits"
+
+[dependencies]
+indexmap.workspace = true
+thiserror.workspace = true

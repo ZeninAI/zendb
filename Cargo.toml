@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "zendb-types",
+    # "zendb-types-macros",
+    # "zendb-storage",
+    # "zendb-replication",
+    # "zendb-engine",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zenin/zendb"
+authors = ["ZeninDB Contributors"]
+
+[workspace.dependencies]
+# Core types crate — no heavy deps
+indexmap = "2"
+
+# Error handling
+thiserror = "2"

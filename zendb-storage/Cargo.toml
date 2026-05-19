@@ -1,0 +1,10 @@
+[package]
+name = "zendb-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Storage subsystem for ZeninDB — WAL, SkipList, B+Tree, HashTable, compaction"
+
+[dependencies]
+zendb-types = { path = "../zendb-types" }
+memmap2 = "0.9"

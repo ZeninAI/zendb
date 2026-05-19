@@ -45,6 +45,33 @@ pub fn decode_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     None
 }
 
+/// Read exactly N bytes into a fixed-size array.
+pub fn read_fixed<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
+    if bytes.len() < N {
+        return None;
+    }
+    let mut arr = [0u8; N];
+    arr.copy_from_slice(&bytes[..N]);
+    Some(arr)
+}
+
+/// Encode a length-prefixed UTF-8 string.
+pub fn encode_string(out: &mut Vec<u8>, s: &str) {
+    encode_varint(out, s.len() as u64);
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Decode a length-prefixed UTF-8 string. Returns string and bytes consumed.
+pub fn decode_string(bytes: &[u8]) -> Option<(String, usize)> {
+    let (len, n) = decode_varint(bytes)?;
+    let end = n + len as usize;
+    if bytes.len() < end {
+        return None;
+    }
+    let s = String::from_utf8(bytes[n..end].to_vec()).ok()?;
+    Some((s, end))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

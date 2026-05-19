@@ -3,8 +3,7 @@ resolver = "2"
 
 members = [
     "zendb-types",
-    # "zendb-types-macros",
-    # "zendb-storage",
+    "zendb-storage",
     # "zendb-replication",
     # "zendb-engine",
 ]

@@ -4,8 +4,7 @@ resolver = "2"
 members = [
     "zendb-types",
     "zendb-storage",
-    # "zendb-replication",
-    # "zendb-engine",
+    "zendb-engine",
 ]
 
 [workspace.package]
@@ -16,8 +15,13 @@ repository = "https://github.com/zenin/zendb"
 authors = ["ZeninDB Contributors"]
 
 [workspace.dependencies]
-# Core types crate — no heavy deps
+# zendb-types
 indexmap = "2"
-
-# Error handling
 thiserror = "2"
+
+# zendb-storage
+memmap2 = "0.9"
+hashbrown = "0.15"
+
+# zendb-engine
+blake3 = "1"

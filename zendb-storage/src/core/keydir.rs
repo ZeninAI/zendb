@@ -51,7 +51,7 @@ use hashbrown::HashMap;
 use memmap2::MmapMut;
 
 /// Default pre-allocated file size (1 MiB).
-const DEFAULT_CAPACITY: u64 = 1024 * 1024;
+const DEFAULT_INITIAL_CAPACITY: u64 = 1024 * 1024;
 
 /// Per-entry header: 4 bytes key_len + 4 bytes value_len.
 const HEADER_SIZE: usize = 8;
@@ -67,7 +67,7 @@ const DEFAULT_COMPACTION_RATIO: f64 = 0.5;
 #[derive(Debug, Clone)]
 pub struct KeyDirConfig {
     /// Pre-allocated file size in bytes.
-    pub capacity: u64,
+    pub initial_capacity: u64,
     /// When dead_bytes / write_offset exceeds this, compaction triggers.
     pub compaction_ratio: f64,
 }
@@ -75,7 +75,7 @@ pub struct KeyDirConfig {
 impl Default for KeyDirConfig {
     fn default() -> Self {
         KeyDirConfig {
-            capacity: DEFAULT_CAPACITY,
+            initial_capacity: DEFAULT_INITIAL_CAPACITY,
             compaction_ratio: DEFAULT_COMPACTION_RATIO,
         }
     }
@@ -83,7 +83,7 @@ impl Default for KeyDirConfig {
 
 impl KeyDirConfig {
     pub fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.capacity.to_le_bytes());
+        out.extend_from_slice(&self.initial_capacity.to_le_bytes());
         out.extend_from_slice(&self.compaction_ratio.to_le_bytes());
     }
 
@@ -96,12 +96,12 @@ impl KeyDirConfig {
         }
         let mut c = [0u8; 8];
         c.copy_from_slice(&bytes[0..8]);
-        let capacity = u64::from_le_bytes(c);
+        let initial_capacity = u64::from_le_bytes(c);
         c.copy_from_slice(&bytes[8..16]);
         let compaction_ratio = f64::from_le_bytes(c);
         Ok((
             KeyDirConfig {
-                capacity,
+                initial_capacity,
                 compaction_ratio,
             },
             16,
@@ -152,7 +152,7 @@ impl KeyDir {
 
     /// Create a new KeyDir at `path`.
     pub fn create(path: &Path, config: KeyDirConfig) -> io::Result<Self> {
-        let capacity = config.capacity;
+        let capacity = config.initial_capacity;
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -397,7 +397,7 @@ impl KeyDir {
         let mut new_kd = KeyDir::create(
             &tmp_path,
             KeyDirConfig {
-                capacity: self.write_offset.max(self.config.capacity),
+                initial_capacity: self.write_offset.max(self.config.initial_capacity),
                 ..Default::default()
             },
         )?;
@@ -718,7 +718,7 @@ mod tests {
     fn auto_grows() {
         let p = tmp("grow");
         let cfg = KeyDirConfig {
-            capacity: 64,
+            initial_capacity: 64,
             ..default_cfg()
         };
         let mut kd = KeyDir::create(&p, cfg).unwrap();
@@ -776,7 +776,7 @@ mod tests {
     fn geometric_capacity_growth() {
         let p = tmp("geom");
         let cfg = KeyDirConfig {
-            capacity: 128,
+            initial_capacity: 128,
             compaction_ratio: 1.1, // never compact during this test
         };
         let mut kd = KeyDir::create(&p, cfg).unwrap();

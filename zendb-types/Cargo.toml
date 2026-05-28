@@ -10,3 +10,4 @@ description = "Core type system for ZeninDB — HLC, Cell, Value, Op, Path, Delt
 [dependencies]
 indexmap.workspace = true
 thiserror.workspace = true
+rkyv.workspace = true

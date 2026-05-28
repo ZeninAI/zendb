@@ -4,71 +4,79 @@
 //! # Architecture
 //!
 //! ```text
-//! ┌───────────────────────┐
-//! │  KeyDir               │
-//! │  ┌──────────────────┐ │       ┌────────────────────────────────┐
-//! │  │ HashMap          │ │       │  MmapMut (data file)           │
-//! │  │ key → EntryMeta  │─┼──────▶│  ┌──────────────────────────┐ │
-//! │  │   offset         │ │       │  │ entry │ entry │ entry ... │ │
-//! │  │   key_len        │ │       │  └──────────────────────────┘ │
-//! │  │   value_len      │ │       └────────────────────────────────┘
-//! │  └──────────────────┘ │
-//! └───────────────────────┘
+//! ┌───────────────┐     ┌──────────────────────────────────┐
+//! │  HashMap<K,   │     │  append-only mmap data file      │
+//! │   EntryMeta>  │────▶│  [entry] [entry] [tombstone] …  │
+//! │  (in memory)  │     │  live entries + dead gaps        │
+//! └───────────────┘     └──────────────────────────────────┘
 //! ```
 //!
-//! Every `put` appends a new entry to the end of the file and updates the
-//! in-memory index to point at the new location.  `get` looks up the offset
-//! in the index and reads directly from the mmap'd file (no syscalls).
+//! The in-memory hash index maps each key to its on-disk location
+//! (offset + sizes). Every write appends, never mutates in place
+//! (except `update_in_place`, which is opt-in and size-stable).
+//!
+//! # Writing
+//!
+//! Generic over `K` (key) and `V` (value). Uses rkyv for true zero-copy I/O:
+//! - **Write**: `serialize_into` writes directly into the mmap buffer — no
+//!   intermediate allocation.
+//! - **Read**: `get` returns a [`ValueRef`] borrowing the archived bytes
+//!   directly from the mmap — no allocation, no copy.
+//! - **Compact**: rewrites the file by `memcpy`-ing each live entry's raw
+//!   bytes — no deserialize/re-serialize round-trip.
+//!
+//! # Dead bytes & compaction
+//!
+//! Overwrites and deletes leave "dead" bytes in the append-only file.
+//! When the dead-byte ratio exceeds `compaction_ratio`, the file is
+//! rewritten to a `.compact` file containing only live entries. The
+//! atomic rename protocol (main → .bak, .compact → main, remove .bak)
+//! ensures crash-safety.
 //!
 //! # File format
 //!
+//! Live entry:
 //! ```text
-//! [key_len: u32 LE][value_len: u32 LE][key_bytes][value_bytes]
+//! [value_size: u32 LE][archived V bytes (value_size)][key_size: u32 LE][archived K bytes (key_size)]
+//! ```
+//! Tombstone:
+//! ```text
+//! [0xFFFF_FFFF: u32][key_size: u32 LE][archived K bytes (key_size)]
 //! ```
 //!
-//! When `value_len == 0xFFFF_FFFF` (u32::MAX), the entry is a **tombstone**
-//! marker and has no value bytes.
-//!
-//! The file is pre-allocated on creation and auto-grows on overflow.
-//! On startup (`open`), the entire file is scanned to rebuild the in-memory
-//! index — overwritten keys are naturally deduplicated (last write wins).
-//!
-//! # Deletes
-//!
-//! `delete` appends a tombstone entry to the data file and removes the key
-//! from the in-memory index.  On the next `open`, the tombstone is replayed
-//! and the key stays deleted.  Dead space (tombstones + overwritten entries)
-//! is reclaimed automatically when the dead-byte ratio exceeds
-//! `compaction_ratio` (default 0.5).
+//! A tombstone is a special entry with value_size = `u32::MAX` (no value
+//! bytes). It marks a key as deleted. During `rebuild_index`, tombstones
+//! remove keys from the in-memory index; during compaction, they are
+//! stripped entirely.
 
 use std::{
     fs::{self, File, OpenOptions},
+    hash::Hash,
     io::{self},
+    marker::PhantomData,
     path::{Path, PathBuf},
 };
 
 use hashbrown::HashMap;
 use memmap2::MmapMut;
+use rkyv::{
+    api::high::{HighDeserializer, HighSerializer},
+    rancor::Error as RkyvError,
+    ser::{allocator::ArenaHandle, writer::Buffer},
+    Archive, Archived, Deserialize, Portable, Serialize,
+};
 
-/// Default pre-allocated file size (1 MiB).
+use crate::utils::serdes::{
+    read_u32_le, serialize_into, serialized_size, CountingWriter, ValueRef,
+};
+
 const DEFAULT_INITIAL_CAPACITY: u64 = 1024 * 1024;
-
-/// Per-entry header: 4 bytes key_len + 4 bytes value_len.
-const HEADER_SIZE: usize = 8;
-
-/// Sentinel `value_len` marking a tombstone (deleted key).
-/// Tombstone entries have no value bytes.
+const DEFAULT_COMPACTION_RATIO: f64 = 0.5;
 const TOMBSTONE: u32 = u32::MAX;
 
-/// Default compaction ratio — compact when 50% of the file is dead space.
-const DEFAULT_COMPACTION_RATIO: f64 = 0.5;
-
-/// Configuration for a KeyDir instance.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct KeyDirConfig {
-    /// Pre-allocated file size in bytes.
     pub initial_capacity: u64,
-    /// When dead_bytes / write_offset exceeds this, compaction triggers.
     pub compaction_ratio: f64,
 }
 
@@ -81,76 +89,46 @@ impl Default for KeyDirConfig {
     }
 }
 
-impl KeyDirConfig {
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.initial_capacity.to_le_bytes());
-        out.extend_from_slice(&self.compaction_ratio.to_le_bytes());
-    }
-
-    pub fn decode(bytes: &[u8]) -> io::Result<(KeyDirConfig, usize)> {
-        if bytes.len() < 16 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated KeyDirConfig",
-            ));
-        }
-        let mut c = [0u8; 8];
-        c.copy_from_slice(&bytes[0..8]);
-        let initial_capacity = u64::from_le_bytes(c);
-        c.copy_from_slice(&bytes[8..16]);
-        let compaction_ratio = f64::from_le_bytes(c);
-        Ok((
-            KeyDirConfig {
-                initial_capacity,
-                compaction_ratio,
-            },
-            16,
-        ))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// EntryMeta — points into the mmap'd file
-// ---------------------------------------------------------------------------
-
+/// Serialized sizes and offset of an entry in the mmap. Kept compact so the
+/// in-memory HashMap stays lean.
 #[derive(Debug, Clone, Copy)]
 struct EntryMeta {
-    /// Byte offset in the file where the entry header starts.
     offset: u64,
-    /// Length of the key in bytes.
-    key_len: u32,
-    /// Length of the value in bytes.
-    value_len: u32,
+    value_size: u32,
+    key_size: u32,
 }
 
-// ---------------------------------------------------------------------------
-// KeyDir
-// ---------------------------------------------------------------------------
+impl EntryMeta {
+    /// Total bytes the entry occupies on disk: two u32 length prefixes (8)
+    /// plus the archived key and value bytes.
+    fn on_disk_size(&self) -> u64 {
+        8 + self.value_size as u64 + self.key_size as u64
+    }
+}
 
-pub struct KeyDir {
-    /// In-memory index: key → location in the data file.
-    index: HashMap<Vec<u8>, EntryMeta>,
-    /// Memory-mapped data file.
+pub struct KeyDir<K, V> {
+    index: HashMap<K, EntryMeta>,
     mmap: MmapMut,
-    /// Underlying file handle (for growing and syncing).
     file: File,
-    /// Path on disk (for reopening after compaction).
     path: PathBuf,
-    /// Configuration.
     config: KeyDirConfig,
-    /// Next byte offset at which to append a new entry.
     write_offset: u64,
-    /// Total allocated file size in bytes.
     capacity: u64,
-    /// Bytes in the file that are no longer referenced (overwritten or
-    /// tombstoned entries).
     dead_bytes: u64,
+    _phantom: PhantomData<V>,
 }
 
-impl KeyDir {
-    // ---- constructors ----
-
-    /// Create a new KeyDir at `path`.
+impl<K, V> KeyDir<K, V>
+where
+    K: Hash + Eq + Clone + Archive,
+    for<'buf, 'a> K: Serialize<HighSerializer<Buffer<'buf>, ArenaHandle<'a>, RkyvError>>,
+    for<'a> K: Serialize<HighSerializer<CountingWriter, ArenaHandle<'a>, RkyvError>>,
+    <K as Archive>::Archived: Portable + Deserialize<K, HighDeserializer<RkyvError>> + 'static,
+    V: Archive,
+    for<'buf, 'a> V: Serialize<HighSerializer<Buffer<'buf>, ArenaHandle<'a>, RkyvError>>,
+    for<'a> V: Serialize<HighSerializer<CountingWriter, ArenaHandle<'a>, RkyvError>>,
+    <V as Archive>::Archived: Portable + Deserialize<V, HighDeserializer<RkyvError>> + 'static,
+{
     pub fn create(path: &Path, config: KeyDirConfig) -> io::Result<Self> {
         let capacity = config.initial_capacity;
         let file = OpenOptions::new()
@@ -161,7 +139,6 @@ impl KeyDir {
             .open(path)?;
 
         file.set_len(capacity)?;
-
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
         Ok(KeyDir {
@@ -173,11 +150,11 @@ impl KeyDir {
             write_offset: 0,
             capacity,
             dead_bytes: 0,
+            _phantom: PhantomData,
         })
     }
 
     pub fn open(path: &Path, config: KeyDirConfig) -> io::Result<Self> {
-        // Crash recovery: if main file is missing, try to restore.
         if !path.exists() {
             let compact = path.with_extension("compact");
             let bak = path.with_extension("bak");
@@ -201,6 +178,7 @@ impl KeyDir {
             write_offset: 0,
             capacity,
             dead_bytes: 0,
+            _phantom: PhantomData,
         };
 
         this.rebuild_index()?;
@@ -211,346 +189,368 @@ impl KeyDir {
         Ok(this)
     }
 
-    // ---- read path ----
+    // ---- read (zero-copy) ----
 
-    /// Get the value for `key`, returning an owned copy.
-    ///
-    /// Returns `None` if the key is not present or was deleted.
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    /// Look up `key`. Returns a [`ValueRef`] borrowing the archived value
+    /// directly from the memory-mapped file — no allocation, no copy.
+    pub fn get(&self, key: &K) -> Option<ValueRef<'_, V>> {
         let meta = self.index.get(key)?;
-        let offset = meta.offset as usize;
-        let value_start = offset + HEADER_SIZE + meta.key_len as usize;
-        let value_end = value_start + meta.value_len as usize;
-        Some(self.mmap[value_start..value_end].to_vec())
+        Some(self.value_ref(meta))
     }
 
-    /// Returns `true` if the key exists in the index.
-    pub fn contains_key(&self, key: &[u8]) -> bool {
+    /// Iterate all entries. Yields owned keys (cloned from the in-memory
+    /// HashMap) and zero-copy [`ValueRef`]s into the mmap. Order is
+    /// HashMap order.
+    pub fn entries(&self) -> impl Iterator<Item = (K, ValueRef<'_, V>)> + '_ {
+        self.index
+            .iter()
+            .map(|(k, meta)| (k.clone(), self.value_ref(meta)))
+    }
+
+    /// Iterate all keys (cloned from the in-memory index). Order is
+    /// HashMap order.
+    pub fn keys(&self) -> impl Iterator<Item = K> + '_ {
+        self.index.keys().cloned()
+    }
+
+    /// Iterate all values. Yields zero-copy [`ValueRef`]s into the mmap.
+    /// Order is HashMap order.
+    pub fn values(&self) -> impl Iterator<Item = ValueRef<'_, V>> + '_ {
+        self.index.values().map(|meta| self.value_ref(meta))
+    }
+
+    pub fn contains_key(&self, key: &K) -> bool {
         self.index.contains_key(key)
     }
-
-    /// Number of live keys in the index.
     pub fn len(&self) -> usize {
         self.index.len()
     }
-
-    /// Returns `true` if the index is empty.
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
     }
 
-    /// Iterate over all live (key, value) pairs.
-    pub fn entries(&self) -> impl Iterator<Item = (&[u8], Vec<u8>)> + '_ {
-        self.index.iter().map(|(key, meta)| {
-            let start = meta.offset as usize + HEADER_SIZE + meta.key_len as usize;
-            let end = start + meta.value_len as usize;
-            (key.as_slice(), self.mmap[start..end].to_vec())
-        })
+    /// Construct a `ValueRef` for the entry pointed at by `meta`.
+    fn value_ref(&self, meta: &EntryMeta) -> ValueRef<'_, V> {
+        let start = meta.offset as usize + 4;
+        let end = start + meta.value_size as usize;
+        ValueRef::from_bytes(&self.mmap[start..end])
     }
 
-    // ---- write path ----
+    // ---- write (direct-to-mmap) ----
 
-    /// Insert or update a key-value pair.
-    ///
-    /// The entry is appended to the data file and the index is updated
-    /// to point at the new location.  Previous values for the same key
-    /// become dead space tracked by `dead_bytes`.  If the dead-byte
-    /// ratio exceeds `compaction_ratio`, compaction runs automatically.
-    ///
-    /// Data is not durable until `flush()` is called.
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
-        // If overwriting, the old entry becomes dead space.
-        if let Some(old) = self.index.get(key) {
-            let old_entry_size = HEADER_SIZE + old.key_len as usize + old.value_len as usize;
-            self.dead_bytes += old_entry_size as u64;
+    /// Insert or overwrite. Both `key` and `value` are consumed —
+    /// `value` is serialized directly into the mmap (no intermediate
+    /// allocation), `key` is moved into the in-memory index.
+    pub fn put(&mut self, key: K, value: V) -> io::Result<()> {
+        if let Some(old) = self.index.get(&key) {
+            self.dead_bytes += old.on_disk_size();
         }
 
-        let entry_size = HEADER_SIZE + key.len() + value.len();
-
-        // Grow the file if needed.
-        if self.write_offset + entry_size as u64 > self.capacity {
-            self.grow(entry_size as u64)?;
-        }
-
-        let offset = self.write_offset as usize;
-        let key_len = key.len() as u32;
-        let val_len = value.len() as u32;
-
-        // Write directly into the mmap.
-        self.mmap[offset..offset + 4].copy_from_slice(&key_len.to_le_bytes());
-        self.mmap[offset + 4..offset + 8].copy_from_slice(&val_len.to_le_bytes());
-        self.mmap[offset + 8..offset + 8 + key.len()].copy_from_slice(key);
-        self.mmap[offset + 8 + key.len()..offset + entry_size].copy_from_slice(value);
-
+        let (offset, value_size, key_size) = self.write_entry(&key, &value)?;
         self.index.insert(
-            key.to_vec(),
+            key,
             EntryMeta {
-                offset: offset as u64,
-                key_len: key_len,
-                value_len: val_len,
+                offset,
+                value_size,
+                key_size,
             },
         );
-
-        self.write_offset += entry_size as u64;
         self.maybe_compact()?;
         Ok(())
     }
 
-    /// Delete a key by appending a tombstone entry to the file and
-    /// removing the key from the in-memory index.
+    /// Serialize `key` and `value` into the mmap at the current write
+    /// offset. The entry layout is:
     ///
-    /// On reopen, the tombstone is replayed and the key stays deleted.
-    /// The tombstone and old value entries remain in the data file as
-    /// dead space until `compact()` is called.
+    /// ```text
+    /// [value_size: u32 LE][archived V][key_size: u32 LE][archived K]
+    /// ```
     ///
-    /// Returns `true` if the key was present in the index.
-    pub fn delete(&mut self, key: &[u8]) -> io::Result<bool> {
-        let old = match self.index.remove(key) {
-            Some(meta) => meta,
-            None => return Ok(false),
+    /// Updates `self.write_offset` to point past the new entry. Returns
+    /// the metadata (`offset`, `value_size`, `key_size`) needed to index
+    /// the entry. The caller is responsible for inserting the metadata
+    /// into `self.index` and calling `maybe_compact()`.
+    fn write_entry(&mut self, key: &K, value: &V) -> io::Result<(u64, u32, u32)> {
+        let offset = self.write_offset as usize;
+
+        // Layout: [value_size: u32][archived value][key_size: u32][archived key]
+        let v_end = self.serialize_into_mmap(value, offset + 4)?;
+        let value_size = (v_end - (offset + 4)) as u32;
+        self.mmap[offset..offset + 4].copy_from_slice(&value_size.to_le_bytes());
+
+        let k_end = self.serialize_into_mmap(key, v_end + 4)?;
+        let key_size = (k_end - (v_end + 4)) as u32;
+        self.mmap[v_end..v_end + 4].copy_from_slice(&key_size.to_le_bytes());
+
+        self.write_offset = k_end as u64;
+        Ok((offset as u64, value_size, key_size))
+    }
+
+    /// Read-modify-write. Deserializes the value, passes it to `f`,
+    /// and serializes the result back. Returns `true` if the key existed,
+    /// `false` otherwise — `f` is never called when the key is absent.
+    pub fn update<F>(&mut self, key: &K, f: F) -> io::Result<bool>
+    where
+        F: FnOnce(V) -> V,
+    {
+        // Single lookup — get metadata and account for dead bytes upfront.
+        let Some(meta) = self.index.get(key).copied() else {
+            return Ok(false);
         };
+        self.dead_bytes += meta.on_disk_size();
 
-        // The old entry becomes dead space.
-        let old_entry_size = HEADER_SIZE + old.key_len as usize + old.value_len as usize;
-        self.dead_bytes += old_entry_size as u64;
+        // Deserialize current value from mmap.
+        let current = self.value_ref(&meta).to_owned();
+        let new_v = f(current);
 
-        self.write_tombstone(key)?;
+        // Write the new entry (serializes &K — no clone needed).
+        let (offset, value_size, key_size) = self.write_entry(key, &new_v)?;
 
-        // The tombstone itself is also dead space.
-        self.dead_bytes += (HEADER_SIZE + key.len()) as u64;
-
+        // Update the index entry in place — no key clone.
+        *self.index.get_mut(key).expect("key just found") = EntryMeta {
+            offset,
+            value_size,
+            key_size,
+        };
         self.maybe_compact()?;
         Ok(true)
     }
 
-    /// Append a tombstone marker for `key` to the data file.
-    fn write_tombstone(&mut self, key: &[u8]) -> io::Result<()> {
-        let entry_size = HEADER_SIZE + key.len(); // no value bytes
-
-        if self.write_offset + entry_size as u64 > self.capacity {
-            self.grow(entry_size as u64)?;
-        }
-
-        let offset = self.write_offset as usize;
-        let key_len = key.len() as u32;
-
-        self.mmap[offset..offset + 4].copy_from_slice(&key_len.to_le_bytes());
-        self.mmap[offset + 4..offset + 8].copy_from_slice(&TOMBSTONE.to_le_bytes());
-        self.mmap[offset + 8..offset + 8 + key.len()].copy_from_slice(key);
-        // No value bytes — the tombstone sentinel is the marker.
-
-        self.write_offset += entry_size as u64;
-        Ok(())
-    }
-
-    /// Write a key-value pair directly without triggering `maybe_compact`.
-    /// Used only during compaction to populate the new file.
-    fn compact_write(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
-        let entry_size = HEADER_SIZE + key.len() + value.len();
-        if self.write_offset + entry_size as u64 > self.capacity {
-            self.grow(entry_size as u64)?;
-        }
-        let offset = self.write_offset as usize;
-        self.mmap[offset..offset + 4].copy_from_slice(&(key.len() as u32).to_le_bytes());
-        self.mmap[offset + 4..offset + 8].copy_from_slice(&(value.len() as u32).to_le_bytes());
-        self.mmap[offset + 8..offset + 8 + key.len()].copy_from_slice(key);
-        self.mmap[offset + 8 + key.len()..offset + entry_size].copy_from_slice(value);
-        self.index.insert(
-            key.to_vec(),
-            EntryMeta {
-                offset: offset as u64,
-                key_len: key.len() as u32,
-                value_len: value.len() as u32,
-            },
-        );
-        self.write_offset += entry_size as u64;
-        Ok(())
-    }
-
-    /// Sync the mmap to disk.
+    /// In-place archived update. Mutates the value's bytes in the mmap
+    /// without deserializing — the closure operates directly on the
+    /// archived form. Returns whether the key existed.
     ///
-    /// After this returns, all writes are durable.
+    /// # Safety contract
+    /// The closure must not change the byte length of the archive (no
+    /// growing `ArchivedVec`s, no `ArchivedString` length changes, etc.).
+    /// Size-stable mutations only — see the trait docs for details.
+    pub fn update_in_place<F>(&mut self, key: &K, f: F) -> io::Result<bool>
+    where
+        F: FnOnce(&mut Archived<V>),
+    {
+        let Some(meta) = self.index.get(key).copied() else {
+            return Ok(false);
+        };
+        let start = meta.offset as usize + 4;
+        let end = start + meta.value_size as usize;
+        // SAFETY: bytes are a valid archive of V (maintained by `put`).
+        // The caller's closure must not change the byte length — documented
+        // contract above. `unseal_unchecked` is sound under the same
+        // assumption: the closure only mutates in-place fields, never
+        // restructures relative pointers.
+        let sealed =
+            unsafe { rkyv::access_unchecked_mut::<Archived<V>>(&mut self.mmap[start..end]) };
+        let archived: &mut Archived<V> = unsafe { sealed.unseal_unchecked() };
+        f(archived);
+        Ok(true)
+    }
+
+    pub fn delete(&mut self, key: &K) -> io::Result<bool> {
+        let Some(old) = self.index.remove(key) else {
+            return Ok(false);
+        };
+        self.dead_bytes += old.on_disk_size();
+        self.write_tombstone(key)?;
+        self.maybe_compact()?;
+        Ok(true)
+    }
+
+    /// Write a tombstone entry for `key` at the current write offset. A
+    /// tombstone is a marker entry with `value_size = u32::MAX` and no
+    /// value bytes — just the key. Records the dead bytes it consumes.
+    fn write_tombstone(&mut self, key: &K) -> io::Result<()> {
+        let offset = self.write_offset as usize;
+        let k_end = self.serialize_into_mmap(key, offset + 8)?;
+        let key_size = (k_end - (offset + 8)) as u32;
+
+        self.mmap[offset..offset + 4].copy_from_slice(&TOMBSTONE.to_le_bytes());
+        self.mmap[offset + 4..offset + 8].copy_from_slice(&key_size.to_le_bytes());
+
+        self.write_offset = k_end as u64;
+        self.dead_bytes += 8 + key_size as u64;
+        Ok(())
+    }
+
+    /// Serialize `value` directly into `self.mmap` starting at byte `pos`.
+    ///
+    /// Two-phase: first measures the archive size via [`CountingWriter`]
+    /// (no allocation), then writes in one pass via [`Buffer`]. If the
+    /// measured size exceeds `self.capacity`, the file is grown before
+    /// writing. Returns the byte offset just past the written archive.
+    ///
+    /// This is the core write primitive — every entry (live or tombstone)
+    /// calls it for its key and (for live entries) value.
+    fn serialize_into_mmap<T>(&mut self, value: &T, pos: usize) -> io::Result<usize>
+    where
+        T: for<'buf, 'a> Serialize<HighSerializer<Buffer<'buf>, ArenaHandle<'a>, RkyvError>>
+            + for<'a> Serialize<HighSerializer<CountingWriter, ArenaHandle<'a>, RkyvError>>,
+    {
+        let size = serialized_size(value)?;
+        let end = pos
+            .checked_add(size)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir offset overflow"))?;
+        if (end as u64) > self.capacity {
+            self.grow(end as u64)?;
+        }
+        let written = serialize_into(value, &mut self.mmap[pos..end])?;
+        debug_assert_eq!(written, size);
+        Ok(end)
+    }
+
     pub fn flush(&self) -> io::Result<()> {
         self.mmap.flush()
     }
 
-    // ---- maintenance ----
-
-    /// Trigger compaction if the dead-byte ratio exceeds the threshold.
+    /// Trigger compaction if the dead-byte ratio meets or exceeds
+    /// `compaction_ratio`. Called after every mutation (`put`, `update`,
+    /// `delete`). Idempotent: does nothing if dead_bytes is zero or below
+    /// the threshold.
     fn maybe_compact(&mut self) -> io::Result<()> {
         if self.write_offset == 0 || self.dead_bytes == 0 {
             return Ok(());
         }
-        let ratio = self.dead_bytes as f64 / self.write_offset as f64;
-        if ratio >= self.config.compaction_ratio {
+        if self.dead_bytes as f64 / self.write_offset as f64 >= self.config.compaction_ratio {
             self.compact()?;
         }
         Ok(())
     }
 
-    /// Compact the data file by writing only live entries to a new file.
+    /// Rewrite the file, keeping only live entries. Uses a three-phase
+    /// atomic rename protocol for crash safety:
     ///
-    /// Called automatically when the dead-byte ratio exceeds
-    /// `compaction_ratio`.  Tombstone and overwritten entries are dropped.
+    /// 1. Write a `.compact` file with only live entries (`memcpy` from
+    ///    the old mmap — no deserialization).
+    /// 2. Rename old main file to `.bak`.
+    /// 3. Rename `.compact` to the main path.
+    /// 4. Remove `.bak`.
+    ///
+    /// After compaction: dead_bytes = 0, write_offset = total live bytes,
+    /// and `self.mmap`/`self.file`/`self.index` are replaced with the
+    /// compacted versions.
     fn compact(&mut self) -> io::Result<()> {
         let tmp_path = self.path.with_extension("compact");
-        let mut new_kd = KeyDir::create(
-            &tmp_path,
-            KeyDirConfig {
-                initial_capacity: self.write_offset.max(self.config.initial_capacity),
-                ..Default::default()
-            },
-        )?;
 
-        // Walk the mmap in file order to preserve sequential layout.
-        // Use `compact_write` instead of `put` to avoid triggering
-        // `maybe_compact` recursively on the new file.
-        let mut cursor: usize = 0;
-        while cursor < self.write_offset as usize {
-            let key_len =
-                u32::from_le_bytes(self.mmap[cursor..cursor + 4].try_into().unwrap()) as usize;
-            let val_len =
-                u32::from_le_bytes(self.mmap[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        let live_size: u64 = self.index.values().map(EntryMeta::on_disk_size).sum();
+        let new_capacity = live_size.max(self.config.initial_capacity);
 
-            let key = &self.mmap[cursor + HEADER_SIZE..cursor + HEADER_SIZE + key_len];
+        let mut new_index: HashMap<K, EntryMeta> = HashMap::with_capacity(self.index.len());
+        let write_offset = {
+            let new_file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            new_file.set_len(new_capacity)?;
+            let mut new_mmap = unsafe { MmapMut::map_mut(&new_file)? };
 
-            if val_len == TOMBSTONE as usize {
-                cursor += HEADER_SIZE + key_len;
-                continue;
+            let mut cursor: usize = 0;
+            for (key, meta) in self.index.iter() {
+                let entry_size = meta.on_disk_size() as usize;
+                let src_start = meta.offset as usize;
+                new_mmap[cursor..cursor + entry_size]
+                    .copy_from_slice(&self.mmap[src_start..src_start + entry_size]);
+                new_index.insert(
+                    key.clone(),
+                    EntryMeta {
+                        offset: cursor as u64,
+                        ..*meta
+                    },
+                );
+                cursor += entry_size;
             }
+            new_mmap.flush()?;
+            cursor as u64
+            // new_mmap and new_file dropped here so the rename below can
+            // proceed even on platforms with mandatory locking.
+        };
 
-            let value = &self.mmap
-                [cursor + HEADER_SIZE + key_len..cursor + HEADER_SIZE + key_len + val_len];
-
-            // Only copy entries still in the index AND whose offset matches.
-            if let Some(meta) = self.index.get(key) {
-                if meta.offset == cursor as u64 {
-                    new_kd.compact_write(key, value)?;
-                }
-            }
-
-            cursor += HEADER_SIZE + key_len + val_len;
-        }
-
-        new_kd.flush()?;
-
-        // Atomic-ish swap: rename old → backup, rename new → target.
         let bak_path = self.path.with_extension("bak");
         let _ = fs::remove_file(&bak_path);
         fs::rename(&self.path, &bak_path)?;
         fs::rename(&tmp_path, &self.path)?;
         let _ = fs::remove_file(&bak_path);
 
-        // Replace our state with the compacted version.
-        let KeyDir {
-            mmap,
-            file,
-            index,
-            capacity,
-            write_offset,
-            path: _,
-            dead_bytes: _,
-            config: _,
-        } = new_kd;
+        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
+
         self.mmap = mmap;
         self.file = file;
-        self.index = index;
-        self.capacity = capacity;
+        self.index = new_index;
+        self.capacity = new_capacity;
         self.write_offset = write_offset;
         self.dead_bytes = 0;
-
         Ok(())
     }
 
-    /// Bytes written so far (logical end of data, excludes pre-allocated tail).
     pub fn data_size(&self) -> u64 {
         self.write_offset
     }
-
-    /// Total allocated file capacity.
     pub fn capacity(&self) -> u64 {
         self.capacity
     }
-
-    /// Bytes in the file that are no longer referenced by any live key.
     pub fn dead_bytes(&self) -> u64 {
         self.dead_bytes
     }
 
-    // ---- internal helpers ----
+    // ---- rebuild ----
 
-    /// Scan the file from offset 0 to rebuild the in-memory index in a single
-    /// pass.
+    /// Rebuild the in-memory index by scanning the file from byte 0.
+    /// Replays all entries in order: live entries overwrite prior index
+    /// entries, tombstones remove them. Accumulates dead_bytes from entries
+    /// that get overwritten or tombstoned. Sets `write_offset` to the end
+    /// of the last valid entry.
     ///
-    /// Dead-byte accounting is done inline: when an insert displaces an
-    /// existing index entry, the old entry's size is added to `dead_bytes`
-    /// immediately.  Tombstones are counted as dead on sight.  This avoids
-    /// the O(n) second pass over the file.
-    ///
-    /// Stops when it hits a zeroed `key_len` (pre-allocated but unwritten
-    /// space) or runs past the file boundary.  Overwritten keys are
-    /// naturally deduplicated (last write wins).
+    /// Called once at startup (`open`). Makes no assumptions about the
+    /// file's contents — the index is built purely from what's on disk.
     fn rebuild_index(&mut self) -> io::Result<()> {
         let mut cursor: usize = 0;
         self.dead_bytes = 0;
 
-        loop {
-            if cursor + HEADER_SIZE > self.mmap.len() {
+        while let Some(value_size) = read_u32_le(&self.mmap, cursor) {
+            // 0 marks the (zero-filled) tail of the pre-allocated file.
+            if value_size == 0 {
                 break;
             }
 
-            let key_len =
-                u32::from_le_bytes(self.mmap[cursor..cursor + 4].try_into().unwrap()) as usize;
-
-            // key_len == 0 means pre-allocated, unwritten space — stop here.
-            if key_len == 0 {
+            let is_tombstone = value_size == TOMBSTONE;
+            let key_size_off = if is_tombstone {
+                cursor + 4
+            } else {
+                cursor + 4 + value_size as usize
+            };
+            let Some(key_size) = read_u32_le(&self.mmap, key_size_off) else {
                 break;
-            }
-
-            let val_len =
-                u32::from_le_bytes(self.mmap[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
-
-            if val_len == TOMBSTONE as usize {
-                let entry_end = cursor + HEADER_SIZE + key_len;
-                if entry_end > self.mmap.len() {
-                    break;
-                }
-                let key = &self.mmap[cursor + HEADER_SIZE..cursor + HEADER_SIZE + key_len];
-                // Tombstone: remove from index; both this entry and the
-                // previously live entry (already counted when displaced) are dead.
-                if let Some(old) = self.index.remove(key) {
-                    let old_size = HEADER_SIZE + old.key_len as usize + old.value_len as usize;
-                    self.dead_bytes += old_size as u64;
-                }
-                self.dead_bytes += (HEADER_SIZE + key_len) as u64;
-                cursor = entry_end;
-                continue;
-            }
-
-            let entry_end = cursor + HEADER_SIZE + key_len + val_len;
-
-            // Partial write (crashed mid-append) — discard and stop.
+            };
+            let key_start = key_size_off + 4;
+            let entry_end = key_start + key_size as usize;
             if entry_end > self.mmap.len() {
                 break;
             }
 
-            let key = &self.mmap[cursor + HEADER_SIZE..cursor + HEADER_SIZE + key_len];
-
-            // If a previous entry for this key exists, it becomes dead space.
-            if let Some(old) = self.index.get(key) {
-                let old_size = HEADER_SIZE + old.key_len as usize + old.value_len as usize;
-                self.dead_bytes += old_size as u64;
+            let key: K = unsafe {
+                rkyv::from_bytes_unchecked::<K, RkyvError>(&self.mmap[key_start..entry_end])
             }
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "corrupt KeyDir entry"))?;
 
-            self.index.insert(
-                key.to_vec(),
-                EntryMeta {
-                    offset: cursor as u64,
-                    key_len: key_len as u32,
-                    value_len: val_len as u32,
-                },
-            );
-
+            if is_tombstone {
+                if let Some(old) = self.index.remove(&key) {
+                    self.dead_bytes += old.on_disk_size();
+                }
+                self.dead_bytes += 8 + key_size as u64;
+            } else {
+                if let Some(old) = self.index.get(&key) {
+                    self.dead_bytes += old.on_disk_size();
+                }
+                self.index.insert(
+                    key,
+                    EntryMeta {
+                        offset: cursor as u64,
+                        value_size,
+                        key_size,
+                    },
+                );
+            }
             cursor = entry_end;
         }
 
@@ -558,29 +558,97 @@ impl KeyDir {
         Ok(())
     }
 
-    /// Grow the file so it can accommodate at least `needed` more bytes.
+    /// Grow the backing file to at least `desired` bytes in a single shot.
     ///
-    /// Uses geometric (doubling) growth: doubles the current capacity
-    /// until it covers `self.write_offset + needed`.
-    fn grow(&mut self, needed: u64) -> io::Result<()> {
+    /// Picks `max(capacity * 2, desired)` so amortized growth stays
+    /// exponential even when a write skips several doubling rounds.
+    /// Caller is responsible for only invoking this when an actual grow
+    /// is required (`desired > self.capacity`).
+    fn grow(&mut self, desired: u64) -> io::Result<()> {
         self.mmap.flush()?;
-
-        let target = self.write_offset.checked_add(needed).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir write offset overflow")
+        let doubled = self.capacity.checked_mul(2).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir capacity overflow")
         })?;
-
-        let mut new_capacity = self.capacity;
-        while new_capacity < target {
-            new_capacity = new_capacity.saturating_mul(2);
-        }
-
+        let new_capacity = doubled.max(desired);
         self.file.set_len(new_capacity)?;
-
-        // SAFETY: the file is at least `new_capacity` bytes and we are the
-        // sole owner of the mmap.
         self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
         self.capacity = new_capacity;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Backend impl — unordered backend.
+//
+// KeyDir implements `Backend` only (not `OrderedBackend`) — its in-memory
+// hash index has no usable key ordering. Iteration order is arbitrary
+// (HashMap iteration order). Every method is a thin delegation to the
+// identically-named inherent method.
+// ---------------------------------------------------------------------------
+
+impl<K, V> crate::core::backend::Backend<K, V> for KeyDir<K, V>
+where
+    K: Hash + Eq + Clone + Archive,
+    for<'buf, 'a> K: Serialize<HighSerializer<Buffer<'buf>, ArenaHandle<'a>, RkyvError>>,
+    for<'a> K: Serialize<HighSerializer<CountingWriter, ArenaHandle<'a>, RkyvError>>,
+    <K as Archive>::Archived: Portable + Deserialize<K, HighDeserializer<RkyvError>> + 'static,
+    V: Archive,
+    for<'buf, 'a> V: Serialize<HighSerializer<Buffer<'buf>, ArenaHandle<'a>, RkyvError>>,
+    for<'a> V: Serialize<HighSerializer<CountingWriter, ArenaHandle<'a>, RkyvError>>,
+    <V as Archive>::Archived: Portable + Deserialize<V, HighDeserializer<RkyvError>> + 'static,
+{
+    fn get(&self, key: &K) -> Option<ValueRef<'_, V>> {
+        KeyDir::get(self, key)
+    }
+
+    fn contains(&self, key: &K) -> bool {
+        KeyDir::contains_key(self, key)
+    }
+
+    fn put(&mut self, key: K, value: V) -> io::Result<()> {
+        KeyDir::put(self, key, value)
+    }
+
+    fn delete(&mut self, key: &K) -> io::Result<bool> {
+        KeyDir::delete(self, key)
+    }
+
+    fn update<F>(&mut self, key: &K, f: F) -> io::Result<bool>
+    where
+        F: FnOnce(V) -> V,
+    {
+        KeyDir::update(self, key, f)
+    }
+
+    fn update_in_place<F>(&mut self, key: &K, f: F) -> io::Result<bool>
+    where
+        F: FnOnce(&mut Archived<V>),
+    {
+        KeyDir::update_in_place(self, key, f)
+    }
+
+    fn keys(&self) -> impl Iterator<Item = K> + '_ {
+        KeyDir::keys(self)
+    }
+
+    fn values(&self) -> impl Iterator<Item = ValueRef<'_, V>> + '_ {
+        KeyDir::values(self)
+    }
+
+    fn entries(&self) -> impl Iterator<Item = (K, ValueRef<'_, V>)> + '_ {
+        KeyDir::entries(self)
+    }
+
+    fn len(&self) -> usize {
+        KeyDir::len(self)
+    }
+
+    fn is_empty(&self) -> bool {
+        KeyDir::is_empty(self)
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        KeyDir::flush(self)
     }
 }
 
@@ -591,290 +659,716 @@ impl KeyDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn tmp(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("zendb_keydir_{}", name))
+    type TestKey = Vec<u8>;
+
+    #[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq)]
+    struct TestVal {
+        name: String,
+        count: u32,
+        tags: Vec<u32>,
     }
 
-    fn default_cfg() -> KeyDirConfig {
-        KeyDirConfig::default()
+    fn k(s: &str) -> TestKey {
+        s.as_bytes().to_vec()
     }
 
-    #[test]
-    fn put_and_get() {
-        let p = tmp("put_get");
-        let mut kd = KeyDir::create(&p, default_cfg()).unwrap();
-        kd.put(b"hello", b"world").unwrap();
-        kd.flush().unwrap();
-        assert_eq!(kd.get(b"hello"), Some(b"world".to_vec()));
-        assert_eq!(kd.get(b"nope"), None);
-        fs::remove_file(&p).ok();
-    }
-
-    #[test]
-    fn overwrite_last_write_wins() {
-        let p = tmp("overwrite");
-        let mut kd = KeyDir::create(&p, default_cfg()).unwrap();
-        kd.put(b"key", b"v1").unwrap();
-        kd.put(b"key", b"v2").unwrap();
-        kd.flush().unwrap();
-        assert_eq!(kd.get(b"key"), Some(b"v2".to_vec()));
-        fs::remove_file(&p).ok();
-    }
-
-    #[test]
-    fn delete_and_missing() {
-        let p = tmp("delete");
-        let mut kd = KeyDir::create(&p, default_cfg()).unwrap();
-        kd.put(b"key", b"val").unwrap();
-        assert!(kd.delete(b"key").unwrap());
-        assert!(!kd.delete(b"key").unwrap());
-        assert_eq!(kd.get(b"key"), None);
-        fs::remove_file(&p).ok();
-    }
-
-    #[test]
-    fn reopen_rebuilds_index() {
-        let p = tmp("reopen");
-        {
-            let mut kd = KeyDir::create(&p, default_cfg()).unwrap();
-            kd.put(b"a", b"alpha").unwrap();
-            kd.put(b"b", b"beta").unwrap();
-            kd.put(b"c", b"gamma").unwrap();
-            kd.flush().unwrap();
+    fn v(name: &str, count: u32) -> TestVal {
+        TestVal {
+            name: name.into(),
+            count,
+            tags: vec![count, count * 2, count * 3],
         }
-        let kd = KeyDir::open(&p, default_cfg()).unwrap();
-        assert_eq!(kd.get(b"a"), Some(b"alpha".to_vec()));
-        assert_eq!(kd.get(b"b"), Some(b"beta".to_vec()));
-        assert_eq!(kd.get(b"c"), Some(b"gamma".to_vec()));
+    }
+
+    fn assert_val_eq(archived: &ArchivedTestVal, expected: &TestVal) {
+        assert_eq!(archived.name.as_str(), expected.name);
+        assert_eq!(archived.count.to_native(), expected.count);
+        let tags: Vec<u32> = archived.tags.iter().map(|t| t.to_native()).collect();
+        assert_eq!(tags, expected.tags);
+    }
+
+    /// Each test gets a fresh, isolated path.
+    fn tmp_path(label: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join("zendb_keydir_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(format!("{}_{}_{}.kd", label, std::process::id(), n));
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_file(p.with_extension("compact"));
+        let _ = fs::remove_file(p.with_extension("bak"));
+        p
+    }
+
+    fn create(path: &Path) -> KeyDir<TestKey, TestVal> {
+        KeyDir::create(path, KeyDirConfig::default()).unwrap()
+    }
+
+    fn create_with(path: &Path, cfg: KeyDirConfig) -> KeyDir<TestKey, TestVal> {
+        KeyDir::create(path, cfg).unwrap()
+    }
+
+    fn open(path: &Path) -> KeyDir<TestKey, TestVal> {
+        KeyDir::open(path, KeyDirConfig::default()).unwrap()
+    }
+
+    // ---- basic put / get ----
+
+    #[test]
+    fn put_then_get() {
+        let p = tmp_path("put_get");
+        let mut kd = create(&p);
+        kd.put(k("alice"), v("alice", 1)).unwrap();
+        assert_val_eq(&*kd.get(&k("alice")).unwrap(), &v("alice", 1));
+    }
+
+    #[test]
+    fn get_missing_returns_none() {
+        let p = tmp_path("missing");
+        let kd = create(&p);
+        assert!(kd.get(&k("ghost")).is_none());
+    }
+
+    #[test]
+    fn put_multiple_keys() {
+        let p = tmp_path("multi");
+        let mut kd = create(&p);
+        kd.put(k("a"), v("alpha", 1)).unwrap();
+        kd.put(k("b"), v("beta", 2)).unwrap();
+        kd.put(k("c"), v("gamma", 3)).unwrap();
         assert_eq!(kd.len(), 3);
-        fs::remove_file(&p).ok();
+        assert_val_eq(&*kd.get(&k("a")).unwrap(), &v("alpha", 1));
+        assert_val_eq(&*kd.get(&k("b")).unwrap(), &v("beta", 2));
+        assert_val_eq(&*kd.get(&k("c")).unwrap(), &v("gamma", 3));
+    }
+
+    // ---- overwrite & dead-bytes accounting ----
+
+    #[test]
+    fn overwrite_replaces_value() {
+        let p = tmp_path("overwrite");
+        let mut kd = create(&p);
+        kd.put(k("a"), v("first", 1)).unwrap();
+        kd.put(k("a"), v("second", 2)).unwrap();
+        assert_eq!(kd.len(), 1);
+        assert_val_eq(&*kd.get(&k("a")).unwrap(), &v("second", 2));
     }
 
     #[test]
-    fn reopen_overwrite_last_write_wins() {
-        let p = tmp("reopen_overwrite");
-        {
-            let mut kd = KeyDir::create(&p, default_cfg()).unwrap();
-            kd.put(b"key", b"old").unwrap();
-            kd.put(b"key", b"new").unwrap();
-            kd.flush().unwrap();
-        }
-        let kd = KeyDir::open(&p, default_cfg()).unwrap();
-        assert_eq!(kd.get(b"key"), Some(b"new".to_vec()));
-        fs::remove_file(&p).ok();
-    }
-
-    #[test]
-    fn large_values() {
-        let p = tmp("large");
-        let mut kd = KeyDir::create(&p, default_cfg()).unwrap();
-        let big = vec![0xABu8; 10_000];
-        kd.put(b"big", &big).unwrap();
-        kd.flush().unwrap();
-        assert_eq!(kd.get(b"big"), Some(big));
-        fs::remove_file(&p).ok();
-    }
-
-    #[test]
-    fn empty_keydir() {
-        let p = tmp("empty");
-        let kd = KeyDir::create(&p, default_cfg()).unwrap();
-        assert!(kd.is_empty());
-        assert_eq!(kd.len(), 0);
-        assert_eq!(kd.get(b"anything"), None);
-        fs::remove_file(&p).ok();
-    }
-
-    #[test]
-    fn compact_reclaims_space() {
-        let p = tmp("compact");
-        {
-            let cfg = KeyDirConfig {
-                compaction_ratio: 0.0,
-                ..default_cfg()
-            };
-            let mut kd = KeyDir::create(&p, cfg).unwrap();
-            kd.put(b"keep", b"value").unwrap();
-            kd.put(b"overwritten", b"v1").unwrap();
-            kd.put(b"overwritten", b"v2").unwrap();
-            assert_eq!(kd.dead_bytes(), 0);
-            kd.put(b"deleted", b"gone").unwrap();
-            kd.delete(b"deleted").unwrap();
-            assert_eq!(kd.dead_bytes(), 0);
-            assert_eq!(kd.get(b"keep"), Some(b"value".to_vec()));
-            assert_eq!(kd.get(b"overwritten"), Some(b"v2".to_vec()));
-            assert_eq!(kd.get(b"deleted"), None);
-            kd.flush().unwrap();
-        }
-        let kd = KeyDir::open(&p, default_cfg()).unwrap();
-        assert_eq!(kd.get(b"keep"), Some(b"value".to_vec()));
-        assert_eq!(kd.get(b"overwritten"), Some(b"v2".to_vec()));
-        assert_eq!(kd.get(b"deleted"), None);
-        fs::remove_file(&p).ok();
-    }
-
-    #[test]
-    fn auto_grows() {
-        let p = tmp("grow");
-        let cfg = KeyDirConfig {
-            initial_capacity: 64,
-            ..default_cfg()
-        };
-        let mut kd = KeyDir::create(&p, cfg).unwrap();
-        let data = vec![0xCDu8; 200];
-        kd.put(b"data", &data).unwrap();
-        kd.flush().unwrap();
-        assert_eq!(kd.get(b"data"), Some(data));
-        assert!(kd.capacity() > 64, "file should have grown");
-        fs::remove_file(&p).ok();
-    }
-
-    #[test]
-    fn contains_key() {
-        let p = tmp("contains");
-        let mut kd = KeyDir::create(&p, default_cfg()).unwrap();
-        kd.put(b"exists", b"yes").unwrap();
-        assert!(kd.contains_key(b"exists"));
-        assert!(!kd.contains_key(b"nope"));
-        fs::remove_file(&p).ok();
-    }
-
-    // --- Regression tests for fixed bugs ---
-
-    // Old bug: entries() called self.get(key) internally, which did a second
-    // self.index.get(key) — two hash lookups per entry.  Verify that the
-    // values returned by entries() exactly match those returned by get().
-    #[test]
-    fn entries_values_match_get() {
-        let p = tmp("entries_match");
-        let mut kd = KeyDir::create(&p, default_cfg()).unwrap();
-        kd.put(b"alpha", b"aaa").unwrap();
-        kd.put(b"beta", b"bbb").unwrap();
-        kd.put(b"gamma", b"ccc").unwrap();
-        // Overwrite one key — entries() must return the latest value.
-        kd.put(b"alpha", b"zzz").unwrap();
-
-        let mut from_entries: Vec<(Vec<u8>, Vec<u8>)> =
-            kd.entries().map(|(k, v)| (k.to_vec(), v)).collect();
-        from_entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        for (key, val_from_entries) in &from_entries {
-            let val_from_get = kd.get(key).expect("get() must find the same key");
-            assert_eq!(
-                val_from_entries, &val_from_get,
-                "entries() and get() disagree for key {:?}",
-                key
-            );
-        }
-        assert_eq!(from_entries.len(), 3);
-        fs::remove_file(&p).ok();
-    }
-
-    // Geometric growth: doubling capacity until the needed size is covered.
-    #[test]
-    fn geometric_capacity_growth() {
-        let p = tmp("geom");
-        let cfg = KeyDirConfig {
-            initial_capacity: 128,
-            compaction_ratio: 1.1, // never compact during this test
-        };
-        let mut kd = KeyDir::create(&p, cfg).unwrap();
-        let initial = kd.capacity();
-        // Write enough data to trigger at least one grow.
-        let data = vec![0xFFu8; 256]; // bigger than initial capacity
-        kd.put(b"k", &data).unwrap();
-        // With geometric growth the new capacity must be at least 2× the
-        // original.
-        assert!(
-            kd.capacity() >= initial * 2,
-            "capacity {} did not double from {}",
-            kd.capacity(),
-            initial
+    fn overwrite_accumulates_dead_bytes() {
+        let p = tmp_path("dead_bytes");
+        // High compaction_ratio so we observe dead_bytes without auto-compaction kicking in.
+        let mut kd = create_with(
+            &p,
+            KeyDirConfig {
+                initial_capacity: 1 << 20,
+                compaction_ratio: 0.99,
+            },
         );
-        assert_eq!(kd.get(b"k"), Some(data));
-        fs::remove_file(&p).ok();
+        kd.put(k("a"), v("first", 1)).unwrap();
+        assert_eq!(kd.dead_bytes(), 0);
+        kd.put(k("a"), v("second", 2)).unwrap();
+        assert!(kd.dead_bytes() > 0);
     }
 
-    // Old bug: rebuild_index() used two passes — the second pass re-scanned
-    // the whole file to compute dead_bytes.  The new single pass computes
-    // dead_bytes inline.  Verify the count is accurate after reopening a file
-    // with known dead entries.
+    // ---- delete & tombstones ----
+
     #[test]
-    fn rebuild_index_dead_bytes_accurate() {
-        let p = tmp("dead_bytes");
+    fn delete_removes_key() {
+        let p = tmp_path("delete");
+        let mut kd = create(&p);
+        kd.put(k("a"), v("x", 1)).unwrap();
+        assert!(kd.contains_key(&k("a")));
+        assert!(kd.delete(&k("a")).unwrap());
+        assert!(!kd.contains_key(&k("a")));
+        assert!(kd.get(&k("a")).is_none());
+        assert_eq!(kd.len(), 0);
+    }
+
+    #[test]
+    fn delete_missing_returns_false() {
+        let p = tmp_path("delete_missing");
+        let mut kd = create(&p);
+        assert!(!kd.delete(&k("ghost")).unwrap());
+    }
+
+    #[test]
+    fn delete_then_reinsert() {
+        let p = tmp_path("delete_reinsert");
+        let mut kd = create(&p);
+        kd.put(k("a"), v("first", 1)).unwrap();
+        kd.delete(&k("a")).unwrap();
+        kd.put(k("a"), v("second", 2)).unwrap();
+        assert_val_eq(&*kd.get(&k("a")).unwrap(), &v("second", 2));
+    }
+
+    // ---- introspection ----
+
+    #[test]
+    fn len_and_is_empty() {
+        let p = tmp_path("len");
+        let mut kd = create(&p);
+        assert_eq!(kd.len(), 0);
+        assert!(kd.is_empty());
+        kd.put(k("a"), v("a", 1)).unwrap();
+        kd.put(k("b"), v("b", 2)).unwrap();
+        assert_eq!(kd.len(), 2);
+        assert!(!kd.is_empty());
+    }
+
+    #[test]
+    fn entries_yields_live_pairs_only() {
+        let p = tmp_path("entries");
+        let mut kd = create(&p);
+        kd.put(k("a"), v("av", 1)).unwrap();
+        kd.put(k("b"), v("bv", 2)).unwrap();
+        kd.put(k("c"), v("cv", 3)).unwrap();
+        kd.delete(&k("b")).unwrap();
+
+        // entries() now yields (&Archived<K>, &Archived<V>); ArchivedVec<u8>
+        // derefs to [u8], so we convert via as_slice().to_vec().
+        let mut collected: std::collections::HashMap<TestKey, u32> = kd
+            .entries()
+            .map(|(key, val)| (key.as_slice().to_vec(), val.count.to_native()))
+            .collect();
+        assert_eq!(collected.len(), 2);
+        assert_eq!(collected.remove(&k("a")), Some(1));
+        assert_eq!(collected.remove(&k("c")), Some(3));
+    }
+
+    // ---- persistence: reopen ----
+
+    #[test]
+    fn reopen_preserves_live_entries() {
+        let p = tmp_path("persist_live");
         {
-            let cfg = KeyDirConfig {
-                compaction_ratio: 1.1, // suppress auto-compaction
-                ..default_cfg()
-            };
-            let mut kd = KeyDir::create(&p, cfg).unwrap();
-            // Entry 1: "x" = "old"  → will be overwritten (dead)
-            kd.put(b"x", b"old").unwrap();
-            // Entry 2: "y" = "live" → stays live
-            kd.put(b"y", b"live").unwrap();
-            // Entry 3: "x" = "new"  → overwrites entry 1 (entry 1 becomes dead)
-            kd.put(b"x", b"new").unwrap();
-            // Entry 4: "z" = "gone" → will be deleted (entry 4 + tombstone are dead)
-            kd.put(b"z", b"gone").unwrap();
-            kd.delete(b"z").unwrap();
+            let mut kd = create(&p);
+            kd.put(k("a"), v("alpha", 1)).unwrap();
+            kd.put(k("b"), v("beta", 2)).unwrap();
             kd.flush().unwrap();
         }
-        let kd = KeyDir::open(&p, default_cfg()).unwrap();
-        // Dead entries: "x"="old" (HEADER+1+3=12) + "z"="gone" (HEADER+1+4=13)
-        //               + tombstone "z" (HEADER+1=9).
-        // The exact byte count depends on HEADER_SIZE (8), but it must be > 0.
+        let kd = open(&p);
+        assert_eq!(kd.len(), 2);
+        assert_val_eq(&*kd.get(&k("a")).unwrap(), &v("alpha", 1));
+        assert_val_eq(&*kd.get(&k("b")).unwrap(), &v("beta", 2));
+    }
+
+    #[test]
+    fn reopen_replays_tombstones() {
+        let p = tmp_path("persist_tombstone");
+        {
+            let mut kd = create(&p);
+            kd.put(k("a"), v("a", 1)).unwrap();
+            kd.put(k("b"), v("b", 2)).unwrap();
+            kd.delete(&k("a")).unwrap();
+            kd.flush().unwrap();
+        }
+        let kd = open(&p);
+        assert_eq!(kd.len(), 1);
+        assert!(!kd.contains_key(&k("a")));
+        assert!(kd.contains_key(&k("b")));
+    }
+
+    #[test]
+    fn reopen_last_write_wins() {
+        let p = tmp_path("persist_overwrite");
+        {
+            let mut kd = create(&p);
+            kd.put(k("a"), v("v1", 1)).unwrap();
+            kd.put(k("a"), v("v2", 2)).unwrap();
+            kd.put(k("a"), v("v3", 3)).unwrap();
+            kd.flush().unwrap();
+        }
+        let kd = open(&p);
+        assert_eq!(kd.len(), 1);
+        assert_val_eq(&*kd.get(&k("a")).unwrap(), &v("v3", 3));
+    }
+
+    #[test]
+    fn reopen_accumulates_dead_bytes_from_overwrites() {
+        let p = tmp_path("persist_dead");
+        {
+            let mut kd = create_with(
+                &p,
+                KeyDirConfig {
+                    initial_capacity: 1 << 20,
+                    compaction_ratio: 0.99,
+                },
+            );
+            kd.put(k("a"), v("v1", 1)).unwrap();
+            kd.put(k("a"), v("v2", 2)).unwrap();
+            kd.flush().unwrap();
+        }
+        let kd = KeyDir::<TestKey, TestVal>::open(
+            &p,
+            KeyDirConfig {
+                initial_capacity: 1 << 20,
+                compaction_ratio: 0.99,
+            },
+        )
+        .unwrap();
         assert!(
             kd.dead_bytes() > 0,
-            "rebuild should have detected dead bytes"
+            "rebuild should have seen the overwrite as dead"
         );
-        // Live entries must still be correct.
-        assert_eq!(kd.get(b"x"), Some(b"new".to_vec()));
-        assert_eq!(kd.get(b"y"), Some(b"live".to_vec()));
-        assert_eq!(kd.get(b"z"), None);
-        assert_eq!(kd.len(), 2);
-        fs::remove_file(&p).ok();
     }
 
-    // Old bug: compact() called new_kd.put() which called maybe_compact() on
-    // the freshly-created destination file.  With compaction_ratio=0.0 the
-    // destination file would immediately trigger another compaction cycle.
-    // The fix: compact_write() bypasses maybe_compact() entirely.
+    // ---- growth ----
+
     #[test]
-    fn compaction_does_not_recurse() {
-        let p = tmp("no_recurse");
+    fn grows_when_initial_capacity_exceeded() {
+        let p = tmp_path("grow");
         let cfg = KeyDirConfig {
-            compaction_ratio: 0.0, // compact on every write — would recurse infinitely before fix
-            ..default_cfg()
+            initial_capacity: 256,
+            compaction_ratio: 1.0,
         };
-        let mut kd = KeyDir::create(&p, cfg).unwrap();
-        // These writes trigger compaction; if the bug were present this would
-        // stack-overflow or loop infinitely.
-        for i in 0u32..20 {
-            kd.put(format!("k{}", i).as_bytes(), b"v").unwrap();
-            // Overwrite to build up dead bytes and keep triggering compaction.
-            kd.put(format!("k{}", i).as_bytes(), b"vv").unwrap();
+        let mut kd = create_with(&p, cfg);
+        let initial_capacity = kd.capacity();
+
+        for i in 0..50u32 {
+            kd.put(
+                format!("key_{:04}", i).into_bytes(),
+                v("payload-grows-the-file", i),
+            )
+            .unwrap();
         }
-        for i in 0u32..20 {
-            assert_eq!(kd.get(format!("k{}", i).as_bytes()), Some(b"vv".to_vec()));
+        assert!(
+            kd.capacity() > initial_capacity,
+            "capacity should have grown beyond {}",
+            initial_capacity
+        );
+        for i in 0..50u32 {
+            let key = format!("key_{:04}", i).into_bytes();
+            assert_val_eq(&*kd.get(&key).unwrap(), &v("payload-grows-the-file", i));
         }
-        fs::remove_file(&p).ok();
+    }
+
+    // ---- compaction ----
+
+    #[test]
+    fn compaction_zeros_dead_bytes_and_preserves_data() {
+        let p = tmp_path("compact_basic");
+        let cfg = KeyDirConfig {
+            initial_capacity: 8 * 1024,
+            compaction_ratio: 0.3,
+        };
+        let mut kd = create_with(&p, cfg);
+
+        // 20 rounds of overwriting 10 keys → tons of dead bytes → compaction fires.
+        for round in 0..20u32 {
+            for i in 0..10u32 {
+                kd.put(format!("k{}", i).into_bytes(), v("payload", round * 10 + i))
+                    .unwrap();
+            }
+        }
+
+        assert_eq!(kd.len(), 10);
+        // After compaction, dead_bytes should be small relative to file size.
+        // (May not be exactly zero if a write happened after the last compact.)
+        assert!(
+            (kd.dead_bytes() as f64) / (kd.data_size() as f64) < 0.3,
+            "post-compact dead_bytes ratio too high: {} / {}",
+            kd.dead_bytes(),
+            kd.data_size()
+        );
+        for i in 0..10u32 {
+            let archived = kd.get(&format!("k{}", i).into_bytes()).unwrap();
+            assert_eq!(archived.name.as_str(), "payload");
+            assert_eq!(archived.count.to_native(), 19 * 10 + i);
+        }
     }
 
     #[test]
-    fn delete_persists_across_reopen() {
-        let p = tmp("delete_persists");
+    fn compaction_drops_tombstoned_keys() {
+        let p = tmp_path("compact_tomb");
+        let cfg = KeyDirConfig {
+            initial_capacity: 4 * 1024,
+            compaction_ratio: 0.3,
+        };
+        let mut kd = create_with(&p, cfg);
+
+        for i in 0..50u32 {
+            kd.put(format!("k{}", i).into_bytes(), v("p", i)).unwrap();
+        }
+        // delete most of them, then keep churning so compaction fires
+        for i in 0..40u32 {
+            kd.delete(&format!("k{}", i).into_bytes()).unwrap();
+        }
+        // Force a few more writes to push the dead-byte ratio over the threshold.
+        for i in 40..50u32 {
+            kd.put(format!("k{}", i).into_bytes(), v("p2", i)).unwrap();
+        }
+
+        for i in 0..40u32 {
+            assert!(!kd.contains_key(&format!("k{}", i).into_bytes()));
+        }
+        for i in 40..50u32 {
+            assert!(kd.contains_key(&format!("k{}", i).into_bytes()));
+        }
+    }
+
+    #[test]
+    fn compaction_survives_reopen() {
+        let p = tmp_path("compact_reopen");
+        let cfg = KeyDirConfig {
+            initial_capacity: 8 * 1024,
+            compaction_ratio: 0.3,
+        };
         {
-            let mut kd = KeyDir::create(&p, default_cfg()).unwrap();
-            kd.put(b"keep", b"alive").unwrap();
-            kd.put(b"gone", b"dead").unwrap();
-            kd.delete(b"gone").unwrap();
+            let mut kd = create_with(&p, cfg.clone());
+            for round in 0..20u32 {
+                for i in 0..10u32 {
+                    kd.put(format!("k{}", i).into_bytes(), v("p", round * 10 + i))
+                        .unwrap();
+                }
+            }
             kd.flush().unwrap();
         }
-        let kd = KeyDir::open(&p, default_cfg()).unwrap();
-        assert_eq!(kd.get(b"keep"), Some(b"alive".to_vec()));
-        assert_eq!(kd.get(b"gone"), None);
-        assert_eq!(kd.len(), 1);
-        fs::remove_file(&p).ok();
+        let kd: KeyDir<TestKey, TestVal> = KeyDir::open(&p, cfg).unwrap();
+        assert_eq!(kd.len(), 10);
+        for i in 0..10u32 {
+            let archived = kd.get(&format!("k{}", i).into_bytes()).unwrap();
+            assert_eq!(archived.count.to_native(), 19 * 10 + i);
+        }
+    }
+
+    // ---- crash-recovery rename paths ----
+
+    #[test]
+    fn open_recovers_from_compact_extension() {
+        // Simulates a crash *after* compaction wrote the new file and the
+        // first rename succeeded (main → bak) but the second (compact → main)
+        // didn't: we observe `<path>.compact` exists, `<path>` doesn't.
+        let p = tmp_path("recover_compact");
+        {
+            let mut kd = create(&p);
+            kd.put(k("a"), v("recovered_compact", 7)).unwrap();
+            kd.flush().unwrap();
+        }
+        let compact = p.with_extension("compact");
+        fs::rename(&p, &compact).unwrap();
+        assert!(!p.exists() && compact.exists());
+
+        let kd = open(&p);
+        assert!(
+            p.exists() && !compact.exists(),
+            "main should have been restored"
+        );
+        assert_val_eq(&*kd.get(&k("a")).unwrap(), &v("recovered_compact", 7));
+    }
+
+    #[test]
+    fn open_recovers_from_bak_extension() {
+        // Simulates a crash between the two renames in compact(), with no
+        // .compact file present — falls back to .bak.
+        let p = tmp_path("recover_bak");
+        {
+            let mut kd = create(&p);
+            kd.put(k("b"), v("recovered_bak", 11)).unwrap();
+            kd.flush().unwrap();
+        }
+        let bak = p.with_extension("bak");
+        fs::rename(&p, &bak).unwrap();
+        assert!(!p.exists() && bak.exists());
+
+        let kd = open(&p);
+        assert!(
+            p.exists() && !bak.exists(),
+            "main should have been restored"
+        );
+        assert_val_eq(&*kd.get(&k("b")).unwrap(), &v("recovered_bak", 11));
+    }
+
+    #[test]
+    fn open_prefers_compact_over_bak() {
+        // If both stale files exist, .compact (the newer, intended-final file)
+        // wins over .bak (the safety copy of the pre-compaction state).
+        let p = tmp_path("recover_both");
+        // Build a "compact" candidate with the new data.
+        let compact = p.with_extension("compact");
+        {
+            let mut kd = create(&compact);
+            kd.put(k("k"), v("from_compact", 1)).unwrap();
+            kd.flush().unwrap();
+        }
+        // Build a "bak" candidate with the old data.
+        let bak = p.with_extension("bak");
+        {
+            let mut kd = create(&bak);
+            kd.put(k("k"), v("from_bak", 99)).unwrap();
+            kd.flush().unwrap();
+        }
+        assert!(!p.exists());
+
+        let kd = open(&p);
+        assert_val_eq(&*kd.get(&k("k")).unwrap(), &v("from_compact", 1));
+    }
+
+    // ---- zero-copy properties ----
+
+    #[test]
+    fn get_returns_stable_reference_into_mmap() {
+        // Two successive `get`s on the same key must yield the *same* address
+        // — proving no allocation/copy occurred. If `get` was deserializing
+        // into an owned value, each call would produce a fresh address.
+        let p = tmp_path("zero_copy_ptr");
+        let mut kd = create(&p);
+        kd.put(k("a"), v("hello", 1)).unwrap();
+        let p1 = kd.get(&k("a")).unwrap().archived() as *const ArchivedTestVal as usize;
+        let p2 = kd.get(&k("a")).unwrap().archived() as *const ArchivedTestVal as usize;
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn variable_length_value_round_trips() {
+        // Exercises rkyv's *relative pointers* inside V (`String`, `Vec`).
+        // The previous buggy `get` cast bytes at offset 0 instead of at the
+        // root position (end of buffer) — variable-length payloads would
+        // either crash or silently return garbage. This test would fail
+        // catastrophically under the old code.
+        let p = tmp_path("rel_ptrs");
+        let mut kd = create(&p);
+        let big = TestVal {
+            name: "a moderately long string that lives via a relative pointer".into(),
+            count: 0xDEAD_BEEF,
+            tags: (0..32).collect(),
+        };
+        let big_clone = big.clone();
+        kd.put(k("big"), big).unwrap();
+        assert_val_eq(&*kd.get(&k("big")).unwrap(), &big_clone);
+    }
+
+    #[test]
+    fn deserialize_via_rkyv_high_api_works() {
+        // Sanity-check: from the archived reference we can also deserialize
+        // into an owned `TestVal` using the regular rkyv API.
+        let p = tmp_path("deser");
+        let mut kd = create(&p);
+        let original = v("round-trip", 42);
+        kd.put(k("a"), original.clone()).unwrap();
+
+        let archived = kd.get(&k("a")).unwrap();
+        let restored: TestVal =
+            rkyv::deserialize::<TestVal, rkyv::rancor::Error>(&*archived).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    // ---- stress ----
+
+    #[test]
+    fn many_entries_round_trip() {
+        let p = tmp_path("many");
+        let mut kd = create(&p);
+        let n = 500u32;
+        for i in 0..n {
+            kd.put(
+                format!("key_{:05}", i).into_bytes(),
+                v(&format!("val_{}", i), i),
+            )
+            .unwrap();
+        }
+        assert_eq!(kd.len(), n as usize);
+        for i in 0..n {
+            let key = format!("key_{:05}", i).into_bytes();
+            let archived = kd.get(&key).unwrap();
+            assert_eq!(archived.name.as_str(), format!("val_{}", i));
+            assert_eq!(archived.count.to_native(), i);
+        }
+    }
+
+    #[test]
+    fn many_entries_survive_reopen() {
+        let p = tmp_path("many_reopen");
+        let n = 200u32;
+        {
+            let mut kd = create(&p);
+            for i in 0..n {
+                kd.put(
+                    format!("key_{:04}", i).into_bytes(),
+                    v(&format!("val_{}", i), i),
+                )
+                .unwrap();
+            }
+            kd.flush().unwrap();
+        }
+        let kd = open(&p);
+        assert_eq!(kd.len(), n as usize);
+        for i in 0..n {
+            let key = format!("key_{:04}", i).into_bytes();
+            let archived = kd.get(&key).unwrap();
+            assert_eq!(archived.count.to_native(), i);
+        }
+    }
+
+    // ---- empty / fresh ----
+
+    #[test]
+    fn fresh_keydir_has_zero_data() {
+        let p = tmp_path("fresh");
+        let kd = create(&p);
+        assert_eq!(kd.len(), 0);
+        assert_eq!(kd.data_size(), 0);
+        assert_eq!(kd.dead_bytes(), 0);
+        assert!(kd.is_empty());
+    }
+
+    #[test]
+    fn open_fresh_file_is_empty() {
+        let p = tmp_path("open_fresh");
+        // Create then immediately drop without writing anything.
+        drop(create(&p));
+        let kd = open(&p);
+        assert_eq!(kd.len(), 0);
+        assert!(kd.is_empty());
+    }
+
+    // ---- new API surface: ValueRef, owned-key iteration, update ----------
+
+    #[test]
+    fn value_ref_derefs_to_archived() {
+        // ValueRef should be transparently usable wherever &Archived<V> is.
+        let p = tmp_path("vr_deref");
+        let mut kd = create(&p);
+        kd.put(k("a"), v("hello", 7)).unwrap();
+        let vr = kd.get(&k("a")).unwrap();
+        // Field access through Deref.
+        assert_eq!(vr.name.as_str(), "hello");
+        assert_eq!(vr.count.to_native(), 7);
+    }
+
+    #[test]
+    fn value_ref_to_owned_round_trips() {
+        let p = tmp_path("vr_owned");
+        let mut kd = create(&p);
+        let original = v("round", 42);
+        kd.put(k("a"), original.clone()).unwrap();
+        let owned: TestVal = kd.get(&k("a")).unwrap().to_owned();
+        assert_eq!(owned, original);
+    }
+
+    #[test]
+    fn keys_yields_owned() {
+        let p = tmp_path("keys_owned");
+        let mut kd = create(&p);
+        kd.put(k("a"), v("x", 1)).unwrap();
+        kd.put(k("b"), v("y", 2)).unwrap();
+        // Collect the iterator — yields owned Vec<u8>, no borrow held.
+        let mut keys: Vec<TestKey> = kd.keys().collect();
+        keys.sort();
+        assert_eq!(keys, vec![k("a"), k("b")]);
+    }
+
+    #[test]
+    fn entries_yields_owned_keys_and_value_refs() {
+        let p = tmp_path("entries_owned");
+        let mut kd = create(&p);
+        kd.put(k("a"), v("av", 1)).unwrap();
+        kd.put(k("b"), v("bv", 2)).unwrap();
+        // Collect into a HashMap keyed by owned K — proves keys are detached
+        // from kd's borrow (ValueRefs still borrow, dropped at end of map).
+        let collected: std::collections::HashMap<TestKey, u32> = kd
+            .entries()
+            .map(|(key, vr)| (key, vr.count.to_native()))
+            .collect();
+        assert_eq!(collected.len(), 2);
+        assert_eq!(collected.get(&k("a")), Some(&1));
+        assert_eq!(collected.get(&k("b")), Some(&2));
+    }
+
+    #[test]
+    fn update_modifies_existing() {
+        let p = tmp_path("update_exists");
+        let mut kd = create(&p);
+        kd.put(k("a"), v("initial", 10)).unwrap();
+        let existed = kd
+            .update(&k("a"), |mut v| {
+                v.count += 5;
+                v.tags.push(999);
+                v
+            })
+            .unwrap();
+        assert!(existed);
+        let archived = kd.get(&k("a")).unwrap();
+        assert_eq!(archived.count.to_native(), 15);
+        assert_eq!(archived.tags.len(), 4);
+        assert_eq!(archived.tags[3].to_native(), 999);
+    }
+
+    #[test]
+    fn update_missing_returns_false() {
+        // `update` only modifies existing keys — no implicit insert.
+        let p = tmp_path("update_missing");
+        let mut kd = create(&p);
+        let call_count = std::cell::Cell::new(0);
+        let existed = kd
+            .update(&k("new"), |v| {
+                call_count.set(call_count.get() + 1);
+                v
+            })
+            .unwrap();
+        assert!(!existed);
+        assert_eq!(
+            call_count.get(),
+            0,
+            "f should not be called when key is absent"
+        );
+        assert!(kd.get(&k("new")).is_none());
+    }
+
+    #[test]
+    fn update_in_place_mutates_fixed_width_field() {
+        // Increment a u32 counter directly in the archive — no deserialize.
+        let p = tmp_path("uip_count");
+        let mut kd = create(&p);
+        kd.put(k("a"), v("counter", 10)).unwrap();
+
+        let existed = kd
+            .update_in_place(&k("a"), |archived| {
+                let new = archived.count.to_native() + 5;
+                archived.count = new.into();
+            })
+            .unwrap();
+        assert!(existed);
+
+        let archived = kd.get(&k("a")).unwrap();
+        assert_eq!(archived.count.to_native(), 15);
+        // Name and tags unchanged.
+        assert_eq!(archived.name.as_str(), "counter");
+        assert_eq!(archived.tags.len(), 3);
+    }
+
+    #[test]
+    fn update_in_place_returns_false_for_missing() {
+        let p = tmp_path("uip_missing");
+        let mut kd = create(&p);
+        let mut called = false;
+        let existed = kd
+            .update_in_place(&k("ghost"), |_| {
+                called = true;
+            })
+            .unwrap();
+        assert!(!existed);
+        assert!(!called, "closure must not run for absent keys");
+    }
+
+    #[test]
+    fn update_in_place_persists_after_reopen() {
+        // Mutation through update_in_place writes directly into the mmap,
+        // so it must survive reopen.
+        let p = tmp_path("uip_persist");
+        {
+            let mut kd = create(&p);
+            kd.put(k("a"), v("counter", 100)).unwrap();
+            kd.update_in_place(&k("a"), |archived| {
+                archived.count = 999u32.into();
+            })
+            .unwrap();
+            kd.flush().unwrap();
+        }
+        let kd = open(&p);
+        let archived = kd.get(&k("a")).unwrap();
+        assert_eq!(archived.count.to_native(), 999);
     }
 }

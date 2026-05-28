@@ -2,8 +2,10 @@
 
 use std::{fs, io, path::Path};
 
+use rkyv::{vec::ArchivedVec, Archived};
 use zendb_storage::core::{
-    btree::BPlusTree,
+    backend::Backend,
+    btree::{BPlusTree, BTreeIter, BTreeRange},
     keydir::KeyDir,
     skiplist::SkipList,
     wal::{Wal, WalConfig},
@@ -14,41 +16,133 @@ use crate::config::{TableConfig, TableKind};
 
 const FLUSH_THRESHOLD: usize = 10_000;
 
-/// Polymorphic storage backend.
-enum Backend {
-    Ordered(BPlusTree),
-    Unordered(KeyDir),
+// ---------------------------------------------------------------------------
+// Storage — concrete enum wrapping the two backend kinds and implementing
+// `Backend<Vec<u8>, Vec<u8>>` so engine code can program against the trait
+// without `dyn` (the trait is not object-safe).
+//
+// Iterator methods unify the two backends' concrete iterator types via a
+// small `Either` enum.
+// ---------------------------------------------------------------------------
+
+type BytesKeyDir = KeyDir<Vec<u8>, Vec<u8>>;
+type BytesBPlusTree = BPlusTree<Vec<u8>, Vec<u8>>;
+
+pub enum Storage {
+    Ordered(BytesBPlusTree),
+    Unordered(BytesKeyDir),
 }
 
-impl Backend {
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+/// Two-variant iterator: yields `Option<A::Item>` from whichever variant
+/// is active. Used to unify the concrete iterator types each backend
+/// returns under a single `impl Iterator` return.
+enum Either<A, B> {
+    Left(A),
+    Right(B),
+}
+
+impl<A, B, Item> Iterator for Either<A, B>
+where
+    A: Iterator<Item = Item>,
+    B: Iterator<Item = Item>,
+{
+    type Item = Item;
+    fn next(&mut self) -> Option<Item> {
         match self {
-            Backend::Ordered(tree) => tree.get(key),
-            Backend::Unordered(kd) => kd.get(key),
+            Either::Left(a) => a.next(),
+            Either::Right(b) => b.next(),
+        }
+    }
+}
+
+impl Backend<Vec<u8>, Vec<u8>> for Storage {
+    fn get(&self, key: &Vec<u8>) -> Option<&Archived<Vec<u8>>> {
+        match self {
+            Storage::Ordered(t) => t.get(key),
+            Storage::Unordered(k) => k.get(key),
         }
     }
 
-    fn put(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
+    fn put(&mut self, key: &Vec<u8>, value: &Vec<u8>) -> io::Result<()> {
         match self {
-            Backend::Ordered(tree) => tree.insert(key, value),
-            Backend::Unordered(kd) => kd.put(key, value),
+            Storage::Ordered(t) => t.insert(key, value),
+            Storage::Unordered(k) => k.put(key, value),
+        }
+    }
+
+    fn delete(&mut self, key: &Vec<u8>) -> io::Result<bool> {
+        match self {
+            Storage::Ordered(t) => t.delete(key),
+            Storage::Unordered(k) => k.delete(key),
+        }
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &ArchivedVec<u8>> + '_ {
+        match self {
+            Storage::Ordered(t) => Either::Left(t.keys()),
+            Storage::Unordered(k) => Either::Right(k.keys()),
+        }
+    }
+
+    fn values(&self) -> impl Iterator<Item = &ArchivedVec<u8>> + '_ {
+        match self {
+            Storage::Ordered(t) => Either::Left(t.values()),
+            Storage::Unordered(k) => Either::Right(k.values()),
+        }
+    }
+
+    fn entries(&self) -> impl Iterator<Item = (&ArchivedVec<u8>, &ArchivedVec<u8>)> + '_ {
+        match self {
+            Storage::Ordered(t) => Either::Left(t.entries()),
+            Storage::Unordered(k) => Either::Right(k.entries()),
+        }
+    }
+
+    fn count(&self) -> usize {
+        match self {
+            Storage::Ordered(t) => t.len() as usize,
+            Storage::Unordered(k) => k.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Storage::Ordered(t) => t.is_empty(),
+            Storage::Unordered(k) => k.is_empty(),
         }
     }
 
     fn flush(&self) -> io::Result<()> {
         match self {
-            Backend::Ordered(tree) => tree.flush(),
-            Backend::Unordered(kd) => kd.flush(),
+            Storage::Ordered(t) => t.flush(),
+            Storage::Unordered(k) => k.flush(),
+        }
+    }
+
+    fn range(
+        &self,
+        start: &Vec<u8>,
+        end: &Vec<u8>,
+    ) -> impl Iterator<Item = (&ArchivedVec<u8>, &ArchivedVec<u8>)> + '_ {
+        match self {
+            Storage::Ordered(t) => Either::Left(t.range(start, end)),
+            Storage::Unordered(k) => Either::Right(k.range(start, end)),
         }
     }
 }
+
+// Concrete iterator type aliases used inside `Either<..>` returns above.
+// These reference the public iterator structs so the trait's `impl Iterator`
+// return resolves to a single concrete shape per match arm.
+type _OrdIter<'a> = BTreeIter<'a, Vec<u8>, Vec<u8>>;
+type _OrdRange<'a> = BTreeRange<'a, Vec<u8>, Vec<u8>>;
 
 pub struct Table {
     name: String,
     sync_enabled: bool,
     wal: Wal,
     buffer: SkipList<Vec<u8>, Vec<Delta>>,
-    backend: Backend,
+    backend: Storage,
     buffered_count: usize,
 }
 
@@ -63,24 +157,24 @@ impl Table {
 
         let wal = Wal::create(&wal_path, config.wal.clone())?;
 
-        let backend = match &config.kind {
+        let backend: Storage = match &config.kind {
             TableKind::Ordered => {
                 let tree_path = path.join("tree");
-                let tree = if tree_path.exists() {
+                let tree: BytesBPlusTree = if tree_path.exists() {
                     BPlusTree::open(&tree_path)?
                 } else {
                     BPlusTree::create(&tree_path)?
                 };
-                Backend::Ordered(tree)
+                Storage::Ordered(tree)
             }
             TableKind::Unordered(kd_config) => {
                 let kd_path = path.join("data");
-                let kd = if kd_path.exists() {
+                let kd: BytesKeyDir = if kd_path.exists() {
                     KeyDir::open(&kd_path, kd_config.clone())?
                 } else {
                     KeyDir::create(&kd_path, kd_config.clone())?
                 };
-                Backend::Unordered(kd)
+                Storage::Unordered(kd)
             }
         };
 
@@ -141,7 +235,8 @@ impl Table {
         self.buffered_count = 0;
 
         for (key, deltas) in entries {
-            let current_bytes = self.backend.get(&key);
+            let current_bytes: Option<Vec<u8>> =
+                self.backend.get(&key).map(|a| a.as_slice().to_vec());
             let mut cell = decode_cell(current_bytes.as_deref()).unwrap_or_else(|| {
                 Cell::dummy(zendb_types::Value::Atom(zendb_types::AtomValue::Null))
             });
@@ -164,12 +259,14 @@ impl Table {
 
     /// Get the current value for a key, merging buffered deltas on top.
     pub fn get(&self, key: &[u8]) -> Option<Cell> {
-        let current_bytes = self.backend.get(key);
+        let key_vec = key.to_vec();
+        let current_bytes: Option<Vec<u8>> =
+            self.backend.get(&key_vec).map(|a| a.as_slice().to_vec());
         let mut cell = decode_cell(current_bytes.as_deref())
             .unwrap_or_else(|| Cell::dummy(zendb_types::Value::Atom(zendb_types::AtomValue::Null)));
 
         let mut modified = false;
-        if let Some(deltas) = self.buffer.get(&key.to_vec()) {
+        if let Some(deltas) = self.buffer.get(&key_vec) {
             for delta in deltas {
                 cell.apply_delta(delta);
                 modified = true;
@@ -188,6 +285,11 @@ impl Table {
     }
     pub fn sync_enabled(&self) -> bool {
         self.sync_enabled
+    }
+
+    /// Borrow the backend for read-only operations (range scans, iteration, etc.).
+    pub fn backend(&self) -> &Storage {
+        &self.backend
     }
 
     pub fn sync(&mut self) -> io::Result<()> {
@@ -309,5 +411,35 @@ mod tests {
         let table = Table::open(&dir, &cfg).unwrap();
         let (_, k) = make_delta("k", "", 0);
         assert!(table.get(&k).is_some());
+    }
+
+    #[test]
+    fn ordered_backend_supports_range() {
+        let dir = tmp_dir("range_ordered");
+        let cfg = TableConfig::ordered("test");
+        let mut table = Table::open(&dir, &cfg).unwrap();
+        let mut keys = Vec::new();
+        for i in 0u32..10 {
+            let (d, k) = make_delta(&format!("k{:02}", i), "v", 100 + i as u64);
+            keys.push(k);
+            table.apply(d).unwrap();
+        }
+        table.flush().unwrap();
+        // keys[i] are the encoded PrimaryKey bytes; query the encoded range.
+        let count = table.backend().range(&keys[2], &keys[7]).count();
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not support range queries")]
+    fn unordered_backend_panics_on_range() {
+        let dir = tmp_dir("range_unordered");
+        let cfg = TableConfig::unordered("test");
+        let mut table = Table::open(&dir, &cfg).unwrap();
+        let (d, _) = make_delta("k", "v", 100);
+        table.apply(d).unwrap();
+        table.flush().unwrap();
+        // Should panic with `unimplemented!`.
+        let _ = table.backend().range(&b"a".to_vec(), &b"z".to_vec()).count();
     }
 }

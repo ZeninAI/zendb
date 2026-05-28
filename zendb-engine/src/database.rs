@@ -1,6 +1,6 @@
 //! Database — entry point for ZeninDB.  Owns multiple tables, routes
 //! deltas to the correct table, and persists table configurations in a
-//! metadata file backed by KeyDir (one key per table).
+//! metadata file backed by a `Backend` (one key per table).
 
 use std::{
     fs, io,
@@ -8,7 +8,10 @@ use std::{
 };
 
 use hashbrown::HashMap;
-use zendb_storage::core::keydir::{KeyDir, KeyDirConfig};
+use zendb_storage::core::{
+    backend::Backend,
+    keydir::{KeyDir, KeyDirConfig},
+};
 use zendb_types::Delta;
 
 use crate::config::TableConfig;
@@ -16,7 +19,9 @@ use crate::table::Table;
 
 pub struct Database {
     path: PathBuf,
-    meta: KeyDir,
+    /// Metadata store — concrete `KeyDir`; engine code uses it through
+    /// the `Backend` trait. No `dyn` because the trait is not object-safe.
+    meta: KeyDir<Vec<u8>, Vec<u8>>,
     tables: HashMap<String, Table>,
 }
 
@@ -27,18 +32,21 @@ impl Database {
         fs::create_dir_all(path)?;
 
         let meta_path = path.join("_meta");
-        let meta = if meta_path.exists() {
+        let meta: KeyDir<Vec<u8>, Vec<u8>> = if meta_path.exists() {
             KeyDir::open(&meta_path, KeyDirConfig::default())?
         } else {
             KeyDir::create(&meta_path, KeyDirConfig::default())?
         };
 
         // Recover tables from metadata — each key is a table name.
+        // Iterating through the `Backend` trait: yields `(&Archived<K>, &Archived<V>)`
+        // which for `Vec<u8>` is `(&ArchivedVec<u8>, &ArchivedVec<u8>)`.
         let mut tables = HashMap::new();
-        for (key, value) in meta.entries() {
-            let name = String::from_utf8(key.to_vec())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let (config, _) = TableConfig::decode(&value)?;
+        for (key, value) in Backend::entries(&meta) {
+            let name = std::str::from_utf8(key.as_slice())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                .to_owned();
+            let (config, _) = TableConfig::decode(value.as_slice())?;
             let table = Table::open(path, &config)?;
             tables.insert(name, table);
         }
@@ -60,8 +68,8 @@ impl Database {
 
             // Persist under the table name.
             let mut buf = Vec::new();
-            config.encode(&mut buf);
-            self.meta.put(name.as_bytes(), &buf)?;
+            config.encode(&mut buf)?;
+            self.meta.put(&name.as_bytes().to_vec(), &buf)?;
             self.meta.flush()?;
         }
         Ok(self.tables.get_mut(&name).unwrap())

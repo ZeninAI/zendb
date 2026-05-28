@@ -29,7 +29,7 @@
 use std::io;
 
 use blake3::Hasher;
-use zendb_storage::core::btree::BPlusTree;
+use zendb_storage::core::backend::Backend;
 use zendb_types::Cell;
 
 /// Rows per Merkle leaf.
@@ -57,23 +57,34 @@ pub struct MerkleLeaf {
 }
 
 impl MerkleTree {
-    /// Build a Merkle tree from a B+Tree's current contents.
-    pub fn build(tree: &BPlusTree) -> io::Result<MerkleTree> {
+    /// Build a Merkle tree from a backend's current contents.
+    ///
+    /// Entries are read via `backend.entries()`. For ordered backends
+    /// (e.g. `BPlusTree`) this yields keys in sort order, which is what
+    /// peers need for deterministic leaf boundaries; unordered backends
+    /// will produce stable-but-arbitrary leaf hashes and should be used
+    /// only when the caller doesn't rely on inter-peer comparability.
+    /// Generic over any backend. No `dyn` because the `Backend` trait
+    /// is not object-safe (its iterator methods return `impl Iterator`).
+    pub fn build<B: Backend<Vec<u8>, Vec<u8>>>(backend: &B) -> io::Result<MerkleTree> {
         let mut leaves: Vec<MerkleLeaf> = Vec::new();
         let mut current_hasher = Hasher::new();
         let mut row_count = 0usize;
         let mut first_key: Option<Vec<u8>> = None;
         let mut last_key: Vec<u8> = Vec::new();
 
-        for (key, value) in tree.iter() {
+        for (key, value) in backend.entries() {
+            // `key` / `value` are `&ArchivedVec<u8>` borrowed from mmap.
+            let key_bytes: Vec<u8> = key.as_slice().to_vec();
             if row_count == 0 {
-                first_key = Some(key.clone());
+                first_key = Some(key_bytes.clone());
             }
-            last_key = key.clone();
+            last_key = key_bytes.clone();
 
             // Decode cell and compute row hash.
-            if let Some(cell) = decode_cell(&value) {
-                let rh = row_hash(&key, &cell);
+            let value_bytes: Vec<u8> = value.as_slice().to_vec();
+            if let Some(cell) = decode_cell(&value_bytes) {
+                let rh = row_hash(&key_bytes, &cell);
                 current_hasher.update(&rh);
             }
 

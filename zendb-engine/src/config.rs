@@ -1,6 +1,6 @@
 //! Table configuration — persisted in the database metadata file.
 
-use std::{io, time::Duration};
+use std::{io, iter, time::Duration};
 
 use zendb_storage::core::{keydir::KeyDirConfig, wal::WalConfig};
 
@@ -86,7 +86,7 @@ impl TableConfig {
 
     // --- wire format ---
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
         encode_string(out, &self.name);
         out.push(self.sync_enabled as u8);
 
@@ -94,12 +94,24 @@ impl TableConfig {
             TableKind::Ordered => out.push(0),
             TableKind::Unordered(kd) => {
                 out.push(1);
-                kd.encode(out);
+                // Pad to 8-byte alignment for rkyv
+                let pad = (8 - (out.len() % 8)) % 8;
+                out.extend(iter::repeat_n(0u8, pad));
+                let kd_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(kd)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                out.extend_from_slice(&(kd_bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(&kd_bytes);
             }
         }
 
-        // WalConfig
-        self.wal.encode(out);
+        // Pad to 8-byte alignment for rkyv
+        let pad = (8 - (out.len() % 8)) % 8;
+        out.extend(iter::repeat_n(0u8, pad));
+        let wal_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&self.wal)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        out.extend_from_slice(&(wal_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&wal_bytes);
+        Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> io::Result<(TableConfig, usize)> {
@@ -123,8 +135,31 @@ impl TableConfig {
             }
             1 => {
                 pos += 1;
-                let (kd, n) = KeyDirConfig::decode(&bytes[pos..])?;
-                pos += n;
+                // Skip alignment padding
+                let pad = (8 - (pos % 8)) % 8;
+                pos += pad;
+                if bytes.len() < pos + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated KeyDirConfig length",
+                    ));
+                }
+                let kd_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                if bytes.len() < pos + kd_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated KeyDirConfig",
+                    ));
+                }
+                let kd: KeyDirConfig = {
+                    let aligned = bytes[pos..pos + kd_len].to_vec();
+                    unsafe {
+                        rkyv::from_bytes_unchecked::<KeyDirConfig, rkyv::rancor::Error>(&aligned)
+                    }
+                }
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                pos += kd_len;
                 TableKind::Unordered(kd)
             }
             b => {
@@ -135,9 +170,29 @@ impl TableConfig {
             }
         };
 
-        // WalConfig
-        let (wal, n) = WalConfig::decode(&bytes[pos..])?;
-        pos += n;
+        // Skip alignment padding
+        let pad = (8 - (pos % 8)) % 8;
+        pos += pad;
+        if bytes.len() < pos + 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated WalConfig length",
+            ));
+        }
+        let wal_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if bytes.len() < pos + wal_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated WalConfig",
+            ));
+        }
+        let wal: WalConfig = {
+            let aligned = bytes[pos..pos + wal_len].to_vec();
+            unsafe { rkyv::from_bytes_unchecked::<WalConfig, rkyv::rancor::Error>(&aligned) }
+        }
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        pos += wal_len;
 
         Ok((
             TableConfig {
@@ -189,7 +244,7 @@ mod tests {
             .with_sync(true)
             .with_wal_linger(200);
         let mut buf = Vec::new();
-        cfg.encode(&mut buf);
+        cfg.encode(&mut buf).unwrap();
         let (decoded, n) = TableConfig::decode(&buf).unwrap();
         assert_eq!(n, buf.len());
         assert_eq!(decoded.name, "notes");
@@ -208,7 +263,7 @@ mod tests {
             .with_sync(false)
             .with_keydir(kd);
         let mut buf = Vec::new();
-        cfg.encode(&mut buf);
+        cfg.encode(&mut buf).unwrap();
         let (decoded, _) = TableConfig::decode(&buf).unwrap();
         assert!(!decoded.sync_enabled);
         match decoded.kind {
@@ -222,7 +277,7 @@ mod tests {
         let cfg = TableConfig::ordered("test");
         assert!(matches!(cfg.kind, TableKind::Ordered));
         let mut buf = Vec::new();
-        cfg.encode(&mut buf);
+        cfg.encode(&mut buf).unwrap();
         let (decoded, _) = TableConfig::decode(&buf).unwrap();
         assert!(matches!(decoded.kind, TableKind::Ordered));
     }

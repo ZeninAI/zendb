@@ -23,5 +23,8 @@ thiserror = "2"
 memmap2 = "0.9"
 hashbrown = "0.15"
 
+# serialization
+rkyv = "0.8"
+
 # zendb-engine
 blake3 = "1"

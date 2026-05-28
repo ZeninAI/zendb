@@ -10,3 +10,4 @@ zendb-types = { path = "../zendb-types" }
 zendb-storage = { path = "../zendb-storage" }
 blake3.workspace = true
 hashbrown.workspace = true
+rkyv.workspace = true

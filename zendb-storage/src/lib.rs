@@ -12,3 +12,4 @@
 //! - DeltaBuffer, Compactor, StateHash, Storage
 
 pub mod core;
+pub mod utils;

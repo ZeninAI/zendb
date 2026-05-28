@@ -22,6 +22,7 @@
 //! one, then call `into_iter`.  No seeks, no offsets, no cursor management —
 //! the file cursor handles everything.
 
+use rkyv::{Archive, Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
     io::{self, IoSlice, Read, Write},
@@ -36,7 +37,7 @@ const DEFAULT_MAX_BUF: usize = 16 * 1024;
 const FRAMING: usize = 4;
 
 /// Configuration for a WAL instance.
-#[derive(Debug, Clone)]
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
 pub struct WalConfig {
     /// Maximum buffer size before auto-flush.
     pub max_buf: usize,
@@ -51,49 +52,6 @@ impl Default for WalConfig {
             max_buf: DEFAULT_MAX_BUF,
             linger: None,
         }
-    }
-}
-
-impl WalConfig {
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&(self.max_buf as u64).to_le_bytes());
-        match self.linger {
-            Some(d) => {
-                out.push(1);
-                out.extend_from_slice(&d.as_millis().to_le_bytes());
-            }
-            None => out.push(0),
-        }
-    }
-
-    pub fn decode(bytes: &[u8]) -> io::Result<(WalConfig, usize)> {
-        if bytes.len() < 9 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated WalConfig",
-            ));
-        }
-        let max_buf = u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]) as usize;
-        let linger = match bytes[8] {
-            1 => {
-                if bytes.len() < 25 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated WalConfig linger",
-                    ));
-                }
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&bytes[9..17]);
-                let ms = u64::from_le_bytes(b);
-                // 8 bytes u64 for max_buf + 8 bytes u128 for millis
-                Some(Duration::from_millis(ms))
-            }
-            _ => None,
-        };
-        let consumed = if bytes[8] == 1 { 25 } else { 9 };
-        Ok((WalConfig { max_buf, linger }, consumed))
     }
 }
 

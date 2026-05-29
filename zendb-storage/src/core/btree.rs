@@ -241,8 +241,12 @@ where
             .write(true)
             .truncate(true)
             .open(path)?;
+        // 2 pages used (meta + root leaf), but pre-allocate 64 pages
+        // (256 KiB) so small workloads finish without a single remap.
+        // Exponential growth kicks in past that.
         let np = 2u64;
-        file.set_len(np * PAGE_SIZE as u64)?;
+        let initial_pages = 64u64;
+        file.set_len(initial_pages * PAGE_SIZE as u64)?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
         let m = page_offset(META_PAGE);
         wr_u32(&mut mmap[m..m + 4], MAGIC);
@@ -1181,7 +1185,8 @@ where
     /// callers must re-derive mmap offsets after calling this.
     fn alloc_extent(&mut self, n_pages: u64) -> io::Result<u64> {
         let start = self.pages();
-        self.grow(n_pages)?;
+        self.ensure_capacity((start + n_pages) * PAGE_SIZE as u64)?;
+        self.set_pages(start + n_pages);
         Ok(start)
     }
 
@@ -1203,8 +1208,9 @@ where
     }
 
     /// Allocate a single free page. Pulls from the freelist (if non-empty)
-    /// or grows the file by one page. The returned page is **not** zeroed —
-    /// the caller is responsible for initializing it (e.g. via
+    /// or extends the page-count high-water mark, growing the file only when
+    /// the mark crosses the current mmap length. The returned page is **not**
+    /// zeroed — the caller is responsible for initializing it (e.g. via
     /// `init_leaf` / `init_internal`).
     fn alloc_page(&mut self) -> io::Result<u64> {
         let free = self.free_head();
@@ -1213,9 +1219,10 @@ where
             self.set_free_head(next);
             return Ok(free);
         }
-        let tp = self.pages();
-        self.grow(1)?;
-        Ok(tp)
+        let p = self.pages();
+        self.ensure_capacity((p + 1) * PAGE_SIZE as u64)?;
+        self.set_pages(p + 1);
+        Ok(p)
     }
 
     /// Return a single page to the freelist. The page is prepended to the
@@ -1230,18 +1237,21 @@ where
         self.set_free_head(page);
     }
 
-    /// Grow the file by `extra` pages, re-mmap, and update the meta
-    /// page count in one shot. Flushes the existing mapping first so
-    /// dirty pages are written back before the old mapping is unmapped.
+    /// Ensure the backing file is at least `target_bytes` long, growing
+    /// exponentially (`max(mmap_len * 2, target_bytes)`) so the cost is
+    /// amortized O(1) per write. Does **not** flush — the OS page cache
+    /// is unified, so the new mapping sees prior writes immediately, and
+    /// durability is handled by explicit `flush()` and the `Drop` impl.
     /// Invalidates existing mmap references — callers must re-derive
-    /// offsets from `self.mmap` after `grow` returns.
-    fn grow(&mut self, extra: u64) -> io::Result<()> {
-        self.mmap.flush()?;
-        let old_pages = self.pages();
-        let new_pages = old_pages + extra;
-        self.file.set_len(new_pages * PAGE_SIZE as u64)?;
+    /// offsets from `self.mmap` after this returns.
+    fn ensure_capacity(&mut self, target_bytes: u64) -> io::Result<()> {
+        let current = self.mmap.len() as u64;
+        if target_bytes <= current {
+            return Ok(());
+        }
+        let new_size = (current * 2).max(target_bytes);
+        self.file.set_len(new_size)?;
         self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
-        self.set_pages(new_pages);
         Ok(())
     }
 

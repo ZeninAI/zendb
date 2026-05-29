@@ -2,13 +2,16 @@
 
 use std::{fs, io, path::Path};
 
-use rkyv::{vec::ArchivedVec, Archived};
-use zendb_storage::core::{
-    backend::Backend,
-    btree::{BPlusTree, BTreeIter, BTreeRange},
-    keydir::KeyDir,
-    skiplist::SkipList,
-    wal::{Wal, WalConfig},
+use rkyv::Archived;
+use zendb_storage::{
+    core::{
+        backend::Backend,
+        btree::{BPlusTree, BTreeRange},
+        keydir::KeyDir,
+        skiplist::SkipList,
+        wal::{Wal, WalConfig},
+    },
+    utils::serdes::ValueRef,
 };
 use zendb_types::{Cell, Delta, PrimaryKey, TypedValue};
 
@@ -56,16 +59,16 @@ where
 }
 
 impl Backend<Vec<u8>, Vec<u8>> for Storage {
-    fn get(&self, key: &Vec<u8>) -> Option<&Archived<Vec<u8>>> {
+    fn get(&self, key: &Vec<u8>) -> Option<ValueRef<'_, Vec<u8>>> {
         match self {
             Storage::Ordered(t) => t.get(key),
             Storage::Unordered(k) => k.get(key),
         }
     }
 
-    fn put(&mut self, key: &Vec<u8>, value: &Vec<u8>) -> io::Result<()> {
+    fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> io::Result<()> {
         match self {
-            Storage::Ordered(t) => t.insert(key, value),
+            Storage::Ordered(t) => t.put(key, value),
             Storage::Unordered(k) => k.put(key, value),
         }
     }
@@ -77,30 +80,50 @@ impl Backend<Vec<u8>, Vec<u8>> for Storage {
         }
     }
 
-    fn keys(&self) -> impl Iterator<Item = &ArchivedVec<u8>> + '_ {
+    fn update<F>(&mut self, key: &Vec<u8>, f: F) -> io::Result<bool>
+    where
+        F: FnOnce(Vec<u8>) -> Vec<u8>,
+    {
         match self {
-            Storage::Ordered(t) => Either::Left(t.keys()),
-            Storage::Unordered(k) => Either::Right(k.keys()),
+            Storage::Ordered(t) => Backend::update(t, key, f),
+            Storage::Unordered(k) => Backend::update(k, key, f),
         }
     }
 
-    fn values(&self) -> impl Iterator<Item = &ArchivedVec<u8>> + '_ {
+    fn update_in_place<F>(&mut self, key: &Vec<u8>, f: F) -> io::Result<bool>
+    where
+        F: FnOnce(&mut Archived<Vec<u8>>),
+    {
         match self {
-            Storage::Ordered(t) => Either::Left(t.values()),
-            Storage::Unordered(k) => Either::Right(k.values()),
+            Storage::Ordered(t) => Backend::update_in_place(t, key, f),
+            Storage::Unordered(k) => Backend::update_in_place(k, key, f),
         }
     }
 
-    fn entries(&self) -> impl Iterator<Item = (&ArchivedVec<u8>, &ArchivedVec<u8>)> + '_ {
+    fn keys(&self) -> impl Iterator<Item = Vec<u8>> + '_ {
         match self {
-            Storage::Ordered(t) => Either::Left(t.entries()),
-            Storage::Unordered(k) => Either::Right(k.entries()),
+            Storage::Ordered(t) => Either::Left(Backend::keys(t)),
+            Storage::Unordered(k) => Either::Right(Backend::keys(k)),
         }
     }
 
-    fn count(&self) -> usize {
+    fn values(&self) -> impl Iterator<Item = ValueRef<'_, Vec<u8>>> + '_ {
         match self {
-            Storage::Ordered(t) => t.len() as usize,
+            Storage::Ordered(t) => Either::Left(Backend::values(t)),
+            Storage::Unordered(k) => Either::Right(Backend::values(k)),
+        }
+    }
+
+    fn entries(&self) -> impl Iterator<Item = (Vec<u8>, ValueRef<'_, Vec<u8>>)> + '_ {
+        match self {
+            Storage::Ordered(t) => Either::Left(Backend::entries(t)),
+            Storage::Unordered(k) => Either::Right(Backend::entries(k)),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Storage::Ordered(t) => t.len(),
             Storage::Unordered(k) => k.len(),
         }
     }
@@ -118,24 +141,25 @@ impl Backend<Vec<u8>, Vec<u8>> for Storage {
             Storage::Unordered(k) => k.flush(),
         }
     }
+}
 
-    fn range(
-        &self,
+impl Storage {
+    /// Range scan over `[start, end)`. Only the `Ordered` (BPlusTree) variant
+    /// supports range queries; calling this on `Unordered` panics — KeyDir's
+    /// hash index has no usable key ordering, so the request is meaningless.
+    pub fn range<'a>(
+        &'a self,
         start: &Vec<u8>,
         end: &Vec<u8>,
-    ) -> impl Iterator<Item = (&ArchivedVec<u8>, &ArchivedVec<u8>)> + '_ {
+    ) -> BTreeRange<'a, Vec<u8>, Vec<u8>> {
         match self {
-            Storage::Ordered(t) => Either::Left(t.range(start, end)),
-            Storage::Unordered(k) => Either::Right(k.range(start, end)),
+            Storage::Ordered(t) => t.range(start, end),
+            Storage::Unordered(_) => {
+                panic!("Unordered backend (KeyDir) does not support range queries")
+            }
         }
     }
 }
-
-// Concrete iterator type aliases used inside `Either<..>` returns above.
-// These reference the public iterator structs so the trait's `impl Iterator`
-// return resolves to a single concrete shape per match arm.
-type _OrdIter<'a> = BTreeIter<'a, Vec<u8>, Vec<u8>>;
-type _OrdRange<'a> = BTreeRange<'a, Vec<u8>, Vec<u8>>;
 
 pub struct Table {
     name: String,
@@ -236,7 +260,7 @@ impl Table {
 
         for (key, deltas) in entries {
             let current_bytes: Option<Vec<u8>> =
-                self.backend.get(&key).map(|a| a.as_slice().to_vec());
+                self.backend.get(&key).map(|v| v.as_slice().to_vec());
             let mut cell = decode_cell(current_bytes.as_deref()).unwrap_or_else(|| {
                 Cell::dummy(zendb_types::Value::Atom(zendb_types::AtomValue::Null))
             });
@@ -248,7 +272,7 @@ impl Table {
             let mut buf = Vec::new();
             cell.encode(&mut buf)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            self.backend.put(&key, &buf)?;
+            self.backend.put(key, buf)?;
         }
 
         self.backend.flush()?;
@@ -261,7 +285,7 @@ impl Table {
     pub fn get(&self, key: &[u8]) -> Option<Cell> {
         let key_vec = key.to_vec();
         let current_bytes: Option<Vec<u8>> =
-            self.backend.get(&key_vec).map(|a| a.as_slice().to_vec());
+            self.backend.get(&key_vec).map(|v| v.as_slice().to_vec());
         let mut cell = decode_cell(current_bytes.as_deref())
             .unwrap_or_else(|| Cell::dummy(zendb_types::Value::Atom(zendb_types::AtomValue::Null)));
 

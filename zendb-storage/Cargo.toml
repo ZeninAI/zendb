@@ -9,3 +9,7 @@ description = "Storage subsystem for ZeninDB — WAL, SkipList, KeyDir, B+Tree, 
 memmap2.workspace = true
 hashbrown.workspace = true
 rkyv = { version = "0.8", default-features = false, features = ["std", "alloc", "unaligned"] }
+
+[dev-dependencies]
+lmdb = "0.8"
+tempfile = "3"

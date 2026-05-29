@@ -72,9 +72,9 @@
 //!
 //! The first page of the file is the meta page, not a tree node:
 //! ```text
-//! [magic: u32][version: u32][root: u64][free_head: u64][pages: u64][entries: u64] …
+//! [magic: u32][root: u64][free_head: u64][pages: u64][entries: u64] …
 //! ```
-//! `root` is the page number of the root node (0 = empty tree).
+//! `root` is the page number of the root node.
 //! `free_head` is the head of the single-page freelist.
 //! `pages` is the total number of pages in the file.
 //! `entries` is the count of live key-value pairs.
@@ -246,11 +246,10 @@ where
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
         let m = page_offset(META_PAGE);
         wr_u32(&mut mmap[m..m + 4], MAGIC);
-        wr_u32(&mut mmap[m + 4..m + 8], 1);
-        wr_u64(&mut mmap[m + 8..m + 16], 1); // root page
-        wr_u64(&mut mmap[m + 16..m + 24], 0); // free list head
-        wr_u64(&mut mmap[m + 24..m + 32], np); // total pages
-        wr_u64(&mut mmap[m + 32..m + 40], 0); // entry count
+        wr_u64(&mut mmap[m + 4..m + 12], 1); // root page
+        wr_u64(&mut mmap[m + 12..m + 20], 0); // free list head
+        wr_u64(&mut mmap[m + 20..m + 28], np); // total pages
+        wr_u64(&mut mmap[m + 28..m + 36], 0); // entry count
         let r = page_offset(1);
         mmap[r] = PAGE_LEAF;
         mmap[r + 1] = FLAG_ROOT;
@@ -344,16 +343,11 @@ where
         F: FnOnce(&mut Archived<V>),
     {
         let key_bytes = serialize_to_vec(key)?;
-        let root = self.root();
-        if root == 0 {
-            return Ok(false);
-        }
-        let leaf = self.find_leaf(root, &key_bytes);
+        let leaf = self.find_leaf(self.root(), &key_bytes);
         let off = page_offset(leaf);
         let count = rd_u16(&self.mmap[off + 2..off + 4]) as usize;
-        let i = match self.leaf_find_slot(off, count, &key_bytes) {
-            Ok(i) => i,
-            Err(_) => return Ok(false),
+        let Ok(i) = self.leaf_find_slot(off, count, &key_bytes) else {
+            return Ok(false);
         };
         let sp = off + HEADER_SIZE + i * SLOT_SIZE;
         let eo = off + rd_u16(&self.mmap[sp..sp + 2]) as usize;
@@ -387,7 +381,7 @@ where
     }
 
     pub fn len(&self) -> usize {
-        rd_u64(&self.mmap[32..40]) as usize
+        rd_u64(&self.mmap[28..36]) as usize
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -399,7 +393,7 @@ where
 
     /// Iterate all entries in serialized-key order. Keys are deserialized;
     /// values are zero-copy [`ValueRef`]s into the mmap.
-    pub fn entries(&self) -> BTreeIter<'_, K, V> {
+    pub fn entries(&self) -> impl Iterator<Item = (K, ValueRef<'_, V>)> + '_ {
         BTreeIter {
             tree: self,
             page: self.first_leaf(),
@@ -436,16 +430,7 @@ where
                 end: Vec::new(),
             };
         };
-        let root = self.root();
-        if root == 0 {
-            return BTreeRange {
-                tree: self,
-                page: 0,
-                slot: 0,
-                end: end_bytes,
-            };
-        }
-        let leaf = self.find_leaf(root, &start_bytes);
+        let leaf = self.find_leaf(self.root(), &start_bytes);
         let off = page_offset(leaf);
         let count = rd_u16(&self.mmap[off + 2..off + 4]) as usize;
         let slot = match self.leaf_find_slot(off, count, &start_bytes) {
@@ -467,14 +452,10 @@ where
 
     /// Navigate the tree to the leaf that would contain `key_bytes`, then
     /// return the contiguous archived value bytes (inline or extent).
-    /// Returns `None` if the tree is empty or the key is not present.
-    /// The returned slice borrows from `self.mmap`.
+    /// Returns `None` if the key is not present. Slice borrows from
+    /// `self.mmap`.
     fn value_slice_for(&self, key_bytes: &[u8]) -> Option<&[u8]> {
-        let root = self.root();
-        if root == 0 {
-            return None;
-        }
-        let leaf = self.find_leaf(root, key_bytes);
+        let leaf = self.find_leaf(self.root(), key_bytes);
         let off = page_offset(leaf);
         let count = rd_u16(&self.mmap[off + 2..off + 4]) as usize;
         let i = self.leaf_find_slot(off, count, key_bytes).ok()?;
@@ -497,17 +478,8 @@ where
     /// pages are freed; if the new value is the same size and still inline,
     /// the write is a cheap in-place overwrite (no slot shuffle).
     fn insert_typed(&mut self, key: &[u8], value: &V, v_size: usize) -> io::Result<()> {
-        let root = self.root();
-        if root == 0 {
-            let p = self.alloc_page()?;
-            self.set_root(p);
-            self.init_leaf(p, true);
-            self.leaf_insert_typed(page_offset(p), p, key, value, v_size)?;
-            self.inc_entries(1);
-            return Ok(());
-        }
         let mut path: Vec<(u64, usize)> = Vec::new();
-        let mut page = root;
+        let mut page = self.root();
         loop {
             let off = page_offset(page);
             if self.mmap[off] == PAGE_LEAF {
@@ -535,15 +507,8 @@ where
     /// slide the leaf's slot array and data gap. Returns `true` if the
     /// key existed (and was removed).
     fn delete_bytes(&mut self, key: &[u8]) -> io::Result<bool> {
-        let root = self.root();
-        if root == 0 {
-            return Ok(false);
-        }
-        let leaf = self.find_leaf(root, key);
+        let leaf = self.find_leaf(self.root(), key);
         let off = page_offset(leaf);
-        if self.mmap[off] != PAGE_LEAF {
-            return Ok(false);
-        }
         let count = rd_u16(&self.mmap[off + 2..off + 4]) as usize;
         let data_off = rd_u32(&self.mmap[off + 4..off + 8]) as usize;
         match self.leaf_find_slot(off, count, key) {
@@ -569,22 +534,22 @@ where
 
     /// Page number of the root node. `0` means the tree is empty.
     fn root(&self) -> u64 {
-        rd_u64(&self.mmap[8..16])
+        rd_u64(&self.mmap[4..12])
     }
     /// Update the root page pointer in the meta page.
     fn set_root(&mut self, p: u64) {
-        wr_u64(&mut self.mmap[8..16], p);
+        wr_u64(&mut self.mmap[4..12], p);
     }
     /// Atomically increment the global entry counter by `d` (wrapping).
     fn inc_entries(&mut self, d: u64) {
-        let c = rd_u64(&self.mmap[32..40]);
-        wr_u64(&mut self.mmap[32..40], c.wrapping_add(d));
+        let c = rd_u64(&self.mmap[28..36]);
+        wr_u64(&mut self.mmap[28..36], c.wrapping_add(d));
     }
     /// Decrement the global entry counter by 1 (wrapping). Caller must
     /// ensure the counter is ≥ 1 before calling.
     fn dec_entries(&mut self) {
-        let c = rd_u64(&self.mmap[32..40]);
-        wr_u64(&mut self.mmap[32..40], c.wrapping_sub(1));
+        let c = rd_u64(&self.mmap[28..36]);
+        wr_u64(&mut self.mmap[28..36], c.wrapping_sub(1));
     }
 
     // -- traversal — navigate the tree using serialized key bytes --
@@ -593,9 +558,6 @@ where
     /// page (the one with the smallest key range). Used to seed iteration.
     fn first_leaf(&self) -> u64 {
         let mut p = self.root();
-        if p == 0 {
-            return 0;
-        }
         loop {
             let off = page_offset(p);
             if self.mmap[off] == PAGE_LEAF {
@@ -625,9 +587,6 @@ where
     fn internal_search(&self, off: usize, key: &[u8]) -> u64 {
         let count = rd_u16(&self.mmap[off + 2..off + 4]) as usize;
         let leftmost = rd_u64(&self.mmap[off + 8..off + 16]);
-        if count == 0 {
-            return leftmost;
-        }
         let mut lo = 0usize;
         let mut hi = count;
         while lo < hi {
@@ -728,7 +687,7 @@ where
                 }
                 // Fast path: same-size inline overwrite → serialize new
                 // value straight into the existing slot, no slot shuffle.
-                if !ovfl && raw_vl & OVFL_FLAG == 0 && raw_vl as usize == v_size {
+                if !ovfl && raw_vl as usize == v_size {
                     let v_off = eo + 6 + kl;
                     let written = serialize_into(value, &mut self.mmap[v_off..v_off + v_size])?;
                     debug_assert_eq!(written, v_size);
@@ -1223,7 +1182,6 @@ where
     fn alloc_extent(&mut self, n_pages: u64) -> io::Result<u64> {
         let start = self.pages();
         self.grow(n_pages)?;
-        self.set_pages(start + n_pages);
         Ok(start)
     }
 
@@ -1231,17 +1189,17 @@ where
 
     /// Head of the single-page freelist. `0` means the list is empty.
     fn free_head(&self) -> u64 {
-        rd_u64(&self.mmap[16..24])
+        rd_u64(&self.mmap[12..20])
     }
     fn set_free_head(&mut self, p: u64) {
-        wr_u64(&mut self.mmap[16..24], p);
+        wr_u64(&mut self.mmap[12..20], p);
     }
     /// Total number of pages in the file (including meta page and extents).
     fn pages(&self) -> u64 {
-        rd_u64(&self.mmap[24..32])
+        rd_u64(&self.mmap[20..28])
     }
     fn set_pages(&mut self, n: u64) {
-        wr_u64(&mut self.mmap[24..32], n);
+        wr_u64(&mut self.mmap[20..28], n);
     }
 
     /// Allocate a single free page. Pulls from the freelist (if non-empty)
@@ -1257,7 +1215,6 @@ where
         }
         let tp = self.pages();
         self.grow(1)?;
-        self.set_pages(tp + 1);
         Ok(tp)
     }
 
@@ -1273,13 +1230,18 @@ where
         self.set_free_head(page);
     }
 
-    /// Grow the file by `extra` pages and re-mmap. Invalidates existing
-    /// mmap references — callers must re-derive offsets from `self.mmap`
-    /// after `grow` returns.
+    /// Grow the file by `extra` pages, re-mmap, and update the meta
+    /// page count in one shot. Flushes the existing mapping first so
+    /// dirty pages are written back before the old mapping is unmapped.
+    /// Invalidates existing mmap references — callers must re-derive
+    /// offsets from `self.mmap` after `grow` returns.
     fn grow(&mut self, extra: u64) -> io::Result<()> {
-        let np = (self.pages() + extra) * PAGE_SIZE as u64;
-        self.file.set_len(np)?;
+        self.mmap.flush()?;
+        let old_pages = self.pages();
+        let new_pages = old_pages + extra;
+        self.file.set_len(new_pages * PAGE_SIZE as u64)?;
         self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
+        self.set_pages(new_pages);
         Ok(())
     }
 
@@ -1406,8 +1368,8 @@ impl<K, V> fmt::Debug for BPlusTree<K, V> {
     /// on `K` or `V`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BPlusTree")
-            .field("entries", &rd_u64(&self.mmap[32..40]))
-            .field("pages", &rd_u64(&self.mmap[24..32]))
+            .field("entries", &rd_u64(&self.mmap[28..36]))
+            .field("pages", &rd_u64(&self.mmap[20..28]))
             .finish()
     }
 }

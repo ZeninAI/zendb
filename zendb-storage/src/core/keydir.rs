@@ -35,6 +35,12 @@
 //!
 //! # File format
 //!
+//! Header (4 bytes):
+//! ```text
+//! [MAGIC: u32 LE = 0x4452494B ("KIRD")]
+//! ```
+//! All entry data follows immediately after the 4-byte header.
+//!
 //! Live entry:
 //! ```text
 //! [value_size: u32 LE][archived V bytes (value_size)][key_size: u32 LE][archived K bytes (key_size)]
@@ -50,6 +56,7 @@
 //! stripped entirely.
 
 use std::{
+    fmt,
     fs::{self, File, OpenOptions},
     hash::Hash,
     io::{self},
@@ -72,6 +79,11 @@ use crate::utils::serdes::{
 
 const DEFAULT_INITIAL_CAPACITY: u64 = 1024 * 1024;
 const DEFAULT_COMPACTION_RATIO: f64 = 0.5;
+/// Magic number identifying a KeyDir file. Stored at offset 0 as `u32` LE.
+/// ASCII: `"KIRD"`.
+const MAGIC: u32 = 0x4452494B;
+/// File header size in bytes: [MAGIC: u32 LE]. All entry data follows immediately.
+const HEADER_SIZE: usize = 4;
 const TOMBSTONE: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
@@ -113,7 +125,6 @@ pub struct KeyDir<K, V> {
     path: PathBuf,
     config: KeyDirConfig,
     write_offset: u64,
-    capacity: u64,
     dead_bytes: u64,
     _phantom: PhantomData<V>,
 }
@@ -130,7 +141,6 @@ where
     <V as Archive>::Archived: Portable + Deserialize<V, HighDeserializer<RkyvError>> + 'static,
 {
     pub fn create(path: &Path, config: KeyDirConfig) -> io::Result<Self> {
-        let capacity = config.initial_capacity;
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -138,8 +148,11 @@ where
             .truncate(true)
             .open(path)?;
 
-        file.set_len(capacity)?;
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        file.set_len(config.initial_capacity)?;
+        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+
+        // Write file header: MAGIC at offset 0.
+        mmap[0..4].copy_from_slice(&MAGIC.to_le_bytes());
 
         Ok(KeyDir {
             index: HashMap::new(),
@@ -147,27 +160,24 @@ where
             file,
             path: path.to_path_buf(),
             config,
-            write_offset: 0,
-            capacity,
+            write_offset: HEADER_SIZE as u64,
             dead_bytes: 0,
             _phantom: PhantomData,
         })
     }
 
     pub fn open(path: &Path, config: KeyDirConfig) -> io::Result<Self> {
-        if !path.exists() {
-            let compact = path.with_extension("compact");
-            let bak = path.with_extension("bak");
-            if compact.exists() {
-                fs::rename(&compact, path)?;
-            } else if bak.exists() {
-                fs::rename(&bak, path)?;
-            }
-        }
-
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let capacity = file.metadata()?.len();
         let mmap = unsafe { MmapMut::map_mut(&file)? };
+
+        // Validate the file header MAGIC.
+        let file_magic = u32::from_le_bytes(mmap[0..4].try_into().unwrap());
+        if file_magic != MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a KeyDir file",
+            ));
+        }
 
         let mut this = KeyDir {
             index: HashMap::new(),
@@ -176,16 +186,11 @@ where
             path: path.to_path_buf(),
             config,
             write_offset: 0,
-            capacity,
             dead_bytes: 0,
             _phantom: PhantomData,
         };
 
         this.rebuild_index()?;
-
-        let _ = fs::remove_file(path.with_extension("compact"));
-        let _ = fs::remove_file(path.with_extension("bak"));
-
         Ok(this)
     }
 
@@ -219,7 +224,7 @@ where
         self.index.values().map(|meta| self.value_ref(meta))
     }
 
-    pub fn contains_key(&self, key: &K) -> bool {
+    pub fn contains(&self, key: &K) -> bool {
         self.index.contains_key(key)
     }
     pub fn len(&self) -> usize {
@@ -307,7 +312,7 @@ where
         let (offset, value_size, key_size) = self.write_entry(key, &new_v)?;
 
         // Update the index entry in place — no key clone.
-        *self.index.get_mut(key).expect("key just found") = EntryMeta {
+        *self.index.get_mut(key).unwrap() = EntryMeta {
             offset,
             value_size,
             key_size,
@@ -375,8 +380,8 @@ where
     ///
     /// Two-phase: first measures the archive size via [`CountingWriter`]
     /// (no allocation), then writes in one pass via [`Buffer`]. If the
-    /// measured size exceeds `self.capacity`, the file is grown before
-    /// writing. Returns the byte offset just past the written archive.
+    /// measured size exceeds the current mmap length, the file is grown
+    /// before writing. Returns the byte offset just past the written archive.
     ///
     /// This is the core write primitive — every entry (live or tombstone)
     /// calls it for its key and (for live entries) value.
@@ -389,7 +394,7 @@ where
         let end = pos
             .checked_add(size)
             .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir offset overflow"))?;
-        if (end as u64) > self.capacity {
+        if end > self.mmap.len() {
             self.grow(end as u64)?;
         }
         let written = serialize_into(value, &mut self.mmap[pos..end])?;
@@ -416,13 +421,14 @@ where
     }
 
     /// Rewrite the file, keeping only live entries. Uses a three-phase
-    /// atomic rename protocol for crash safety:
+    /// Steps:
     ///
     /// 1. Write a `.compact` file with only live entries (`memcpy` from
     ///    the old mmap — no deserialization).
-    /// 2. Rename old main file to `.bak`.
-    /// 3. Rename `.compact` to the main path.
-    /// 4. Remove `.bak`.
+    /// 2. Re-open the `.compact` file into `self.file`/`self.mmap`,
+    ///    dropping the existing handles on the main path so it's free.
+    /// 3. Rename `.compact` → main path. The open handle ghost-follows
+    ///    the rename on both Unix and Windows.
     ///
     /// After compaction: dead_bytes = 0, write_offset = total live bytes,
     /// and `self.mmap`/`self.file`/`self.index` are replaced with the
@@ -431,7 +437,7 @@ where
         let tmp_path = self.path.with_extension("compact");
 
         let live_size: u64 = self.index.values().map(EntryMeta::on_disk_size).sum();
-        let new_capacity = live_size.max(self.config.initial_capacity);
+        let new_capacity = (live_size + HEADER_SIZE as u64).max(self.config.initial_capacity);
 
         let mut new_index: HashMap<K, EntryMeta> = HashMap::with_capacity(self.index.len());
         let write_offset = {
@@ -444,7 +450,10 @@ where
             new_file.set_len(new_capacity)?;
             let mut new_mmap = unsafe { MmapMut::map_mut(&new_file)? };
 
-            let mut cursor: usize = 0;
+            // Write the MAGIC header.
+            new_mmap[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+
+            let mut cursor: usize = HEADER_SIZE;
             for (key, meta) in self.index.iter() {
                 let entry_size = meta.on_disk_size() as usize;
                 let src_start = meta.offset as usize;
@@ -461,23 +470,25 @@ where
             }
             new_mmap.flush()?;
             cursor as u64
-            // new_mmap and new_file dropped here so the rename below can
-            // proceed even on platforms with mandatory locking.
+            // new_mmap and new_file dropped here so we can re-open the
+            // tmp file fresh below.
         };
 
-        let bak_path = self.path.with_extension("bak");
-        let _ = fs::remove_file(&bak_path);
-        fs::rename(&self.path, &bak_path)?;
-        fs::rename(&tmp_path, &self.path)?;
-        let _ = fs::remove_file(&bak_path);
-
-        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        // Re-open the tmp file into self.{file,mmap}. Assigning these
+        // drops the existing handles on the main path, releasing it for
+        // the rename. On both Unix and Windows the new handles continue
+        // to reference the same bytes after the rename below.
+        let file = OpenOptions::new().read(true).write(true).open(&tmp_path)?;
         let mmap = unsafe { MmapMut::map_mut(&file)? };
-
         self.mmap = mmap;
         self.file = file;
+
+        // Single atomic-ish rename: tmp → main. The old main file is
+        // overwritten (no handles to it now). Our open file/mapping ghosts
+        // to the new path.
+        fs::rename(&tmp_path, &self.path)?;
+
         self.index = new_index;
-        self.capacity = new_capacity;
         self.write_offset = write_offset;
         self.dead_bytes = 0;
         Ok(())
@@ -485,9 +496,6 @@ where
 
     pub fn data_size(&self) -> u64 {
         self.write_offset
-    }
-    pub fn capacity(&self) -> u64 {
-        self.capacity
     }
     pub fn dead_bytes(&self) -> u64 {
         self.dead_bytes
@@ -504,7 +512,7 @@ where
     /// Called once at startup (`open`). Makes no assumptions about the
     /// file's contents — the index is built purely from what's on disk.
     fn rebuild_index(&mut self) -> io::Result<()> {
-        let mut cursor: usize = 0;
+        let mut cursor: usize = HEADER_SIZE;
         self.dead_bytes = 0;
 
         while let Some(value_size) = read_u32_le(&self.mmap, cursor) {
@@ -524,14 +532,11 @@ where
             };
             let key_start = key_size_off + 4;
             let entry_end = key_start + key_size as usize;
-            if entry_end > self.mmap.len() {
-                break;
-            }
 
             let key: K = unsafe {
                 rkyv::from_bytes_unchecked::<K, RkyvError>(&self.mmap[key_start..entry_end])
             }
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "corrupt KeyDir entry"))?;
+            .unwrap();
 
             if is_tombstone {
                 if let Some(old) = self.index.remove(&key) {
@@ -560,20 +565,33 @@ where
 
     /// Grow the backing file to at least `desired` bytes in a single shot.
     ///
-    /// Picks `max(capacity * 2, desired)` so amortized growth stays
+    /// Picks `max(mmap.len() * 2, desired)` so amortized growth stays
     /// exponential even when a write skips several doubling rounds.
     /// Caller is responsible for only invoking this when an actual grow
-    /// is required (`desired > self.capacity`).
+    /// is required (`desired > self.mmap.len()`).
     fn grow(&mut self, desired: u64) -> io::Result<()> {
         self.mmap.flush()?;
-        let doubled = self.capacity.checked_mul(2).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir capacity overflow")
-        })?;
-        let new_capacity = doubled.max(desired);
+        let new_capacity = ((self.mmap.len() as u64) * 2).max(desired);
         self.file.set_len(new_capacity)?;
         self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
-        self.capacity = new_capacity;
         Ok(())
+    }
+}
+
+impl<K, V> Drop for KeyDir<K, V> {
+    fn drop(&mut self) {
+        let _ = self.mmap.flush();
+    }
+}
+
+impl<K, V> fmt::Debug for KeyDir<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Counters only — no rkyv bounds needed, no key/value rendering.
+        f.debug_struct("KeyDir")
+            .field("entries", &self.index.len())
+            .field("data_size", &self.write_offset)
+            .field("dead_bytes", &self.dead_bytes)
+            .finish()
     }
 }
 
@@ -602,7 +620,7 @@ where
     }
 
     fn contains(&self, key: &K) -> bool {
-        KeyDir::contains_key(self, key)
+        KeyDir::contains(self, key)
     }
 
     fn put(&mut self, key: K, value: V) -> io::Result<()> {
@@ -780,9 +798,9 @@ mod tests {
         let p = tmp_path("delete");
         let mut kd = create(&p);
         kd.put(k("a"), v("x", 1)).unwrap();
-        assert!(kd.contains_key(&k("a")));
+        assert!(kd.contains(&k("a")));
         assert!(kd.delete(&k("a")).unwrap());
-        assert!(!kd.contains_key(&k("a")));
+        assert!(!kd.contains(&k("a")));
         assert!(kd.get(&k("a")).is_none());
         assert_eq!(kd.len(), 0);
     }
@@ -867,8 +885,8 @@ mod tests {
         }
         let kd = open(&p);
         assert_eq!(kd.len(), 1);
-        assert!(!kd.contains_key(&k("a")));
-        assert!(kd.contains_key(&k("b")));
+        assert!(!kd.contains(&k("a")));
+        assert!(kd.contains(&k("b")));
     }
 
     #[test]
@@ -925,7 +943,7 @@ mod tests {
             compaction_ratio: 1.0,
         };
         let mut kd = create_with(&p, cfg);
-        let initial_capacity = kd.capacity();
+        let initial_len = kd.mmap.len();
 
         for i in 0..50u32 {
             kd.put(
@@ -935,9 +953,9 @@ mod tests {
             .unwrap();
         }
         assert!(
-            kd.capacity() > initial_capacity,
-            "capacity should have grown beyond {}",
-            initial_capacity
+            kd.mmap.len() > initial_len,
+            "mmap length should have grown beyond {}",
+            initial_len
         );
         for i in 0..50u32 {
             let key = format!("key_{:04}", i).into_bytes();
@@ -1002,10 +1020,10 @@ mod tests {
         }
 
         for i in 0..40u32 {
-            assert!(!kd.contains_key(&format!("k{}", i).into_bytes()));
+            assert!(!kd.contains(&format!("k{}", i).into_bytes()));
         }
         for i in 40..50u32 {
-            assert!(kd.contains_key(&format!("k{}", i).into_bytes()));
+            assert!(kd.contains(&format!("k{}", i).into_bytes()));
         }
     }
 
@@ -1032,78 +1050,6 @@ mod tests {
             let archived = kd.get(&format!("k{}", i).into_bytes()).unwrap();
             assert_eq!(archived.count.to_native(), 19 * 10 + i);
         }
-    }
-
-    // ---- crash-recovery rename paths ----
-
-    #[test]
-    fn open_recovers_from_compact_extension() {
-        // Simulates a crash *after* compaction wrote the new file and the
-        // first rename succeeded (main → bak) but the second (compact → main)
-        // didn't: we observe `<path>.compact` exists, `<path>` doesn't.
-        let p = tmp_path("recover_compact");
-        {
-            let mut kd = create(&p);
-            kd.put(k("a"), v("recovered_compact", 7)).unwrap();
-            kd.flush().unwrap();
-        }
-        let compact = p.with_extension("compact");
-        fs::rename(&p, &compact).unwrap();
-        assert!(!p.exists() && compact.exists());
-
-        let kd = open(&p);
-        assert!(
-            p.exists() && !compact.exists(),
-            "main should have been restored"
-        );
-        assert_val_eq(&*kd.get(&k("a")).unwrap(), &v("recovered_compact", 7));
-    }
-
-    #[test]
-    fn open_recovers_from_bak_extension() {
-        // Simulates a crash between the two renames in compact(), with no
-        // .compact file present — falls back to .bak.
-        let p = tmp_path("recover_bak");
-        {
-            let mut kd = create(&p);
-            kd.put(k("b"), v("recovered_bak", 11)).unwrap();
-            kd.flush().unwrap();
-        }
-        let bak = p.with_extension("bak");
-        fs::rename(&p, &bak).unwrap();
-        assert!(!p.exists() && bak.exists());
-
-        let kd = open(&p);
-        assert!(
-            p.exists() && !bak.exists(),
-            "main should have been restored"
-        );
-        assert_val_eq(&*kd.get(&k("b")).unwrap(), &v("recovered_bak", 11));
-    }
-
-    #[test]
-    fn open_prefers_compact_over_bak() {
-        // If both stale files exist, .compact (the newer, intended-final file)
-        // wins over .bak (the safety copy of the pre-compaction state).
-        let p = tmp_path("recover_both");
-        // Build a "compact" candidate with the new data.
-        let compact = p.with_extension("compact");
-        {
-            let mut kd = create(&compact);
-            kd.put(k("k"), v("from_compact", 1)).unwrap();
-            kd.flush().unwrap();
-        }
-        // Build a "bak" candidate with the old data.
-        let bak = p.with_extension("bak");
-        {
-            let mut kd = create(&bak);
-            kd.put(k("k"), v("from_bak", 99)).unwrap();
-            kd.flush().unwrap();
-        }
-        assert!(!p.exists());
-
-        let kd = open(&p);
-        assert_val_eq(&*kd.get(&k("k")).unwrap(), &v("from_compact", 1));
     }
 
     // ---- zero-copy properties ----
@@ -1209,7 +1155,7 @@ mod tests {
         let p = tmp_path("fresh");
         let kd = create(&p);
         assert_eq!(kd.len(), 0);
-        assert_eq!(kd.data_size(), 0);
+        assert_eq!(kd.data_size(), HEADER_SIZE as u64);
         assert_eq!(kd.dead_bytes(), 0);
         assert!(kd.is_empty());
     }

@@ -39,11 +39,13 @@ impl Database {
         };
 
         // Recover tables from metadata — each key is a table name.
-        // Iterating through the `Backend` trait: yields `(&Archived<K>, &Archived<V>)`
-        // which for `Vec<u8>` is `(&ArchivedVec<u8>, &ArchivedVec<u8>)`.
+        // `Backend::entries` yields `(K, ValueRef<'_, V>)`. For `Vec<u8>`
+        // keys we get owned bytes; for the value, `ValueRef` derefs to
+        // `ArchivedVec<u8>` from which `.as_slice()` borrows directly
+        // out of the mmap.
         let mut tables = HashMap::new();
         for (key, value) in Backend::entries(&meta) {
-            let name = std::str::from_utf8(key.as_slice())
+            let name = std::str::from_utf8(&key)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
                 .to_owned();
             let (config, _) = TableConfig::decode(value.as_slice())?;
@@ -69,7 +71,7 @@ impl Database {
             // Persist under the table name.
             let mut buf = Vec::new();
             config.encode(&mut buf)?;
-            self.meta.put(&name.as_bytes().to_vec(), &buf)?;
+            self.meta.put(name.as_bytes().to_vec(), buf)?;
             self.meta.flush()?;
         }
         Ok(self.tables.get_mut(&name).unwrap())

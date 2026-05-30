@@ -69,6 +69,49 @@
 //! read straight from `index.len()` via [`Backend::size`]. That means
 //! there's no separate counter to update on every mutation, and no
 //! `refresh_stats()` call to forget to make.
+//!
+//! # Bulk-write mode (`open_tx` / `close_tx`)
+//!
+//! [`KeyDir`] overrides the trait's transactional bracket to route writes
+//! through an in-memory staging buffer while a "transaction" is open. The
+//! goal is **write throughput, not atomicity**: there is no isolation,
+//! no rollback, no crash semantics beyond what the underlying mmap
+//! provides. It's a batching window — call `open_tx`, dump many writes,
+//! call `close_tx`, pay the per-batch costs once.
+//!
+//! ## What changes during a tx
+//!
+//! - `put` / `delete` encode records into a [`crate::utils::reusables::PooledBuf`]
+//!   (a recycled `Vec<u8>`) instead of the mmap. No `grow`, no remap,
+//!   no auto-compaction during the tx.
+//! - The in-memory index stores **virtual offsets** that span both the
+//!   committed mmap region and the staged region. Reads check one
+//!   branch: if `meta.offset >= tx_base`, materialize from staging; else
+//!   from the mmap. This gives read-your-own-writes for free.
+//!
+//! ## What `close_tx` actually does
+//!
+//! 1. `grow` the mmap once to fit `tx_base + staging.len()`.
+//! 2. One `copy_from_slice` from staging into `mmap[tx_base..]`.
+//! 3. Advance `stats.data_size`. **No index walk** — every
+//!    `EntryMeta.offset` written during the tx already addresses the
+//!    correct byte of the post-commit mmap, because `tx_base + staging_off
+//!    == eventual mmap offset`.
+//! 4. Run one `maybe_compact` against the post-commit state.
+//! 5. The `PooledBuf` is returned to the thread-local pool on drop, so
+//!    the next `open_tx` on any KeyDir in this thread can reuse its
+//!    capacity without a new allocation.
+//!
+//! ## Restrictions
+//!
+//! - `open_tx` while a tx is already open returns
+//!   [`io::ErrorKind::AlreadyExists`]. No nesting, no savepoints.
+//! - `compact` / `clear` mid-tx is undefined behaviour for the index
+//!   (their staged offsets would point at relocated bytes). A
+//!   `debug_assert` catches it in tests; release builds trust the caller.
+//! - The caller is responsible for the staging buffer's size — there is
+//!   no soft cap. Stuffing gigabytes into one tx will double-buffer
+//!   that much RAM until commit.
 
 use std::{
     fmt,
@@ -80,10 +123,12 @@ use std::{
 };
 
 use bincode::{Decode, Encode};
+use hashbrown::hash_map::Entry;
 use hashbrown::HashMap;
 use memmap2::MmapMut;
 
 use crate::core::backend::Backend;
+use crate::utils::reusables::PooledBuf;
 use crate::utils::serdes::{deserialize_from, read_u32_le, serialize_into, serialized_size};
 
 const DEFAULT_INITIAL_CAPACITY: u64 = 1024 * 1024;
@@ -138,12 +183,178 @@ impl EntryMeta {
     }
 }
 
+/// Active bulk-write window. Holds the staging buffer and the snapshot
+/// of `stats.data_size` taken at `open_tx` — together they let every
+/// `EntryMeta.offset` written during the tx address the eventual mmap
+/// location directly (see the "Bulk-write mode" section of the module
+/// docs).
+struct TxState {
+    staging: PooledBuf,
+    tx_base: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Field-level free functions
+//
+// These mirror the inherent helpers (`value_bytes`, `grow`, `write_entry`,
+// `write_tombstone_for`) but take individual field borrows instead of
+// `&self` / `&mut self`. Methods that need to hold a HashMap `Entry` /
+// `RawEntryMut` open across a read-and-then-write sequence destructure
+// `self` and call these directly, so the entry's borrow on `self.index`
+// doesn't conflict with the disjoint borrows on mmap / tx / stats / file.
+// ---------------------------------------------------------------------------
+
+/// Borrow the raw value bytes for `meta` — from staging if the entry
+/// was written during the current tx (virtual offset >= `tx_base`),
+/// otherwise from the mmap. The 4-byte length prefix is excluded.
+fn value_bytes_in<'a>(mmap: &'a MmapMut, tx: Option<&'a TxState>, meta: &EntryMeta) -> &'a [u8] {
+    if let Some(tx) = tx {
+        if meta.offset >= tx.tx_base {
+            let local = (meta.offset - tx.tx_base) as usize;
+            let start = local + 4;
+            let end = start + meta.value_size as usize;
+            return &tx.staging[start..end];
+        }
+    }
+    let start = meta.offset as usize + 4;
+    let end = start + meta.value_size as usize;
+    &mmap[start..end]
+}
+
+/// Grow the file to at least `desired` bytes (`max(current * 2, desired)`)
+/// and remap. Matches the inherent [`KeyDir::grow`] semantics.
+fn grow_into(mmap: &mut MmapMut, file: &mut File, desired: u64) -> io::Result<()> {
+    let new_capacity = ((mmap.len() as u64) * 2).max(desired);
+    file.set_len(new_capacity)?;
+    *mmap = unsafe { MmapMut::map_mut(&*file)? };
+    Ok(())
+}
+
+/// Append `[vlen u32][V][klen u32][K]` at the current write tail —
+/// either `stats.data_size` (mmap path) or the end of `tx.staging`
+/// (tx path). Returns `(virtual_offset, value_size, key_size)`. Mirrors
+/// [`KeyDir::write_entry`].
+fn write_entry_into<K, V>(
+    mmap: &mut MmapMut,
+    file: &mut File,
+    tx: &mut Option<TxState>,
+    stats: &mut KeyDirStats,
+    key: &K,
+    value: &V,
+) -> io::Result<(u64, u32, u32)>
+where
+    K: Encode,
+    V: Encode,
+{
+    let v_size = serialized_size(value)?;
+    let k_size = serialized_size(key)?;
+    let total = 8 + v_size + k_size;
+
+    if let Some(tx_state) = tx.as_mut() {
+        let local = tx_state.staging.len();
+        let virtual_offset = tx_state
+            .tx_base
+            .checked_add(local as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir offset overflow"))?;
+        tx_state.staging.resize(local + total, 0);
+        let dst = &mut tx_state.staging[local..local + total];
+        dst[0..4].copy_from_slice(&(v_size as u32).to_le_bytes());
+        let written = serialize_into(value, &mut dst[4..4 + v_size])?;
+        debug_assert_eq!(written, v_size);
+        let k_len_off = 4 + v_size;
+        dst[k_len_off..k_len_off + 4].copy_from_slice(&(k_size as u32).to_le_bytes());
+        let written = serialize_into(key, &mut dst[k_len_off + 4..total])?;
+        debug_assert_eq!(written, k_size);
+        return Ok((virtual_offset, v_size as u32, k_size as u32));
+    }
+
+    let offset = stats.data_size as usize;
+    let end = offset
+        .checked_add(total)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir offset overflow"))?;
+    if end > mmap.len() {
+        grow_into(mmap, file, end as u64)?;
+    }
+
+    mmap[offset..offset + 4].copy_from_slice(&(v_size as u32).to_le_bytes());
+    let v_off = offset + 4;
+    let written = serialize_into(value, &mut mmap[v_off..v_off + v_size])?;
+    debug_assert_eq!(written, v_size);
+    let k_len_off = v_off + v_size;
+    mmap[k_len_off..k_len_off + 4].copy_from_slice(&(k_size as u32).to_le_bytes());
+    let k_off = k_len_off + 4;
+    let written = serialize_into(key, &mut mmap[k_off..k_off + k_size])?;
+    debug_assert_eq!(written, k_size);
+
+    stats.data_size = end as u64;
+    Ok((offset as u64, v_size as u32, k_size as u32))
+}
+
+/// Append a tombstone for `old`, reusing the already-encoded key bytes
+/// from wherever `old` lives (mmap or staging). Mirrors
+/// [`KeyDir::write_tombstone_for`].
+fn write_tombstone_into(
+    mmap: &mut MmapMut,
+    file: &mut File,
+    tx: &mut Option<TxState>,
+    stats: &mut KeyDirStats,
+    old: EntryMeta,
+) -> io::Result<()> {
+    let key_size = old.key_size as usize;
+    let total = 8 + key_size;
+    let key_offset_within_entry = 4 + old.value_size as usize + 4;
+
+    if let Some(tx_state) = tx.as_mut() {
+        let new_local = tx_state.staging.len();
+        tx_state.staging.resize(new_local + total, 0);
+        tx_state.staging[new_local..new_local + 4].copy_from_slice(&TOMBSTONE.to_le_bytes());
+        tx_state.staging[new_local + 4..new_local + 8]
+            .copy_from_slice(&(key_size as u32).to_le_bytes());
+
+        if old.offset < tx_state.tx_base {
+            let src = old.offset as usize + key_offset_within_entry;
+            tx_state.staging[new_local + 8..new_local + 8 + key_size]
+                .copy_from_slice(&mmap[src..src + key_size]);
+        } else {
+            let local = (old.offset - tx_state.tx_base) as usize;
+            let src = local + key_offset_within_entry;
+            tx_state
+                .staging
+                .copy_within(src..src + key_size, new_local + 8);
+        }
+
+        stats.dead_bytes += 8 + key_size as u64;
+        return Ok(());
+    }
+
+    let new_offset = stats.data_size as usize;
+    let end = new_offset
+        .checked_add(total)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir offset overflow"))?;
+    if end > mmap.len() {
+        grow_into(mmap, file, end as u64)?;
+    }
+    let key_src_start = old.offset as usize + key_offset_within_entry;
+
+    mmap[new_offset..new_offset + 4].copy_from_slice(&TOMBSTONE.to_le_bytes());
+    mmap[new_offset + 4..new_offset + 8].copy_from_slice(&(key_size as u32).to_le_bytes());
+    mmap.copy_within(key_src_start..key_src_start + key_size, new_offset + 8);
+
+    stats.data_size = end as u64;
+    stats.dead_bytes += 8 + key_size as u64;
+    Ok(())
+}
+
 pub struct KeyDir<K, V> {
     index: HashMap<K, EntryMeta>,
     mmap: MmapMut,
     file: File,
     config: KeyDirConfig,
     stats: KeyDirStats,
+    /// `Some` while a bulk-write window is open. Writes encode into
+    /// `tx.staging` instead of `mmap`; reads consult both via the
+    /// virtual-offset branch in `value_bytes`.
+    tx: Option<TxState>,
     _phantom: PhantomData<V>,
 }
 
@@ -178,6 +389,7 @@ where
                 data_size: HEADER_SIZE as u64,
                 dead_bytes: 0,
             },
+            tx: None,
             _phantom: PhantomData,
         })
     }
@@ -205,6 +417,7 @@ where
             file,
             config,
             stats: KeyDirStats::default(),
+            tx: None,
             _phantom: PhantomData,
         };
 
@@ -219,82 +432,66 @@ where
     // -----------------------------------------------------------------------
 
     /// Raw value bytes for the entry pointed at by `meta` — borrowed
-    /// directly from the mmap, **not** including the leading length prefix.
+    /// directly from either the staging buffer (during a tx, if the
+    /// entry lives past `tx_base`) or the mmap. The leading length
+    /// prefix is excluded.
     fn value_bytes(&self, meta: &EntryMeta) -> &[u8] {
-        let start = meta.offset as usize + 4;
-        let end = start + meta.value_size as usize;
-        &self.mmap[start..end]
+        value_bytes_in(&self.mmap, self.tx.as_ref(), meta)
     }
 
-    /// Append `[vlen u32][V][klen u32][K]` at `stats.data_size`. Measures
-    /// both halves up front and `grow`s the file **at most once** — the
-    /// previous implementation could grow twice when the value pushed
-    /// past the boundary and then the key did too.
+    /// Append `[vlen u32][V][klen u32][K]` at the current write tail —
+    /// either `stats.data_size` (mmap path) or the end of the staging
+    /// buffer (tx path). Measures both halves up front so the mmap path
+    /// `grow`s **at most once** per call.
+    ///
+    /// Returns `(virtual_offset, value_size, key_size)`. Outside of a tx
+    /// `virtual_offset == mmap byte offset`; inside a tx it is
+    /// `tx_base + staging_offset`, which becomes the correct mmap offset
+    /// after `close_tx` copies staging into `mmap[tx_base..]`.
     fn write_entry(&mut self, key: &K, value: &V) -> io::Result<(u64, u32, u32)> {
-        let offset = self.stats.data_size as usize;
-        let v_size = serialized_size(value)?;
-        let k_size = serialized_size(key)?;
-        let total = 8 + v_size + k_size;
-        let end = offset
-            .checked_add(total)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir offset overflow"))?;
-        if end > self.mmap.len() {
-            self.grow(end as u64)?;
-        }
-
-        // vlen prefix
-        self.mmap[offset..offset + 4].copy_from_slice(&(v_size as u32).to_le_bytes());
-        // value bytes
-        let v_off = offset + 4;
-        let written = serialize_into(value, &mut self.mmap[v_off..v_off + v_size])?;
-        debug_assert_eq!(written, v_size);
-        // klen prefix
-        let k_len_off = v_off + v_size;
-        self.mmap[k_len_off..k_len_off + 4].copy_from_slice(&(k_size as u32).to_le_bytes());
-        // key bytes
-        let k_off = k_len_off + 4;
-        let written = serialize_into(key, &mut self.mmap[k_off..k_off + k_size])?;
-        debug_assert_eq!(written, k_size);
-
-        self.stats.data_size = end as u64;
-        Ok((offset as u64, v_size as u32, k_size as u32))
+        write_entry_into(
+            &mut self.mmap,
+            &mut self.file,
+            &mut self.tx,
+            &mut self.stats,
+            key,
+            value,
+        )
     }
 
     /// Append a tombstone for the entry described by `old`, reusing the
     /// already-encoded key bytes already living in the doomed entry's
     /// slot — no bincode encode, no scratch `Vec<u8>`. A single
     /// `copy_within` moves the key into the tombstone payload.
+    ///
+    /// In tx mode the tombstone is appended to the staging buffer, and
+    /// the source key bytes are read from either mmap (if `old` was
+    /// committed) or staging (if `old` was written earlier in the same
+    /// tx).
     fn write_tombstone_for(&mut self, old: EntryMeta) -> io::Result<()> {
-        let new_offset = self.stats.data_size as usize;
-        let key_size = old.key_size as usize;
-        let total = 8 + key_size;
-        let end = new_offset
-            .checked_add(total)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir offset overflow"))?;
-        if end > self.mmap.len() {
-            self.grow(end as u64)?;
-        }
-        // `grow` may remap, but file contents are preserved so the
-        // source bytes are still where `old` says they are.
-        let key_src_start = old.offset as usize + 4 + old.value_size as usize + 4;
-
-        self.mmap[new_offset..new_offset + 4].copy_from_slice(&TOMBSTONE.to_le_bytes());
-        self.mmap[new_offset + 4..new_offset + 8].copy_from_slice(&(key_size as u32).to_le_bytes());
-        // src lives strictly before dst (old entry is inside data_size,
-        // new_offset is past data_size), so the regions never overlap.
-        self.mmap
-            .copy_within(key_src_start..key_src_start + key_size, new_offset + 8);
-
-        self.stats.data_size = end as u64;
-        self.stats.dead_bytes += 8 + key_size as u64;
-        Ok(())
+        write_tombstone_into(
+            &mut self.mmap,
+            &mut self.file,
+            &mut self.tx,
+            &mut self.stats,
+            old,
+        )
     }
 
     /// Auto-compaction guard. Reads the configured threshold and, if the
     /// dead-byte ratio is over it, calls the [`Backend::compact`]
     /// implementation. `compact` lives on the trait — no separate
     /// inherent copy of the in-place algorithm.
+    ///
+    /// Suppressed while a tx is open: mid-tx compaction would relocate
+    /// committed bytes that staged offsets implicitly depend on (the
+    /// virtual-offset scheme assumes `mmap[..tx_base]` is stable until
+    /// commit). `close_tx` runs `maybe_compact` once after the staging
+    /// flush, so deferred dead-byte ratios still trigger.
     fn maybe_compact(&mut self) -> io::Result<()> {
+        if self.tx.is_some() {
+            return Ok(());
+        }
         let threshold = self.config.compaction_ratio;
         if threshold >= 1.0 {
             return Ok(());
@@ -313,15 +510,15 @@ where
     /// cache hands them to the new mapping. Saves an msync syscall on
     /// every growth round.
     fn grow(&mut self, desired: u64) -> io::Result<()> {
-        let new_capacity = ((self.mmap.len() as u64) * 2).max(desired);
-        self.file.set_len(new_capacity)?;
-        self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
-        Ok(())
+        grow_into(&mut self.mmap, &mut self.file, desired)
     }
 
     /// Rebuild the in-memory index by scanning the file from `HEADER_SIZE`.
     /// Replays all entries: live entries overwrite prior index entries,
     /// tombstones remove them. Accumulates dead_bytes from each.
+    ///
+    /// Live-entry inserts route through the `Entry` API so the cold
+    /// path hashes once instead of twice.
     fn rebuild_index(&mut self) -> io::Result<()> {
         let mut cursor: usize = HEADER_SIZE;
         self.stats.dead_bytes = 0;
@@ -358,11 +555,14 @@ where
                     value_size,
                     key_size,
                 };
-                if let Some(old) = self.index.get_mut(&key) {
-                    self.stats.dead_bytes += old.on_disk_size();
-                    *old = meta;
-                } else {
-                    self.index.insert(key, meta);
+                match self.index.entry(key) {
+                    Entry::Occupied(mut e) => {
+                        self.stats.dead_bytes += e.get().on_disk_size();
+                        *e.get_mut() = meta;
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(meta);
+                    }
                 }
             }
             cursor = entry_end;
@@ -374,8 +574,13 @@ where
 }
 
 impl<K, V> Drop for KeyDir<K, V> {
+    /// Schedule a final writeback without blocking. We don't promise
+    /// crash recovery in this layer, so a sync `flush()` here would
+    /// just stall shutdown for a guarantee we don't make. Callers that
+    /// need durability should call [`Backend::sync`] explicitly before
+    /// dropping.
     fn drop(&mut self) {
-        let _ = self.mmap.flush();
+        let _ = self.mmap.flush_async();
     }
 }
 
@@ -398,6 +603,57 @@ where
 {
     type Stats = KeyDirStats;
 
+    /// Open a bulk-write window. Subsequent `put` / `delete` calls stage
+    /// their records into an in-memory pooled buffer; the mmap is left
+    /// alone until [`close_tx`] copies the staging buffer back in.
+    /// Returns [`io::ErrorKind::AlreadyExists`] if a tx is already open
+    /// — nesting is not supported.
+    ///
+    /// See the "Bulk-write mode" section of the module docs for the
+    /// detailed semantics.
+    fn open_tx(&mut self) -> io::Result<()> {
+        if self.tx.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "KeyDir tx already open",
+            ));
+        }
+        self.tx = Some(TxState {
+            staging: PooledBuf::acquire(),
+            tx_base: self.stats.data_size,
+        });
+        Ok(())
+    }
+
+    /// Commit the staged writes. Grows the mmap once to fit
+    /// `tx_base + staging.len()`, performs one `copy_from_slice` from
+    /// staging into `mmap[tx_base..]`, advances `stats.data_size`, then
+    /// runs `maybe_compact` once. The staging buffer is returned to the
+    /// thread-local pool on drop.
+    ///
+    /// Idempotent: calling without a prior `open_tx` returns `Ok(())`.
+    fn close_tx(&mut self) -> io::Result<()> {
+        let Some(tx) = self.tx.take() else {
+            return Ok(());
+        };
+        let staged_len = tx.staging.len();
+        if staged_len > 0 {
+            let end = tx.tx_base.checked_add(staged_len as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir offset overflow")
+            })?;
+            if end > self.mmap.len() as u64 {
+                self.grow(end)?;
+            }
+            let start = tx.tx_base as usize;
+            self.mmap[start..start + staged_len].copy_from_slice(&tx.staging);
+            self.stats.data_size = end;
+        }
+        // `tx` (and its `PooledBuf`) drops here, returning the staging
+        // buffer to the thread-local pool.
+        drop(tx);
+        self.maybe_compact()
+    }
+
     /// One HashMap lookup, then materialize the value by decoding the
     /// mmap slice the meta points at.
     fn get(&self, key: &K) -> Option<V> {
@@ -411,26 +667,25 @@ where
         self.index.contains_key(key)
     }
 
-    /// Append the new record, then update the index. The hot path takes a
-    /// single HashMap lookup via `get_mut` — overwrites update in place;
-    /// fresh inserts fall through to a single `insert` call. Either way
-    /// only one hash is computed per `put`.
+    /// Append the new record, then update the index. Routes the index
+    /// touch through hashbrown's `Entry` API — one hash whether the key
+    /// is fresh or being overwritten. (The previous `get_mut` / `insert`
+    /// pair hashed twice on the cold path.)
     fn put(&mut self, key: K, value: V) -> io::Result<()> {
         let (offset, value_size, key_size) = self.write_entry(&key, &value)?;
-        if let Some(old) = self.index.get_mut(&key) {
-            self.stats.dead_bytes += old.on_disk_size();
-            old.offset = offset;
-            old.value_size = value_size;
-            old.key_size = key_size;
-        } else {
-            self.index.insert(
-                key,
-                EntryMeta {
-                    offset,
-                    value_size,
-                    key_size,
-                },
-            );
+        let new_meta = EntryMeta {
+            offset,
+            value_size,
+            key_size,
+        };
+        match self.index.entry(key) {
+            Entry::Occupied(mut e) => {
+                self.stats.dead_bytes += e.get().on_disk_size();
+                *e.get_mut() = new_meta;
+            }
+            Entry::Vacant(e) => {
+                e.insert(new_meta);
+            }
         }
         self.maybe_compact()
     }
@@ -449,49 +704,278 @@ where
         Ok(true)
     }
 
+    /// Insert iff `key` is absent. One hash per call: probes via
+    /// `Entry`; the Vacant arm writes the record and fills the slot in
+    /// the same lookup. The default trait impl does `contains` + `put`
+    /// — two hashes — which is why we override.
+    fn put_if_absent(&mut self, key: K, value: V) -> io::Result<bool> {
+        let inserted;
+        {
+            let Self {
+                index,
+                mmap,
+                file,
+                tx,
+                stats,
+                ..
+            } = self;
+
+            match index.entry(key) {
+                Entry::Occupied(_) => {
+                    inserted = false;
+                }
+                Entry::Vacant(e) => {
+                    // The entry holds K; pass it as &K to write_entry_into
+                    // via VacantEntry::key().
+                    let key_ref: &K = e.key();
+                    let (offset, value_size, key_size) =
+                        write_entry_into(mmap, file, tx, stats, key_ref, &value)?;
+                    e.insert(EntryMeta {
+                        offset,
+                        value_size,
+                        key_size,
+                    });
+                    inserted = true;
+                }
+            }
+        }
+
+        if inserted {
+            self.maybe_compact()?;
+        }
+        Ok(inserted)
+    }
+
+    /// Insert or overwrite, returning the previous value (if any).
+    /// One hash per call: the same `Entry` slot is reused for the
+    /// optional value read and for the placement. The default trait
+    /// impl does `get` + `put` — two hashes plus a redundant decode on
+    /// the missing-key path — which is why we override.
+    fn replace(&mut self, key: K, value: V) -> io::Result<Option<V>> {
+        let prev;
+        {
+            let Self {
+                index,
+                mmap,
+                file,
+                tx,
+                stats,
+                ..
+            } = self;
+
+            match index.entry(key) {
+                Entry::Occupied(mut e) => {
+                    let old_meta: EntryMeta = *e.get();
+                    let prev_val: V = {
+                        let bytes = value_bytes_in(mmap, tx.as_ref(), &old_meta);
+                        deserialize_from(bytes)?
+                    };
+                    let key_ref: &K = e.key();
+                    let (offset, value_size, key_size) =
+                        write_entry_into(mmap, file, tx, stats, key_ref, &value)?;
+                    stats.dead_bytes += old_meta.on_disk_size();
+                    *e.get_mut() = EntryMeta {
+                        offset,
+                        value_size,
+                        key_size,
+                    };
+                    prev = Some(prev_val);
+                }
+                Entry::Vacant(e) => {
+                    let key_ref: &K = e.key();
+                    let (offset, value_size, key_size) =
+                        write_entry_into(mmap, file, tx, stats, key_ref, &value)?;
+                    e.insert(EntryMeta {
+                        offset,
+                        value_size,
+                        key_size,
+                    });
+                    prev = None;
+                }
+            }
+        }
+
+        self.maybe_compact()?;
+        Ok(prev)
+    }
+
+    /// Insert every item. Auto-wraps the loop in [`open_tx`] /
+    /// [`close_tx`] when no tx is already open, so callers get the
+    /// bulk-write amortization (one mmap grow, one deferred
+    /// `maybe_compact`) without having to manage the tx themselves.
+    ///
+    /// If a tx is already open, the items are simply appended into the
+    /// caller's existing staging buffer — no nested tx, no early
+    /// commit. The caller's `close_tx` still controls when the batch
+    /// becomes visible in the mmap.
+    ///
+    /// Pre-reserves the index from the iterator's `size_hint().0` so
+    /// the cold path avoids HashMap rehashes during the load.
+    fn bulk_put<I>(&mut self, items: I) -> io::Result<()>
+    where
+        I: IntoIterator<Item = (K, V)>,
+    {
+        let iter = items.into_iter();
+        let (lower, _) = iter.size_hint();
+        if lower > 0 {
+            self.index.reserve(lower);
+        }
+
+        let opened_here = self.tx.is_none();
+        if opened_here {
+            self.open_tx()?;
+        }
+
+        let mut first_err: Option<io::Error> = None;
+        for (k, v) in iter {
+            if let Err(e) = self.put(k, v) {
+                first_err = Some(e);
+                break;
+            }
+        }
+
+        if opened_here {
+            // Always close the auto-opened tx so the backend isn't left
+            // stuck in tx mode — even if one of the puts failed. The
+            // close commits whatever was staged successfully.
+            if let Err(e) = self.close_tx() {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Remove every key the iterator yields, auto-wrapped in
+    /// [`open_tx`] / [`close_tx`] when no tx is already open. Returns
+    /// the number of keys that were actually present (and removed).
+    ///
+    /// Same error semantics as [`bulk_put`]: a failing `delete` stops
+    /// the loop, the auto-opened tx still closes, and the first error
+    /// is returned.
+    fn bulk_delete<'a, I>(&mut self, keys: I) -> io::Result<usize>
+    where
+        I: IntoIterator<Item = &'a K>,
+        K: 'a,
+    {
+        let opened_here = self.tx.is_none();
+        if opened_here {
+            self.open_tx()?;
+        }
+
+        let mut n: usize = 0;
+        let mut first_err: Option<io::Error> = None;
+        for k in keys {
+            match self.delete(k) {
+                Ok(true) => n += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    first_err = Some(e);
+                    break;
+                }
+            }
+        }
+
+        if opened_here {
+            if let Err(e) = self.close_tx() {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(n),
+        }
+    }
+
     /// Unified read-modify-write / insert / delete primitive. Writes at
-    /// most one new log record. Existing entries are located once before
-    /// the closure runs, then the selected branch updates the index.
+    /// most one new log record.
+    ///
+    /// Hashes the key exactly **once** per call. The slot is located via
+    /// `raw_entry_mut().from_key(key)` and held open across the value
+    /// read, the closure invocation, and the slot mutation — `self` is
+    /// destructured into field-level borrows so the disjoint
+    /// `mmap` / `file` / `tx` / `stats` writes don't conflict with the
+    /// entry's borrow on `self.index`.
     fn update<F>(&mut self, key: &K, f: F) -> io::Result<()>
     where
         F: FnOnce(Option<V>) -> Option<V>,
     {
-        let existing = self.index.get(key).copied();
-        let current: Option<V> = match &existing {
-            Some(meta) => Some(deserialize_from(self.value_bytes(meta))?),
-            None => None,
-        };
+        use hashbrown::hash_map::RawEntryMut;
 
-        match (existing, f(current)) {
-            (Some(old), Some(new_v)) => {
-                self.stats.dead_bytes += old.on_disk_size();
-                let (offset, value_size, key_size) = self.write_entry(key, &new_v)?;
-                *self.index.get_mut(key).unwrap() = EntryMeta {
-                    offset,
-                    value_size,
-                    key_size,
-                };
-                self.maybe_compact()?;
+        // Did the closure mutate state? Used to decide whether to run
+        // maybe_compact after the destructure goes out of scope.
+        let mutated;
+
+        {
+            let Self {
+                index,
+                mmap,
+                file,
+                tx,
+                stats,
+                ..
+            } = self;
+
+            match index.raw_entry_mut().from_key(key) {
+                RawEntryMut::Occupied(mut e) => {
+                    // Copy out the meta (it's `Copy`) so we can drop the
+                    // immutable borrow before doing the mutable write.
+                    let old_meta: EntryMeta = *e.get();
+                    let current: V = {
+                        let bytes = value_bytes_in(mmap, tx.as_ref(), &old_meta);
+                        deserialize_from(bytes)?
+                    };
+                    match f(Some(current)) {
+                        Some(new_v) => {
+                            let (offset, value_size, key_size) =
+                                write_entry_into(mmap, file, tx, stats, key, &new_v)?;
+                            stats.dead_bytes += old_meta.on_disk_size();
+                            *e.get_mut() = EntryMeta {
+                                offset,
+                                value_size,
+                                key_size,
+                            };
+                            mutated = true;
+                        }
+                        None => {
+                            stats.dead_bytes += old_meta.on_disk_size();
+                            e.remove();
+                            write_tombstone_into(mmap, file, tx, stats, old_meta)?;
+                            mutated = true;
+                        }
+                    }
+                }
+                RawEntryMut::Vacant(e) => match f(None) {
+                    Some(new_v) => {
+                        let (offset, value_size, key_size) =
+                            write_entry_into(mmap, file, tx, stats, key, &new_v)?;
+                        e.insert(
+                            key.clone(),
+                            EntryMeta {
+                                offset,
+                                value_size,
+                                key_size,
+                            },
+                        );
+                        mutated = true;
+                    }
+                    None => {
+                        mutated = false;
+                    }
+                },
             }
-            (None, Some(new_v)) => {
-                let (offset, value_size, key_size) = self.write_entry(key, &new_v)?;
-                self.index.insert(
-                    key.clone(),
-                    EntryMeta {
-                        offset,
-                        value_size,
-                        key_size,
-                    },
-                );
-                self.maybe_compact()?;
-            }
-            (Some(old), None) => {
-                self.stats.dead_bytes += old.on_disk_size();
-                self.index.remove(key);
-                self.write_tombstone_for(old)?;
-                self.maybe_compact()?;
-            }
-            (None, None) => {}
+        }
+
+        if mutated {
+            self.maybe_compact()?;
         }
         Ok(())
     }
@@ -499,7 +983,12 @@ where
     /// Drop every live entry. Resets `data_size` to `HEADER_SIZE` and
     /// zeroes the post-header sentinel so a subsequent open sees an
     /// empty log. The backing file is not truncated.
+    ///
+    /// Calling this mid-tx would invalidate every staged offset; doing
+    /// so is undefined behaviour at the index level. Tests catch it via
+    /// `debug_assert`.
     fn clear(&mut self) -> io::Result<()> {
+        debug_assert!(self.tx.is_none(), "clear() called inside an open tx");
         self.index.clear();
         self.stats.data_size = HEADER_SIZE as u64;
         self.stats.dead_bytes = 0;
@@ -523,7 +1012,12 @@ where
     /// the write cursor (`dst`) is always ≤ `src` at each step, so the
     /// forward shift never destructively overlaps a record we haven't
     /// moved yet (`copy_within` itself uses memmove semantics).
+    ///
+    /// Calling this mid-tx would relocate committed bytes that staged
+    /// offsets depend on. `maybe_compact` already short-circuits during
+    /// a tx; this assert catches direct calls.
     fn compact(&mut self) -> io::Result<()> {
+        debug_assert!(self.tx.is_none(), "compact() called inside an open tx");
         // Collect mutable references to every entry so we can update
         // offsets in-place — no drain/reinsert, no key clones.
         let mut snapshot: Vec<(&K, &mut EntryMeta)> = self.index.iter_mut().collect();
@@ -597,12 +1091,20 @@ where
 
     /// Schedule mmap writeback asynchronously. Returns once the OS has
     /// accepted the request; use [`sync`](Self::sync) to wait for it.
+    ///
+    /// Called mid-tx, this only flushes the committed mmap region —
+    /// staged writes live in the heap-backed [`PooledBuf`] and are not
+    /// yet part of the file. They become durable only after
+    /// [`close_tx`](Self::close_tx) followed by `flush` / `sync`.
     fn flush(&self) -> io::Result<()> {
         self.mmap.flush_async()
     }
 
     /// Block until pending mmap writes have been flushed by the OS.
     /// This does not provide crash recovery or log repair.
+    ///
+    /// Same mid-tx caveat as [`flush`](Self::flush): only the
+    /// committed mmap region is synced; staged writes are not touched.
     fn sync(&self) -> io::Result<()> {
         self.mmap.flush()
     }
@@ -1323,7 +1825,7 @@ mod tests {
         assert_eq!(kd.get(&k("a")), Some(v("new", 99)));
     }
 
-    // ---- bulk_put / bulk_put_sorted / bulk_delete ----
+    // ---- bulk_put / bulk_delete ----
 
     #[test]
     fn bulk_put_inserts_all_items() {
@@ -1337,17 +1839,6 @@ mod tests {
         for i in 0..50u32 {
             assert_eq!(kd.get(&format!("k{:04}", i).into_bytes()), Some(v("p", i)));
         }
-    }
-
-    #[test]
-    fn bulk_put_sorted_inserts_all_items() {
-        let p = tmp_path("bulk_put_sorted");
-        let mut kd = create(&p);
-        let items: Vec<(TestKey, TestVal)> = (0..50u32)
-            .map(|i| (format!("k{:04}", i).into_bytes(), v("p", i)))
-            .collect();
-        Backend::bulk_put_sorted(&mut kd, items).unwrap();
-        assert_eq!(kd.size(), 50);
     }
 
     #[test]
@@ -1389,5 +1880,394 @@ mod tests {
         let kd = create(&p);
         kd.flush().unwrap();
         kd.sync().unwrap();
+    }
+
+    // ---- bulk-write mode (open_tx / close_tx) ----
+
+    #[test]
+    fn tx_bulk_put_visible_after_close_and_reopen() {
+        let p = tmp_path("tx_bulk_put");
+        {
+            let mut kd = create(&p);
+            kd.open_tx().unwrap();
+            for i in 0..1000u32 {
+                kd.put(format!("k{:04}", i).into_bytes(), v("payload", i))
+                    .unwrap();
+            }
+            kd.close_tx().unwrap();
+            kd.sync().unwrap();
+        }
+        let kd = open(&p);
+        assert_eq!(kd.size(), 1000);
+        for i in 0..1000u32 {
+            assert_eq!(
+                kd.get(&format!("k{:04}", i).into_bytes()),
+                Some(v("payload", i))
+            );
+        }
+    }
+
+    #[test]
+    fn tx_read_your_own_writes() {
+        let p = tmp_path("tx_ryow");
+        let mut kd = create(&p);
+        kd.open_tx().unwrap();
+        kd.put(k("staged"), v("fresh", 42)).unwrap();
+        // Reading during the tx returns the staged value.
+        assert_eq!(kd.get(&k("staged")), Some(v("fresh", 42)));
+        assert_eq!(kd.size(), 1);
+        kd.close_tx().unwrap();
+        assert_eq!(kd.get(&k("staged")), Some(v("fresh", 42)));
+    }
+
+    #[test]
+    fn tx_delete_inside_tx_survives_reopen() {
+        let p = tmp_path("tx_delete_inside");
+        {
+            let mut kd = create(&p);
+            kd.put(k("doomed"), v("v", 1)).unwrap();
+            kd.put(k("keeper"), v("v", 2)).unwrap();
+            kd.open_tx().unwrap();
+            assert!(kd.delete(&k("doomed")).unwrap());
+            // Mid-tx the delete is already visible.
+            assert!(!kd.contains(&k("doomed")));
+            assert!(kd.contains(&k("keeper")));
+            kd.close_tx().unwrap();
+            kd.sync().unwrap();
+        }
+        let kd = open(&p);
+        assert!(!kd.contains(&k("doomed")));
+        assert!(kd.contains(&k("keeper")));
+    }
+
+    #[test]
+    fn tx_overwrite_within_tx_only() {
+        let p = tmp_path("tx_overwrite_within");
+        let mut kd = create(&p);
+        kd.open_tx().unwrap();
+        kd.put(k("a"), v("first", 1)).unwrap();
+        kd.put(k("a"), v("second", 2)).unwrap();
+        assert_eq!(kd.get(&k("a")), Some(v("second", 2)));
+        kd.close_tx().unwrap();
+        assert_eq!(kd.get(&k("a")), Some(v("second", 2)));
+    }
+
+    #[test]
+    fn tx_overwrite_committed_entry_inside_tx() {
+        // Committed entry is overwritten by a staged write: covers the
+        // cross-region path where `old` lives in mmap but the new entry
+        // (and any later tombstone source) lives in staging.
+        let p = tmp_path("tx_overwrite_cross");
+        let mut kd = create(&p);
+        kd.put(k("a"), v("mmap_v", 1)).unwrap();
+        kd.open_tx().unwrap();
+        kd.put(k("a"), v("staged_v", 2)).unwrap();
+        assert_eq!(kd.get(&k("a")), Some(v("staged_v", 2)));
+        kd.close_tx().unwrap();
+        assert_eq!(kd.get(&k("a")), Some(v("staged_v", 2)));
+        assert!(kd.stats().dead_bytes > 0);
+    }
+
+    #[test]
+    fn tx_delete_committed_entry_inside_tx() {
+        // Tombstone written into staging sources its key bytes from
+        // mmap (the old entry was committed pre-tx). Exercises the
+        // mmap→staging branch of `write_tombstone_for`.
+        let p = tmp_path("tx_delete_cross");
+        let mut kd = create(&p);
+        kd.put(k("doomed"), v("mmap_v", 1)).unwrap();
+        kd.open_tx().unwrap();
+        assert!(kd.delete(&k("doomed")).unwrap());
+        assert!(!kd.contains(&k("doomed")));
+        kd.close_tx().unwrap();
+        assert!(!kd.contains(&k("doomed")));
+    }
+
+    #[test]
+    fn tx_delete_staged_entry_inside_tx() {
+        // Tombstone written into staging sources its key bytes from
+        // staging itself (the entry was put earlier in the same tx).
+        // Exercises the staging→staging copy_within branch.
+        let p = tmp_path("tx_delete_staged");
+        let mut kd = create(&p);
+        kd.open_tx().unwrap();
+        kd.put(k("doomed"), v("staged_v", 1)).unwrap();
+        assert!(kd.delete(&k("doomed")).unwrap());
+        assert!(!kd.contains(&k("doomed")));
+        kd.close_tx().unwrap();
+        assert!(!kd.contains(&k("doomed")));
+    }
+
+    #[test]
+    fn nested_open_tx_errors() {
+        let p = tmp_path("tx_nested");
+        let mut kd = create(&p);
+        kd.open_tx().unwrap();
+        let err = kd.open_tx().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        kd.close_tx().unwrap();
+    }
+
+    #[test]
+    fn close_tx_without_open_is_noop() {
+        let p = tmp_path("tx_close_noop");
+        let mut kd = create(&p);
+        // Calling close_tx with no tx open is idempotent.
+        kd.close_tx().unwrap();
+        kd.close_tx().unwrap();
+        kd.put(k("a"), v("v", 1)).unwrap();
+        kd.close_tx().unwrap();
+    }
+
+    #[test]
+    fn compaction_does_not_fire_during_tx() {
+        // With compaction_ratio = 0.0 every non-tx mutation would trigger
+        // compact. Inside a tx mutations accumulate dead bytes without
+        // ever compacting. After close_tx, the deferred maybe_compact
+        // fires and reclaims them in one pass.
+        let p = tmp_path("tx_compact_deferred");
+        let cfg = KeyDirConfig {
+            initial_capacity: 16 * 1024,
+            compaction_ratio: 0.0,
+        };
+        let mut kd = create_with(&p, cfg);
+        kd.put(k("hot"), v("seed", 0)).unwrap();
+        // After the seeded put compaction has already run, so dead_bytes
+        // is 0 going into the tx.
+        assert_eq!(kd.stats().dead_bytes, 0);
+        kd.open_tx().unwrap();
+        for i in 1..20u32 {
+            kd.put(k("hot"), v("staged", i)).unwrap();
+        }
+        // Dead bytes have accumulated (each overwrite kills the prior
+        // entry) but no compaction has fired — the index still points
+        // into staging via virtual offsets.
+        assert!(
+            kd.stats().dead_bytes > 0,
+            "expected accumulated dead bytes mid-tx; got {}",
+            kd.stats().dead_bytes
+        );
+        kd.close_tx().unwrap();
+        // Post-commit compaction reclaims everything.
+        assert_eq!(kd.stats().dead_bytes, 0);
+        assert_eq!(kd.get(&k("hot")), Some(v("staged", 19)));
+    }
+
+    #[test]
+    fn tx_pooled_buffer_is_recycled() {
+        // Two consecutive txs should reuse the staging buffer from the
+        // thread-local pool. We can't observe the pool directly without
+        // adding test hooks, but we can verify the second tx's writes
+        // round-trip correctly — proving the recycled buffer was cleared.
+        let p = tmp_path("tx_recycle");
+        let mut kd = create(&p);
+        kd.open_tx().unwrap();
+        for i in 0..50u32 {
+            kd.put(format!("a{:02}", i).into_bytes(), v("first", i))
+                .unwrap();
+        }
+        kd.close_tx().unwrap();
+        kd.open_tx().unwrap();
+        for i in 0..50u32 {
+            kd.put(format!("b{:02}", i).into_bytes(), v("second", i))
+                .unwrap();
+        }
+        kd.close_tx().unwrap();
+        assert_eq!(kd.size(), 100);
+        for i in 0..50u32 {
+            assert_eq!(
+                kd.get(&format!("a{:02}", i).into_bytes()),
+                Some(v("first", i))
+            );
+            assert_eq!(
+                kd.get(&format!("b{:02}", i).into_bytes()),
+                Some(v("second", i))
+            );
+        }
+    }
+
+    // ---- bulk methods (auto-tx wrapping) ----
+
+    #[test]
+    fn bulk_put_auto_opens_and_closes_tx() {
+        let p = tmp_path("bulk_put_auto_tx");
+        {
+            let mut kd = create(&p);
+            let items: Vec<(TestKey, TestVal)> = (0..500u32)
+                .map(|i| (format!("k{:04}", i).into_bytes(), v("p", i)))
+                .collect();
+            Backend::bulk_put(&mut kd, items).unwrap();
+            // No tx should be lingering after bulk_put returns.
+            assert!(
+                kd.open_tx().is_ok(),
+                "bulk_put left a tx open — open_tx should not error"
+            );
+            kd.close_tx().unwrap();
+            kd.flush().unwrap();
+        }
+        let kd = open(&p);
+        assert_eq!(kd.size(), 500);
+        for i in 0..500u32 {
+            assert_eq!(kd.get(&format!("k{:04}", i).into_bytes()), Some(v("p", i)));
+        }
+    }
+
+    #[test]
+    fn bulk_put_within_existing_tx_does_not_close_it() {
+        // If the caller already opened a tx, bulk_put should join it
+        // rather than auto-closing — the caller's close_tx still
+        // controls when the batch becomes visible in the mmap.
+        let p = tmp_path("bulk_put_within_tx");
+        let mut kd = create(&p);
+        kd.open_tx().unwrap();
+        let items: Vec<(TestKey, TestVal)> = (0..50u32)
+            .map(|i| (format!("a{:02}", i).into_bytes(), v("bulk", i)))
+            .collect();
+        Backend::bulk_put(&mut kd, items).unwrap();
+        // Tx is still open — a follow-up put must continue staging.
+        kd.put(k("after_bulk"), v("staged", 999)).unwrap();
+        // Nested open_tx would error iff the tx is still open. Verify.
+        let err = kd.open_tx().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        kd.close_tx().unwrap();
+        // All entries — both the bulk batch and the trailing put — are
+        // committed by the caller's close_tx.
+        assert_eq!(kd.size(), 51);
+        assert_eq!(kd.get(&k("after_bulk")), Some(v("staged", 999)));
+    }
+
+    #[test]
+    fn bulk_delete_auto_opens_and_closes_tx() {
+        let p = tmp_path("bulk_delete_auto_tx");
+        let mut kd = create(&p);
+        for i in 0..20u32 {
+            kd.put(format!("k{:02}", i).into_bytes(), v("p", i))
+                .unwrap();
+        }
+        let to_remove: Vec<TestKey> = (0..10u32)
+            .map(|i| format!("k{:02}", i).into_bytes())
+            .collect();
+        let ghosts: Vec<TestKey> = vec![k("ghost1"), k("ghost2")];
+        let all: Vec<&TestKey> = to_remove.iter().chain(ghosts.iter()).collect();
+        let n = Backend::bulk_delete(&mut kd, all).unwrap();
+        assert_eq!(n, 10);
+        assert_eq!(kd.size(), 10);
+        // No tx should be lingering.
+        kd.open_tx().unwrap();
+        kd.close_tx().unwrap();
+    }
+
+    #[test]
+    fn bulk_delete_within_existing_tx_does_not_close_it() {
+        let p = tmp_path("bulk_delete_within_tx");
+        let mut kd = create(&p);
+        for i in 0..10u32 {
+            kd.put(format!("k{:02}", i).into_bytes(), v("p", i))
+                .unwrap();
+        }
+        kd.open_tx().unwrap();
+        let to_remove: Vec<TestKey> = (0..5u32)
+            .map(|i| format!("k{:02}", i).into_bytes())
+            .collect();
+        let n = Backend::bulk_delete(&mut kd, to_remove.iter()).unwrap();
+        assert_eq!(n, 5);
+        // Tx still open — caller's close_tx commits the deletions.
+        let err = kd.open_tx().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        kd.close_tx().unwrap();
+        assert_eq!(kd.size(), 5);
+    }
+
+    #[test]
+    fn tx_mixed_committed_and_staged_reads() {
+        // Some entries committed before tx, others added inside; all
+        // reachable through `get` via the appropriate branch.
+        let p = tmp_path("tx_mixed");
+        let mut kd = create(&p);
+        kd.put(k("c1"), v("committed", 1)).unwrap();
+        kd.put(k("c2"), v("committed", 2)).unwrap();
+        kd.open_tx().unwrap();
+        kd.put(k("s1"), v("staged", 10)).unwrap();
+        kd.put(k("s2"), v("staged", 20)).unwrap();
+        assert_eq!(kd.get(&k("c1")), Some(v("committed", 1)));
+        assert_eq!(kd.get(&k("c2")), Some(v("committed", 2)));
+        assert_eq!(kd.get(&k("s1")), Some(v("staged", 10)));
+        assert_eq!(kd.get(&k("s2")), Some(v("staged", 20)));
+        kd.close_tx().unwrap();
+        assert_eq!(kd.size(), 4);
+    }
+
+    // ---- replace / put_if_absent: persistence checks for the overrides ----
+
+    #[test]
+    fn replace_inserts_when_absent_and_persists() {
+        // The Backend override of `replace` exercises the Vacant->Insert
+        // branch — write the record, fill the slot, return None. Reopen
+        // to confirm the new record is durable.
+        let p = tmp_path("replace_absent_persist");
+        {
+            let mut kd = create(&p);
+            let prev = Backend::replace(&mut kd, k("fresh"), v("inserted", 7)).unwrap();
+            assert!(prev.is_none());
+            kd.sync().unwrap();
+        }
+        let kd = open(&p);
+        assert_eq!(kd.get(&k("fresh")), Some(v("inserted", 7)));
+    }
+
+    #[test]
+    fn replace_returns_old_value_and_accounts_dead_bytes() {
+        // The Occupied branch of the override must return the decoded
+        // old value AND record the old record's bytes as dead.
+        let p = tmp_path("replace_old_dead");
+        let mut kd = create_with(
+            &p,
+            KeyDirConfig {
+                initial_capacity: 1 << 20,
+                compaction_ratio: 0.99,
+            },
+        );
+        kd.put(k("a"), v("v1", 1)).unwrap();
+        assert_eq!(kd.stats().dead_bytes, 0);
+        let prev = Backend::replace(&mut kd, k("a"), v("v2", 2)).unwrap();
+        assert_eq!(prev, Some(v("v1", 1)));
+        assert_eq!(kd.get(&k("a")), Some(v("v2", 2)));
+        assert!(kd.stats().dead_bytes > 0);
+    }
+
+    #[test]
+    fn put_if_absent_does_not_touch_disk_when_present() {
+        // The Occupied branch of the override must NOT call write_entry —
+        // no record is appended, data_size doesn't move.
+        let p = tmp_path("pia_no_disk_write");
+        let mut kd = create_with(
+            &p,
+            KeyDirConfig {
+                initial_capacity: 1 << 20,
+                compaction_ratio: 0.99,
+            },
+        );
+        kd.put(k("a"), v("first", 1)).unwrap();
+        let size_before = kd.stats().data_size;
+        let dead_before = kd.stats().dead_bytes;
+        let inserted = Backend::put_if_absent(&mut kd, k("a"), v("second", 2)).unwrap();
+        assert!(!inserted);
+        assert_eq!(kd.get(&k("a")), Some(v("first", 1)));
+        // No write happened.
+        assert_eq!(kd.stats().data_size, size_before);
+        assert_eq!(kd.stats().dead_bytes, dead_before);
+    }
+
+    #[test]
+    fn put_if_absent_inserts_and_persists() {
+        let p = tmp_path("pia_persist");
+        {
+            let mut kd = create(&p);
+            assert!(Backend::put_if_absent(&mut kd, k("only"), v("once", 1)).unwrap());
+            assert!(!Backend::put_if_absent(&mut kd, k("only"), v("twice", 2)).unwrap());
+            kd.sync().unwrap();
+        }
+        let kd = open(&p);
+        assert_eq!(kd.get(&k("only")), Some(v("once", 1)));
     }
 }

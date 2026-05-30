@@ -18,7 +18,7 @@
 //! `read_u32_le`) live here too so the page-based formats share one
 //! definition.
 
-use std::{cell::RefCell, io};
+use std::io;
 
 use bincode::{
     config::{Configuration, Fixint, LittleEndian, NoLimit},
@@ -26,6 +26,8 @@ use bincode::{
     error::{DecodeError, EncodeError},
     Decode, Encode,
 };
+
+use crate::utils::reusables::PooledBuf;
 
 // ---------------------------------------------------------------------------
 // Shared bincode configuration — chosen for fastest encode/decode loops.
@@ -81,33 +83,23 @@ pub fn serialize_to_vec<T: Encode>(value: &T) -> io::Result<Vec<u8>> {
     bincode::encode_to_vec(value, cfg()).map_err(encode_err)
 }
 
-thread_local! {
-    /// Per-thread scratch buffer used by [`with_scratch`]. The buffer
-    /// retains its capacity across calls so the common case (point lookup,
-    /// `put`, `delete`) avoids the per-call allocation that
-    /// `serialize_to_vec` would otherwise perform.
-    static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Encode a value into a thread-local scratch buffer and pass the resulting
-/// byte slice to `f`. The scratch buffer is reused across calls, so the hot
-/// path (`get`/`put`/`delete`/`contains`/`update`) avoids allocating a
-/// fresh `Vec<u8>` on every invocation.
+/// Encode a value into a recycled scratch buffer and pass the resulting
+/// byte slice to `f`. The buffer is acquired from the thread-local pool
+/// in [`crate::utils::reusables`], so the hot path
+/// (`get`/`put`/`delete`/`contains`/`update`) avoids allocating a fresh
+/// `Vec<u8>` on every invocation.
 ///
-/// `f` must not recursively call `with_scratch` — the inner call would
-/// panic on a double `RefCell::borrow_mut`. None of the storage hot paths
-/// recurse, so this restriction is invisible in practice.
+/// Unlike the earlier `RefCell` version, recursion is safe:
+/// a nested `with_scratch` call acquires a separate buffer from the pool
+/// rather than re-borrowing the same one.
 pub fn with_scratch<T, F, R>(value: &T, f: F) -> io::Result<R>
 where
     T: Encode,
     F: FnOnce(&[u8]) -> io::Result<R>,
 {
-    SCRATCH.with(|cell| {
-        let mut buf = cell.borrow_mut();
-        buf.clear();
-        let written = serialize_into_std(value, &mut *buf)?;
-        f(&buf[..written])
-    })
+    let mut buf = PooledBuf::acquire();
+    let written = serialize_into_std(value, &mut *buf)?;
+    f(&buf[..written])
 }
 
 /// Decode a value from `src`. Returns the decoded value, discarding the

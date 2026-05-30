@@ -156,10 +156,7 @@ where
     where
         I: IntoIterator<Item = (K, V)>,
     {
-        for (k, v) in sorted {
-            self.put(k, v)?;
-        }
-        Ok(())
+        self.bulk_put(sorted)
     }
 
     /// Remove `key`. Returns whether it existed. Does *not* return the
@@ -194,13 +191,7 @@ where
         I: IntoIterator<Item = &'a K>,
         K: 'a,
     {
-        let mut n = 0;
-        for k in sorted {
-            if self.delete(k)? {
-                n += 1;
-            }
-        }
-        Ok(n)
+        self.bulk_delete(sorted)
     }
 
     /// Unified read-modify-write / insert / delete primitive.
@@ -297,7 +288,7 @@ where
 /// The ordering is backend-defined:
 /// - [`crate::core::btree::BPlusTree`] orders by lexicographic bincode key
 ///   bytes because tree navigation stores serialized keys.
-/// - [`crate::core::order_log::OrderLog`] orders by `K::Ord` because its
+/// - [`crate::core::orderlog::OrderLog`] orders by `K::Ord` because its
 ///   in-memory skip list stores decoded keys.
 ///
 /// `Ord` lives **here**, not on [`Backend`]: only ordered backends

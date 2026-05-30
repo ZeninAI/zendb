@@ -334,4 +334,18 @@ where
         v.reverse();
         v.into_iter()
     }
+
+    /// Iterate entries with keys in `[start, end)` in **descending** key
+    /// order. Default implementation materializes the forward range into a
+    /// `Vec` then reverses (O(n) memory). Backends with prev-pointer support
+    /// may override for true streaming reverse iteration.
+    fn range_rev(&self, start: &K, end: &K) -> impl Iterator<Item = (K, V)> + '_
+    where
+        K: 'static,
+        V: 'static,
+    {
+        let mut v: Vec<(K, V)> = self.range(start, end).collect();
+        v.reverse();
+        v.into_iter()
+    }
 }

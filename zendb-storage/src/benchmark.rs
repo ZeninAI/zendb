@@ -1,9 +1,9 @@
-//! KeyDir bulk-write benchmarks.
+//! KeyDir and OrderLog bulk-write benchmarks.
 //!
-//! The headline comparison is **KeyDir write-through vs KeyDir
-//! `open_tx` / `close_tx` bulk-write mode** — same backend, same
-//! workload, two write modes. The tx-mode win comes from amortizing
-//! the per-op overheads that the no-tx path pays on every call:
+//! The headline comparison is **write-through vs `open_tx` / `close_tx`
+//! bulk-write mode** — same backend, same workload, two write modes.
+//! The tx-mode win comes from amortizing the per-op overheads that the
+//! no-tx path pays on every call:
 //!
 //! - mmap `grow` (file `set_len` + remap) — at most one per batch in
 //!   tx mode, vs. one every time the no-tx path crosses the current
@@ -23,7 +23,12 @@
 //!   in the no-tx path. The tx path defers all of it to commit and
 //!   wins.
 //!
-//! LMDB sits next to KeyDir as a baseline:
+//! OrderLog also has sorted bulk paths. Its unsorted bulk methods collect
+//! and sort before delegating to the sorted finger-walk implementation, so
+//! the bulk benchmarks include both direct sorted input and reversed input
+//! that pays the sort cost.
+//!
+//! LMDB sits next to the in-tree backends as a baseline:
 //!
 //! - KeyDir no-tx ↔ LMDB one-txn-per-op (both pay a per-record commit).
 //! - KeyDir open_tx ↔ LMDB single batch txn (both amortize commit).
@@ -52,6 +57,7 @@ use crate::{
     core::{
         backend::Backend,
         keydir::{KeyDir, KeyDirConfig},
+        orderlog::{OrderLog, OrderLogConfig},
     },
     utils::serdes::{deserialize_from, serialize_to_vec},
 };
@@ -81,6 +87,12 @@ fn keydir_config() -> KeyDirConfig {
     // mmap growth), compaction_ratio 0.5 (so overwrites in the churn
     // scenario trigger maybe_compact in the no-tx path).
     KeyDirConfig::default()
+}
+
+fn orderlog_config() -> OrderLogConfig {
+    // Match KeyDir's defaults: 1 MiB initial capacity and 0.5 compaction
+    // ratio, so fresh/churn measurements line up across both backends.
+    OrderLogConfig::default()
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +171,17 @@ fn fresh_keys() -> Vec<u64> {
 fn churn_keys() -> Vec<u64> {
     let domain = N / CHURN_FACTOR;
     (0..N).map(|k| k % domain).collect()
+}
+
+fn kv_payload(keys: &[u64]) -> Vec<(u64, u64)> {
+    keys.iter().map(|&k| (k, k.wrapping_mul(7))).collect()
+}
+
+fn reversed_kv_payload(keys: &[u64]) -> Vec<(u64, u64)> {
+    keys.iter()
+        .rev()
+        .map(|&k| (k, k.wrapping_mul(7)))
+        .collect()
 }
 
 /// Pre-encode every (key, value) pair for LMDB. Lets the LMDB scenario
@@ -287,6 +310,184 @@ fn keydir_reads() -> io::Result<()> {
     })?;
 
     BenchResult::new("KeyDir reads", N, elapsed).print();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// OrderLog — fresh (no overwrites)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn orderlog_writes_fresh_no_tx() -> io::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("orderlog.bin");
+    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+    let keys = fresh_keys();
+
+    let elapsed = timed(|| {
+        for &k in &keys {
+            ol.put(k, k.wrapping_mul(7))?;
+        }
+        ol.flush()
+    })?;
+
+    BenchResult::new("OrderLog fresh writes (no tx)", N, elapsed).print();
+    Ok(())
+}
+
+#[test]
+fn orderlog_writes_fresh_in_tx() -> io::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("orderlog.bin");
+    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+    let keys = fresh_keys();
+
+    let elapsed = timed(|| {
+        ol.open_tx()?;
+        for &k in &keys {
+            ol.put(k, k.wrapping_mul(7))?;
+        }
+        ol.close_tx()?;
+        ol.flush()
+    })?;
+
+    BenchResult::new("OrderLog fresh writes (open_tx batch)", N, elapsed).print();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// OrderLog — churn (4× overwrite ratio, exercises maybe_compact)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn orderlog_writes_churn_no_tx() -> io::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("orderlog.bin");
+    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+    let keys = churn_keys();
+
+    let elapsed = timed(|| {
+        for &k in &keys {
+            ol.put(k, k.wrapping_mul(7))?;
+        }
+        ol.flush()
+    })?;
+
+    BenchResult::new("OrderLog churn writes (no tx)", N, elapsed).print();
+    Ok(())
+}
+
+#[test]
+fn orderlog_writes_churn_in_tx() -> io::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("orderlog.bin");
+    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+    let keys = churn_keys();
+
+    let elapsed = timed(|| {
+        ol.open_tx()?;
+        for &k in &keys {
+            ol.put(k, k.wrapping_mul(7))?;
+        }
+        ol.close_tx()?;
+        ol.flush()
+    })?;
+
+    BenchResult::new("OrderLog churn writes (open_tx batch)", N, elapsed).print();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// OrderLog — sorted bulk paths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn orderlog_bulk_put_sorted_fresh() -> io::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("orderlog.bin");
+    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+    let items = kv_payload(&fresh_keys());
+
+    let elapsed = timed(|| {
+        ol.bulk_put_sorted(items)?;
+        ol.flush()
+    })?;
+
+    BenchResult::new("OrderLog fresh bulk_put_sorted", N, elapsed).print();
+    Ok(())
+}
+
+#[test]
+fn orderlog_bulk_put_unsorted_fresh() -> io::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("orderlog.bin");
+    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+    let items = reversed_kv_payload(&fresh_keys());
+
+    let elapsed = timed(|| {
+        ol.bulk_put(items)?;
+        ol.flush()
+    })?;
+
+    BenchResult::new("OrderLog fresh bulk_put (sort first)", N, elapsed).print();
+    Ok(())
+}
+
+#[test]
+fn orderlog_bulk_put_sorted_churn() -> io::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("orderlog.bin");
+    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+    let mut items = kv_payload(&churn_keys());
+    items.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let elapsed = timed(|| {
+        ol.bulk_put_sorted(items)?;
+        ol.flush()
+    })?;
+
+    BenchResult::new("OrderLog churn bulk_put_sorted", N, elapsed).print();
+    Ok(())
+}
+
+#[test]
+fn orderlog_bulk_put_unsorted_churn() -> io::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("orderlog.bin");
+    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+    let items = reversed_kv_payload(&churn_keys());
+
+    let elapsed = timed(|| {
+        ol.bulk_put(items)?;
+        ol.flush()
+    })?;
+
+    BenchResult::new("OrderLog churn bulk_put (sort first)", N, elapsed).print();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// OrderLog — reads
+// ---------------------------------------------------------------------------
+
+#[test]
+fn orderlog_reads() -> io::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("orderlog.bin");
+    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+
+    ol.bulk_put_sorted(kv_payload(&fresh_keys()))?;
+    ol.flush()?;
+
+    let elapsed = timed(|| {
+        for k in 0..N {
+            let v: u64 = ol.get(&k).expect("key must exist");
+            assert_eq!(v, k.wrapping_mul(7));
+        }
+        Ok(())
+    })?;
+
+    BenchResult::new("OrderLog reads", N, elapsed).print();
     Ok(())
 }
 

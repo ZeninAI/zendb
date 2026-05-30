@@ -24,6 +24,7 @@ memmap2 = "0.9"
 hashbrown = "0.15"
 
 # serialization
+bincode = { version = "2", features = ["derive"] }
 rkyv = "0.8"
 
 # zendb-engine

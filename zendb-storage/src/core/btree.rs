@@ -1,53 +1,34 @@
-//! BPlusTree — persistent, ordered key-value store backed by a mmap'd B+ tree
-//! with suffix truncation and **contiguous extents** for large values.
+//! BPlusTree - persistent, ordered key-value store backed by a mmap'd B+ tree
+//! with suffix truncation and contiguous extents for large values.
 //!
-//! # Generic over K, V (rkyv-archived)
+//! # Generic over K, V
 //!
-//! Keys and values are serialized through rkyv. Reads are zero-copy:
-//! `get` returns `&Archived<V>` borrowed directly from the mmap.
-//! Iteration yields `(&K, &Archived<V>)`. Keys are kept in an in-memory
-//! `HashMap<Vec<u8>, K>` (mirroring `KeyDir`'s model) so the trait can
-//! hand back `&K` cheaply.
+//! Keys and values are serialized through bincode. Reads return owned decoded
+//! values (`Option<V>`), and iteration yields owned `(K, V)` pairs.
 //!
 //! # Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────┐
-//! │                    BPlusTree (mmap'd)                    │
-//! │  Internal pages:              Leaf pages:               │
-//! │  [key₁ child₁] [key₂ child₂]  [K:V] [K:V] [K:V] ...    │
-//! │  [leftmost_child──────▶leaf]  sorted → next_leaf→       │
-//! └─────────────────────────────────────────────────────────┘
-//! ```
 //!
 //! Every internal page holds a `leftmost_child` pointer plus an array of
 //! `(child_page, separator_key)` pairs. Binary search on the separator keys
 //! routes point-lookups to the correct subtree. All values live in leaves;
 //! internal pages carry only keys for navigation.
 //!
-//! # Comparison
+//! Tree navigation compares serialized key bytes lexicographically, not
+//! `K::Ord`. Callers that need semantic ordering must choose key encodings
+//! whose bincode byte representation has that ordering, or use a backend such
+//! as `OrderLog` whose ordered surface is based on `K::Ord`.
 //!
-//! Tree navigation compares **serialized key bytes** lexicographically.
-//! Callers requiring meaningful ordering should pick a `K` whose rkyv
-//! encoding sorts in the desired order (byte strings, fixed-width
-//! big-endian integers, etc.).
+//! # Page layout
 //!
-//! # Page layout (4096 bytes, slotted)
+//! Pages are 4096-byte slotted pages. Internal pages have a 16-byte header:
+//! `type(u8) flags(u8) count(u16 LE) data_off(u32 LE) leftmost_child(u64 LE)`.
+//! Leaf pages have a 24-byte header:
+//! `type(u8) flags(u8) count(u16 LE) data_off(u32 LE) next_leaf(u64 LE)
+//! prev_leaf(u64 LE)`.
 //!
-//! ```text
-//! ┌──────────────┬───────┬───────────┐
-//! │ header (16B) │ slots │ free      │ entries  ────│
-//! └──────────────┴───────┴───────────┴──────────────┘
-//! 0              16      slot_end    data_off        4096
-//! ```
-//!
-//! **Header**: `type(u8) flags(u8) count(u16 LE) data_off(u32 LE) ptr(u64 LE)`.
-//! `ptr` = `next_leaf` (leaves) or `leftmost_child` (internal).
-//!
-//! Slots are a grow-down array of `u16` LE offsets from the slot array
-//! itself — each points to an entry's starting byte within the page.
-//! Entries grow up from the bottom. When the two regions collide,
-//! the page splits.
+//! Slots are a grow-down array of `u16` LE offsets from the slot array; each
+//! points to an entry's starting byte within the page. Entries grow up from the
+//! bottom. When the two regions collide, the page splits.
 //!
 //! # Entry formats
 //!
@@ -55,37 +36,26 @@
 //! Leaf, extent:   `[key_len: u16][value_len: u32 | OVFL_FLAG][key_bytes][extent_start: u64]`
 //! Internal:       `[key_len: u16][child_page: u64][separator_key]`
 //!
-//! # Extents (contiguous overflow)
+//! # Extents
 //!
 //! Values exceeding the per-page inline limit (`MAX_INLINE`) are stored in a
-//! **contiguous run of pages** allocated at the file's tail. The leaf
-//! entry stores the first page index of the extent and the true value
-//! length; the value bytes occupy bytes `[0..value_len]` of the extent
-//! mmap slice. This keeps the value contiguous in memory so rkyv's
-//! relative-pointer-based zero-copy read works for any size.
+//! contiguous run of pages allocated at the file's tail. The leaf entry stores
+//! the first page index of the extent and the true value length; the value bytes
+//! occupy bytes `[0..value_len]` of the extent mmap slice.
 //!
-//! Extent allocation always grows the file (no extent freelist reuse
-//! in v1); freed extent pages go onto the single-page freelist so they
-//! can be reused as tree (internal/leaf) pages.
+//! Extent allocation always grows the file. Freed extent pages go onto the
+//! single-page freelist so they can be reused as tree pages.
 //!
-//! # Meta page (page 0)
+//! # Meta page
 //!
-//! The first page of the file is the meta page, not a tree node:
-//! ```text
-//! [magic: u32][root: u64][free_head: u64][pages: u64][entries: u64] …
-//! ```
-//! `root` is the page number of the root node.
-//! `free_head` is the head of the single-page freelist.
-//! `pages` is the total number of pages in the file.
-//! `entries` is the count of live key-value pairs.
+//! Page 0 is the meta page:
+//! `[magic: u32][root: u64][free_head: u64][pages: u64][entries: u64][rightmost_leaf: u64]`.
 //!
 //! # Suffix truncation
 //!
-//! When a leaf or internal page splits, the separator key pushed to the
-//! parent is the **shortest prefix** of the new page's first key that is
-//! strictly greater than the old page's last key (see [`truncated_separator`]).
-//! This maximizes fanout in internal pages by storing the minimum
-//! distinguishing prefix.
+//! When a leaf or internal page splits, the separator key pushed to the parent
+//! is the shortest prefix of the new page's first key that is strictly greater
+//! than the old page's last key.
 
 use memmap2::MmapMut;
 use std::{
@@ -97,16 +67,11 @@ use std::{
     path::Path,
 };
 
-use rkyv::{
-    api::high::{HighDeserializer, HighSerializer},
-    rancor::Error as RkyvError,
-    ser::{allocator::ArenaHandle, writer::Buffer},
-    Archive, Archived, Deserialize, Portable, Serialize,
-};
+use bincode::{Decode, Encode};
 
 use crate::utils::serdes::{
-    rd_u16, rd_u32, rd_u64, serialize_into, serialize_to_vec, serialized_size, wr_u16, wr_u32,
-    wr_u64, CountingWriter, ValueRef,
+    deserialize_from, rd_u16, rd_u32, rd_u64, serialize_into, serialize_to_vec, serialized_size,
+    with_scratch, wr_u16, wr_u32, wr_u64,
 };
 
 // ---------------------------------------------------------------------------
@@ -114,20 +79,34 @@ use crate::utils::serdes::{
 // ---------------------------------------------------------------------------
 
 const PAGE_SIZE: usize = 4096;
+/// Header size for internal pages (type, flags, count, data_off, leftmost_child).
 const HEADER_SIZE: usize = 16;
+/// Header size for leaf pages — adds an 8-byte `prev_leaf` pointer after
+/// `next_leaf` so reverse iteration can stream without materializing.
+const LEAF_HEADER_SIZE: usize = 24;
 const SLOT_SIZE: usize = 2;
-const MAGIC: u32 = 0x5450425A;
+/// Magic identifies the on-disk BPlusTree layout.
+const MAGIC: u32 = 0x5450425B;
+const DEFAULT_COMPACTION_RATIO: f64 = 0.5;
 const META_PAGE: u64 = 0;
 const PAGE_LEAF: u8 = 1;
 const PAGE_INTERNAL: u8 = 2;
 const FLAG_ROOT: u8 = 0x01;
 
+// Meta-page field offsets (page 0).
+// Layout: magic(4) root(8) free_head(8) pages(8) entries(8) rightmost_leaf(8)
+const META_ROOT: usize = 4;
+const META_FREE_HEAD: usize = 12;
+const META_PAGES: usize = 20;
+const META_ENTRIES: usize = 28;
+const META_RIGHTMOST_LEAF: usize = 36;
+
 /// High bit of `value_len` marks an extent value (stored in dedicated pages).
 const OVFL_FLAG: u32 = 0x8000_0000;
 
-/// Maximum inline entry size: a single entry must fit in a fresh page.
-/// = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE - 6 (key_len u16 + value_len u32)
-const MAX_INLINE: usize = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE - 6;
+/// Maximum inline entry size: a single entry must fit in a fresh leaf page.
+/// = PAGE_SIZE - LEAF_HEADER_SIZE - SLOT_SIZE - 6 (key_len u16 + value_len u32)
+const MAX_INLINE: usize = PAGE_SIZE - LEAF_HEADER_SIZE - SLOT_SIZE - 6;
 
 #[inline]
 fn page_offset(page: u64) -> usize {
@@ -187,17 +166,59 @@ fn truncated_separator(left_last: &[u8], right_first: &[u8]) -> Vec<u8> {
 pub struct BPlusTree<K, V> {
     mmap: MmapMut,
     file: fs::File,
+    config: BPlusTreeConfig,
+    stats: BPlusTreeStats,
     _phantom: PhantomData<(K, V)>,
 }
 
-/// Byte-level helpers — no rkyv bounds, just raw mmap access. Lives in
-/// its own impl block so the iterator types (which only carry `Archive`
-/// bounds, not the full `Serialize` set) can call them.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BPlusTreeStats {
+    pub entries: usize,
+    pub pages: u64,
+    pub free_pages: u64,
+    /// Number of pages currently used as leaves. Maintained incrementally
+    /// in [`BPlusTree::init_leaf`] and reset in `create` / `clear` /
+    /// `compact` so [`BPlusTree::fragmentation_ratio`] can answer in O(1)
+    /// without re-walking the leaf chain on every write.
+    pub leaf_pages: u64,
+    /// Total live entry bytes across all leaves (entry header + key +
+    /// payload + slot). Used together with `leaf_pages` to estimate the
+    /// packed leaf count.
+    pub leaf_entry_bytes: u64,
+}
+
+/// Byte cost of a single leaf entry: `[klen u16][vlen u32][key][payload]`
+/// (header + key + payload) plus the 2-byte slot pointer. `payload_len` is
+/// the inline value length or `8` for an extent pointer.
+#[inline]
+fn leaf_entry_bytes(key_len: usize, payload_len: usize) -> u64 {
+    (6 + key_len + payload_len + SLOT_SIZE) as u64
+}
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct BPlusTreeConfig {
+    /// Auto-compaction threshold. The tree estimates reclaimable pages as
+    /// freed extent pages plus leaf pages that would disappear if live
+    /// entries were packed into fresh leaves. Callers must pass a value
+    /// in `[0.0, 1.0]`: `0.0` compacts after every write, `1.0` disables
+    /// automatic compaction.
+    pub compaction_ratio: f64,
+}
+
+impl Default for BPlusTreeConfig {
+    fn default() -> Self {
+        BPlusTreeConfig {
+            compaction_ratio: DEFAULT_COMPACTION_RATIO,
+        }
+    }
+}
+
+/// Byte-level helpers: raw mmap access without `K`/`V` serialization bounds.
 impl<K, V> BPlusTree<K, V> {
     /// Read the value slice at leaf page `off`, slot `i`. Handles both
     /// inline and extent layouts and returns a single contiguous slice.
     fn value_slice_at(&self, off: usize, i: usize) -> &[u8] {
-        let sp = off + HEADER_SIZE + i * SLOT_SIZE;
+        let sp = off + LEAF_HEADER_SIZE + i * SLOT_SIZE;
         let eo = off + rd_u16(&self.mmap[sp..sp + 2]) as usize;
         let kl = rd_u16(&self.mmap[eo..eo + 2]) as usize;
         let raw_vl = rd_u32(&self.mmap[eo + 2..eo + 6]);
@@ -214,7 +235,7 @@ impl<K, V> BPlusTree<K, V> {
 
     /// Key slice for slot `i` of leaf `off`. Borrows from `self.mmap`.
     fn key_slice_at(&self, off: usize, i: usize) -> &[u8] {
-        let sp = off + HEADER_SIZE + i * SLOT_SIZE;
+        let sp = off + LEAF_HEADER_SIZE + i * SLOT_SIZE;
         let eo = off + rd_u16(&self.mmap[sp..sp + 2]) as usize;
         let kl = rd_u16(&self.mmap[eo..eo + 2]) as usize;
         &self.mmap[eo + 6..eo + 6 + kl]
@@ -223,18 +244,17 @@ impl<K, V> BPlusTree<K, V> {
 
 impl<K, V> BPlusTree<K, V>
 where
-    K: Archive + Hash + Eq + Clone,
-    for<'buf, 'a> K: Serialize<HighSerializer<Buffer<'buf>, ArenaHandle<'a>, RkyvError>>,
-    for<'a> K: Serialize<HighSerializer<CountingWriter, ArenaHandle<'a>, RkyvError>>,
-    <K as Archive>::Archived: Portable + Deserialize<K, HighDeserializer<RkyvError>> + 'static,
-    V: Archive,
-    for<'buf, 'a> V: Serialize<HighSerializer<Buffer<'buf>, ArenaHandle<'a>, RkyvError>>,
-    for<'a> V: Serialize<HighSerializer<CountingWriter, ArenaHandle<'a>, RkyvError>>,
-    <V as Archive>::Archived: Portable + Deserialize<V, HighDeserializer<RkyvError>> + 'static,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
+    V: Encode + Decode<()> + Clone,
 {
     // -- constructors --
 
-    pub fn create(path: &Path) -> io::Result<Self> {
+    /// Create a fresh BPlusTree at `path`, **truncating** any existing
+    /// file. Pre-allocates 64 pages (256 KiB) — the meta page, an empty
+    /// root leaf, and 62 reserved-but-unused pages — so typical small
+    /// workloads finish without triggering a single file grow. The
+    /// meta page is stamped with MAGIC + initial counters.
+    pub fn create(path: &Path, config: BPlusTreeConfig) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -250,154 +270,257 @@ where
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
         let m = page_offset(META_PAGE);
         wr_u32(&mut mmap[m..m + 4], MAGIC);
-        wr_u64(&mut mmap[m + 4..m + 12], 1); // root page
-        wr_u64(&mut mmap[m + 12..m + 20], 0); // free list head
-        wr_u64(&mut mmap[m + 20..m + 28], np); // total pages
-        wr_u64(&mut mmap[m + 28..m + 36], 0); // entry count
+        wr_u64(&mut mmap[m + META_ROOT..m + META_ROOT + 8], 1); // root page
+        wr_u64(&mut mmap[m + META_FREE_HEAD..m + META_FREE_HEAD + 8], 0); // freelist
+        wr_u64(&mut mmap[m + META_PAGES..m + META_PAGES + 8], np); // total pages
+        wr_u64(&mut mmap[m + META_ENTRIES..m + META_ENTRIES + 8], 0); // entries
+        wr_u64(
+            &mut mmap[m + META_RIGHTMOST_LEAF..m + META_RIGHTMOST_LEAF + 8],
+            1,
+        ); // rightmost
         let r = page_offset(1);
         mmap[r] = PAGE_LEAF;
         mmap[r + 1] = FLAG_ROOT;
         wr_u16(&mut mmap[r + 2..r + 4], 0);
         wr_u32(&mut mmap[r + 4..r + 8], PAGE_SIZE as u32);
-        wr_u64(&mut mmap[r + 8..r + 16], 0);
+        wr_u64(&mut mmap[r + 8..r + 16], 0); // next_leaf = 0
+        wr_u64(&mut mmap[r + 16..r + 24], 0); // prev_leaf = 0
         Ok(BPlusTree {
             mmap,
             file,
+            config,
+            stats: BPlusTreeStats {
+                entries: 0,
+                pages: np,
+                free_pages: 0,
+                leaf_pages: 1,
+                leaf_entry_bytes: 0,
+            },
             _phantom: PhantomData,
         })
     }
 
-    pub fn open(path: &Path) -> io::Result<Self> {
+    /// Open an existing BPlusTree at `path`. Validates the MAGIC header
+    /// at offset 0 (returns `InvalidData` if missing/mismatched). No
+    /// index rebuild needed — the tree structure lives in the mmap
+    /// itself and is read on demand.
+    pub fn open(path: &Path, config: BPlusTreeConfig) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let mmap = unsafe { MmapMut::map_mut(&file)? };
         if rd_u32(&mmap[0..4]) != MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "not a BPlusTree file",
+                "not a BPlusTree file (bad magic)",
             ));
         }
-        let this = BPlusTree {
+        let mut this = BPlusTree {
             mmap,
             file,
+            config,
+            stats: BPlusTreeStats::default(),
             _phantom: PhantomData,
         };
+        this.refresh_stats_from_meta();
         Ok(this)
     }
 
     // -- public generic API --
 
-    /// Look up `key`, returning a zero-copy [`ValueRef`] into the mmap.
-    pub fn get(&self, key: &K) -> Option<ValueRef<'_, V>> {
-        let key_bytes = serialize_to_vec(key).ok()?;
-        let slice = self.value_slice_for(&key_bytes)?;
-        Some(ValueRef::from_bytes(slice))
+    /// Look up `key`. Returns the decoded value, or `None` if absent.
+    pub fn get(&self, key: &K) -> Option<V> {
+        with_scratch(key, |kb| {
+            Ok(self
+                .value_slice_for(kb)
+                .map(|slice| deserialize_from(slice).expect("valid encoded value")))
+        })
+        .ok()
+        .flatten()
     }
 
-    /// Convenience: existence check without materializing a [`ValueRef`].
+    /// Convenience: existence check without deserializing the value.
     pub fn contains(&self, key: &K) -> bool {
-        let Ok(kb) = serialize_to_vec(key) else {
-            return false;
-        };
-        self.value_slice_for(&kb).is_some()
+        with_scratch(key, |kb| Ok(self.value_slice_for(kb).is_some())).unwrap_or(false)
     }
 
     /// Insert or overwrite. Both `key` and `value` are consumed.
     ///
-    /// The value's archive is written **directly into the mmap** — no
-    /// intermediate buffer. The key is serialized into a single tight
-    /// `Vec<u8>` used for tree navigation and then copied into the leaf
-    /// slot in one pass.
+    /// The value's encoding is written **directly into the mmap** — no
+    /// intermediate buffer. The key is encoded into a reusable thread-local
+    /// scratch buffer (no per-call allocation) used for tree navigation and
+    /// then copied into the leaf slot in one pass.
     pub fn put(&mut self, key: K, value: V) -> io::Result<()> {
-        let key_bytes = serialize_to_vec(&key)?;
         let v_size = serialized_size(&value)?;
-        self.insert_typed(&key_bytes, &value, v_size)
+        with_scratch(&key, |kb| self.insert_typed(kb, &value, v_size).map(|_| ()))?;
+        self.maybe_compact()?;
+        Ok(())
     }
 
-    /// Read-modify-write. Deserializes the value, passes it to `f`,
-    /// and serializes the result back. Returns `true` if the key existed,
-    /// `false` otherwise.
-    pub fn update<F>(&mut self, key: &K, f: F) -> io::Result<bool>
-    where
-        F: FnOnce(V) -> V,
-    {
-        let key_bytes = serialize_to_vec(key)?;
-        let Some(slice) = self.value_slice_for(&key_bytes) else {
-            return Ok(false);
-        };
-        let current = ValueRef::<V>::from_bytes(slice).to_owned();
-        let new_v = f(current);
-        let v_size = serialized_size(&new_v)?;
-        self.insert_typed(&key_bytes, &new_v, v_size)?;
-        Ok(true)
-    }
-
-    /// In-place archived update. The closure receives `&mut Archived<V>` —
-    /// direct mutation of the value's bytes in storage, whether the value
-    /// lives inline in the leaf page or in a dedicated extent.
-    /// Returns whether the key existed.
+    /// Unified read-modify-write / insert / delete primitive. `f`
+    /// receives `Some(current)` when the key exists, `None` otherwise,
+    /// and returns the desired post-state:
     ///
-    /// # Safety contract
-    /// The closure must not change the byte length of the archive.
-    /// Only size-stable mutations are sound (integer fields, flags,
-    /// fixed-width numeric updates). The trait can't enforce this — the
-    /// caller is responsible. Growing an `ArchivedVec` or changing an
-    /// `ArchivedString` length will corrupt the file.
-    pub fn update_in_place<F>(&mut self, key: &K, f: F) -> io::Result<bool>
+    /// - `Some(new)` → write the new value (overwrite or insert)
+    /// - `None`      → delete the entry (or no-op when absent)
+    pub fn update<F>(&mut self, key: &K, f: F) -> io::Result<()>
     where
-        F: FnOnce(&mut Archived<V>),
+        F: FnOnce(Option<V>) -> Option<V>,
     {
-        let key_bytes = serialize_to_vec(key)?;
-        let leaf = self.find_leaf(self.root(), &key_bytes);
-        let off = page_offset(leaf);
-        let count = rd_u16(&self.mmap[off + 2..off + 4]) as usize;
-        let Ok(i) = self.leaf_find_slot(off, count, &key_bytes) else {
-            return Ok(false);
-        };
-        let sp = off + HEADER_SIZE + i * SLOT_SIZE;
-        let eo = off + rd_u16(&self.mmap[sp..sp + 2]) as usize;
-        let kl = rd_u16(&self.mmap[eo..eo + 2]) as usize;
-        let raw_vl = rd_u32(&self.mmap[eo + 2..eo + 6]);
-        // Locate the archived value bytes — inline in the leaf, or in an
-        // extent. Either way, mutate them directly under the size-stable
-        // safety contract above.
-        let (vstart, vlen) = if raw_vl & OVFL_FLAG != 0 {
-            let real_len = (raw_vl & !OVFL_FLAG) as usize;
-            let extent_start = rd_u64(&self.mmap[eo + 6 + kl..eo + 6 + kl + 8]);
-            (page_offset(extent_start), real_len)
-        } else {
-            (eo + 6 + kl, raw_vl as usize)
-        };
-        // SAFETY: `vstart..vstart+vlen` is a valid archive of V (maintained
-        // by `put`/`insert_typed`). The caller's closure must not change
-        // the byte length — documented contract above.
-        let sealed = unsafe {
-            rkyv::access_unchecked_mut::<Archived<V>>(&mut self.mmap[vstart..vstart + vlen])
-        };
-        let archived: &mut Archived<V> = unsafe { sealed.unseal_unchecked() };
-        f(archived);
-        Ok(true)
+        // Use the thread-local scratch so the read leg, the optional
+        // overwrite/insert, and the optional delete all share one encoded
+        // key buffer. The whole sequence lives inside a single `with`
+        // borrow — that's why `f` runs there too.
+        with_scratch(key, |kb| {
+            let current: Option<V> = self
+                .value_slice_for(kb)
+                .map(|slice| deserialize_from(slice))
+                .transpose()?;
+            let had_value = current.is_some();
+            match (had_value, f(current)) {
+                (_, Some(new_v)) => {
+                    let v_size = serialized_size(&new_v)?;
+                    self.insert_typed(kb, &new_v, v_size)?;
+                    self.maybe_compact()?;
+                }
+                (true, None) => {
+                    self.delete_bytes(kb)?;
+                    self.maybe_compact()?;
+                }
+                (false, None) => {}
+            }
+            Ok(())
+        })
     }
 
     /// Remove `key`. Returns true if the key existed.
     pub fn delete(&mut self, key: &K) -> io::Result<bool> {
-        let key_bytes = serialize_to_vec(key)?;
-        self.delete_bytes(&key_bytes)
+        let deleted = with_scratch(key, |kb| self.delete_bytes(kb))?;
+        if deleted {
+            self.maybe_compact()?;
+        }
+        Ok(deleted)
     }
 
-    pub fn len(&self) -> usize {
-        rd_u64(&self.mmap[28..36]) as usize
-    }
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// Remove every entry, resetting the tree to its post-`create` state.
+    /// The on-disk file size is left as-is; pages 2..N are now logically
+    /// unallocated and future writes reuse them.
+    pub fn clear(&mut self) -> io::Result<()> {
+        let m = page_offset(META_PAGE);
+        wr_u64(&mut self.mmap[m + META_ROOT..m + META_ROOT + 8], 1); // root page = 1
+        wr_u64(
+            &mut self.mmap[m + META_FREE_HEAD..m + META_FREE_HEAD + 8],
+            0,
+        ); // freelist = 0
+        wr_u64(&mut self.mmap[m + META_PAGES..m + META_PAGES + 8], 2); // pages = 2
+        wr_u64(&mut self.mmap[m + META_ENTRIES..m + META_ENTRIES + 8], 0); // entries = 0
+        wr_u64(
+            &mut self.mmap[m + META_RIGHTMOST_LEAF..m + META_RIGHTMOST_LEAF + 8],
+            1,
+        ); // rightmost = root leaf
+        self.stats = BPlusTreeStats {
+            entries: 0,
+            pages: 2,
+            free_pages: 0,
+            leaf_pages: 1,
+            leaf_entry_bytes: 0,
+        };
+        // Re-initialize page 1 as a fresh root leaf.
+        let r = page_offset(1);
+        self.mmap[r] = PAGE_LEAF;
+        self.mmap[r + 1] = FLAG_ROOT;
+        wr_u16(&mut self.mmap[r + 2..r + 4], 0);
+        wr_u32(&mut self.mmap[r + 4..r + 8], PAGE_SIZE as u32);
+        wr_u64(&mut self.mmap[r + 8..r + 16], 0); // next_leaf = 0
+        wr_u64(&mut self.mmap[r + 16..r + 24], 0); // prev_leaf = 0
+        Ok(())
     }
 
+    /// Rebuild the tree from live entries. Removes empty/underfilled leaves
+    /// and drops freed extent pages from the logical page high-water mark.
+    ///
+    /// The rebuild path snapshots **raw bytes** straight from the existing
+    /// leaves — no bincode `Decode` → `Encode` roundtrip. Both keys and
+    /// values are copied as already-encoded `&[u8]` and replayed via
+    /// [`insert_raw`], which writes them directly into the new leaf slots.
+    /// Saves one decode and one encode per live entry vs. the previous
+    /// `entries().collect()` round-trip.
+    pub fn compact(&mut self) -> io::Result<()> {
+        // Phase 1: snapshot raw (key, value) byte pairs. Both must be copied
+        // out before `clear()` resets the page space — including extent
+        // payloads, since `clear()` truncates the logical page count and
+        // any old extent pages stop being reachable.
+        let mut snapshot: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(self.stats.entries);
+        let mut page = self.first_leaf();
+        while page != 0 {
+            let off = page_offset(page);
+            let count = rd_u16(&self.mmap[off + 2..off + 4]) as usize;
+            for i in 0..count {
+                let key_bytes = self.key_slice_at(off, i).to_vec();
+                let value_bytes = self.value_slice_at(off, i).to_vec();
+                snapshot.push((key_bytes, value_bytes));
+            }
+            page = rd_u64(&self.mmap[off + 8..off + 16]);
+        }
+
+        // Phase 2: reset the tree to its post-`create` state.
+        self.clear()?;
+
+        // Phase 3: replay the snapshot via the raw-bytes insert path.
+        for (k, v) in snapshot {
+            self.insert_raw(&k, &v)?;
+        }
+        Ok(())
+    }
+
+    /// Number of live entries from the in-memory stats snapshot.
+    pub fn size(&self) -> usize {
+        self.stats.entries
+    }
+
+    /// Current estimated reclaimable-page ratio used by auto-compaction.
+    ///
+    /// Reads the incrementally-maintained `leaf_pages` and
+    /// `leaf_entry_bytes` counters from `stats` rather than walking the
+    /// leaf chain — so this is O(1) on every `put`/`delete`.
+    pub fn fragmentation_ratio(&self) -> f64 {
+        let allocated = self.pages().saturating_sub(1);
+        if allocated == 0 {
+            return 0.0;
+        }
+        let capacity = (PAGE_SIZE - LEAF_HEADER_SIZE) as u64;
+        // Approximation: ceil(live_bytes / per_leaf_capacity). Exact
+        // bottom-up packing might fit one more or fewer entries per leaf
+        // due to entry-boundary alignment, but the heuristic is fine for
+        // the auto-compaction trigger.
+        let packed_leaf_pages = if self.stats.leaf_entry_bytes == 0 {
+            1
+        } else {
+            (self.stats.leaf_entry_bytes + capacity - 1) / capacity
+        };
+        let reclaimable_leaf_pages = self.stats.leaf_pages.saturating_sub(packed_leaf_pages);
+        let free_pages = self.stats.free_pages;
+        (free_pages + reclaimable_leaf_pages) as f64 / allocated as f64
+    }
+
+    pub fn stats(&self) -> &BPlusTreeStats {
+        &self.stats
+    }
+
+    /// Schedule mmap writeback asynchronously. Returns once the OS has
+    /// accepted the request; use [`sync`] when the caller wants to wait
+    /// for that writeback to complete.
     pub fn flush(&self) -> io::Result<()> {
+        self.mmap.flush_async()
+    }
+
+    /// Block until pending mmap writes have been flushed by the OS.
+    /// This does not provide crash recovery or multi-page atomicity.
+    pub fn sync(&self) -> io::Result<()> {
         self.mmap.flush()
     }
 
-    /// Iterate all entries in serialized-key order. Keys are deserialized;
-    /// values are zero-copy [`ValueRef`]s into the mmap.
-    pub fn entries(&self) -> impl Iterator<Item = (K, ValueRef<'_, V>)> + '_ {
+    /// Iterate all entries in serialized-key order. Yields owned `(K, V)`
+    /// — both are deserialized from the mmap'd bytes per slot.
+    pub fn entries(&self) -> impl Iterator<Item = (K, V)> + '_ {
         BTreeIter {
             tree: self,
             page: self.first_leaf(),
@@ -405,19 +528,18 @@ where
         }
     }
 
-    /// Iterate all keys in serialized-key order (deserialized, owned).
+    /// Iterate all keys in serialized-key order. Yields owned `K`.
     pub fn keys(&self) -> impl Iterator<Item = K> + '_ {
         self.entries().map(|(k, _)| k)
     }
 
-    /// Iterate all values in serialized-key order (zero-copy into mmap).
-    pub fn values(&self) -> impl Iterator<Item = ValueRef<'_, V>> + '_ {
+    /// Iterate all values in serialized-key order. Yields owned `V`.
+    pub fn values(&self) -> impl Iterator<Item = V> + '_ {
         self.entries().map(|(_, v)| v)
     }
 
     /// Iterate entries with serialized keys in `[start, end)`.
     pub fn range(&self, start: &K, end: &K) -> BTreeRange<'_, K, V> {
-        // Best-effort: if serialization fails, return an empty iterator.
         let Ok(start_bytes) = serialize_to_vec(start) else {
             return BTreeRange {
                 tree: self,
@@ -451,11 +573,11 @@ where
     // -----------------------------------------------------------------------
     // Internal byte-level helpers — operate on serialized key bytes, not
     // typed K/V. This keeps the trait-bound surface minimal for generic
-    // code while the byte-level machinery is agnostic to rkyv types.
+    // code while the byte-level machinery is agnostic to typed values.
     // -----------------------------------------------------------------------
 
     /// Navigate the tree to the leaf that would contain `key_bytes`, then
-    /// return the contiguous archived value bytes (inline or extent).
+    /// return the contiguous encoded value bytes (inline or extent).
     /// Returns `None` if the key is not present. Slice borrows from
     /// `self.mmap`.
     fn value_slice_for(&self, key_bytes: &[u8]) -> Option<&[u8]> {
@@ -481,7 +603,7 @@ where
     /// On overwrite of an existing key: if the old value was an extent, its
     /// pages are freed; if the new value is the same size and still inline,
     /// the write is a cheap in-place overwrite (no slot shuffle).
-    fn insert_typed(&mut self, key: &[u8], value: &V, v_size: usize) -> io::Result<()> {
+    fn insert_typed(&mut self, key: &[u8], value: &V, v_size: usize) -> io::Result<bool> {
         let mut path: Vec<(u64, usize)> = Vec::new();
         let mut page = self.root();
         loop {
@@ -503,6 +625,123 @@ where
         if let Some(si) = split {
             self.cascade_split(path, si)?;
         }
+        Ok(existed)
+    }
+
+    /// Insert raw `(key_bytes, value_bytes)` — both pre-encoded. Used by
+    /// [`compact`] to rebuild the tree without a bincode `Decode` →
+    /// `Encode` roundtrip on every entry. The caller guarantees no
+    /// duplicate keys (compact just cleared the tree and is replaying a
+    /// snapshot in ascending order).
+    fn insert_raw(&mut self, key: &[u8], value_bytes: &[u8]) -> io::Result<()> {
+        let mut path: Vec<(u64, usize)> = Vec::new();
+        let mut page = self.root();
+        loop {
+            let off = page_offset(page);
+            if self.mmap[off] == PAGE_LEAF {
+                break;
+            }
+            path.push((page, off));
+            page = self.internal_search(off, key);
+        }
+        let loff = page_offset(page);
+        let split = self.leaf_insert_raw(loff, page, key, value_bytes)?;
+        self.inc_entries(1);
+        if let Some(si) = split {
+            self.cascade_split(path, si)?;
+        }
+        Ok(())
+    }
+
+    /// Insert raw `(key, value_bytes)` into the leaf at `off`. Mirrors
+    /// [`leaf_insert_typed`]'s `Err(pos)` branch — fresh-insert only, no
+    /// overwrite handling — since [`compact`] is the only caller and
+    /// guarantees no duplicates.
+    fn leaf_insert_raw(
+        &mut self,
+        off: usize,
+        page: u64,
+        key: &[u8],
+        value_bytes: &[u8],
+    ) -> io::Result<Option<PageSplit>> {
+        let count = rd_u16(&self.mmap[off + 2..off + 4]) as usize;
+        let data_off = rd_u32(&self.mmap[off + 4..off + 8]) as usize;
+        let v_len = value_bytes.len();
+        let ovfl = key.len() + v_len + 6 > MAX_INLINE;
+        let leaf_es = if ovfl {
+            6 + key.len() + 8
+        } else {
+            6 + key.len() + v_len
+        };
+        let needed = leaf_es + SLOT_SIZE;
+        let free_start = LEAF_HEADER_SIZE + count * SLOT_SIZE;
+
+        let pos = match self.leaf_find_slot(off, count, key) {
+            Ok(_) => {
+                debug_assert!(false, "compact rebuild encountered duplicate key");
+                return Ok(None);
+            }
+            Err(p) => p,
+        };
+
+        if free_start + needed > data_off {
+            return self.leaf_split(off, page, key, value_bytes);
+        }
+
+        let ss = off + LEAF_HEADER_SIZE;
+        for j in (pos..count).rev() {
+            let v = rd_u16(&self.mmap[ss + j * SLOT_SIZE..ss + j * SLOT_SIZE + 2]);
+            wr_u16(
+                &mut self.mmap[ss + (j + 1) * SLOT_SIZE..ss + (j + 1) * SLOT_SIZE + 2],
+                v,
+            );
+        }
+        let nd = data_off - leaf_es;
+        self.write_leaf_entry_raw(off, nd, key, value_bytes, ovfl)?;
+        wr_u16(
+            &mut self.mmap[ss + pos * SLOT_SIZE..ss + pos * SLOT_SIZE + 2],
+            nd as u16,
+        );
+        wr_u16(&mut self.mmap[off + 2..off + 4], (count + 1) as u16);
+        wr_u32(&mut self.mmap[off + 4..off + 8], nd as u32);
+        let payload = if ovfl { 8 } else { v_len };
+        self.stats.leaf_entry_bytes += leaf_entry_bytes(key.len(), payload);
+        Ok(None)
+    }
+
+    /// Write a leaf entry from raw bytes (key + value). Mirrors
+    /// [`write_leaf_entry_typed`] but the value is already a `&[u8]`, so
+    /// we copy it straight in (or, for extents, copy into a fresh extent
+    /// and store the pointer).
+    fn write_leaf_entry_raw(
+        &mut self,
+        off: usize,
+        nd: usize,
+        key: &[u8],
+        value_bytes: &[u8],
+        is_ovfl: bool,
+    ) -> io::Result<()> {
+        wr_u16(&mut self.mmap[off + nd..off + nd + 2], key.len() as u16);
+        if is_ovfl {
+            let extent_start = self.write_extent(value_bytes)?;
+            wr_u32(
+                &mut self.mmap[off + nd + 2..off + nd + 6],
+                value_bytes.len() as u32 | OVFL_FLAG,
+            );
+            self.mmap[off + nd + 6..off + nd + 6 + key.len()].copy_from_slice(key);
+            wr_u64(
+                &mut self.mmap[off + nd + 6 + key.len()..off + nd + 6 + key.len() + 8],
+                extent_start,
+            );
+        } else {
+            wr_u32(
+                &mut self.mmap[off + nd + 2..off + nd + 6],
+                value_bytes.len() as u32,
+            );
+            self.mmap[off + nd + 6..off + nd + 6 + key.len()].copy_from_slice(key);
+            self.mmap[off + nd + 6 + key.len()..off + nd + 6 + key.len() + value_bytes.len()]
+                .copy_from_slice(value_bytes);
+        }
         Ok(())
     }
 
@@ -517,7 +756,7 @@ where
         let data_off = rd_u32(&self.mmap[off + 4..off + 8]) as usize;
         match self.leaf_find_slot(off, count, key) {
             Ok(i) => {
-                let sp = off + HEADER_SIZE + i * SLOT_SIZE;
+                let sp = off + LEAF_HEADER_SIZE + i * SLOT_SIZE;
                 let eo = off + rd_u16(&self.mmap[sp..sp + 2]) as usize;
                 let kl = rd_u16(&self.mmap[eo..eo + 2]) as usize;
                 let raw_vl = rd_u32(&self.mmap[eo + 2..eo + 6]);
@@ -536,24 +775,38 @@ where
 
     // -- meta accessors — read/write fields of the meta page (page 0) --
 
-    /// Page number of the root node. `0` means the tree is empty.
+    /// Page number of the root node.
     fn root(&self) -> u64 {
-        rd_u64(&self.mmap[4..12])
+        rd_u64(&self.mmap[META_ROOT..META_ROOT + 8])
     }
     /// Update the root page pointer in the meta page.
     fn set_root(&mut self, p: u64) {
-        wr_u64(&mut self.mmap[4..12], p);
+        wr_u64(&mut self.mmap[META_ROOT..META_ROOT + 8], p);
     }
-    /// Atomically increment the global entry counter by `d` (wrapping).
+    /// Page number of the rightmost leaf (for O(1) `last` / reverse iteration seed).
+    fn rightmost_leaf(&self) -> u64 {
+        rd_u64(&self.mmap[META_RIGHTMOST_LEAF..META_RIGHTMOST_LEAF + 8])
+    }
+    fn set_rightmost_leaf(&mut self, p: u64) {
+        wr_u64(
+            &mut self.mmap[META_RIGHTMOST_LEAF..META_RIGHTMOST_LEAF + 8],
+            p,
+        );
+    }
+    /// Increment the global entry counter by `d` (wrapping).
     fn inc_entries(&mut self, d: u64) {
-        let c = rd_u64(&self.mmap[28..36]);
-        wr_u64(&mut self.mmap[28..36], c.wrapping_add(d));
+        let c = rd_u64(&self.mmap[META_ENTRIES..META_ENTRIES + 8]);
+        let next = c.wrapping_add(d);
+        wr_u64(&mut self.mmap[META_ENTRIES..META_ENTRIES + 8], next);
+        self.stats.entries = next as usize;
     }
     /// Decrement the global entry counter by 1 (wrapping). Caller must
     /// ensure the counter is ≥ 1 before calling.
     fn dec_entries(&mut self) {
-        let c = rd_u64(&self.mmap[28..36]);
-        wr_u64(&mut self.mmap[28..36], c.wrapping_sub(1));
+        let c = rd_u64(&self.mmap[META_ENTRIES..META_ENTRIES + 8]);
+        let next = c.wrapping_sub(1);
+        wr_u64(&mut self.mmap[META_ENTRIES..META_ENTRIES + 8], next);
+        self.stats.entries = next as usize;
     }
 
     // -- traversal — navigate the tree using serialized key bytes --
@@ -622,7 +875,7 @@ where
         let mut hi = count;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let sp = off + HEADER_SIZE + mid * SLOT_SIZE;
+            let sp = off + LEAF_HEADER_SIZE + mid * SLOT_SIZE;
             let eo = off + rd_u16(&self.mmap[sp..sp + 2]) as usize;
             let kl = rd_u16(&self.mmap[eo..eo + 2]) as usize;
             match self.mmap[eo + 6..eo + 6 + kl].cmp(key) {
@@ -664,22 +917,11 @@ where
             6 + key.len() + v_size
         };
         let needed = leaf_es + SLOT_SIZE;
-        let free_start = HEADER_SIZE + count * SLOT_SIZE;
-
-        if free_start + needed > data_off {
-            // Split path: materialize the value as bytes so `leaf_split`
-            // can replay it alongside the existing serialized entries.
-            // This is the only place the typed `put` path allocates a
-            // scratch buffer for the value, and it only happens on split.
-            let mut v_bytes = vec![0u8; v_size];
-            let written = serialize_into(value, &mut v_bytes)?;
-            debug_assert_eq!(written, v_size);
-            return self.leaf_split(off, page, key, &v_bytes);
-        }
+        let free_start = LEAF_HEADER_SIZE + count * SLOT_SIZE;
 
         match self.leaf_find_slot(off, count, key) {
             Ok(i) => {
-                let sp = off + HEADER_SIZE + i * SLOT_SIZE;
+                let sp = off + LEAF_HEADER_SIZE + i * SLOT_SIZE;
                 let eo = off + rd_u16(&self.mmap[sp..sp + 2]) as usize;
                 let kl = rd_u16(&self.mmap[eo..eo + 2]) as usize;
                 let raw_vl = rd_u32(&self.mmap[eo + 2..eo + 6]);
@@ -691,19 +933,31 @@ where
                 }
                 // Fast path: same-size inline overwrite → serialize new
                 // value straight into the existing slot, no slot shuffle.
-                if !ovfl && raw_vl as usize == v_size {
+                if raw_vl & OVFL_FLAG == 0 && !ovfl && raw_vl as usize == v_size {
                     let v_off = eo + 6 + kl;
                     let written = serialize_into(value, &mut self.mmap[v_off..v_off + v_size])?;
                     debug_assert_eq!(written, v_size);
                     return Ok(None);
                 }
                 // Size changed (or inline/extent flipped): drop the old
-                // entry then re-insert via the Err(pos) arm below.
+                // entry then re-insert. Checking existence before page space
+                // prevents full-leaf overwrites from duplicating the key.
                 self.leaf_remove_entry(off, i, count, data_off);
                 return self.leaf_insert_typed(off, page, key, value, v_size);
             }
             Err(pos) => {
-                let ss = off + HEADER_SIZE;
+                if free_start + needed > data_off {
+                    // Split path: materialize the value as bytes so `leaf_split`
+                    // can replay it alongside the existing serialized entries.
+                    // This is the only place the typed `put` path allocates a
+                    // scratch buffer for the value, and it only happens on split.
+                    let mut v_bytes = vec![0u8; v_size];
+                    let written = serialize_into(value, &mut v_bytes)?;
+                    debug_assert_eq!(written, v_size);
+                    return self.leaf_split(off, page, key, &v_bytes);
+                }
+
+                let ss = off + LEAF_HEADER_SIZE;
                 for j in (pos..count).rev() {
                     let v = rd_u16(&self.mmap[ss + j * SLOT_SIZE..ss + j * SLOT_SIZE + 2]);
                     wr_u16(
@@ -719,13 +973,15 @@ where
                 );
                 wr_u16(&mut self.mmap[off + 2..off + 4], (count + 1) as u16);
                 wr_u32(&mut self.mmap[off + 4..off + 8], nd as u32);
+                let payload = if ovfl { 8 } else { v_size };
+                self.stats.leaf_entry_bytes += leaf_entry_bytes(key.len(), payload);
                 Ok(None)
             }
         }
     }
 
     /// Write a complete leaf entry (header + key + value) at byte `nd`
-    /// within the page. For inline values, the archive is serialized directly
+    /// within the page. For inline values, the value is serialized directly
     /// into the mmap. For extent values, a contiguous extent is allocated at
     /// the file tail and the value is serialized there; the leaf slot stores
     /// `(key, extent_start)` instead of the value bytes.
@@ -841,7 +1097,7 @@ where
         // Collect existing entries without materializing extent data.
         let mut entries: Vec<(Vec<u8>, SplitVal)> = Vec::with_capacity(count + 1);
         for i in 0..count {
-            let sp = off + HEADER_SIZE + i * SLOT_SIZE;
+            let sp = off + LEAF_HEADER_SIZE + i * SLOT_SIZE;
             let eo = off + rd_u16(&self.mmap[sp..sp + 2]) as usize;
             let kl = rd_u16(&self.mmap[eo..eo + 2]) as usize;
             let raw_vl = rd_u32(&self.mmap[eo + 2..eo + 6]);
@@ -882,7 +1138,7 @@ where
                     _ => 8,
                 };
                 let sz = 6 + k.len() + payload + SLOT_SIZE;
-                if used + sz > PAGE_SIZE - HEADER_SIZE {
+                if used + sz > PAGE_SIZE - LEAF_HEADER_SIZE {
                     return true;
                 }
                 used += sz;
@@ -890,12 +1146,23 @@ where
             })
             .unwrap_or(entries.len());
 
+        // Net delta to leaf_entry_bytes across a split is exactly the new
+        // entry's footprint (existing entries are redistributed, not
+        // added). Compute it once here from the inserted (key, value)
+        // before we redistribute below.
+        let new_entry_payload = match &entries[ip].1 {
+            SplitVal::Inline(v) if 6 + key.len() + v.len() <= MAX_INLINE => v.len(),
+            _ => 8,
+        };
+        let new_entry_bytes = leaf_entry_bytes(key.len(), new_entry_payload);
+
         if mid >= entries.len() {
             wr_u16(&mut self.mmap[off + 2..off + 4], 0);
             wr_u32(&mut self.mmap[off + 4..off + 8], PAGE_SIZE as u32);
             for (k, v) in entries {
                 self.leaf_insert_split_entry(off, &k, v)?;
             }
+            self.stats.leaf_entry_bytes += new_entry_bytes;
             return Ok(None);
         }
         let mid = mid.max(1);
@@ -915,10 +1182,21 @@ where
         for (k, v) in entries_right {
             self.leaf_insert_split_entry(ro, &k, v)?;
         }
+        self.stats.leaf_entry_bytes += new_entry_bytes;
 
+        // Link prev/next pointers for the new sibling chain.
         let old_next = rd_u64(&self.mmap[off + 8..off + 16]);
-        wr_u64(&mut self.mmap[ro + 8..ro + 16], old_next);
-        wr_u64(&mut self.mmap[off + 8..off + 16], right);
+        wr_u64(&mut self.mmap[ro + 8..ro + 16], old_next); // right.next = old.next
+        wr_u64(&mut self.mmap[ro + 16..ro + 24], page); // right.prev = left
+        wr_u64(&mut self.mmap[off + 8..off + 16], right); // left.next = right
+        if old_next != 0 {
+            // Fix up the old successor's prev pointer.
+            let ono = page_offset(old_next);
+            wr_u64(&mut self.mmap[ono + 16..ono + 24], right);
+        } else {
+            // Old page was the rightmost — new right page takes over.
+            self.set_rightmost_leaf(right);
+        }
 
         Ok(Some(PageSplit {
             left_page: page,
@@ -945,7 +1223,7 @@ where
         let nd = data_off - leaf_es;
         self.write_leaf_entry(off, nd, key, &val, is_ovfl)?;
 
-        let ss = off + HEADER_SIZE;
+        let ss = off + LEAF_HEADER_SIZE;
         wr_u16(
             &mut self.mmap[ss + count * SLOT_SIZE..ss + count * SLOT_SIZE + 2],
             nd as u16,
@@ -963,17 +1241,22 @@ where
     /// header fields. The caller is responsible for freeing any extent pages
     /// before calling this.
     fn leaf_remove_entry(&mut self, off: usize, pos: usize, count: usize, data_off: usize) {
-        let sp = off + HEADER_SIZE + pos * SLOT_SIZE;
+        let sp = off + LEAF_HEADER_SIZE + pos * SLOT_SIZE;
         let eo_rel = rd_u16(&self.mmap[sp..sp + 2]) as usize;
         let eo = off + eo_rel;
         let kl = rd_u16(&self.mmap[eo..eo + 2]) as usize;
         let raw_vl = rd_u32(&self.mmap[eo + 2..eo + 6]) as usize;
-        let es = if raw_vl & OVFL_FLAG as usize != 0 {
-            6 + kl + 8
+        let payload = if raw_vl & OVFL_FLAG as usize != 0 {
+            8
         } else {
-            6 + kl + raw_vl
+            raw_vl
         };
-        let ss = off + HEADER_SIZE;
+        let es = 6 + kl + payload;
+        // Maintain the incremental leaf_entry_bytes counter used by
+        // `fragmentation_ratio`. Same formula as `leaf_entry_bytes`.
+        let removed = leaf_entry_bytes(kl, payload);
+        self.stats.leaf_entry_bytes = self.stats.leaf_entry_bytes.saturating_sub(removed);
+        let ss = off + LEAF_HEADER_SIZE;
         for j in pos + 1..count {
             let v = rd_u16(&self.mmap[ss + j * SLOT_SIZE..ss + j * SLOT_SIZE + 2]);
             wr_u16(
@@ -1194,17 +1477,70 @@ where
 
     /// Head of the single-page freelist. `0` means the list is empty.
     fn free_head(&self) -> u64 {
-        rd_u64(&self.mmap[12..20])
+        rd_u64(&self.mmap[META_FREE_HEAD..META_FREE_HEAD + 8])
     }
     fn set_free_head(&mut self, p: u64) {
-        wr_u64(&mut self.mmap[12..20], p);
+        wr_u64(&mut self.mmap[META_FREE_HEAD..META_FREE_HEAD + 8], p);
     }
     /// Total number of pages in the file (including meta page and extents).
     fn pages(&self) -> u64 {
-        rd_u64(&self.mmap[20..28])
+        rd_u64(&self.mmap[META_PAGES..META_PAGES + 8])
     }
     fn set_pages(&mut self, n: u64) {
-        wr_u64(&mut self.mmap[20..28], n);
+        wr_u64(&mut self.mmap[META_PAGES..META_PAGES + 8], n);
+        self.stats.pages = n;
+    }
+
+    fn maybe_compact(&mut self) -> io::Result<()> {
+        let threshold = self.config.compaction_ratio;
+        if threshold >= 1.0 {
+            return Ok(());
+        }
+        if self.fragmentation_ratio() >= threshold {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    fn free_list_pages(&self) -> u64 {
+        let mut n = 0u64;
+        let mut p = self.free_head();
+        let max_pages = self.pages();
+        while p != 0 && n < max_pages {
+            n += 1;
+            p = rd_u64(&self.mmap[page_offset(p)..page_offset(p) + 8]);
+        }
+        n
+    }
+
+    /// Walk the leaf chain once to seed `stats.leaf_pages` and
+    /// `stats.leaf_entry_bytes` — used by `open` only. After the seed,
+    /// these counters are maintained incrementally so neither
+    /// `fragmentation_ratio` nor the auto-compaction trigger need to
+    /// re-walk the tree.
+    fn scan_leaf_stats(&self) -> (u64, u64) {
+        let mut leaf_pages = 0u64;
+        let mut total_bytes = 0u64;
+        let mut page = self.first_leaf();
+        while page != 0 {
+            leaf_pages += 1;
+            let off = page_offset(page);
+            let count = rd_u16(&self.mmap[off + 2..off + 4]) as usize;
+            for i in 0..count {
+                let sp = off + LEAF_HEADER_SIZE + i * SLOT_SIZE;
+                let eo = off + rd_u16(&self.mmap[sp..sp + 2]) as usize;
+                let kl = rd_u16(&self.mmap[eo..eo + 2]) as usize;
+                let raw_vl = rd_u32(&self.mmap[eo + 2..eo + 6]);
+                let payload = if raw_vl & OVFL_FLAG != 0 {
+                    8
+                } else {
+                    raw_vl as usize
+                };
+                total_bytes += leaf_entry_bytes(kl, payload);
+            }
+            page = rd_u64(&self.mmap[off + 8..off + 16]);
+        }
+        (leaf_pages.max(1), total_bytes)
     }
 
     /// Allocate a single free page. Pulls from the freelist (if non-empty)
@@ -1217,6 +1553,7 @@ where
         if free != 0 {
             let next = rd_u64(&self.mmap[page_offset(free)..page_offset(free) + 8]);
             self.set_free_head(next);
+            self.stats.free_pages = self.stats.free_pages.saturating_sub(1);
             return Ok(free);
         }
         let p = self.pages();
@@ -1235,6 +1572,18 @@ where
             head,
         );
         self.set_free_head(page);
+        self.stats.free_pages += 1;
+    }
+
+    fn refresh_stats_from_meta(&mut self) {
+        let (leaf_pages, leaf_entry_bytes) = self.scan_leaf_stats();
+        self.stats = BPlusTreeStats {
+            entries: rd_u64(&self.mmap[META_ENTRIES..META_ENTRIES + 8]) as usize,
+            pages: self.pages(),
+            free_pages: self.free_list_pages(),
+            leaf_pages,
+            leaf_entry_bytes,
+        };
     }
 
     /// Ensure the backing file is at least `target_bytes` long, growing
@@ -1257,13 +1606,20 @@ where
 
     /// Initialize a page as a leaf. Zeros out the header and slot array.
     /// If `root` is true, the `FLAG_ROOT` bit is set.
+    ///
+    /// Increments `stats.leaf_pages` because the caller always passes a
+    /// freshly allocated page (this is the only path that promotes a page
+    /// into a leaf — `create`/`clear` initialize the root leaf inline and
+    /// set the counter directly).
     fn init_leaf(&mut self, page: u64, root: bool) {
         let off = page_offset(page);
         self.mmap[off] = PAGE_LEAF;
         self.mmap[off + 1] = if root { FLAG_ROOT } else { 0 };
         wr_u16(&mut self.mmap[off + 2..off + 4], 0);
         wr_u32(&mut self.mmap[off + 4..off + 8], PAGE_SIZE as u32);
-        wr_u64(&mut self.mmap[off + 8..off + 16], 0);
+        wr_u64(&mut self.mmap[off + 8..off + 16], 0); // next_leaf = 0
+        wr_u64(&mut self.mmap[off + 16..off + 24], 0); // prev_leaf = 0
+        self.stats.leaf_pages += 1;
     }
 
     /// Initialize a page as an internal node. Zeros out the header,
@@ -1284,7 +1640,7 @@ where
 
 /// Full-scan iterator over all entries in the tree. Walks leaf pages
 /// left-to-right via `next_leaf` pointers, visiting each slot in order.
-/// Yields deserialized keys (owned) and zero-copy [`ValueRef`] values.
+/// Yields owned `(K, V)` — both decoded from the mmap'd bytes.
 pub struct BTreeIter<'a, K, V> {
     tree: &'a BPlusTree<K, V>,
     page: u64,
@@ -1293,12 +1649,10 @@ pub struct BTreeIter<'a, K, V> {
 
 impl<'a, K, V> Iterator for BTreeIter<'a, K, V>
 where
-    K: Archive,
-    <K as Archive>::Archived: Portable + Deserialize<K, HighDeserializer<RkyvError>> + 'static,
-    V: Archive,
-    <V as Archive>::Archived: Portable + 'static,
+    K: Decode<()>,
+    V: Decode<()>,
 {
-    type Item = (K, ValueRef<'a, V>);
+    type Item = (K, V);
     fn next(&mut self) -> Option<Self::Item> {
         while self.page != 0 {
             let off = page_offset(self.page);
@@ -1307,14 +1661,46 @@ where
                 let key_slice = self.tree.key_slice_at(off, self.slot);
                 let value_slice = self.tree.value_slice_at(off, self.slot);
                 self.slot += 1;
-                let k = rkyv::deserialize::<K, RkyvError>(unsafe {
-                    rkyv::access_unchecked::<Archived<K>>(key_slice)
-                })
-                .expect("valid archive");
-                let v = ValueRef::from_bytes(value_slice);
+                let k: K = deserialize_from(key_slice).expect("valid encoded key");
+                let v: V = deserialize_from(value_slice).expect("valid encoded value");
                 return Some((k, v));
             }
-            self.page = rd_u64(&self.tree.mmap[off + 8..off + 16]);
+            self.page = rd_u64(&self.tree.mmap[off + 8..off + 16]); // next_leaf
+            self.slot = 0;
+        }
+        None
+    }
+}
+
+/// Reverse iterator — walks the leaf chain backward via `prev_leaf`
+/// pointers, yielding entries in descending key order without
+/// materializing the entire tree into memory.
+pub struct BTreeIterRev<'a, K, V> {
+    tree: &'a BPlusTree<K, V>,
+    page: u64,
+    slot: usize, // 0 = last entry; increment walks backward through slots
+}
+
+impl<'a, K, V> Iterator for BTreeIterRev<'a, K, V>
+where
+    K: Decode<()>,
+    V: Decode<()>,
+{
+    type Item = (K, V);
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.page != 0 {
+            let off = page_offset(self.page);
+            let count = rd_u16(&self.tree.mmap[off + 2..off + 4]) as usize;
+            if self.slot < count {
+                let idx = count - 1 - self.slot;
+                let key_slice = self.tree.key_slice_at(off, idx);
+                let value_slice = self.tree.value_slice_at(off, idx);
+                self.slot += 1;
+                let k: K = deserialize_from(key_slice).expect("valid encoded key");
+                let v: V = deserialize_from(value_slice).expect("valid encoded value");
+                return Some((k, v));
+            }
+            self.page = rd_u64(&self.tree.mmap[off + 16..off + 24]); // prev_leaf
             self.slot = 0;
         }
         None
@@ -1333,12 +1719,10 @@ pub struct BTreeRange<'a, K, V> {
 
 impl<'a, K, V> Iterator for BTreeRange<'a, K, V>
 where
-    K: Archive,
-    <K as Archive>::Archived: Portable + Deserialize<K, HighDeserializer<RkyvError>> + 'static,
-    V: Archive,
-    <V as Archive>::Archived: Portable + 'static,
+    K: Decode<()>,
+    V: Decode<()>,
 {
-    type Item = (K, ValueRef<'a, V>);
+    type Item = (K, V);
     fn next(&mut self) -> Option<Self::Item> {
         while self.page != 0 {
             let off = page_offset(self.page);
@@ -1350,11 +1734,8 @@ where
                 }
                 let value_slice = self.tree.value_slice_at(off, self.slot);
                 self.slot += 1;
-                let k = rkyv::deserialize::<K, RkyvError>(unsafe {
-                    rkyv::access_unchecked::<Archived<K>>(key_slice)
-                })
-                .expect("valid archive");
-                let v = ValueRef::from_bytes(value_slice);
+                let k: K = deserialize_from(key_slice).expect("valid encoded key");
+                let v: V = deserialize_from(value_slice).expect("valid encoded value");
                 return Some((k, v));
             }
             self.page = rd_u64(&self.tree.mmap[off + 8..off + 16]);
@@ -1365,47 +1746,27 @@ where
 }
 
 impl<K, V> Drop for BPlusTree<K, V> {
-    /// Flush the mmap to disk on drop as a best-effort durability measure.
-    /// Errors are silently ignored — call [`flush`](BPlusTree::flush)
-    /// explicitly if you need to guarantee data is on disk.
     fn drop(&mut self) {
         let _ = self.mmap.flush();
     }
 }
 
 impl<K, V> fmt::Debug for BPlusTree<K, V> {
-    /// Read counters directly from the mmap so this impl has no trait bounds
-    /// on `K` or `V`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BPlusTree")
-            .field("entries", &rd_u64(&self.mmap[28..36]))
-            .field("pages", &rd_u64(&self.mmap[20..28]))
-            .finish()
+        fmt::Debug::fmt(&self.stats, f)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Backend / OrderedBackend impls
-//
-// The BPlusTree satisfies both the common `Backend` contract and the
-// `OrderedBackend` extension (range scans). Delegation is straightforward
-// — every trait method forwards to the identically-named inherent method.
-// ---------------------------------------------------------------------------
 
 use crate::core::backend::{Backend, OrderedBackend};
 
 impl<K, V> Backend<K, V> for BPlusTree<K, V>
 where
-    K: Archive + Hash + Eq + Clone,
-    for<'buf, 'a> K: Serialize<HighSerializer<Buffer<'buf>, ArenaHandle<'a>, RkyvError>>,
-    for<'a> K: Serialize<HighSerializer<CountingWriter, ArenaHandle<'a>, RkyvError>>,
-    <K as Archive>::Archived: Portable + Deserialize<K, HighDeserializer<RkyvError>> + 'static,
-    V: Archive,
-    for<'buf, 'a> V: Serialize<HighSerializer<Buffer<'buf>, ArenaHandle<'a>, RkyvError>>,
-    for<'a> V: Serialize<HighSerializer<CountingWriter, ArenaHandle<'a>, RkyvError>>,
-    <V as Archive>::Archived: Portable + Deserialize<V, HighDeserializer<RkyvError>> + 'static,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
+    V: Encode + Decode<()> + Clone,
 {
-    fn get(&self, key: &K) -> Option<ValueRef<'_, V>> {
+    type Stats = BPlusTreeStats;
+
+    fn get(&self, key: &K) -> Option<V> {
         BPlusTree::get(self, key)
     }
 
@@ -1421,58 +1782,99 @@ where
         BPlusTree::delete(self, key)
     }
 
-    fn update<F>(&mut self, key: &K, f: F) -> io::Result<bool>
+    fn update<F>(&mut self, key: &K, f: F) -> io::Result<()>
     where
-        F: FnOnce(V) -> V,
+        F: FnOnce(Option<V>) -> Option<V>,
     {
         BPlusTree::update(self, key, f)
     }
 
-    fn update_in_place<F>(&mut self, key: &K, f: F) -> io::Result<bool>
-    where
-        F: FnOnce(&mut Archived<V>),
-    {
-        BPlusTree::update_in_place(self, key, f)
+    fn clear(&mut self) -> io::Result<()> {
+        BPlusTree::clear(self)
+    }
+
+    fn compact(&mut self) -> io::Result<()> {
+        BPlusTree::compact(self)
     }
 
     fn keys(&self) -> impl Iterator<Item = K> + '_ {
         BPlusTree::keys(self)
     }
 
-    fn values(&self) -> impl Iterator<Item = ValueRef<'_, V>> + '_ {
+    fn values(&self) -> impl Iterator<Item = V> + '_ {
         BPlusTree::values(self)
     }
 
-    fn entries(&self) -> impl Iterator<Item = (K, ValueRef<'_, V>)> + '_ {
+    fn entries(&self) -> impl Iterator<Item = (K, V)> + '_ {
         BPlusTree::entries(self)
     }
 
-    fn len(&self) -> usize {
-        BPlusTree::len(self)
+    fn size(&self) -> usize {
+        BPlusTree::size(self)
     }
 
-    fn is_empty(&self) -> bool {
-        BPlusTree::is_empty(self)
+    fn stats(&self) -> &Self::Stats {
+        BPlusTree::stats(self)
     }
 
     fn flush(&self) -> io::Result<()> {
         BPlusTree::flush(self)
     }
+
+    fn sync(&self) -> io::Result<()> {
+        BPlusTree::sync(self)
+    }
 }
 
 impl<K, V> OrderedBackend<K, V> for BPlusTree<K, V>
 where
-    K: Archive + Hash + Eq + Clone,
-    for<'buf, 'a> K: Serialize<HighSerializer<Buffer<'buf>, ArenaHandle<'a>, RkyvError>>,
-    for<'a> K: Serialize<HighSerializer<CountingWriter, ArenaHandle<'a>, RkyvError>>,
-    <K as Archive>::Archived: Portable + Deserialize<K, HighDeserializer<RkyvError>> + 'static,
-    V: Archive,
-    for<'buf, 'a> V: Serialize<HighSerializer<Buffer<'buf>, ArenaHandle<'a>, RkyvError>>,
-    for<'a> V: Serialize<HighSerializer<CountingWriter, ArenaHandle<'a>, RkyvError>>,
-    <V as Archive>::Archived: Portable + Deserialize<V, HighDeserializer<RkyvError>> + 'static,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
+    V: Encode + Decode<()> + Clone,
 {
-    fn range(&self, start: &K, end: &K) -> impl Iterator<Item = (K, ValueRef<'_, V>)> + '_ {
+    fn range(&self, start: &K, end: &K) -> impl Iterator<Item = (K, V)> + '_ {
         BPlusTree::range(self, start, end)
+    }
+
+    /// Reads the last entry from the rightmost non-empty leaf. Usually O(1),
+    /// but may walk left over empty rightmost leaves left behind by deletes.
+    fn last(&self) -> Option<(K, V)> {
+        if self.size() == 0 {
+            return None;
+        }
+        let mut page = self.rightmost_leaf();
+        while page != 0 {
+            let off = page_offset(page);
+            let count = rd_u16(&self.mmap[off + 2..off + 4]) as usize;
+            if count != 0 {
+                let last_slot = count - 1;
+                let ks = self.key_slice_at(off, last_slot);
+                let vs = self.value_slice_at(off, last_slot);
+                let k: K = deserialize_from(ks).expect("valid encoded key");
+                let v: V = deserialize_from(vs).expect("valid encoded value");
+                return Some((k, v));
+            }
+            page = rd_u64(&self.mmap[off + 16..off + 24]);
+        }
+        None
+    }
+
+    /// Streaming reverse iteration via `prev_leaf` pointers — O(1)
+    /// memory, yields entries in descending key order.
+    fn entries_rev(&self) -> impl Iterator<Item = (K, V)> + '_
+    where
+        K: 'static,
+        V: 'static,
+    {
+        let page = if self.size() == 0 {
+            0
+        } else {
+            self.rightmost_leaf()
+        };
+        BTreeIterRev {
+            tree: self,
+            page,
+            slot: 0,
+        }
     }
 }
 
@@ -1483,6 +1885,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::backend::Backend;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1500,11 +1903,11 @@ mod tests {
     }
 
     fn create(p: &Path) -> BPlusTree<TestKey, TestVal> {
-        BPlusTree::create(p).unwrap()
+        BPlusTree::create(p, BPlusTreeConfig::default()).unwrap()
     }
 
     fn open(p: &Path) -> BPlusTree<TestKey, TestVal> {
-        BPlusTree::open(p).unwrap()
+        BPlusTree::open(p, BPlusTreeConfig::default()).unwrap()
     }
 
     fn k(s: &str) -> TestKey {
@@ -1514,10 +1917,10 @@ mod tests {
         s.as_bytes().to_vec()
     }
 
-    /// Helper: read the archived value as owned bytes (the only sensible
-    /// equality check for `&ArchivedVec<u8>`).
+    /// Helper kept for compatibility with existing tests: `get` already
+    /// returns the owned value directly under the new API.
     fn vget(t: &BPlusTree<TestKey, TestVal>, key: &TestKey) -> Option<Vec<u8>> {
-        t.get(key).map(|vr| vr.archived().as_slice().to_vec())
+        t.get(key)
     }
 
     // -- basic --
@@ -1548,7 +1951,7 @@ mod tests {
         t.put(k("k"), vbytes("v1")).unwrap();
         t.put(k("k"), vbytes("v2")).unwrap();
         assert_eq!(vget(&t, &k("k")), Some(vbytes("v2")));
-        assert_eq!(t.len(), 1);
+        assert_eq!(t.size(), 1);
     }
 
     #[test]
@@ -1561,7 +1964,7 @@ mod tests {
         assert!(!t.delete(&k("a")).unwrap());
         assert_eq!(vget(&t, &k("a")), None);
         assert_eq!(vget(&t, &k("b")), Some(vbytes("2")));
-        assert_eq!(t.len(), 1);
+        assert_eq!(t.size(), 1);
     }
 
     #[test]
@@ -1640,7 +2043,7 @@ mod tests {
             let key = format!("k{:04}", i).into_bytes();
             assert_eq!(vget(&t, &key), Some(i.to_le_bytes().to_vec()));
         }
-        assert_eq!(t.len(), 500);
+        assert_eq!(t.size(), 500);
     }
 
     // -- extents (contiguous overflow) --
@@ -1663,7 +2066,7 @@ mod tests {
         // Delete frees the extent.
         assert!(t.delete(&k("big")).unwrap());
         assert_eq!(vget(&t, &k("big")), None);
-        assert_eq!(t.len(), 0);
+        assert_eq!(t.size(), 0);
     }
 
     #[test]
@@ -1692,7 +2095,7 @@ mod tests {
             let key = format!("ovk{:04}", i).into_bytes();
             assert_eq!(vget(&t, &key), Some(big.clone()));
         }
-        assert_eq!(t.len(), 30);
+        assert_eq!(t.size(), 30);
         // Range scan across page boundaries.
         let count = t.range(&k("ovk0000"), &k("ovk0030")).count();
         assert_eq!(count, 30);
@@ -1769,7 +2172,7 @@ mod tests {
         let big = vec![0x42u8; 9_000];
         t.put(k("k"), big.clone()).unwrap();
         assert_eq!(vget(&t, &k("k")), Some(big));
-        assert_eq!(t.len(), 1);
+        assert_eq!(t.size(), 1);
     }
 
     #[test]
@@ -1780,7 +2183,7 @@ mod tests {
         t.put(k("k"), big).unwrap();
         t.put(k("k"), vbytes("tiny")).unwrap();
         assert_eq!(vget(&t, &k("k")), Some(vbytes("tiny")));
-        assert_eq!(t.len(), 1);
+        assert_eq!(t.size(), 1);
     }
 
     #[test]
@@ -1792,74 +2195,81 @@ mod tests {
         t.put(k("k"), a).unwrap();
         t.put(k("k"), b.clone()).unwrap();
         assert_eq!(vget(&t, &k("k")), Some(b));
-        assert_eq!(t.len(), 1);
-    }
-
-    // -- update_in_place on extent values --
-
-    #[test]
-    fn update_in_place_on_extent_value() {
-        use rkyv::{Archive, Deserialize, Serialize};
-
-        #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-        struct Big {
-            counter: u32,
-            payload: Vec<u8>,
-        }
-
-        let p = tmp("uip_ext");
-        let mut t: BPlusTree<Vec<u8>, Big> = BPlusTree::create(&p).unwrap();
-        let big = Big {
-            counter: 1,
-            // Push it well past MAX_INLINE so it goes to an extent.
-            payload: vec![0xEEu8; 8_000],
-        };
-        t.put(k("big"), big).unwrap();
-
-        let existed = t
-            .update_in_place(&k("big"), |archived| {
-                let new = archived.counter.to_native() + 41;
-                archived.counter = new.into();
-            })
-            .unwrap();
-        assert!(existed, "extent update_in_place must report key existed");
-
-        let vr = t.get(&k("big")).unwrap();
-        assert_eq!(vr.counter.to_native(), 42);
-        assert_eq!(vr.payload.len(), 8_000);
+        assert_eq!(t.size(), 1);
     }
 
     #[test]
-    fn update_in_place_on_extent_persists_after_reopen() {
-        use rkyv::{Archive, Deserialize, Serialize};
+    fn overwrite_full_leaf_does_not_duplicate_key() {
+        let p = tmp("ow_full_leaf");
+        let mut t = BPlusTree::create(
+            &p,
+            BPlusTreeConfig {
+                compaction_ratio: 1.0,
+            },
+        )
+        .unwrap();
 
-        #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-        struct Big {
-            counter: u32,
-            payload: Vec<u8>,
+        for i in 0..120u32 {
+            t.put(format!("k{:04}", i).into_bytes(), vec![0x11; 64])
+                .unwrap();
         }
+        let before = t.size();
+        let key = k("k0005");
+        let replacement = vec![0x22; 3_000];
+        t.put(key.clone(), replacement.clone()).unwrap();
 
-        let p = tmp("uip_ext_reopen");
+        assert_eq!(t.size(), before);
+        assert_eq!(vget(&t, &key), Some(replacement));
+        assert_eq!(t.entries().filter(|(found, _)| found == &key).count(), 1);
+    }
+
+    // -- clear --
+
+    #[test]
+    fn clear_removes_all_entries() {
+        let p = tmp("clear");
+        let mut t = create(&p);
+        t.put(k("a"), vbytes("av")).unwrap();
+        t.put(k("b"), vbytes("bv")).unwrap();
+        t.put(k("c"), vbytes("cv")).unwrap();
+        assert_eq!(t.size(), 3);
+
+        t.clear().unwrap();
+        assert_eq!(t.size(), 0);
+        assert!(t.is_empty());
+        assert_eq!(vget(&t, &k("a")), None);
+        assert_eq!(vget(&t, &k("b")), None);
+        assert!(t.entries().next().is_none());
+    }
+
+    #[test]
+    fn clear_then_put_reuses_file() {
+        let p = tmp("clear_reuse");
+        let mut t = create(&p);
+        for i in 0u32..100 {
+            t.put(format!("k{:04}", i).into_bytes(), vbytes("v"))
+                .unwrap();
+        }
+        t.clear().unwrap();
+        t.put(k("z"), vbytes("zv")).unwrap();
+        assert_eq!(t.size(), 1);
+        assert_eq!(vget(&t, &k("z")), Some(vbytes("zv")));
+        assert_eq!(vget(&t, &k("k0050")), None);
+    }
+
+    #[test]
+    fn clear_survives_reopen() {
+        let p = tmp("clear_reopen");
         {
-            let mut t: BPlusTree<Vec<u8>, Big> = BPlusTree::create(&p).unwrap();
-            t.put(
-                k("big"),
-                Big {
-                    counter: 100,
-                    payload: vec![0xCCu8; 9_500],
-                },
-            )
-            .unwrap();
-            t.update_in_place(&k("big"), |archived| {
-                archived.counter = 999u32.into();
-            })
-            .unwrap();
+            let mut t = create(&p);
+            t.put(k("a"), vbytes("av")).unwrap();
+            t.put(k("b"), vbytes("bv")).unwrap();
+            t.clear().unwrap();
             t.flush().unwrap();
         }
-        let t: BPlusTree<Vec<u8>, Big> = BPlusTree::open(&p).unwrap();
-        let vr = t.get(&k("big")).unwrap();
-        assert_eq!(vr.counter.to_native(), 999);
-        assert_eq!(vr.payload.len(), 9_500);
+        let t: BPlusTree<TestKey, TestVal> = open(&p);
+        assert_eq!(t.size(), 0);
+        assert!(t.is_empty());
     }
 
     // -- delete-counter sanity --
@@ -1872,10 +2282,350 @@ mod tests {
             t.put(format!("k{:04}", i).into_bytes(), vbytes("v"))
                 .unwrap();
         }
-        assert_eq!(t.len(), 100);
+        assert_eq!(t.size(), 100);
         for i in 0u32..100 {
             assert!(t.delete(&format!("k{:04}", i).into_bytes()).unwrap());
         }
-        assert_eq!(t.len(), 0);
+        assert_eq!(t.size(), 0);
+    }
+
+    // -- put_if_absent / replace --
+
+    #[test]
+    fn put_if_absent_inserts_when_missing() {
+        use crate::core::backend::Backend;
+        let p = tmp("pia_insert");
+        let mut t = create(&p);
+        assert!(Backend::put_if_absent(&mut t, k("a"), vbytes("first")).unwrap());
+        assert_eq!(vget(&t, &k("a")), Some(vbytes("first")));
+    }
+
+    #[test]
+    fn put_if_absent_noop_when_present() {
+        use crate::core::backend::Backend;
+        let p = tmp("pia_noop");
+        let mut t = create(&p);
+        t.put(k("a"), vbytes("first")).unwrap();
+        assert!(!Backend::put_if_absent(&mut t, k("a"), vbytes("second")).unwrap());
+        assert_eq!(vget(&t, &k("a")), Some(vbytes("first")));
+    }
+
+    #[test]
+    fn replace_returns_previous_value() {
+        use crate::core::backend::Backend;
+        let p = tmp("replace");
+        let mut t = create(&p);
+        t.put(k("a"), vbytes("first")).unwrap();
+        let prev = Backend::replace(&mut t, k("a"), vbytes("second")).unwrap();
+        assert_eq!(prev, Some(vbytes("first")));
+        assert_eq!(vget(&t, &k("a")), Some(vbytes("second")));
+    }
+
+    #[test]
+    fn replace_returns_none_when_absent() {
+        use crate::core::backend::Backend;
+        let p = tmp("replace_absent");
+        let mut t = create(&p);
+        let prev = Backend::replace(&mut t, k("a"), vbytes("new")).unwrap();
+        assert!(prev.is_none());
+        assert_eq!(vget(&t, &k("a")), Some(vbytes("new")));
+    }
+
+    // -- bulk_put / bulk_put_sorted / bulk_delete --
+
+    #[test]
+    fn bulk_put_inserts_all_items() {
+        use crate::core::backend::Backend;
+        let p = tmp("bulk_put");
+        let mut t = create(&p);
+        let items: Vec<(TestKey, TestVal)> = (0u32..50)
+            .map(|i| (format!("k{:04}", i).into_bytes(), vbytes("v")))
+            .collect();
+        Backend::bulk_put(&mut t, items).unwrap();
+        assert_eq!(t.size(), 50);
+    }
+
+    #[test]
+    fn bulk_put_sorted_inserts_all_items() {
+        use crate::core::backend::Backend;
+        let p = tmp("bulk_put_sorted");
+        let mut t = create(&p);
+        let items: Vec<(TestKey, TestVal)> = (0u32..50)
+            .map(|i| (format!("k{:04}", i).into_bytes(), vbytes("v")))
+            .collect();
+        Backend::bulk_put_sorted(&mut t, items).unwrap();
+        assert_eq!(t.size(), 50);
+    }
+
+    #[test]
+    fn bulk_delete_returns_removed_count() {
+        use crate::core::backend::Backend;
+        let p = tmp("bulk_delete");
+        let mut t = create(&p);
+        for i in 0u32..10 {
+            t.put(format!("k{:02}", i).into_bytes(), vbytes("v"))
+                .unwrap();
+        }
+        let keys: Vec<TestKey> = (0u32..5)
+            .map(|i| format!("k{:02}", i).into_bytes())
+            .collect();
+        let ghosts: Vec<TestKey> = vec![k("ghost1"), k("ghost2")];
+        let all: Vec<&TestKey> = keys.iter().chain(ghosts.iter()).collect();
+        let n = Backend::bulk_delete(&mut t, all).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(t.size(), 5);
+    }
+
+    // -- OrderedBackend::first / last --
+
+    #[test]
+    fn first_and_last_walk_leaf_chain() {
+        use crate::core::backend::OrderedBackend;
+        let p = tmp("first_last");
+        let mut t = create(&p);
+        for i in 0u32..30 {
+            t.put(format!("k{:04}", i).into_bytes(), vbytes("v"))
+                .unwrap();
+        }
+        let (fk, _) = OrderedBackend::first(&t).unwrap();
+        let (lk, _) = OrderedBackend::last(&t).unwrap();
+        assert_eq!(fk, k("k0000"));
+        assert_eq!(lk, k("k0029"));
+    }
+
+    #[test]
+    fn last_skips_empty_rightmost_leaves_after_deletes() {
+        use crate::core::backend::OrderedBackend;
+        let p = tmp("last_after_delete");
+        let mut t = BPlusTree::create(
+            &p,
+            BPlusTreeConfig {
+                compaction_ratio: 1.0,
+            },
+        )
+        .unwrap();
+
+        for i in 0u32..600 {
+            t.put(format!("k{:04}", i).into_bytes(), vbytes("v"))
+                .unwrap();
+        }
+        for i in 500u32..600 {
+            t.delete(&format!("k{:04}", i).into_bytes()).unwrap();
+        }
+
+        let (lk, _) = OrderedBackend::last(&t).unwrap();
+        assert_eq!(lk, k("k0499"));
+        let rev_first = OrderedBackend::entries_rev(&t).next().unwrap().0;
+        assert_eq!(rev_first, k("k0499"));
+    }
+
+    #[test]
+    fn first_and_last_on_empty_tree() {
+        use crate::core::backend::OrderedBackend;
+        let p = tmp("first_last_empty");
+        let t = create(&p);
+        assert!(OrderedBackend::first(&t).is_none());
+        assert!(OrderedBackend::last(&t).is_none());
+    }
+
+    // -- OrderedBackend::entries_rev --
+
+    #[test]
+    fn entries_rev_yields_descending_order() {
+        use crate::core::backend::OrderedBackend;
+        let p = tmp("entries_rev");
+        let mut t = create(&p);
+        for i in 0u32..10 {
+            t.put(format!("k{:04}", i).into_bytes(), vbytes("v"))
+                .unwrap();
+        }
+        let keys: Vec<Vec<u8>> = OrderedBackend::entries_rev(&t).map(|(k, _)| k).collect();
+        let expected: Vec<Vec<u8>> = (0..10u32)
+            .rev()
+            .map(|i| format!("k{:04}", i).into_bytes())
+            .collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn entries_rev_on_empty_tree() {
+        use crate::core::backend::OrderedBackend;
+        let p = tmp("entries_rev_empty");
+        let t = create(&p);
+        assert_eq!(OrderedBackend::entries_rev(&t).count(), 0);
+    }
+
+    // -- sync --
+
+    #[test]
+    fn sync_persists_writes() {
+        let p = tmp("sync_persist");
+        {
+            let mut t = create(&p);
+            t.put(k("a"), vbytes("v")).unwrap();
+            t.sync().unwrap();
+        }
+        let t: BPlusTree<TestKey, TestVal> = open(&p);
+        assert_eq!(vget(&t, &k("a")), Some(vbytes("v")));
+    }
+
+    #[test]
+    fn flush_returns_ok_for_empty_tree() {
+        let p = tmp("flush_empty");
+        let t = create(&p);
+        t.flush().unwrap();
+        t.sync().unwrap();
+    }
+
+    // -- update --
+
+    #[test]
+    fn update_modifies_existing() {
+        let p = tmp("update_exists");
+        let mut t = create(&p);
+        t.put(k("a"), vbytes("hello")).unwrap();
+        t.update(&k("a"), |opt| {
+            let mut v = opt.unwrap();
+            v.extend_from_slice(b" world");
+            Some(v)
+        })
+        .unwrap();
+        assert_eq!(vget(&t, &k("a")), Some(vbytes("hello world")));
+    }
+
+    #[test]
+    fn update_inserts_when_absent_and_returns_some() {
+        let p = tmp("update_insert");
+        let mut t = create(&p);
+        t.update(&k("fresh"), |opt| {
+            assert!(opt.is_none());
+            Some(vbytes("hi"))
+        })
+        .unwrap();
+        assert_eq!(vget(&t, &k("fresh")), Some(vbytes("hi")));
+    }
+
+    #[test]
+    fn update_absent_returning_none_is_noop() {
+        let p = tmp("update_missing");
+        let mut t = create(&p);
+        t.update(&k("ghost"), |opt| {
+            assert!(opt.is_none());
+            None
+        })
+        .unwrap();
+        assert!(vget(&t, &k("ghost")).is_none());
+    }
+
+    #[test]
+    fn update_returning_none_deletes_existing() {
+        let p = tmp("update_delete");
+        let mut t = create(&p);
+        t.put(k("a"), vbytes("hello")).unwrap();
+        t.update(&k("a"), |opt| {
+            assert!(opt.is_some());
+            None
+        })
+        .unwrap();
+        assert!(vget(&t, &k("a")).is_none());
+    }
+
+    #[test]
+    fn stats_track_entries_pages_and_free_pages() {
+        let p = tmp("stats");
+        let mut t = BPlusTree::create(
+            &p,
+            BPlusTreeConfig {
+                compaction_ratio: 1.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *t.stats(),
+            BPlusTreeStats {
+                entries: 0,
+                pages: 2,
+                free_pages: 0,
+                leaf_pages: 1,
+                leaf_entry_bytes: 0,
+            }
+        );
+
+        t.put(k("a"), vec![0xAA; PAGE_SIZE * 2]).unwrap();
+        assert_eq!(t.stats().entries, 1);
+        assert!(t.stats().pages > 2);
+
+        t.put(k("a"), vbytes("inline")).unwrap();
+        assert_eq!(t.stats().entries, 1);
+        assert!(t.stats().free_pages > 0);
+    }
+
+    #[test]
+    fn compact_rebuilds_sparse_tree() {
+        let p = tmp("compact_sparse");
+        let mut t = BPlusTree::create(
+            &p,
+            BPlusTreeConfig {
+                compaction_ratio: 1.0,
+            },
+        )
+        .unwrap();
+
+        for i in 0u32..600 {
+            t.put(format!("k{:04}", i).into_bytes(), vec![0xAB; 32])
+                .unwrap();
+        }
+        for i in 100u32..600 {
+            t.delete(&format!("k{:04}", i).into_bytes()).unwrap();
+        }
+
+        let before_pages = t.pages();
+        assert!(t.fragmentation_ratio() > 0.0);
+        t.compact().unwrap();
+
+        assert!(t.pages() < before_pages);
+        assert_eq!(t.size(), 100);
+        for i in 0u32..100 {
+            assert_eq!(
+                vget(&t, &format!("k{:04}", i).into_bytes()),
+                Some(vec![0xAB; 32])
+            );
+        }
+    }
+
+    #[test]
+    fn zero_ratio_compacts_on_first_insert_after_reopen() {
+        let p = tmp("compact_zero_after_reopen");
+        {
+            let mut t = BPlusTree::create(
+                &p,
+                BPlusTreeConfig {
+                    compaction_ratio: 1.0,
+                },
+            )
+            .unwrap();
+            for i in 0u32..600 {
+                t.put(format!("k{:04}", i).into_bytes(), vec![0xCD; 32])
+                    .unwrap();
+            }
+            for i in 100u32..600 {
+                t.delete(&format!("k{:04}", i).into_bytes()).unwrap();
+            }
+            t.sync().unwrap();
+        }
+
+        let mut t = BPlusTree::open(
+            &p,
+            BPlusTreeConfig {
+                compaction_ratio: 0.0,
+            },
+        )
+        .unwrap();
+        let before_pages = t.pages();
+        t.put(k("k9999"), vbytes("new")).unwrap();
+
+        assert!(t.pages() < before_pages);
+        assert_eq!(t.size(), 101);
+        assert_eq!(vget(&t, &k("k9999")), Some(vbytes("new")));
     }
 }

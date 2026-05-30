@@ -16,15 +16,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bincode::Decode;
 use lmdb::{Database, Environment, EnvironmentFlags, Transaction, WriteFlags};
-use rkyv::{
-    api::high::HighDeserializer, rancor::Error as RkyvError, Archive, Archived, Deserialize,
-};
 use tempfile::TempDir;
 
 use crate::{
-    core::{btree::BPlusTree, keydir::KeyDir, keydir::KeyDirConfig},
-    utils::serdes::serialize_to_vec,
+    core::{
+        backend::Backend,
+        btree::{BPlusTree, BPlusTreeConfig},
+        keydir::KeyDir,
+        keydir::KeyDirConfig,
+    },
+    utils::serdes::{deserialize_from, serialize_to_vec},
 };
 
 // ---------------------------------------------------------------------------
@@ -38,13 +41,8 @@ use crate::{
 /// workloads, run the LMDB and KeyDir benches individually.
 const N: u64 = 1_000;
 
-fn deserialize_value<V>(bytes: &[u8]) -> V
-where
-    V: Archive,
-    V::Archived: Deserialize<V, HighDeserializer<RkyvError>>,
-{
-    let archived = unsafe { rkyv::access_unchecked::<Archived<V>>(bytes) };
-    rkyv::deserialize::<V, RkyvError>(archived).expect("deserialize")
+fn deserialize_value<V: Decode<()>>(bytes: &[u8]) -> V {
+    deserialize_from(bytes).expect("deserialize")
 }
 
 fn ops_per_sec(dur: Duration, n: u64) -> f64 {
@@ -77,7 +75,7 @@ fn bench_btree_write_heavy() -> io::Result<()> {
     let path = dir.path().join("btree.bin");
 
     let t0 = Instant::now();
-    let mut tree = BPlusTree::<u64, u64>::create(&path)?;
+    let mut tree = BPlusTree::<u64, u64>::create(&path, BPlusTreeConfig::default())?;
     for k in 0..N {
         tree.put(k, k.wrapping_mul(7))?;
     }
@@ -98,7 +96,7 @@ fn bench_btree_read_heavy() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
 
-    let mut tree = BPlusTree::<u64, u64>::create(&path)?;
+    let mut tree = BPlusTree::<u64, u64>::create(&path, BPlusTreeConfig::default())?;
     for k in 0..N {
         tree.put(k, k.wrapping_mul(7))?;
     }
@@ -106,7 +104,7 @@ fn bench_btree_read_heavy() -> io::Result<()> {
     let t0 = Instant::now();
     for k in 0..N {
         let v = tree.get(&k).expect("key must exist");
-        assert_eq!(*v.archived(), k.wrapping_mul(7));
+        assert_eq!(v, k.wrapping_mul(7));
     }
     let elapsed = t0.elapsed();
 
@@ -165,8 +163,8 @@ fn bench_keydir_read_heavy() -> io::Result<()> {
 
     let t0 = Instant::now();
     for k in 0..N {
-        let v = kd.get(&k).expect("key must exist");
-        assert_eq!(*v.archived(), k.wrapping_mul(7));
+        let v: u64 = kd.get(&k).expect("key must exist");
+        assert_eq!(v, k.wrapping_mul(7));
     }
     let elapsed = t0.elapsed();
 

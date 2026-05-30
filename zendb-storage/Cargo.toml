@@ -3,12 +3,12 @@ name = "zendb-storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Storage subsystem for ZeninDB — WAL, SkipList, KeyDir, B+Tree, compaction"
+description = "Storage subsystem for ZeninDB — KeyDir, B+Tree, OrderLog, compaction"
 
 [dependencies]
 memmap2.workspace = true
 hashbrown.workspace = true
-rkyv = { version = "0.8", default-features = false, features = ["std", "alloc", "unaligned"] }
+bincode.workspace = true
 
 [dev-dependencies]
 lmdb = "0.8"

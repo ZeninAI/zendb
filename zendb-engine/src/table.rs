@@ -6,7 +6,7 @@ use rkyv::Archived;
 use zendb_storage::{
     core::{
         backend::Backend,
-        btree::{BPlusTree, BTreeRange},
+        btree::{BPlusTree, BPlusTreeConfig, BTreeRange},
         keydir::KeyDir,
         skiplist::SkipList,
         wal::{Wal, WalConfig},
@@ -147,11 +147,7 @@ impl Storage {
     /// Range scan over `[start, end)`. Only the `Ordered` (BPlusTree) variant
     /// supports range queries; calling this on `Unordered` panics — KeyDir's
     /// hash index has no usable key ordering, so the request is meaningless.
-    pub fn range<'a>(
-        &'a self,
-        start: &Vec<u8>,
-        end: &Vec<u8>,
-    ) -> BTreeRange<'a, Vec<u8>, Vec<u8>> {
+    pub fn range<'a>(&'a self, start: &Vec<u8>, end: &Vec<u8>) -> BTreeRange<'a, Vec<u8>, Vec<u8>> {
         match self {
             Storage::Ordered(t) => t.range(start, end),
             Storage::Unordered(_) => {
@@ -185,9 +181,9 @@ impl Table {
             TableKind::Ordered => {
                 let tree_path = path.join("tree");
                 let tree: BytesBPlusTree = if tree_path.exists() {
-                    BPlusTree::open(&tree_path)?
+                    BPlusTree::open(&tree_path, BPlusTreeConfig::default())?
                 } else {
-                    BPlusTree::create(&tree_path)?
+                    BPlusTree::create(&tree_path, BPlusTreeConfig::default())?
                 };
                 Storage::Ordered(tree)
             }
@@ -464,6 +460,9 @@ mod tests {
         table.apply(d).unwrap();
         table.flush().unwrap();
         // Should panic with `unimplemented!`.
-        let _ = table.backend().range(&b"a".to_vec(), &b"z".to_vec()).count();
+        let _ = table
+            .backend()
+            .range(&b"a".to_vec(), &b"z".to_vec())
+            .count();
     }
 }

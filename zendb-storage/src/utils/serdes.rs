@@ -1,194 +1,131 @@
-//! Serialization / deserialization utilities shared across storage backends.
+//! Serialization / deserialization helpers backed by bincode 2.
 //!
-//! The helpers here cover three needs:
+//! Three needs covered:
 //!
-//! 1. **Sizing** a value's archived form without allocating ([`serialized_size`]).
-//! 2. **Writing** a value's archive directly into a caller-provided byte slice
-//!    ([`serialize_into`]). Backends use this to write straight into `mmap`.
-//! 3. **Materializing** a small scratch buffer of serialized bytes when a
-//!    backend needs the bytes for comparison/lookup ([`serialize_to_vec`]).
+//! 1. **Sizing** without allocating — [`serialized_size`] uses
+//!    [`bincode::enc::write::SizeWriter`] to count bytes that would be
+//!    written, no allocation, no I/O.
+//! 2. **Direct-to-buffer writes** — [`serialize_into`] writes the encoded
+//!    archive straight into a caller-supplied `&mut [u8]` (typically a
+//!    slice of a memory-mapped file). One pass, no temporary buffer.
+//! 3. **Owned roundtrip** — [`serialize_to_vec`] and [`deserialize_from`]
+//!    for the cases that need a free-standing `Vec<u8>` or to materialize
+//!    a typed value from raw bytes.
 //!
-//! Together they let backends keep K/V serialization to one pass with at most
-//! one heap allocation — no AlignedVec, no grow-and-retry serialize loops.
-//!
-//! Byte-level page helpers (`rd_u*` / `wr_u*` / `read_u32_le`) also live here
-//! so the page-based formats (B+Tree, KeyDir) can share a single source of
-//! truth.
+//! All helpers use a single shared configuration ([`cfg`]) — little-endian,
+//! fixed-int encoding, no decode limit — tuned for the hot inner loops of
+//! the storage backends. Byte-level page helpers (`rd_u*` / `wr_u*` /
+//! `read_u32_le`) live here too so the page-based formats share one
+//! definition.
 
-use std::{io, marker::PhantomData, ops::Deref};
+use std::{cell::RefCell, io};
 
-use rkyv::{
-    api::high::{to_bytes_in, HighDeserializer, HighSerializer},
-    rancor::{Error as RkyvError, Fallible},
-    ser::{allocator::ArenaHandle, writer::Buffer, Positional, Writer},
-    Archive, Archived, Deserialize, Portable, Serialize,
+use bincode::{
+    config::{Configuration, Fixint, LittleEndian, NoLimit},
+    enc::write::SizeWriter,
+    error::{DecodeError, EncodeError},
+    Decode, Encode,
 };
 
 // ---------------------------------------------------------------------------
-// CountingWriter — measures serialized byte length without allocating.
+// Shared bincode configuration — chosen for fastest encode/decode loops.
+// Fixed-int encoding skips varint decoding cost; LE matches native; NoLimit
+// avoids per-byte bounds checks on trusted internal data.
 // ---------------------------------------------------------------------------
 
-/// A [`Writer`](rkyv::ser::Writer) that discards all data and only counts
-/// how many bytes were written. Use with [`to_bytes_in`](rkyv::api::high::to_bytes_in)
-/// to determine the serialized size of a value before writing it to mmap.
-///
-/// # Example
-///
-/// ```ignore
-/// let mut cw = CountingWriter::new();
-/// let cw = to_bytes_in::<_, RkyvError>(&my_value, cw)?;
-/// let size = cw.count();
-/// ```
-pub struct CountingWriter {
-    count: usize,
-}
-
-impl CountingWriter {
-    pub fn new() -> Self {
-        Self { count: 0 }
-    }
-
-    /// The total number of bytes written so far.
-    pub fn count(&self) -> usize {
-        self.count
-    }
-}
-
-impl Fallible for CountingWriter {
-    type Error = RkyvError;
-}
-
-impl Positional for CountingWriter {
-    fn pos(&self) -> usize {
-        self.count
-    }
-}
-
-impl Writer for CountingWriter {
-    fn write(&mut self, bytes: &[u8]) -> Result<(), RkyvError> {
-        self.count += bytes.len();
-        Ok(())
-    }
-}
-
-impl Default for CountingWriter {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Bincode configuration used everywhere in storage. Returned as a typed
+/// value (rather than a const) because `Configuration` builder methods
+/// aren't const in bincode 2. Constructing it is free — the type itself
+/// is zero-sized.
+#[inline(always)]
+pub fn cfg() -> Configuration<LittleEndian, Fixint, NoLimit> {
+    bincode::config::standard()
+        .with_little_endian()
+        .with_fixed_int_encoding()
 }
 
 // ---------------------------------------------------------------------------
-// ValueRef — borrowed view of an archived value living in backend storage.
+// Sizing / writing / reading helpers
 // ---------------------------------------------------------------------------
 
-/// A borrowed reference to an archived value living in the backend's
-/// storage (mmap). Zero-copy on construction and on reads (via `Deref`).
-///
-/// - As an `&Archived<V>` directly — `ValueRef` derefs to it transparently.
-/// - Call [`to_owned`](Self::to_owned) to materialize a real `V`.
-/// - Call [`as_bytes`](Self::as_bytes) to expose the raw archive bytes
-///   (replication, hashing, etc.).
-pub struct ValueRef<'a, V: Archive> {
-    bytes: &'a [u8],
-    _marker: PhantomData<&'a Archived<V>>,
-}
-
-impl<'a, V: Archive> ValueRef<'a, V>
-where
-    V::Archived: Portable + 'static,
-{
-    /// Construct from a slice known to contain a valid archive of `V`.
-    ///
-    /// # Safety invariant
-    /// The byte slice must be a complete, valid rkyv archive of `V`.
-    /// Backends maintain this invariant for any slice they hand to
-    /// `from_bytes`.
-    pub(crate) fn from_bytes(bytes: &'a [u8]) -> Self {
-        Self {
-            bytes,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Zero-copy view of the archived value.
-    pub fn archived(&self) -> &Archived<V> {
-        // SAFETY: from_bytes invariant — `self.bytes` is a valid archive of V.
-        unsafe { rkyv::access_unchecked::<Archived<V>>(self.bytes) }
-    }
-
-    /// Raw archive bytes. Useful for replication, hashing, or any other
-    /// byte-level handling that doesn't need the typed view.
-    pub fn as_bytes(&self) -> &[u8] {
-        self.bytes
-    }
-
-    /// Deserialize into an owned `V`. Allocates and traverses the archive.
-    pub fn to_owned(&self) -> V
-    where
-        V::Archived: Deserialize<V, HighDeserializer<RkyvError>>,
-    {
-        rkyv::deserialize::<V, RkyvError>(self.archived())
-            .expect("archive bytes produced by backend deserialize successfully")
-    }
-}
-
-impl<'a, V: Archive> Deref for ValueRef<'a, V>
-where
-    V::Archived: Portable + 'static,
-{
-    type Target = Archived<V>;
-    fn deref(&self) -> &Archived<V> {
-        self.archived()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Sizing / writing helpers
-// ---------------------------------------------------------------------------
-
-/// Measure the rkyv-archived byte length of `value` without allocating.
-///
-/// Uses [`CountingWriter`] under the hood — every byte that would be written
-/// is counted but discarded. Pair with [`serialize_into`] to write directly
-/// into a pre-sized destination (mmap slot, extent page, etc.).
-pub fn serialized_size<T>(value: &T) -> io::Result<usize>
-where
-    T: for<'a> Serialize<HighSerializer<CountingWriter, ArenaHandle<'a>, RkyvError>>,
-{
-    let cw = to_bytes_in::<_, RkyvError>(value, CountingWriter::new())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    Ok(cw.count())
+/// Measure the byte length of `value`'s bincode encoding without
+/// allocating. Uses [`SizeWriter`] — every byte that would be written is
+/// counted and discarded.
+pub fn serialized_size<T: Encode>(value: &T) -> io::Result<usize> {
+    let mut sw = SizeWriter::default();
+    bincode::encode_into_writer(value, &mut sw, cfg()).map_err(encode_err)?;
+    Ok(sw.bytes_written)
 }
 
 /// Serialize `value` directly into `dst`, returning the number of bytes
-/// written. The caller is responsible for sizing `dst` correctly — call
+/// written. Caller is responsible for sizing `dst` correctly — call
 /// [`serialized_size`] first when the length isn't already known.
 ///
-/// Backends use this to write straight into `mmap`, eliminating the
-/// intermediate `AlignedVec` + `copy_from_slice` step.
-pub fn serialize_into<T>(value: &T, dst: &mut [u8]) -> io::Result<usize>
-where
-    T: for<'buf, 'a> Serialize<HighSerializer<Buffer<'buf>, ArenaHandle<'a>, RkyvError>>,
-{
-    let written = to_bytes_in::<_, RkyvError>(value, Buffer::from(dst))
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    Ok(written.len())
+/// Used by backends to write straight into `mmap`, eliminating the
+/// intermediate `Vec<u8>` + `copy_from_slice` step.
+pub fn serialize_into<T: Encode>(value: &T, dst: &mut [u8]) -> io::Result<usize> {
+    bincode::encode_into_slice(value, dst, cfg()).map_err(encode_err)
 }
 
-/// Serialize `value` into a tight `Vec<u8>` — one allocation sized exactly
-/// to the archive. Use only when raw archived bytes are needed transiently
-/// (e.g. B+Tree key comparison during navigation); for storage, prefer
-/// [`serialize_into`] writing straight into the destination.
-pub fn serialize_to_vec<T>(value: &T) -> io::Result<Vec<u8>>
+/// Serialize `value` into any [`io::Write`] destination, returning the
+/// number of bytes written. Unlike [`serialize_into`], the destination
+/// grows or streams as needed.
+pub fn serialize_into_std<T: Encode, W: io::Write>(value: &T, dst: &mut W) -> io::Result<usize> {
+    bincode::encode_into_std_write(value, dst, cfg()).map_err(encode_err)
+}
+
+/// Serialize `value` into a freshly-allocated `Vec<u8>`. Used when a
+/// stand-alone byte buffer is needed (e.g., BPlusTree key navigation
+/// scratch where the buffer's lifetime outlives the encode).
+pub fn serialize_to_vec<T: Encode>(value: &T) -> io::Result<Vec<u8>> {
+    bincode::encode_to_vec(value, cfg()).map_err(encode_err)
+}
+
+thread_local! {
+    /// Per-thread scratch buffer used by [`with_scratch`]. The buffer
+    /// retains its capacity across calls so the common case (point lookup,
+    /// `put`, `delete`) avoids the per-call allocation that
+    /// `serialize_to_vec` would otherwise perform.
+    static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Encode a value into a thread-local scratch buffer and pass the resulting
+/// byte slice to `f`. The scratch buffer is reused across calls, so the hot
+/// path (`get`/`put`/`delete`/`contains`/`update`) avoids allocating a
+/// fresh `Vec<u8>` on every invocation.
+///
+/// `f` must not recursively call `with_scratch` — the inner call would
+/// panic on a double `RefCell::borrow_mut`. None of the storage hot paths
+/// recurse, so this restriction is invisible in practice.
+pub fn with_scratch<T, F, R>(value: &T, f: F) -> io::Result<R>
 where
-    T: for<'a> Serialize<HighSerializer<CountingWriter, ArenaHandle<'a>, RkyvError>>
-        + for<'buf, 'a> Serialize<HighSerializer<Buffer<'buf>, ArenaHandle<'a>, RkyvError>>,
+    T: Encode,
+    F: FnOnce(&[u8]) -> io::Result<R>,
 {
-    let size = serialized_size(value)?;
-    let mut buf = vec![0u8; size];
-    let written = serialize_into(value, &mut buf)?;
-    debug_assert_eq!(written, size, "CountingWriter and Buffer disagreed on size");
-    Ok(buf)
+    SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        let written = serialize_into_std(value, &mut *buf)?;
+        f(&buf[..written])
+    })
+}
+
+/// Decode a value from `src`. Returns the decoded value, discarding the
+/// trailing byte count.
+pub fn deserialize_from<T: Decode<()>>(src: &[u8]) -> io::Result<T> {
+    bincode::decode_from_slice(src, cfg())
+        .map(|(value, _bytes_read)| value)
+        .map_err(decode_err)
+}
+
+#[inline]
+fn encode_err(e: EncodeError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
+#[inline]
+fn decode_err(e: DecodeError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
 
 // ---------------------------------------------------------------------------

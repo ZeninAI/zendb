@@ -543,6 +543,77 @@ impl<'a, K: Ord, V> Iterator for OrderIndexRevRangeIter<'a, K, V> {
     }
 }
 
+pub struct ConsumeValIter<'a, K, V> {
+    mmap: &'a [u8],
+    cursor: usize,
+    _marker: std::marker::PhantomData<(K, V)>,
+}
+
+impl<'a, K, V> Iterator for ConsumeValIter<'a, K, V>
+where
+    K: Decode<()>,
+    V: Decode<()>,
+{
+    type Item = io::Result<(K, Option<V>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let value_size = read_u32_le(self.mmap, self.cursor)?;
+        if value_size == 0 {
+            return None;
+        }
+
+        let is_tombstone = value_size == TOMBSTONE;
+        let key_size_off = if is_tombstone {
+            self.cursor + 4
+        } else {
+            self.cursor + 4 + value_size as usize
+        };
+        let key_size = match read_u32_le(self.mmap, key_size_off) {
+            Some(s) => s,
+            None => {
+                return Some(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated WAL entry",
+                )));
+            }
+        };
+        let key_start = key_size_off + 4;
+        let entry_end = key_start + key_size as usize;
+        if entry_end > self.mmap.len() {
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated WAL entry",
+            )));
+        }
+
+        let key: K = match deserialize_from(&self.mmap[key_start..entry_end]) {
+            Ok(k) => k,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let item = if is_tombstone {
+            (key, None)
+        } else {
+            let value_start = self.cursor + 4;
+            let value_end = value_start + value_size as usize;
+            if value_end > self.mmap.len() {
+                return Some(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated WAL entry",
+                )));
+            }
+            let value: V = match deserialize_from(&self.mmap[value_start..value_end]) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            (key, Some(value))
+        };
+
+        self.cursor = entry_end;
+        Some(Ok(item))
+    }
+}
+
 struct TxState {
     staging: PooledBuf,
     tx_base: u64,
@@ -850,6 +921,14 @@ where
             self.compact()?;
         }
         Ok(())
+    }
+
+    pub fn consume_val(&self) -> ConsumeValIter<'_, K, V> {
+        ConsumeValIter {
+            mmap: &self.mmap[..],
+            cursor: HEADER_SIZE,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     fn grow(&mut self, desired: u64) -> io::Result<()> {

@@ -46,7 +46,7 @@ use crate::core::backend::{Backend, OrderedBackend};
 use crate::utils::{
     fast_rand,
     reusables::PooledBuf,
-    serdes::{deserialize_from, read_u32_le, serialize_into, serialized_size},
+    serdes::{deserialize_from, read_u32_le, with_scratch, with_two_scratches},
 };
 
 const DEFAULT_INITIAL_CAPACITY: u64 = 1024 * 1024;
@@ -641,36 +641,32 @@ where
     K: Encode,
     V: Encode,
 {
-    let v_size = serialized_size(value)?;
-    let k_size = serialized_size(key)?;
-    let total = 8usize
-        .checked_add(v_size)
-        .and_then(|n| n.checked_add(k_size))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow"))?;
+    // Encode key + value once; `with_two_scratches` returns the slice
+    // lengths via `.len()` so we never re-run bincode just to count bytes.
+    with_two_scratches(key, value, |kb, vb| {
+        let total = 8usize
+            .checked_add(vb.len())
+            .and_then(|n| n.checked_add(kb.len()))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow"))?;
 
-    if let Some(tx_state) = tx.as_mut() {
-        let local = tx_state.staging.len();
-        tx_state.staging.resize(local + total, 0);
-        encode_live_record(
-            &mut tx_state.staging[local..local + total],
-            key,
-            value,
-            v_size,
-            k_size,
-        )?;
-        return Ok(total as u64);
-    }
+        if let Some(tx_state) = tx.as_mut() {
+            let local = tx_state.staging.len();
+            tx_state.staging.resize(local + total, 0);
+            encode_live_record(&mut tx_state.staging[local..local + total], kb, vb);
+            return Ok(total as u64);
+        }
 
-    let offset = stats.data_size as usize;
-    let end = offset
-        .checked_add(total)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow"))?;
-    if end > mmap.len() {
-        grow_into(mmap, file, end as u64)?;
-    }
-    encode_live_record(&mut mmap[offset..end], key, value, v_size, k_size)?;
-    stats.data_size = end as u64;
-    Ok(total as u64)
+        let offset = stats.data_size as usize;
+        let end = offset.checked_add(total).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow")
+        })?;
+        if end > mmap.len() {
+            grow_into(mmap, file, end as u64)?;
+        }
+        encode_live_record(&mut mmap[offset..end], kb, vb);
+        stats.data_size = end as u64;
+        Ok(total as u64)
+    })
 }
 
 fn append_tombstone_into<K>(
@@ -683,28 +679,29 @@ fn append_tombstone_into<K>(
 where
     K: Encode,
 {
-    let k_size = serialized_size(key)?;
-    let total = 8usize
-        .checked_add(k_size)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow"))?;
+    with_scratch(key, |kb| {
+        let total = 8usize.checked_add(kb.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow")
+        })?;
 
-    if let Some(tx_state) = tx.as_mut() {
-        let local = tx_state.staging.len();
-        tx_state.staging.resize(local + total, 0);
-        encode_tombstone_record(&mut tx_state.staging[local..local + total], key, k_size)?;
-        return Ok(total as u64);
-    }
+        if let Some(tx_state) = tx.as_mut() {
+            let local = tx_state.staging.len();
+            tx_state.staging.resize(local + total, 0);
+            encode_tombstone_record(&mut tx_state.staging[local..local + total], kb);
+            return Ok(total as u64);
+        }
 
-    let offset = stats.data_size as usize;
-    let end = offset
-        .checked_add(total)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow"))?;
-    if end > mmap.len() {
-        grow_into(mmap, file, end as u64)?;
-    }
-    encode_tombstone_record(&mut mmap[offset..end], key, k_size)?;
-    stats.data_size = end as u64;
-    Ok(total as u64)
+        let offset = stats.data_size as usize;
+        let end = offset.checked_add(total).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow")
+        })?;
+        if end > mmap.len() {
+            grow_into(mmap, file, end as u64)?;
+        }
+        encode_tombstone_record(&mut mmap[offset..end], kb);
+        stats.data_size = end as u64;
+        Ok(total as u64)
+    })
 }
 
 fn append_entry_raw<K, V>(
@@ -718,50 +715,41 @@ where
     K: Encode,
     V: Encode,
 {
-    let v_size = serialized_size(value)?;
-    let k_size = serialized_size(key)?;
-    let total = 8usize
-        .checked_add(v_size)
-        .and_then(|n| n.checked_add(k_size))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow"))?;
-    let offset = cursor as usize;
-    let end = offset
-        .checked_add(total)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow"))?;
-    if end > mmap.len() {
-        grow_into(mmap, file, end as u64)?;
-    }
-    encode_live_record(&mut mmap[offset..end], key, value, v_size, k_size)?;
-    Ok(end as u64)
+    with_two_scratches(key, value, |kb, vb| {
+        let total = 8usize
+            .checked_add(vb.len())
+            .and_then(|n| n.checked_add(kb.len()))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow"))?;
+        let offset = cursor as usize;
+        let end = offset.checked_add(total).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow")
+        })?;
+        if end > mmap.len() {
+            grow_into(mmap, file, end as u64)?;
+        }
+        encode_live_record(&mut mmap[offset..end], kb, vb);
+        Ok(end as u64)
+    })
 }
 
-fn encode_live_record<K, V>(
-    dst: &mut [u8],
-    key: &K,
-    value: &V,
-    v_size: usize,
-    k_size: usize,
-) -> io::Result<()>
-where
-    K: Encode,
-    V: Encode,
-{
+/// Pack `[vlen u32][value][klen u32][key]` from pre-encoded byte slices.
+/// Callers pre-encode via `with_two_scratches` (or peer scratch buffers)
+/// so neither key nor value is re-serialized inside this routine.
+fn encode_live_record(dst: &mut [u8], key_bytes: &[u8], value_bytes: &[u8]) {
+    let v_size = value_bytes.len();
+    let k_size = key_bytes.len();
     dst[0..4].copy_from_slice(&(v_size as u32).to_le_bytes());
-    let written = serialize_into(value, &mut dst[4..4 + v_size])?;
-    debug_assert_eq!(written, v_size);
+    dst[4..4 + v_size].copy_from_slice(value_bytes);
     let k_len_off = 4 + v_size;
     dst[k_len_off..k_len_off + 4].copy_from_slice(&(k_size as u32).to_le_bytes());
-    let written = serialize_into(key, &mut dst[k_len_off + 4..])?;
-    debug_assert_eq!(written, k_size);
-    Ok(())
+    dst[k_len_off + 4..k_len_off + 4 + k_size].copy_from_slice(key_bytes);
 }
 
-fn encode_tombstone_record<K: Encode>(dst: &mut [u8], key: &K, k_size: usize) -> io::Result<()> {
+fn encode_tombstone_record(dst: &mut [u8], key_bytes: &[u8]) {
+    let k_size = key_bytes.len();
     dst[0..4].copy_from_slice(&TOMBSTONE.to_le_bytes());
     dst[4..8].copy_from_slice(&(k_size as u32).to_le_bytes());
-    let written = serialize_into(key, &mut dst[8..])?;
-    debug_assert_eq!(written, k_size);
-    Ok(())
+    dst[8..8 + k_size].copy_from_slice(key_bytes);
 }
 
 #[derive(Debug, Clone, Copy, Encode, Decode)]
@@ -1371,6 +1359,7 @@ impl<K: Ord, V> fmt::Debug for OrderLog<K, V> {
 mod tests {
     use super::*;
     use crate::core::backend::{Backend, OrderedBackend};
+    use crate::utils::serdes::serialized_size;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 

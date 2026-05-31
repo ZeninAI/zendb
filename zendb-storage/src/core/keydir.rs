@@ -129,7 +129,7 @@ use memmap2::MmapMut;
 
 use crate::core::backend::Backend;
 use crate::utils::reusables::PooledBuf;
-use crate::utils::serdes::{deserialize_from, read_u32_le, serialize_into, serialized_size};
+use crate::utils::serdes::{deserialize_from, read_u32_le, with_two_scratches};
 
 const DEFAULT_INITIAL_CAPACITY: u64 = 1024 * 1024;
 const DEFAULT_COMPACTION_RATIO: f64 = 0.5;
@@ -246,48 +246,50 @@ where
     K: Encode,
     V: Encode,
 {
-    let v_size = serialized_size(value)?;
-    let k_size = serialized_size(key)?;
-    let total = 8 + v_size + k_size;
+    // Encode key + value once into pooled scratch buffers; the slice
+    // lengths give the on-disk sizes for free. The previous version
+    // double-encoded each side (once for `serialized_size`, once via
+    // `serialize_into` into the destination) — four bincode passes per
+    // put.
+    with_two_scratches(key, value, |kb, vb| {
+        let k_size = kb.len();
+        let v_size = vb.len();
+        let total = 8 + v_size + k_size;
 
-    if let Some(tx_state) = tx.as_mut() {
-        let local = tx_state.staging.len();
-        let virtual_offset = tx_state
-            .tx_base
-            .checked_add(local as u64)
+        if let Some(tx_state) = tx.as_mut() {
+            let local = tx_state.staging.len();
+            let virtual_offset = tx_state.tx_base.checked_add(local as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir offset overflow")
+            })?;
+            tx_state.staging.resize(local + total, 0);
+            let dst = &mut tx_state.staging[local..local + total];
+            dst[0..4].copy_from_slice(&(v_size as u32).to_le_bytes());
+            dst[4..4 + v_size].copy_from_slice(vb);
+            let k_len_off = 4 + v_size;
+            dst[k_len_off..k_len_off + 4].copy_from_slice(&(k_size as u32).to_le_bytes());
+            dst[k_len_off + 4..total].copy_from_slice(kb);
+            return Ok((virtual_offset, v_size as u32, k_size as u32));
+        }
+
+        let offset = stats.data_size as usize;
+        let end = offset
+            .checked_add(total)
             .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir offset overflow"))?;
-        tx_state.staging.resize(local + total, 0);
-        let dst = &mut tx_state.staging[local..local + total];
-        dst[0..4].copy_from_slice(&(v_size as u32).to_le_bytes());
-        let written = serialize_into(value, &mut dst[4..4 + v_size])?;
-        debug_assert_eq!(written, v_size);
-        let k_len_off = 4 + v_size;
-        dst[k_len_off..k_len_off + 4].copy_from_slice(&(k_size as u32).to_le_bytes());
-        let written = serialize_into(key, &mut dst[k_len_off + 4..total])?;
-        debug_assert_eq!(written, k_size);
-        return Ok((virtual_offset, v_size as u32, k_size as u32));
-    }
+        if end > mmap.len() {
+            grow_into(mmap, file, end as u64)?;
+        }
 
-    let offset = stats.data_size as usize;
-    let end = offset
-        .checked_add(total)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir offset overflow"))?;
-    if end > mmap.len() {
-        grow_into(mmap, file, end as u64)?;
-    }
+        mmap[offset..offset + 4].copy_from_slice(&(v_size as u32).to_le_bytes());
+        let v_off = offset + 4;
+        mmap[v_off..v_off + v_size].copy_from_slice(vb);
+        let k_len_off = v_off + v_size;
+        mmap[k_len_off..k_len_off + 4].copy_from_slice(&(k_size as u32).to_le_bytes());
+        let k_off = k_len_off + 4;
+        mmap[k_off..k_off + k_size].copy_from_slice(kb);
 
-    mmap[offset..offset + 4].copy_from_slice(&(v_size as u32).to_le_bytes());
-    let v_off = offset + 4;
-    let written = serialize_into(value, &mut mmap[v_off..v_off + v_size])?;
-    debug_assert_eq!(written, v_size);
-    let k_len_off = v_off + v_size;
-    mmap[k_len_off..k_len_off + 4].copy_from_slice(&(k_size as u32).to_le_bytes());
-    let k_off = k_len_off + 4;
-    let written = serialize_into(key, &mut mmap[k_off..k_off + k_size])?;
-    debug_assert_eq!(written, k_size);
-
-    stats.data_size = end as u64;
-    Ok((offset as u64, v_size as u32, k_size as u32))
+        stats.data_size = end as u64;
+        Ok((offset as u64, v_size as u32, k_size as u32))
+    })
 }
 
 /// Append a tombstone for `old`, reusing the already-encoded key bytes

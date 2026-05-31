@@ -1,27 +1,35 @@
-//! KeyDir, OrderLog, and BPlusTree bulk-write benchmarks.
+//! KeyDir, OrderLog, LMDB, and BPlusTree storage benchmarks.
 //!
-//! The headline comparison is **write-through vs `open_tx` / `close_tx`
-//! bulk-write mode** — same backend, same workload, two write modes.
-//! The tx-mode win comes from amortizing the per-op overheads that the
-//! no-tx path pays on every call:
+//! The suite keeps the workload shape constant within each scenario and
+//! labels each backend by the write mode it actually implements:
 //!
-//! - mmap `grow` (file `set_len` + remap) — at most one per batch in
-//!   tx mode, vs. one every time the no-tx path crosses the current
-//!   capacity boundary.
-//! - `maybe_compact` (dead-byte ratio check + possibly a full sweep)
-//!   — at most one per batch in tx mode, vs. one per record in no-tx.
+//! - KeyDir and OrderLog expose a real `open_tx` / `close_tx` bulk-write
+//!   window, so they are measured both as per-call writes and as one
+//!   explicit batch.
+//! - LMDB is measured as one write transaction per item and as one batch
+//!   transaction, matching the same commit-amortization axis.
+//! - BPlusTree writes directly into its mmap; `open_tx` / `close_tx` are
+//!   inherited no-ops. It is therefore measured once for direct `put`
+//!   loops, plus its meaningful `bulk_put_sorted` bottom-up load path.
+//!
+//! For the batching backends, the batch-mode win comes from amortizing
+//! the per-op overheads that the direct path pays on every call:
+//!
+//! - mmap `grow` (file `set_len` + remap) - at most one per batch, vs.
+//!   one every time the direct path crosses the current capacity boundary.
+//! - `maybe_compact` (dead-byte ratio check + possibly a full sweep) - at
+//!   most one per batch, vs. one per record in the direct path.
 //!
 //! Two scenarios cover both axes:
 //!
 //! - **fresh** — N unique keys, no overwrites. No dead bytes, no
 //!   compaction triggers. This isolates the steady-state encode cost;
-//!   the tx path pays an extra staging→mmap memcpy at commit, so it is
-//!   *slightly slower* than no-tx in this scenario. Worth measuring
-//!   because it sets the floor for the tx path's overhead.
+//!   the batching path pays an extra staging-to-mmap memcpy at commit, so
+//!   it can be slightly slower than direct writes in this scenario. Worth
+//!   measuring because it sets the floor for the batching overhead.
 //! - **churn** — N puts spread across N/4 unique keys (4× overwrite
-//!   ratio). This generates dead bytes and exercises `maybe_compact`
-//!   in the no-tx path. The tx path defers all of it to commit and
-//!   wins.
+//!   ratio). This generates dead bytes and exercises `maybe_compact` in
+//!   direct-write paths. Batching backends defer that work to commit.
 //!
 //! OrderLog also has sorted bulk paths. Its unsorted bulk methods collect
 //! and sort before delegating to the sorted finger-walk implementation, so
@@ -30,8 +38,9 @@
 //!
 //! LMDB sits next to the in-tree backends as a baseline:
 //!
-//! - KeyDir no-tx ↔ LMDB one-txn-per-op (both pay a per-record commit).
-//! - KeyDir open_tx ↔ LMDB single batch txn (both amortize commit).
+//! - KeyDir/OrderLog direct writes <-> LMDB one-txn-per-op.
+//! - KeyDir/OrderLog `open_tx` batches <-> LMDB single batch txn.
+//! - BPlusTree direct writes stand alone because its tx bracket is a no-op.
 //!
 //! ## Running
 //!
@@ -64,9 +73,10 @@ use crate::{
 
 // ---------------------------------------------------------------------------
 // Workload knobs — kept identical across every scenario so the numbers
-// are directly comparable. Keys and values are both `u64`, encoded via
-// bincode for every backend (KeyDir uses bincode internally; LMDB sees
-// the pre-encoded bytes).
+// are directly comparable. KeyDir, OrderLog, and LMDB use `u64` keys.
+// BPlusTree uses fixed-width `[u8; 8]` big-endian keys so its serialized
+// key bytes preserve numeric order without adding Vec allocation or a
+// length prefix. Values are `u64` for every backend.
 // ---------------------------------------------------------------------------
 
 /// Number of `put` operations in each write scenario.
@@ -74,8 +84,8 @@ const N: u64 = 10_000;
 
 /// For the "churn" scenario: number of distinct keys. With `N` puts
 /// across `N / CHURN_FACTOR` keys, each key is overwritten ~4 times on
-/// average — enough to trigger `maybe_compact` repeatedly in the no-tx
-/// path.
+/// average — enough to trigger `maybe_compact` repeatedly in direct
+/// write paths.
 const CHURN_FACTOR: u64 = 4;
 
 /// LMDB map size — larger than the worst-case dataset so no resize event
@@ -85,7 +95,7 @@ const LMDB_MAP_SIZE: usize = 512 * 1024 * 1024;
 fn keydir_config() -> KeyDirConfig {
     // Use defaults: 1 MiB initial capacity (so the bulk-load triggers
     // mmap growth), compaction_ratio 0.5 (so overwrites in the churn
-    // scenario trigger maybe_compact in the no-tx path).
+    // scenario trigger maybe_compact in the direct path).
     KeyDirConfig::default()
 }
 
@@ -205,7 +215,7 @@ fn lmdb_payload(keys: &[u64]) -> Vec<(Vec<u8>, Vec<u8>)> {
 
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn keydir_writes_fresh_no_tx() -> io::Result<()> {
+fn keydir_writes_fresh_direct() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("keydir.bin");
     let mut kd = KeyDir::<u64, u64>::create(&path, keydir_config())?;
@@ -218,7 +228,7 @@ fn keydir_writes_fresh_no_tx() -> io::Result<()> {
         kd.flush()
     })?;
 
-    BenchResult::new("KeyDir fresh writes (no tx)", N, elapsed).print();
+    BenchResult::new("KeyDir fresh writes (direct put)", N, elapsed).print();
     Ok(())
 }
 
@@ -249,7 +259,7 @@ fn keydir_writes_fresh_in_tx() -> io::Result<()> {
 
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn keydir_writes_churn_no_tx() -> io::Result<()> {
+fn keydir_writes_churn_direct() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("keydir.bin");
     let mut kd = KeyDir::<u64, u64>::create(&path, keydir_config())?;
@@ -262,7 +272,7 @@ fn keydir_writes_churn_no_tx() -> io::Result<()> {
         kd.flush()
     })?;
 
-    BenchResult::new("KeyDir churn writes (no tx)", N, elapsed).print();
+    BenchResult::new("KeyDir churn writes (direct put)", N, elapsed).print();
     Ok(())
 }
 
@@ -325,7 +335,7 @@ fn keydir_reads() -> io::Result<()> {
 
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn orderlog_writes_fresh_no_tx() -> io::Result<()> {
+fn orderlog_writes_fresh_direct() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("orderlog.bin");
     let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
@@ -338,7 +348,7 @@ fn orderlog_writes_fresh_no_tx() -> io::Result<()> {
         ol.flush()
     })?;
 
-    BenchResult::new("OrderLog fresh writes (no tx)", N, elapsed).print();
+    BenchResult::new("OrderLog fresh writes (direct put)", N, elapsed).print();
     Ok(())
 }
 
@@ -369,7 +379,7 @@ fn orderlog_writes_fresh_in_tx() -> io::Result<()> {
 
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn orderlog_writes_churn_no_tx() -> io::Result<()> {
+fn orderlog_writes_churn_direct() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("orderlog.bin");
     let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
@@ -382,7 +392,7 @@ fn orderlog_writes_churn_no_tx() -> io::Result<()> {
         ol.flush()
     })?;
 
-    BenchResult::new("OrderLog churn writes (no tx)", N, elapsed).print();
+    BenchResult::new("OrderLog churn writes (direct put)", N, elapsed).print();
     Ok(())
 }
 
@@ -587,120 +597,78 @@ fn lmdb_reads() {
 // BPlusTree orders entries by lexicographic bincode key bytes (not
 // `K::Ord`). Using `u64` directly with bincode's little-endian encoding
 // would NOT preserve numeric order — sorted bulk-load and range scans
-// would be misordered. So btree benchmarks use `Vec<u8>` keys filled
-// with big-endian byte representations of `u64`, which IS lex-order
-// preserving. The value side is still `u64` for parity with the other
-// backends' value payload.
+// would be misordered. So btree benchmarks use fixed-width `[u8; 8]`
+// keys filled with big-endian byte representations of `u64`, which are
+// lex-order preserving and avoid extra heap allocation. The value side
+// is still `u64` for parity with the other backends' value payload.
 // ---------------------------------------------------------------------------
 
-/// Encode a u64 as a big-endian `Vec<u8>` (8 bytes). Lex order on the
-/// returned bytes matches numeric order on the input.
+/// Encode a u64 as big-endian bytes. Lex order on the returned bytes
+/// matches numeric order on the input.
 #[inline]
-fn be_key(k: u64) -> Vec<u8> {
-    k.to_be_bytes().to_vec()
+fn be_key(k: u64) -> [u8; 8] {
+    k.to_be_bytes()
 }
 
-fn btree_fresh_keys() -> Vec<Vec<u8>> {
+fn btree_fresh_keys() -> Vec<[u8; 8]> {
     (0..N).map(be_key).collect()
 }
 
-fn btree_churn_keys() -> Vec<Vec<u8>> {
+fn btree_churn_keys() -> Vec<[u8; 8]> {
     let domain = N / CHURN_FACTOR;
     (0..N).map(|k| be_key(k % domain)).collect()
 }
 
-fn btree_kv_payload(keys: &[Vec<u8>]) -> Vec<(Vec<u8>, u64)> {
+fn btree_kv_payload(keys: &[[u8; 8]]) -> Vec<([u8; 8], u64)> {
     keys.iter()
         .enumerate()
-        .map(|(i, k)| (k.clone(), (i as u64).wrapping_mul(7)))
+        .map(|(i, k)| (*k, (i as u64).wrapping_mul(7)))
         .collect()
 }
 
-fn btree_reversed_kv_payload(keys: &[Vec<u8>]) -> Vec<(Vec<u8>, u64)> {
+fn btree_reversed_kv_payload(keys: &[[u8; 8]]) -> Vec<([u8; 8], u64)> {
     keys.iter()
         .enumerate()
         .rev()
-        .map(|(i, k)| (k.clone(), (i as u64).wrapping_mul(7)))
+        .map(|(i, k)| (*k, (i as u64).wrapping_mul(7)))
         .collect()
 }
 
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn btree_writes_fresh_no_tx() -> io::Result<()> {
+fn btree_writes_fresh_direct() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
-    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+    let mut t = BPlusTree::<[u8; 8], u64>::create(&path, btree_config())?;
     let keys = btree_fresh_keys();
 
     let elapsed = timed(|| {
         for (i, k) in keys.iter().enumerate() {
-            t.put(k.clone(), (i as u64).wrapping_mul(7))?;
+            t.put(*k, (i as u64).wrapping_mul(7))?;
         }
         t.flush()
     })?;
 
-    BenchResult::new("BTree  fresh writes (no tx)", N, elapsed).print();
+    BenchResult::new("BTree  fresh writes (direct put)", N, elapsed).print();
     Ok(())
 }
 
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn btree_writes_fresh_in_tx() -> io::Result<()> {
+fn btree_writes_churn_direct() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
-    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
-    let keys = btree_fresh_keys();
-
-    let elapsed = timed(|| {
-        t.open_tx()?;
-        for (i, k) in keys.iter().enumerate() {
-            t.put(k.clone(), (i as u64).wrapping_mul(7))?;
-        }
-        t.close_tx()?;
-        t.flush()
-    })?;
-
-    BenchResult::new("BTree  fresh writes (open_tx batch)", N, elapsed).print();
-    Ok(())
-}
-
-#[test]
-#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn btree_writes_churn_no_tx() -> io::Result<()> {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("btree.bin");
-    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+    let mut t = BPlusTree::<[u8; 8], u64>::create(&path, btree_config())?;
     let keys = btree_churn_keys();
 
     let elapsed = timed(|| {
         for (i, k) in keys.iter().enumerate() {
-            t.put(k.clone(), (i as u64).wrapping_mul(7))?;
+            t.put(*k, (i as u64).wrapping_mul(7))?;
         }
         t.flush()
     })?;
 
-    BenchResult::new("BTree  churn writes (no tx)", N, elapsed).print();
-    Ok(())
-}
-
-#[test]
-#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn btree_writes_churn_in_tx() -> io::Result<()> {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("btree.bin");
-    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
-    let keys = btree_churn_keys();
-
-    let elapsed = timed(|| {
-        t.open_tx()?;
-        for (i, k) in keys.iter().enumerate() {
-            t.put(k.clone(), (i as u64).wrapping_mul(7))?;
-        }
-        t.close_tx()?;
-        t.flush()
-    })?;
-
-    BenchResult::new("BTree  churn writes (open_tx batch)", N, elapsed).print();
+    BenchResult::new("BTree  churn writes (direct put)", N, elapsed).print();
     Ok(())
 }
 
@@ -711,7 +679,7 @@ fn btree_bulk_put_sorted_fresh() -> io::Result<()> {
     // are already in lex sort order — perfect for bulk_put_sorted.
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
-    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+    let mut t = BPlusTree::<[u8; 8], u64>::create(&path, btree_config())?;
     let items = btree_kv_payload(&btree_fresh_keys());
 
     let elapsed = timed(|| {
@@ -726,12 +694,12 @@ fn btree_bulk_put_sorted_fresh() -> io::Result<()> {
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn btree_bulk_put_unsorted_fresh() -> io::Result<()> {
-    // Reversed input — exercises the bulk_put auto-tx loop fallback
-    // (no bottom-up since the input isn't sorted in lex order from the
-    // tree's perspective).
+    // Reversed input exercises the unsorted bulk_put fallback. For
+    // BPlusTree this is intentionally just the direct put loop; only
+    // sorted input on an empty tree can use the bottom-up build.
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
-    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+    let mut t = BPlusTree::<[u8; 8], u64>::create(&path, btree_config())?;
     let items = btree_reversed_kv_payload(&btree_fresh_keys());
 
     let elapsed = timed(|| {
@@ -739,7 +707,7 @@ fn btree_bulk_put_unsorted_fresh() -> io::Result<()> {
         t.flush()
     })?;
 
-    BenchResult::new("BTree  fresh bulk_put (auto-tx loop)", N, elapsed).print();
+    BenchResult::new("BTree  fresh bulk_put (put loop)", N, elapsed).print();
     Ok(())
 }
 
@@ -748,7 +716,7 @@ fn btree_bulk_put_unsorted_fresh() -> io::Result<()> {
 fn btree_reads() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
-    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+    let mut t = BPlusTree::<[u8; 8], u64>::create(&path, btree_config())?;
 
     let keys = btree_fresh_keys();
     t.bulk_put_sorted(btree_kv_payload(&keys))?;
@@ -772,7 +740,7 @@ fn btree_range_scan() -> io::Result<()> {
     use crate::core::backend::OrderedBackend;
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
-    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+    let mut t = BPlusTree::<[u8; 8], u64>::create(&path, btree_config())?;
     let keys = btree_fresh_keys();
     t.bulk_put_sorted(btree_kv_payload(&keys))?;
     t.flush()?;
@@ -797,7 +765,7 @@ fn btree_range_rev_scan() -> io::Result<()> {
     use crate::core::backend::OrderedBackend;
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
-    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+    let mut t = BPlusTree::<[u8; 8], u64>::create(&path, btree_config())?;
     let keys = btree_fresh_keys();
     t.bulk_put_sorted(btree_kv_payload(&keys))?;
     t.flush()?;

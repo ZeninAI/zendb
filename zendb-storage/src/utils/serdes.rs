@@ -102,6 +102,23 @@ where
     f(&buf[..written])
 }
 
+/// Encode two values into independent pooled scratch buffers and hand
+/// both slices to `f`. Avoids the double-encode that `serialized_size` +
+/// `serialize_into` pays on every keyed write — the encode is the only
+/// pass, and `len()` is the size.
+pub fn with_two_scratches<A, B, F, R>(a: &A, b: &B, f: F) -> io::Result<R>
+where
+    A: Encode,
+    B: Encode,
+    F: FnOnce(&[u8], &[u8]) -> io::Result<R>,
+{
+    let mut buf_a = PooledBuf::acquire();
+    let written_a = serialize_into_std(a, &mut *buf_a)?;
+    let mut buf_b = PooledBuf::acquire();
+    let written_b = serialize_into_std(b, &mut *buf_b)?;
+    f(&buf_a[..written_a], &buf_b[..written_b])
+}
+
 /// Decode a value from `src`. Returns the decoded value, discarding the
 /// trailing byte count.
 pub fn deserialize_from<T: Decode<()>>(src: &[u8]) -> io::Result<T> {

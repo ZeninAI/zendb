@@ -1378,16 +1378,14 @@ where
             }
         };
 
-        let mut used = 0usize;
-        let mut mid = order.len();
-        for (j, &slot_eo) in order.iter().enumerate() {
-            let sz = entry_size(slot_eo);
-            if used + sz > PAGE_SIZE - LEAF_HEADER_SIZE {
-                mid = j;
-                break;
-            }
-            used += sz;
-        }
+        // First, check whether the merged set fits in a single page — if so,
+        // re-pack only and skip the split. Otherwise pick `mid` at the byte
+        // midpoint so both halves get ~50% load. The previous "fill left
+        // until overflow" policy collapsed for prepend-heavy workloads:
+        // the new entry plus the smallest old entries fully repacked the
+        // original page, the next prepend hit the same full page, and the
+        // tree degenerated to ~1 entry per leaf.
+        let total: usize = order.iter().map(|&s| entry_size(s)).sum();
 
         // Reset the page header for fresh packing.
         {
@@ -1396,7 +1394,7 @@ where
             wr_u32(&mut leaf[4..8], PAGE_SIZE as u32);
         }
 
-        if mid >= order.len() {
+        if total <= PAGE_SIZE - LEAF_HEADER_SIZE {
             // Everything fits in the original page; just re-pack.
             for &slot_eo in &order {
                 if slot_eo == NEW_SLOT {
@@ -1408,7 +1406,20 @@ where
             self.add_leaf_entry_bytes(new_entry_bytes);
             return Ok(None);
         }
-        let mid = mid.max(1);
+
+        let half = total / 2;
+        let mid = {
+            let mut used = 0usize;
+            let mut m = 1usize;
+            for (j, &slot_eo) in order.iter().enumerate() {
+                used += entry_size(slot_eo);
+                if used >= half {
+                    m = j + 1;
+                    break;
+                }
+            }
+            m.clamp(1, order.len() - 1)
+        };
 
         // Compute the separator before allocating the right page —
         // borrows of `scratch` via `key_bytes_of` must end before any
@@ -1709,16 +1720,10 @@ where
         };
         let entry_size = |slot_eo: usize| -> usize { 10 + key_bytes_of(slot_eo).len() + SLOT_SIZE };
 
-        let mut used = 0usize;
-        let mut mid = order.len();
-        for (j, &slot_eo) in order.iter().enumerate() {
-            let sz = entry_size(slot_eo);
-            if used + sz > PAGE_SIZE - HEADER_SIZE {
-                mid = j;
-                break;
-            }
-            used += sz;
-        }
+        // See `leaf_split` for why splitting at the byte midpoint matters —
+        // the previous "fill left until overflow" policy degenerated for
+        // prepend-heavy separator inserts.
+        let total: usize = order.iter().map(|&s| entry_size(s)).sum();
 
         // Reset header. The leftmost_child pointer at [8..16] is
         // preserved (we only zero count + data_off).
@@ -1729,7 +1734,7 @@ where
         }
 
         // Append-only repack — `order` is already in ascending key order.
-        if mid >= order.len() {
+        if total <= PAGE_SIZE - HEADER_SIZE {
             for &slot_eo in &order {
                 if slot_eo == NEW_SLOT {
                     self.internal_append_entry(page, key, child);
@@ -1739,7 +1744,20 @@ where
             }
             return Ok(None);
         }
-        let mid = mid.max(1);
+
+        let half = total / 2;
+        let mid = {
+            let mut used = 0usize;
+            let mut m = 1usize;
+            for (j, &slot_eo) in order.iter().enumerate() {
+                used += entry_size(slot_eo);
+                if used >= half {
+                    m = j + 1;
+                    break;
+                }
+            }
+            m.clamp(1, order.len() - 1)
+        };
 
         let sep = {
             let left_last = key_bytes_of(order[mid - 1]).to_vec();

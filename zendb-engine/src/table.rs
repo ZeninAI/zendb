@@ -2,6 +2,7 @@
 
 use std::{fs, io, path::Path};
 
+use bincode::{config, decode_from_slice, encode_to_vec};
 use rkyv::Archived;
 use zendb_storage::{
     core::{
@@ -13,7 +14,7 @@ use zendb_storage::{
     },
     utils::serdes::ValueRef,
 };
-use zendb_types::{Cell, Delta, PrimaryKey, TypedValue};
+use zendb_types::{Cell, Delta, PrimaryKey};
 
 use crate::config::{TableConfig, TableKind};
 
@@ -212,9 +213,7 @@ impl Table {
 
     /// Apply a delta: write to WAL, buffer in memory, optionally flush.
     pub fn apply(&mut self, delta: Delta) -> io::Result<()> {
-        let mut buf = Vec::new();
-        delta
-            .encode(&mut buf)
+        let buf = encode_to_vec(&delta, config::standard())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         self.wal.append(&buf)?;
 
@@ -265,8 +264,7 @@ impl Table {
                 cell.apply_delta(delta);
             }
 
-            let mut buf = Vec::new();
-            cell.encode(&mut buf)
+            let buf = encode_to_vec(&cell, config::standard())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             self.backend.put(key, buf)?;
         }
@@ -333,7 +331,7 @@ impl Table {
 
         for entry in wal.into_iter() {
             let bytes = entry?.data;
-            let (delta, _) = Delta::decode(&bytes)
+            let (delta, _) = decode_from_slice(&bytes, config::standard())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
             let key = primary_key_bytes(&delta.primary_key);
@@ -356,13 +354,15 @@ impl Table {
 }
 
 fn primary_key_bytes(pk: &PrimaryKey) -> Vec<u8> {
-    let mut buf = Vec::new();
-    pk.0.encode(&mut buf).expect("primary key encode");
-    buf
+    encode_to_vec(&pk.0, config::standard()).expect("primary key encode")
 }
 
 fn decode_cell(bytes: Option<&[u8]>) -> Option<Cell> {
-    bytes.and_then(|b| Cell::decode(b).ok().map(|(c, _)| c))
+    bytes.and_then(|b| {
+        decode_from_slice(b, config::standard())
+            .ok()
+            .map(|(c, _)| c)
+    })
 }
 
 #[cfg(test)]
@@ -379,11 +379,7 @@ mod tests {
 
     fn make_delta(key: &str, val: &str, hlc_ms: u64) -> (Delta, Vec<u8>) {
         let pk = PrimaryKey(zendb_types::AtomValue::String(key.into()));
-        let pk_bytes = {
-            let mut buf = Vec::new();
-            pk.0.encode(&mut buf).unwrap();
-            buf
-        };
+        let pk_bytes = encode_to_vec(&pk.0, config::standard()).unwrap();
         let d = Delta {
             table_id: zendb_types::TableId("test".into()),
             primary_key: pk,

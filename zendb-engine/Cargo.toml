@@ -11,3 +11,4 @@ zendb-storage = { path = "../zendb-storage" }
 blake3.workspace = true
 hashbrown.workspace = true
 rkyv.workspace = true
+bincode.workspace = true

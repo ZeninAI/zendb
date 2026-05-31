@@ -13,14 +13,13 @@ src/
 │   ├── mod.rs
 │   ├── cell.rs         # Cell + apply_walk + merge
 │   ├── hlc.rs          # 10-byte Hybrid Logical Clock
-│   ├── traits.rs       # TypedValue, TypedOp, TypedSegment, Type, ContainerType
+│   ├── traits.rs       # Type, ContainerType
 │   ├── path.rs         # Path + PathStep
 │   └── delta.rs        # Delta + TableId + PrimaryKey + Signature
 ├── types/
 │   ├── mod.rs
 │   ├── atom.rs         # AtomValue, AtomOp, AtomFloat, AtomError, AtomType
 │   └── record.rs       # RecordValue, RecordOp, RecordSegment, RecordError, RecordType
-└── codec.rs            # varint, read_fixed, encode_string, decode_string
 ```
 
 ---
@@ -70,10 +69,6 @@ impl Cell {
     pub fn is_dummy(&self) -> bool;
     pub fn type_tag(&self) -> TypeTag;
 
-    // Wire format: Value HLC[10] Sync(1 byte)
-    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), TypeError>;
-    pub fn decode(bytes: &[u8]) -> Result<(Cell, usize), TypeError>;
-
     // Apply a delta to this cell (root of the path).
     pub fn apply_delta(&mut self, delta: &Delta) -> bool;
 
@@ -117,15 +112,12 @@ A child can override its parent: `Some(false)` on a field under a `Some(true)` r
 ## 5. Trait Hierarchy
 
 ```
-TypedValue    ── encode / decode                 (AtomValue, RecordValue)
-TypedOp       ── encode / decode                 (AtomOp, RecordOp)
-TypedSegment  ── encode / decode                 (RecordSegment)
-
 Type          ── TAG, NAME, KEYABLE, IS_CONTAINER,
-                 Value: TypedValue, Op: TypedOp, Error: std::error::Error,
+                 Value: Encode + Decode, Op: Encode + Decode,
+                 Error: std::error::Error,
                  empty(), apply_op(), merge()
 
-ContainerType ── Type + Segment: TypedSegment,
+ContainerType ── Type + Segment: Encode + Decode,
                  descend_or_create()
 ```
 
@@ -137,8 +129,8 @@ pub trait Type {
     const NAME: &'static str;
     const KEYABLE: bool;
     const IS_CONTAINER: bool;
-    type Value: TypedValue;
-    type Op: TypedOp;
+    type Value: Encode + Decode<()>;
+    type Op: Encode + Decode<()>;
     type Error: std::error::Error;
 
     fn empty() -> Self::Value;
@@ -158,7 +150,7 @@ pub trait Type {
 
 ```rust
 pub trait ContainerType: Type {
-    type Segment: TypedSegment;
+    type Segment: Encode + Decode<()>;
 
     /// Navigate into a child, creating a dummy if absent.
     fn descend_or_create<'a>(
@@ -183,7 +175,7 @@ Scalar leaf type. `AtomValue` covers Null, Bool, Int, UInt, Float (via `AtomFloa
 
 ### Record
 
-Named-field container. `RecordValue` has `fields: IndexMap<String, Cell>` and `tombstones: IndexMap<String, Hlc>`. No `replace_hlc` — the Cell's HLC is the sole authority.
+Named-field container. `RecordValue` has `fields: BTreeMap<String, Cell>` and `tombstones: BTreeMap<String, Hlc>`. No `replace_hlc` — the Cell's HLC is the sole authority.
 
 Operations:
 - `SetField { name, value }` — inserts the cell. Checks tombstone: if `value.hlc` doesn't beat the tombstone, returns `Ok(false)`. Otherwise inserts and returns `Ok(true)`.
@@ -223,21 +215,13 @@ register_types! {
 
 ## 8. Encoding
 
-All types have `encode(&self, out: &mut Vec<u8>)` and `decode(bytes: &[u8]) -> (Self, usize)`. Wire formats:
+All persisted types derive `Encode` and `Decode` from bincode. Serialization is handled by storage and other typed callers through bincode directly; `zendb-types` does not expose hand-written or compatibility encode/decode methods.
 
-- **HLC**: fixed 10 bytes (big-endian)
-- **Cell**: `Value HLC[10] Sync(1)` — Sync: 0x00=None, 0x01=Some(false), 0x02=Some(true)
-- **Value**: `TypeTag(1) type_specific_payload`
-- **Op**: `TypeTag(1) type_specific_payload` — SetSync uses 0xFF tag
-- **Segment**: `TypeTag(1) type_specific_payload`
-- **Path**: `count(varint) PathStep*` — PathStep: `TypeTag(1) Segment`
-- **Delta**: `TableId(String) PrimaryKey(AtomValue) Path Op HLC[10] Sync(1) Signature`
-- **String**: `length(varint) UTF8`
-- **Varint**: LEB128-like, 7 bits per byte, MSB = continuation
+The `register_types!` macro derives bincode for generated `TypeTag`, `Value`, `Op`, and `Segment`, so adding a type does not require hand-written serialization dispatch.
 
 ---
 
 ## 9. Dependencies
 
-- `indexmap` — `IndexMap` for Record fields/tombstones (ordered, deterministic iteration)
-- No serde, no crypto, no I/O, no alloc beyond what `indexmap` pulls in
+- `bincode` — canonical serialization/deserialization for all persisted types
+- No serde, no crypto, no I/O

@@ -8,6 +8,4 @@ authors.workspace = true
 description = "Core type system for ZeninDB — HLC, Cell, Value, Op, Path, Delta, and the Type/ContainerType traits"
 
 [dependencies]
-indexmap.workspace = true
-thiserror.workspace = true
-rkyv.workspace = true
+bincode.workspace = true

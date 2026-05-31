@@ -3,43 +3,24 @@
 //! ## Trait hierarchy
 //!
 //! ```text
-//! TypedValue  ── encode / decode             (AtomValue, RecordValue)
-//! TypedOp     ── encode / decode             (AtomOp, RecordOp)
-//! TypedSegment ── encode / decode            (RecordSegment)
 //! Type        ── TAG, NAME, KEYABLE, IS_CONTAINER,
-//!                Value: TypedValue, Op: TypedOp, Error,
+//!                Value: Encode + Decode, Op: Encode + Decode, Error,
 //!                empty(), apply_op(), merge()
-//! ContainerType ── Type + Segment: TypedSegment,
+//! ContainerType ── Type + Segment: Encode + Decode,
 //!                   descend_or_create()
 //! ```
 
+use bincode::{Decode, Encode};
+
 use crate::{Cell, Hlc, TypeTag};
-
-pub trait TypedValue: Sized {
-    type Error: std::error::Error;
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), Self::Error>;
-    fn decode(bytes: &[u8]) -> Result<(Self, usize), Self::Error>;
-}
-
-pub trait TypedOp: Sized {
-    type Error: std::error::Error;
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), Self::Error>;
-    fn decode(bytes: &[u8]) -> Result<(Self, usize), Self::Error>;
-}
-
-pub trait TypedSegment: Sized {
-    type Error: std::error::Error;
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), Self::Error>;
-    fn decode(bytes: &[u8]) -> Result<(Self, usize), Self::Error>;
-}
 
 pub trait Type {
     const TAG: TypeTag;
     const NAME: &'static str;
     const KEYABLE: bool;
     const IS_CONTAINER: bool;
-    type Value: TypedValue;
-    type Op: TypedOp;
+    type Value: Encode + Decode<()>;
+    type Op: Encode + Decode<()>;
     type Error: std::error::Error;
 
     fn empty() -> Self::Value;
@@ -65,7 +46,7 @@ pub trait Type {
 }
 
 pub trait ContainerType: Type {
-    type Segment: TypedSegment;
+    type Segment: Encode + Decode<()>;
 
     /// Navigate into a child, creating a dummy if absent.
     fn descend_or_create<'a>(

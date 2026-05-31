@@ -7,10 +7,12 @@
 //! what type to expect at each depth — this is what enables self-healing
 //! when intermediate containers don't yet exist locally.
 
-use crate::{Segment, TypeError, TypeTag};
+use bincode::{Decode, Encode};
+
+use crate::{Segment, TypeTag};
 
 /// One step in a Path: the expected container type and how to descend.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct PathStep {
     pub container_tag: TypeTag,
     pub segment: Segment,
@@ -23,30 +25,10 @@ impl PathStep {
             segment,
         }
     }
-
-    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), TypeError> {
-        out.push(self.container_tag as u8);
-        self.segment.encode(out)
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<(PathStep, usize), TypeError> {
-        if bytes.is_empty() {
-            return Err(TypeError::DecodeError("empty input".into()));
-        }
-        let tag = TypeTag::from_u8(bytes[0])?;
-        let (seg, n) = Segment::decode(&bytes[1..])?;
-        Ok((
-            PathStep {
-                container_tag: tag,
-                segment: seg,
-            },
-            1 + n,
-        ))
-    }
 }
 
 /// A sequence of path steps from a row root to a target cell.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct Path {
     pub steps: Vec<PathStep>,
 }
@@ -80,26 +62,6 @@ impl Path {
         let mut steps = self.steps.clone();
         steps.push(PathStep::new(container_tag, segment));
         Path { steps }
-    }
-
-    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), TypeError> {
-        crate::codec::encode_varint(out, self.steps.len() as u64);
-        for step in &self.steps {
-            step.encode(out)?;
-        }
-        Ok(())
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<(Path, usize), TypeError> {
-        let (count, mut n) = crate::codec::decode_varint(bytes)
-            .ok_or_else(|| TypeError::DecodeError("truncated path".into()))?;
-        let mut steps = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let (step, m) = PathStep::decode(&bytes[n..])?;
-            n += m;
-            steps.push(step);
-        }
-        Ok((Path { steps }, n))
     }
 }
 

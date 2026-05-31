@@ -70,7 +70,7 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// Number of `put` operations in each write scenario.
-const N: u64 = 100_000;
+const N: u64 = 10_000;
 
 /// For the "churn" scenario: number of distinct keys. With `N` puts
 /// across `N / CHURN_FACTOR` keys, each key is overwritten ~4 times on

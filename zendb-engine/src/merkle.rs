@@ -28,6 +28,7 @@
 
 use std::io;
 
+use bincode::{config, decode_from_slice, encode_to_vec};
 use blake3::Hasher;
 use zendb_storage::core::backend::Backend;
 use zendb_types::Cell;
@@ -215,15 +216,16 @@ fn row_hash(key: &[u8], cell: &Cell) -> [u8; 32] {
     let mut h = Hasher::new();
     h.update(key);
     h.update(&cell.hlc.as_bytes()[..]);
-    let mut buf = Vec::new();
-    if cell.encode(&mut buf).is_ok() {
+    if let Ok(buf) = encode_to_vec(cell, config::standard()) {
         h.update(&buf);
     }
     h.finalize().into()
 }
 
 fn decode_cell(bytes: &[u8]) -> Option<Cell> {
-    Cell::decode(bytes).ok().map(|(c, _)| c)
+    decode_from_slice(bytes, config::standard())
+        .ok()
+        .map(|(c, _)| c)
 }
 
 /// Build internal node levels from leaf hashes.

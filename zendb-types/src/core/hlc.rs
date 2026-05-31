@@ -17,11 +17,13 @@
 //! apply walk. Any real HLC beats `ZERO`. A real generator must never produce
 //! `ZERO` (node_id of 0 is invalid).
 
+use bincode::{Decode, Encode};
+
 /// A 10-byte Hybrid Logical Clock.
 ///
 /// Comparison is lexicographic on the big-endian byte representation,
 /// which means greater = later = "beats".
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct Hlc([u8; 10]);
 
 impl Hlc {

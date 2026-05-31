@@ -60,16 +60,13 @@ Types implement a cascade of traits:
 
 | Trait | Purpose | Implemented by |
 |-------|---------|---------------|
-| `TypedValue` | `encode`/`decode` | AtomValue, RecordValue |
-| `TypedOp` | `encode`/`decode` | AtomOp, RecordOp |
-| `TypedSegment` | `encode`/`decode` | RecordSegment |
 | `Type` | `empty()`, `apply_op()`, `merge()` | AtomType, RecordType |
 | `ContainerType` | `descend_or_create()` | RecordType |
 
 Built-in types:
 
 - **Atom** — Scalars: Null, Bool, Int, UInt, Float, String, Bytes, Timestamp, Uuid, Ulid. `AtomOp::Set(v)` with LWW.
-- **Record** — Named-field container: `IndexMap<String, Cell>` + tombstones (`IndexMap<String, Hlc>`). Operations: `SetField`, `Replace`, `RemoveField`. Tombstones prevent deleted fields from being resurrected by old peers.
+- **Record** — Named-field container: `BTreeMap<String, Cell>` + tombstones (`BTreeMap<String, Hlc>`). Operations: `SetField`, `Replace`, `RemoveField`. Tombstones prevent deleted fields from being resurrected by old peers.
 
 ### 2.4 apply_op and merge signatures
 
@@ -115,7 +112,7 @@ struct Delta {
 
 ### 2.8 Encoding
 
-Every type has `encode(&self, out: &mut Vec<u8>)` and `decode(bytes: &[u8]) -> (Self, usize)`. Wire format uses big-endian integers, LEB128-like varints, length-prefixed strings, and type-tag-prefixed Value/Op/Segment payloads.
+Every persisted type derives `Encode` and `Decode` from bincode. Serialization is handled by storage and other typed callers through bincode directly; `zendb-types` does not expose hand-written or compatibility encode/decode methods.
 
 ---
 
@@ -227,7 +224,7 @@ Streaming cursors over tables, rows, paths, or query shapes. The event system ta
 
 Adding a type:
 1. Create one module with value/op/segment/error types
-2. Implement `TypedValue`, `TypedOp`, `TypedSegment` (if container)
+2. Derive `Encode` and `Decode` from bincode on value/op/segment types
 3. Implement `Type` (and `ContainerType` if container) on a unit struct
 4. Add one line to `register_types!` in `lib.rs`
 
@@ -248,5 +245,5 @@ The macro generates all enum variants, dispatch functions, and the `TypeError` e
 
 ## 12. Dependencies
 
-- `indexmap` — ordered map for Record fields (deterministic encoding/hashing)
+- `bincode` — canonical serialization/deserialization in `zendb-types`
 - No serde, no crypto libraries, no async runtime in `zendb-types`

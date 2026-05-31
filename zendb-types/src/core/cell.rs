@@ -1,8 +1,10 @@
 //! Cell — the universal addressable value wrapper.
 
-use crate::{Hlc, Op, PathStep, TypeError, TypeTag, Value};
+use bincode::{Decode, Encode};
 
-#[derive(Debug, Clone, PartialEq)]
+use crate::{Hlc, Op, PathStep, TypeTag, Value};
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct Cell {
     pub value: Value,
     pub hlc: Hlc,
@@ -27,37 +29,6 @@ impl Cell {
     }
     pub fn type_tag(&self) -> TypeTag {
         self.value.type_tag()
-    }
-
-    // --- wire format ---
-
-    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), TypeError> {
-        self.value.encode(out)?;
-        out.extend_from_slice(self.hlc.as_bytes());
-        out.push(match self.sync {
-            None => 0x00,
-            Some(false) => 0x01,
-            Some(true) => 0x02,
-        });
-        Ok(())
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<(Cell, usize), TypeError> {
-        let (value, n) = Value::decode(bytes)?;
-        let rest = &bytes[n..];
-        if rest.len() < 11 {
-            return Err(TypeError::DecodeError("truncated cell".into()));
-        }
-        let mut hb = [0u8; 10];
-        hb.copy_from_slice(&rest[..10]);
-        let hlc = Hlc::from_bytes(hb);
-        let sync = match rest[10] {
-            0x00 => None,
-            0x01 => Some(false),
-            0x02 => Some(true),
-            b => return Err(TypeError::DecodeError(format!("invalid sync byte: {}", b))),
-        };
-        Ok((Cell::new(value, hlc, sync), n + 11))
     }
 
     // --- apply ---
@@ -144,6 +115,7 @@ mod tests {
     use crate::core::traits::Type;
     use crate::types::atom::{AtomOp, AtomValue};
     use crate::types::record::{RecordOp, RecordType};
+    use bincode::{config, decode_from_slice, encode_to_vec};
 
     fn hlc(ms: u64) -> Hlc {
         Hlc::new(ms, 0, 1).unwrap()
@@ -157,15 +129,14 @@ mod tests {
     }
 
     #[test]
-    fn encode_decode_roundtrip() {
+    fn bincode_roundtrip() {
         let cell = Cell::new(
             Value::Atom(AtomValue::String("hi".into())),
             hlc(100),
             Some(true),
         );
-        let mut buf = Vec::new();
-        cell.encode(&mut buf).unwrap();
-        let (decoded, n) = Cell::decode(&buf).unwrap();
+        let buf = encode_to_vec(&cell, config::standard()).unwrap();
+        let (decoded, n): (Cell, usize) = decode_from_slice(&buf, config::standard()).unwrap();
         assert_eq!(n, buf.len());
         assert_eq!(decoded.hlc, cell.hlc);
     }
@@ -217,12 +188,10 @@ mod tests {
     }
 
     #[test]
-    fn op_set_sync_encode_decode() {
+    fn op_set_sync_bincode_roundtrip() {
         let op = Op::SetSync { sync: Some(false) };
-        let mut buf = Vec::new();
-        op.encode(&mut buf).unwrap();
-        assert_eq!(buf[0], 0xFF);
-        let (decoded, _) = Op::decode(&buf).unwrap();
+        let buf = encode_to_vec(&op, config::standard()).unwrap();
+        let (decoded, _): (Op, usize) = decode_from_slice(&buf, config::standard()).unwrap();
         assert!(matches!(decoded, Op::SetSync { sync: Some(false) }));
     }
 

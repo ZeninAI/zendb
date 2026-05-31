@@ -15,10 +15,6 @@ repository = "https://github.com/zenin/zendb"
 authors = ["ZeninDB Contributors"]
 
 [workspace.dependencies]
-# zendb-types
-indexmap = "2"
-thiserror = "2"
-
 # zendb-storage
 memmap2 = "0.9"
 hashbrown = "0.15"

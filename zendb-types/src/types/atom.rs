@@ -1,16 +1,14 @@
 //! Atom — the scalar leaf type.
 
-use crate::{
-    codec::{decode_string, decode_varint, encode_string, encode_varint, read_fixed},
-    core::traits::{Type, TypedOp, TypedValue},
-    Hlc, TypeTag,
-};
+use bincode::{Decode, Encode};
+
+use crate::{core::traits::Type, Hlc, TypeTag};
 
 // ---------------------------------------------------------------------------
 // AtomFloat — f64 wrapper with total Eq/Ord/Hash
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Encode, Decode)]
 pub struct AtomFloat(pub f64);
 
 impl PartialEq for AtomFloat {
@@ -39,7 +37,7 @@ impl std::hash::Hash for AtomFloat {
 // AtomValue
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub enum AtomValue {
     Null,
     Bool(bool),
@@ -53,144 +51,13 @@ pub enum AtomValue {
     Ulid([u8; 16]),
 }
 
-impl TypedValue for AtomValue {
-    type Error = AtomError;
-
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), AtomError> {
-        match self {
-            AtomValue::Null => out.push(0x00),
-            AtomValue::Bool(false) => out.push(0x01),
-            AtomValue::Bool(true) => out.push(0x02),
-            AtomValue::Int(v) => {
-                out.push(0x03);
-                out.extend_from_slice(&v.to_be_bytes());
-            }
-            AtomValue::UInt(v) => {
-                out.push(0x04);
-                out.extend_from_slice(&v.to_be_bytes());
-            }
-            AtomValue::Float(v) => {
-                out.push(0x05);
-                out.extend_from_slice(&v.0.to_be_bytes());
-            }
-            AtomValue::String(s) => {
-                out.push(0x06);
-                encode_string(out, s);
-            }
-            AtomValue::Bytes(b) => {
-                out.push(0x07);
-                encode_varint(out, b.len() as u64);
-                out.extend_from_slice(b);
-            }
-            AtomValue::Timestamp(v) => {
-                out.push(0x08);
-                out.extend_from_slice(&v.to_be_bytes());
-            }
-            AtomValue::Uuid(b) => {
-                out.push(0x09);
-                out.extend_from_slice(b);
-            }
-            AtomValue::Ulid(b) => {
-                out.push(0x0A);
-                out.extend_from_slice(b);
-            }
-        }
-        Ok(())
-    }
-
-    fn decode(bytes: &[u8]) -> Result<(Self, usize), AtomError> {
-        if bytes.is_empty() {
-            return Err(AtomError::Decode("empty input".into()));
-        }
-        let tag = bytes[0];
-        let rest = &bytes[1..];
-        match tag {
-            0x00 => Ok((AtomValue::Null, 1)),
-            0x01 => Ok((AtomValue::Bool(false), 1)),
-            0x02 => Ok((AtomValue::Bool(true), 1)),
-            0x03 => {
-                let b = read_fixed::<8>(rest)
-                    .ok_or_else(|| AtomError::Decode("truncated Int".into()))?;
-                Ok((AtomValue::Int(i64::from_be_bytes(b)), 9))
-            }
-            0x04 => {
-                let b = read_fixed::<8>(rest)
-                    .ok_or_else(|| AtomError::Decode("truncated UInt".into()))?;
-                Ok((AtomValue::UInt(u64::from_be_bytes(b)), 9))
-            }
-            0x05 => {
-                let b = read_fixed::<8>(rest)
-                    .ok_or_else(|| AtomError::Decode("truncated Float".into()))?;
-                Ok((AtomValue::Float(AtomFloat(f64::from_be_bytes(b))), 9))
-            }
-            0x06 => {
-                let (s, n) = decode_string(rest)
-                    .ok_or_else(|| AtomError::Decode("truncated string".into()))?;
-                Ok((AtomValue::String(s), 1 + n))
-            }
-            0x07 => {
-                let (len, vn) = decode_varint(rest)
-                    .ok_or_else(|| AtomError::Decode("truncated bytes len".into()))?;
-                let start = vn;
-                let end = start + len as usize;
-                if rest.len() < end {
-                    return Err(AtomError::Decode("truncated bytes".into()));
-                }
-                Ok((AtomValue::Bytes(rest[start..end].to_vec()), 1 + end))
-            }
-            0x08 => {
-                let b = read_fixed::<8>(rest)
-                    .ok_or_else(|| AtomError::Decode("truncated Timestamp".into()))?;
-                Ok((AtomValue::Timestamp(i64::from_be_bytes(b)), 9))
-            }
-            0x09 => {
-                let b = read_fixed::<16>(rest)
-                    .ok_or_else(|| AtomError::Decode("truncated Uuid".into()))?;
-                Ok((AtomValue::Uuid(b), 17))
-            }
-            0x0A => {
-                let b = read_fixed::<16>(rest)
-                    .ok_or_else(|| AtomError::Decode("truncated Ulid".into()))?;
-                Ok((AtomValue::Ulid(b), 17))
-            }
-            tag => Err(AtomError::Decode(format!("unknown AtomValue tag: {}", tag))),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // AtomOp
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum AtomOp {
     Set(AtomValue),
-}
-
-impl TypedOp for AtomOp {
-    type Error = AtomError;
-
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), AtomError> {
-        match self {
-            AtomOp::Set(v) => {
-                out.push(0x00);
-                v.encode(out)
-            }
-        }
-    }
-
-    fn decode(bytes: &[u8]) -> Result<(Self, usize), AtomError> {
-        if bytes.is_empty() {
-            return Err(AtomError::Decode("empty input".into()));
-        }
-        match bytes[0] {
-            0x00 => {
-                let (v, n) = AtomValue::decode(&bytes[1..])?;
-                Ok((AtomOp::Set(v), 1 + n))
-            }
-            tag => Err(AtomError::Decode(format!("unknown AtomOp tag: {}", tag))),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,15 +65,11 @@ impl TypedOp for AtomOp {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-pub enum AtomError {
-    Decode(String),
-}
+pub enum AtomError {}
 
 impl std::fmt::Display for AtomError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AtomError::Decode(msg) => write!(f, "Atom decode: {}", msg),
-        }
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {}
     }
 }
 impl std::error::Error for AtomError {}
@@ -269,6 +132,7 @@ impl Type for AtomType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bincode::{config, decode_from_slice, encode_to_vec};
 
     #[test]
     fn atom_float_eq_nan() {
@@ -339,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn atom_value_encode_decode_roundtrip() {
+    fn atom_value_bincode_roundtrip() {
         let values = vec![
             AtomValue::Null,
             AtomValue::Bool(true),
@@ -354,9 +218,9 @@ mod tests {
             AtomValue::Ulid([0xBB; 16]),
         ];
         for val in values {
-            let mut buf = Vec::new();
-            val.encode(&mut buf).unwrap();
-            let (decoded, consumed) = AtomValue::decode(&buf).unwrap();
+            let buf = encode_to_vec(&val, config::standard()).unwrap();
+            let (decoded, consumed): (AtomValue, usize) =
+                decode_from_slice(&buf, config::standard()).unwrap();
             assert_eq!(consumed, buf.len());
             assert_eq!(decoded, val);
         }

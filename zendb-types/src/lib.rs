@@ -10,9 +10,10 @@
 //! 2. Add one line to `register_types!` below
 
 // --- hand-written modules ---
-pub mod codec;
 pub mod core;
 pub mod types;
+
+use bincode::{Decode, Encode};
 
 // --- generated enums and dispatch ---
 // Everything below this point is produced by register_types!
@@ -25,7 +26,18 @@ macro_rules! register_types {
         // =================================================================
         // TypeTag
         // =================================================================
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            Encode,
+            Decode,
+        )]
         #[repr(u8)]
         pub enum TypeTag {
             $($leaf_var,)*
@@ -72,8 +84,6 @@ macro_rules! register_types {
             $($cont_var(<$cont_ty as $crate::Type>::Error),)*
             UnknownTypeTag(u8),
             TypeMismatch { expected: TypeTag, actual: TypeTag },
-            EncodeError(String),
-            DecodeError(String),
             MergeConflict { local: TypeTag, remote: TypeTag },
         }
 
@@ -86,8 +96,6 @@ macro_rules! register_types {
                     TypeError::TypeMismatch { expected, actual } => {
                         write!(f, "type mismatch: expected {:?}, got {:?}", expected, actual)
                     }
-                    TypeError::EncodeError(msg) => write!(f, "encode error: {}", msg),
-                    TypeError::DecodeError(msg) => write!(f, "decode error: {}", msg),
                     TypeError::MergeConflict { local, remote } => {
                         write!(f, "merge conflict: {:?} vs {:?}", local, remote)
                     }
@@ -108,7 +116,7 @@ macro_rules! register_types {
         // =================================================================
         // Value
         // =================================================================
-        #[derive(Debug, Clone, PartialEq)]
+        #[derive(Debug, Clone, PartialEq, Encode, Decode)]
         pub enum Value {
             $($leaf_var(<$leaf_ty as $crate::Type>::Value),)*
             $($cont_var(<$cont_ty as $crate::Type>::Value),)*
@@ -121,48 +129,12 @@ macro_rules! register_types {
                     $(Value::$cont_var(_) => TypeTag::$cont_var,)*
                 }
             }
-
-            /// Encode as `TypeTag TypeSpecificPayload`.
-            pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), TypeError> {
-                match self {
-                    $(Value::$leaf_var(v) => {
-                        out.push(TypeTag::$leaf_var as u8);
-                        $crate::TypedValue::encode(v, out)
-                            .map_err(|e| TypeError::$leaf_var(e))
-                    })*
-                    $(Value::$cont_var(v) => {
-                        out.push(TypeTag::$cont_var as u8);
-                        $crate::TypedValue::encode(v, out)
-                            .map_err(|e| TypeError::$cont_var(e))
-                    })*
-                }
-            }
-
-            /// Decode from bytes. Returns value and bytes consumed.
-            pub fn decode(bytes: &[u8]) -> Result<(Value, usize), TypeError> {
-                if bytes.is_empty() {
-                    return Err(TypeError::DecodeError("empty input".into()));
-                }
-                let tag = TypeTag::from_u8(bytes[0])?;
-                match tag {
-                    $(TypeTag::$leaf_var => {
-                        let (v, n) = < <$leaf_ty as $crate::Type>::Value as $crate::TypedValue >::decode(&bytes[1..])
-                            .map_err(|e| TypeError::$leaf_var(e))?;
-                        Ok((Value::$leaf_var(v), 1 + n))
-                    })*
-                    $(TypeTag::$cont_var => {
-                        let (v, n) = < <$cont_ty as $crate::Type>::Value as $crate::TypedValue >::decode(&bytes[1..])
-                            .map_err(|e| TypeError::$cont_var(e))?;
-                        Ok((Value::$cont_var(v), 1 + n))
-                    })*
-                }
-            }
         }
 
         // =================================================================
         // Op
         // =================================================================
-        #[derive(Debug, Clone)]
+        #[derive(Debug, Clone, Encode, Decode)]
         pub enum Op {
             $($leaf_var(<$leaf_ty as $crate::Type>::Op),)*
             $($cont_var(<$cont_ty as $crate::Type>::Op),)*
@@ -177,69 +149,12 @@ macro_rules! register_types {
                     Op::SetSync { .. } => panic!("SetSync has no TypeTag"),
                 }
             }
-
-            /// Encode as `TypeTag TypeSpecificOpPayload` (or `0xFF` for SetSync).
-            pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), TypeError> {
-                match self {
-                    $(Op::$leaf_var(o) => {
-                        out.push(TypeTag::$leaf_var as u8);
-                        $crate::TypedOp::encode(o, out)
-                            .map_err(|e| TypeError::$leaf_var(e))
-                    })*
-                    $(Op::$cont_var(o) => {
-                        out.push(TypeTag::$cont_var as u8);
-                        $crate::TypedOp::encode(o, out)
-                            .map_err(|e| TypeError::$cont_var(e))
-                    })*
-                    Op::SetSync { sync } => {
-                        out.push(0xFF);
-                        out.push(match sync {
-                            None => 0x00,
-                            Some(false) => 0x01,
-                            Some(true) => 0x02,
-                        });
-                        Ok(())
-                    }
-                }
-            }
-
-            /// Decode from bytes. Returns op and bytes consumed.
-            pub fn decode(bytes: &[u8]) -> Result<(Op, usize), TypeError> {
-                if bytes.is_empty() {
-                    return Err(TypeError::DecodeError("empty input".into()));
-                }
-                if bytes[0] == 0xFF {
-                    if bytes.len() < 2 {
-                        return Err(TypeError::DecodeError("truncated SetSync".into()));
-                    }
-                    let sync = match bytes[1] {
-                        0x00 => None,
-                        0x01 => Some(false),
-                        0x02 => Some(true),
-                        b => return Err(TypeError::DecodeError(format!("invalid SetSync byte: {}", b))),
-                    };
-                    return Ok((Op::SetSync { sync }, 2));
-                }
-                let tag = TypeTag::from_u8(bytes[0])?;
-                match tag {
-                    $(TypeTag::$leaf_var => {
-                        let (o, n) = < <$leaf_ty as $crate::Type>::Op as $crate::TypedOp >::decode(&bytes[1..])
-                            .map_err(|e| TypeError::$leaf_var(e))?;
-                        Ok((Op::$leaf_var(o), 1 + n))
-                    })*
-                    $(TypeTag::$cont_var => {
-                        let (o, n) = < <$cont_ty as $crate::Type>::Op as $crate::TypedOp >::decode(&bytes[1..])
-                            .map_err(|e| TypeError::$cont_var(e))?;
-                        Ok((Op::$cont_var(o), 1 + n))
-                    })*
-                }
-            }
         }
 
         // =================================================================
         // Segment
         // =================================================================
-        #[derive(Debug, Clone)]
+        #[derive(Debug, Clone, Encode, Decode)]
         pub enum Segment {
             $($cont_var(<$cont_ty as $crate::ContainerType>::Segment),)*
         }
@@ -248,35 +163,6 @@ macro_rules! register_types {
             pub fn type_tag(&self) -> TypeTag {
                 match self {
                     $(Segment::$cont_var(_) => TypeTag::$cont_var,)*
-                }
-            }
-
-            /// Encode as `TypeTag TypeSpecificSegmentPayload`.
-            pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), TypeError> {
-                match self {
-                    $(Segment::$cont_var(s) => {
-                        out.push(TypeTag::$cont_var as u8);
-                        $crate::TypedSegment::encode(s, out)
-                            .map_err(|e| TypeError::$cont_var(e))
-                    })*
-                }
-            }
-
-            /// Decode from bytes. Returns segment and bytes consumed.
-            pub fn decode(bytes: &[u8]) -> Result<(Segment, usize), TypeError> {
-                if bytes.is_empty() {
-                    return Err(TypeError::DecodeError("empty input".into()));
-                }
-                let tag = TypeTag::from_u8(bytes[0])?;
-                match tag {
-                    $(TypeTag::$cont_var => {
-                        let (s, n) = < <$cont_ty as $crate::ContainerType>::Segment as $crate::TypedSegment >::decode(&bytes[1..])
-                            .map_err(|e| TypeError::$cont_var(e))?;
-                        Ok((Segment::$cont_var(s), 1 + n))
-                    })*
-                    other => Err(TypeError::DecodeError(
-                        format!("type {:?} has no Segment variant", other)
-                    )),
                 }
             }
         }
@@ -375,7 +261,7 @@ pub use core::cell::Cell;
 pub use core::delta::{Delta, PrimaryKey, Signature, TableId};
 pub use core::hlc::Hlc;
 pub use core::path::{Path, PathStep};
-pub use core::traits::{ContainerType, Type, TypedOp, TypedSegment, TypedValue};
+pub use core::traits::{ContainerType, Type};
 pub use types::atom::{AtomFloat, AtomOp, AtomType, AtomValue};
 pub use types::record::{RecordError, RecordOp, RecordSegment, RecordType, RecordValue};
 // TypeTag, Value, Op, Segment, TypeError are generated above by register_types!

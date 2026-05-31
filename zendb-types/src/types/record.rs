@@ -1,10 +1,11 @@
 //! Record — the named-field container type.
 
-use indexmap::IndexMap;
+use std::collections::BTreeMap;
+
+use bincode::{Decode, Encode};
 
 use crate::{
-    codec::{decode_string, decode_varint, encode_string, encode_varint},
-    core::traits::{ContainerType, Type, TypedOp, TypedSegment, TypedValue},
+    core::traits::{ContainerType, Type},
     Cell, Hlc, TypeTag,
 };
 
@@ -12,10 +13,10 @@ use crate::{
 // RecordValue
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct RecordValue {
-    pub fields: IndexMap<String, Cell>,
-    pub tombstones: IndexMap<String, Hlc>,
+    pub fields: BTreeMap<String, Cell>,
+    pub tombstones: BTreeMap<String, Hlc>,
 }
 
 impl RecordValue {
@@ -40,149 +41,24 @@ impl RecordValue {
     }
 }
 
-impl TypedValue for RecordValue {
-    type Error = RecordError;
-
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), RecordError> {
-        encode_varint(out, self.fields.len() as u64);
-        for (name, cell) in &self.fields {
-            encode_string(out, name);
-            cell.encode(out)
-                .map_err(|e| RecordError::Decode(e.to_string()))?;
-        }
-        encode_varint(out, self.tombstones.len() as u64);
-        for (name, hlc) in &self.tombstones {
-            encode_string(out, name);
-            out.extend_from_slice(hlc.as_bytes());
-        }
-        Ok(())
-    }
-
-    fn decode(bytes: &[u8]) -> Result<(Self, usize), RecordError> {
-        let mut consumed = 0;
-        let mut value = RecordValue {
-            fields: IndexMap::new(),
-            tombstones: IndexMap::new(),
-        };
-
-        let (field_count, n) = decode_varint(&bytes[consumed..])
-            .ok_or_else(|| RecordError::Decode("truncated field count".into()))?;
-        consumed += n;
-        for _ in 0..field_count {
-            let (name, n) = decode_string(&bytes[consumed..])
-                .ok_or_else(|| RecordError::Decode("truncated field name".into()))?;
-            consumed += n;
-            let (cell, n) =
-                Cell::decode(&bytes[consumed..]).map_err(|e| RecordError::Decode(e.to_string()))?;
-            consumed += n;
-            value.fields.insert(name, cell);
-        }
-
-        let (tomb_count, n) = decode_varint(&bytes[consumed..])
-            .ok_or_else(|| RecordError::Decode("truncated tombstone count".into()))?;
-        consumed += n;
-        for _ in 0..tomb_count {
-            let (name, n) = decode_string(&bytes[consumed..])
-                .ok_or_else(|| RecordError::Decode("truncated tombstone name".into()))?;
-            consumed += n;
-            if bytes.len() < consumed + 10 {
-                return Err(RecordError::Decode("truncated tombstone HLC".into()));
-            }
-            let mut hlc_bytes = [0u8; 10];
-            hlc_bytes.copy_from_slice(&bytes[consumed..consumed + 10]);
-            value.tombstones.insert(name, Hlc::from_bytes(hlc_bytes));
-            consumed += 10;
-        }
-        Ok((value, consumed))
-    }
-}
-
 // ---------------------------------------------------------------------------
 // RecordOp
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum RecordOp {
     SetField { name: String, value: Cell },
     Replace { value: RecordValue },
     RemoveField { name: String },
 }
 
-impl TypedOp for RecordOp {
-    type Error = RecordError;
-
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), RecordError> {
-        match self {
-            RecordOp::SetField { name, value } => {
-                out.push(0x00);
-                encode_string(out, name);
-                value
-                    .encode(out)
-                    .map_err(|e| RecordError::Decode(e.to_string()))?;
-            }
-            RecordOp::Replace { value } => {
-                out.push(0x01);
-                value.encode(out)?;
-            }
-            RecordOp::RemoveField { name } => {
-                out.push(0x02);
-                encode_string(out, name);
-            }
-        }
-        Ok(())
-    }
-
-    fn decode(bytes: &[u8]) -> Result<(Self, usize), RecordError> {
-        if bytes.is_empty() {
-            return Err(RecordError::Decode("empty input".into()));
-        }
-        match bytes[0] {
-            0x00 => {
-                let (name, n) = decode_string(&bytes[1..])
-                    .ok_or_else(|| RecordError::Decode("truncated SetField name".into()))?;
-                let (cell, m) = Cell::decode(&bytes[1 + n..])
-                    .map_err(|e| RecordError::Decode(e.to_string()))?;
-                Ok((RecordOp::SetField { name, value: cell }, 1 + n + m))
-            }
-            0x01 => {
-                let (value, n) = RecordValue::decode(&bytes[1..])?;
-                Ok((RecordOp::Replace { value }, 1 + n))
-            }
-            0x02 => {
-                let (name, n) = decode_string(&bytes[1..])
-                    .ok_or_else(|| RecordError::Decode("truncated RemoveField name".into()))?;
-                Ok((RecordOp::RemoveField { name }, 1 + n))
-            }
-            tag => Err(RecordError::Decode(format!(
-                "unknown RecordOp tag: {}",
-                tag
-            ))),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // RecordSegment
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct RecordSegment {
     pub field_name: String,
-}
-
-impl TypedSegment for RecordSegment {
-    type Error = RecordError;
-
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), RecordError> {
-        encode_string(out, &self.field_name);
-        Ok(())
-    }
-
-    fn decode(bytes: &[u8]) -> Result<(Self, usize), RecordError> {
-        let (name, n) =
-            decode_string(bytes).ok_or_else(|| RecordError::Decode("truncated segment".into()))?;
-        Ok((RecordSegment { field_name: name }, n))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -192,14 +68,12 @@ impl TypedSegment for RecordSegment {
 #[derive(Debug)]
 pub enum RecordError {
     UnknownChildTag(u8),
-    Decode(String),
 }
 
 impl std::fmt::Display for RecordError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RecordError::UnknownChildTag(tag) => write!(f, "unknown child type tag: {}", tag),
-            RecordError::Decode(msg) => write!(f, "Record decode: {}", msg),
         }
     }
 }
@@ -222,8 +96,8 @@ impl Type for RecordType {
 
     fn empty() -> RecordValue {
         RecordValue {
-            fields: IndexMap::new(),
-            tombstones: IndexMap::new(),
+            fields: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
         }
     }
 
@@ -239,7 +113,7 @@ impl Type for RecordType {
                     if !cell.hlc.beats(tomb_hlc) {
                         return Ok(false);
                     }
-                    value.tombstones.swap_remove(name);
+                    value.tombstones.remove(name);
                 }
                 value.fields.insert(name.clone(), cell.clone());
                 Ok(true)
@@ -349,7 +223,7 @@ impl ContainerType for RecordType {
         if let Some(&tomb_hlc) = value.tombstones.get(&segment.field_name) {
             if let Some(cell) = value.fields.get(&segment.field_name) {
                 if !cell.hlc.beats(tomb_hlc) {
-                    value.fields.swap_remove(&segment.field_name);
+                    value.fields.remove(&segment.field_name);
                 }
             }
         }
@@ -371,6 +245,7 @@ impl ContainerType for RecordType {
 mod tests {
     use super::*;
     use crate::{types::atom::AtomValue, Value};
+    use bincode::{config, decode_from_slice, encode_to_vec};
 
     fn hlc(ms: u64) -> Hlc {
         Hlc::new(ms, 0, 1).unwrap()
@@ -437,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn record_value_encode_decode_roundtrip() {
+    fn record_value_bincode_roundtrip() {
         let mut val = RecordType::empty();
         val.fields.insert(
             "name".into(),
@@ -452,9 +327,9 @@ mod tests {
             Cell::new(Value::Atom(AtomValue::Int(30)), hlc(200), None),
         );
         val.tombstones.insert("deleted".into(), hlc(300));
-        let mut buf = Vec::new();
-        val.encode(&mut buf).unwrap();
-        let (decoded, consumed) = RecordValue::decode(&buf).unwrap();
+        let buf = encode_to_vec(&val, config::standard()).unwrap();
+        let (decoded, consumed): (RecordValue, usize) =
+            decode_from_slice(&buf, config::standard()).unwrap();
         assert_eq!(consumed, buf.len());
         assert_eq!(decoded.fields.len(), 2);
         assert_eq!(decoded.tombstones.len(), 1);

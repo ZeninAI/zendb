@@ -47,7 +47,7 @@
 //! needs runtime dispatch over multiple backend kinds wraps them in a
 //! concrete enum that itself implements `Backend`.
 
-use std::{fmt, hash::Hash, io};
+use std::{hash::Hash, io};
 
 use bincode::{Decode, Encode};
 
@@ -74,7 +74,11 @@ where
 {
     /// Cheap backend-specific metrics snapshot. Implementations keep
     /// this in the backend object and update it as state changes.
-    type Stats: Copy + fmt::Debug;
+    type Stats: Copy + Encode + Decode<()>;
+
+    /// Backend configuration values. Set once at construction, read
+    /// through `config()`. Immutable after creation.
+    type Config: Copy + Default + Encode + Decode<()>;
 
     // ---- transactional bracket --------------------------------------
 
@@ -263,6 +267,9 @@ where
 
     /// Return the backend's current in-memory stats snapshot.
     fn stats(&self) -> &Self::Stats;
+
+    /// Return the backend's configuration.
+    fn config(&self) -> &Self::Config;
 
     // ---- durability ---------------------------------------------------
 

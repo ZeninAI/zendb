@@ -62,13 +62,23 @@ struct SkipNode<K, V> {
     key: K,
     value: V,
     record_size: u64,
-    next: Box<[Option<usize>]>,
     prev: Option<usize>,
     level: usize,
 }
 
+/// Skip-list arena with a flat next-pointer table.
+///
+/// `nexts` stores each node's forward pointers in a single contiguous
+/// `Vec<Option<usize>>`, laid out as a row-major `[node_idx][level]`
+/// grid of stride `MAX_LEVEL`. Each node owns a full row regardless of
+/// its actual `level`; entries past `level` are unused but cheap and
+/// avoid the per-node `Box<[Option<usize>]>` heap allocation the
+/// previous design paid on every insert.
 struct OrderIndex<K: Ord, V> {
     arena: Vec<SkipNode<K, V>>,
+    /// Flat forward-pointer table. Size = `arena.len() * MAX_LEVEL`.
+    /// `nexts[node_idx * MAX_LEVEL + level]` is `node_idx`'s next pointer at `level`.
+    nexts: Vec<Option<usize>>,
     free: Vec<usize>,
     heads: Heads,
     height: usize,
@@ -84,11 +94,26 @@ impl<K: Ord, V> OrderIndex<K, V> {
     fn new() -> Self {
         OrderIndex {
             arena: Vec::new(),
+            nexts: Vec::new(),
             free: Vec::new(),
             heads: [None; MAX_LEVEL],
             height: 0,
             len: 0,
         }
+    }
+
+    /// Forward pointer of `node` at `level`. Always indexes a real entry
+    /// in `nexts` — the row is allocated to MAX_LEVEL even when the
+    /// node's `level` is smaller. Pointers past `node.level` are unused
+    /// but read as `None`.
+    #[inline]
+    fn next_at(&self, node: usize, level: usize) -> Option<usize> {
+        self.nexts[node * MAX_LEVEL + level]
+    }
+
+    #[inline]
+    fn set_next(&mut self, node: usize, level: usize, value: Option<usize>) {
+        self.nexts[node * MAX_LEVEL + level] = value;
     }
 
     fn len(&self) -> usize {
@@ -114,14 +139,14 @@ impl<K: Ord, V> OrderIndex<K, V> {
 
         for i in (0..self.height).rev() {
             let mut x = match prev {
-                Some(p) => self.arena[p].next[i],
+                Some(p) => self.next_at(p, i),
                 None => self.heads[i],
             };
             while let Some(idx) = x {
                 match self.arena[idx].key.cmp(key) {
                     std::cmp::Ordering::Less => {
                         prev = Some(idx);
-                        x = self.arena[idx].next[i];
+                        x = self.next_at(idx, i);
                     }
                     std::cmp::Ordering::Equal => {
                         found = Some(idx);
@@ -148,16 +173,21 @@ impl<K: Ord, V> OrderIndex<K, V> {
     }
 
     fn alloc_node(&mut self, key: K, value: V, record_size: u64, level: usize) -> usize {
-        let next = vec![None; level].into_boxed_slice();
         if let Some(idx) = self.free.pop() {
             self.arena[idx] = SkipNode {
                 key,
                 value,
                 record_size,
-                next,
                 prev: None,
                 level,
             };
+            // Re-initialize this node's forward-pointer row to None;
+            // remove_found does this too but we reset defensively in
+            // case a future caller frees a node without clearing.
+            let base = idx * MAX_LEVEL;
+            for slot in &mut self.nexts[base..base + MAX_LEVEL] {
+                *slot = None;
+            }
             idx
         } else {
             let idx = self.arena.len();
@@ -165,10 +195,12 @@ impl<K: Ord, V> OrderIndex<K, V> {
                 key,
                 value,
                 record_size,
-                next,
                 prev: None,
                 level,
             });
+            // Grow the flat next-array by one row. New entries default
+            // to None so we don't need to touch them after extending.
+            self.nexts.resize(self.nexts.len() + MAX_LEVEL, None);
             idx
         }
     }
@@ -202,14 +234,15 @@ impl<K: Ord, V> OrderIndex<K, V> {
         self.arena[new_idx].prev = update[0];
         for (i, prev) in update.iter().copied().enumerate().take(level) {
             if let Some(p) = prev {
-                self.arena[new_idx].next[i] = self.arena[p].next[i];
-                self.arena[p].next[i] = Some(new_idx);
+                let pn = self.next_at(p, i);
+                self.set_next(new_idx, i, pn);
+                self.set_next(p, i, Some(new_idx));
             } else {
-                self.arena[new_idx].next[i] = self.heads[i];
+                self.set_next(new_idx, i, self.heads[i]);
                 self.heads[i] = Some(new_idx);
             }
         }
-        if let Some(next) = self.arena[new_idx].next[0] {
+        if let Some(next) = self.next_at(new_idx, 0) {
             self.arena[next].prev = Some(new_idx);
         }
     }
@@ -224,14 +257,15 @@ impl<K: Ord, V> OrderIndex<K, V> {
 
     fn remove_found(&mut self, update: Heads, idx: usize) -> u64 {
         let level = self.arena[idx].level;
-        let next0 = self.arena[idx].next[0];
+        let next0 = self.next_at(idx, 0);
         let prev0 = self.arena[idx].prev;
 
         for (i, prev) in update.iter().copied().enumerate().take(level) {
+            let nxt = self.next_at(idx, i);
             if let Some(p) = prev {
-                self.arena[p].next[i] = self.arena[idx].next[i];
+                self.set_next(p, i, nxt);
             } else {
-                self.heads[i] = self.arena[idx].next[i];
+                self.heads[i] = nxt;
             }
         }
         if let Some(next) = next0 {
@@ -241,6 +275,12 @@ impl<K: Ord, V> OrderIndex<K, V> {
             self.height -= 1;
         }
         let record_size = self.arena[idx].record_size;
+        // Clear this node's forward-pointer row so a future alloc_node
+        // recycling this slot starts from a clean state.
+        let base = idx * MAX_LEVEL;
+        for slot in &mut self.nexts[base..base + MAX_LEVEL] {
+            *slot = None;
+        }
         self.free.push(idx);
         self.len -= 1;
         record_size
@@ -248,6 +288,7 @@ impl<K: Ord, V> OrderIndex<K, V> {
 
     fn clear(&mut self) {
         self.arena.clear();
+        self.nexts.clear();
         self.free.clear();
         self.heads = [None; MAX_LEVEL];
         self.height = 0;
@@ -257,6 +298,7 @@ impl<K: Ord, V> OrderIndex<K, V> {
     fn iter(&self) -> OrderIndexIter<'_, K, V> {
         OrderIndexIter {
             arena: &self.arena,
+            nexts: &self.nexts,
             current: self.heads[0],
         }
     }
@@ -264,6 +306,7 @@ impl<K: Ord, V> OrderIndex<K, V> {
     fn iter_with_nodes(&self) -> OrderIndexNodeIter<'_, K, V> {
         OrderIndexNodeIter {
             arena: &self.arena,
+            nexts: &self.nexts,
             current: self.heads[0],
         }
     }
@@ -275,11 +318,12 @@ impl<K: Ord, V> OrderIndex<K, V> {
             let (update, found) = self.search(start);
             found.or_else(|| match update[0] {
                 None => self.heads[0],
-                Some(p) => self.arena[p].next[0],
+                Some(p) => self.next_at(p, 0),
             })
         };
         OrderIndexRangeIter {
             arena: &self.arena,
+            nexts: &self.nexts,
             current: first,
             end,
         }
@@ -296,12 +340,12 @@ impl<K: Ord, V> OrderIndex<K, V> {
         let mut idx: Option<usize> = None;
         for i in (0..self.height).rev() {
             let mut cur = match idx {
-                Some(p) => self.arena[p].next[i],
+                Some(p) => self.next_at(p, i),
                 None => self.heads[i],
             };
             while let Some(c) = cur {
                 idx = Some(c);
-                cur = self.arena[c].next[i];
+                cur = self.next_at(c, i);
             }
         }
         idx
@@ -346,14 +390,12 @@ impl<K: Ord, V> OrderIndex<K, V> {
             for i in 0..level {
                 finger.update[i] = Some(idx);
             }
-            finger.cursor = self.arena[idx].next[0];
+            finger.cursor = self.next_at(idx, 0);
         }
     }
 
     fn finger_matches(&self, finger: &Finger, key: &K) -> bool {
-        finger
-            .cursor
-            .is_some_and(|idx| self.arena[idx].key == *key)
+        finger.cursor.is_some_and(|idx| self.arena[idx].key == *key)
     }
 
     fn insert_at_finger(&mut self, finger: &mut Finger, key: K, value: V, record_size: u64) {
@@ -379,15 +421,16 @@ impl<K: Ord, V> OrderIndex<K, V> {
 
     fn remove_at_finger(&mut self, finger: &mut Finger) -> u64 {
         let idx = finger.cursor.expect("finger cursor must point at a node");
-        let next0 = self.arena[idx].next[0];
+        let next0 = self.next_at(idx, 0);
         let prev0 = self.arena[idx].prev;
         let level = self.arena[idx].level;
 
         for i in 0..level {
+            let nxt = self.next_at(idx, i);
             if let Some(p) = finger.update[i] {
-                self.arena[p].next[i] = self.arena[idx].next[i];
+                self.set_next(p, i, nxt);
             } else {
-                self.heads[i] = self.arena[idx].next[i];
+                self.heads[i] = nxt;
             }
         }
         if let Some(next) = next0 {
@@ -398,6 +441,11 @@ impl<K: Ord, V> OrderIndex<K, V> {
         }
         finger.cursor = next0;
         let record_size = self.arena[idx].record_size;
+        // Clear this node's forward-pointer row before recycling.
+        let base = idx * MAX_LEVEL;
+        for slot in &mut self.nexts[base..base + MAX_LEVEL] {
+            *slot = None;
+        }
         self.free.push(idx);
         self.len -= 1;
         record_size
@@ -406,6 +454,7 @@ impl<K: Ord, V> OrderIndex<K, V> {
 
 struct OrderIndexIter<'a, K, V> {
     arena: &'a [SkipNode<K, V>],
+    nexts: &'a [Option<usize>],
     current: Option<usize>,
 }
 
@@ -415,13 +464,14 @@ impl<'a, K, V> Iterator for OrderIndexIter<'a, K, V> {
     fn next(&mut self) -> Option<Self::Item> {
         let idx = self.current?;
         let node = &self.arena[idx];
-        self.current = node.next[0];
+        self.current = self.nexts[idx * MAX_LEVEL];
         Some((&node.key, &node.value))
     }
 }
 
 struct OrderIndexNodeIter<'a, K, V> {
     arena: &'a [SkipNode<K, V>],
+    nexts: &'a [Option<usize>],
     current: Option<usize>,
 }
 
@@ -431,13 +481,14 @@ impl<'a, K, V> Iterator for OrderIndexNodeIter<'a, K, V> {
     fn next(&mut self) -> Option<Self::Item> {
         let idx = self.current?;
         let node = &self.arena[idx];
-        self.current = node.next[0];
+        self.current = self.nexts[idx * MAX_LEVEL];
         Some((&node.key, node))
     }
 }
 
 struct OrderIndexRangeIter<'a, K: Ord, V> {
     arena: &'a [SkipNode<K, V>],
+    nexts: &'a [Option<usize>],
     current: Option<usize>,
     end: K,
 }
@@ -451,7 +502,7 @@ impl<'a, K: Ord, V> Iterator for OrderIndexRangeIter<'a, K, V> {
         if node.key >= self.end {
             return None;
         }
-        self.current = node.next[0];
+        self.current = self.nexts[idx * MAX_LEVEL];
         Some((&node.key, &node.value))
     }
 }
@@ -529,7 +580,13 @@ where
     if let Some(tx_state) = tx.as_mut() {
         let local = tx_state.staging.len();
         tx_state.staging.resize(local + total, 0);
-        encode_live_record(&mut tx_state.staging[local..local + total], key, value, v_size, k_size)?;
+        encode_live_record(
+            &mut tx_state.staging[local..local + total],
+            key,
+            value,
+            v_size,
+            k_size,
+        )?;
         return Ok(total as u64);
     }
 
@@ -636,7 +693,7 @@ fn encode_tombstone_record<K: Encode>(dst: &mut [u8], key: &K, k_size: usize) ->
     Ok(())
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Copy, Encode, Decode)]
 pub struct OrderLogConfig {
     pub initial_capacity: u64,
     pub compaction_ratio: f64,
@@ -651,7 +708,7 @@ impl Default for OrderLogConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Encode, Decode)]
 pub struct OrderLogStats {
     pub data_size: u64,
     pub dead_bytes: u64,
@@ -806,6 +863,7 @@ where
     V: Encode + Decode<()> + Clone,
 {
     type Stats = OrderLogStats;
+    type Config = OrderLogConfig;
 
     fn open_tx(&mut self) -> io::Result<()> {
         if self.tx.is_some() {
@@ -1129,7 +1187,7 @@ where
         stats.data_size = cursor;
         stats.dead_bytes = 0;
 
-        let new_capacity = cursor.max(config.initial_capacity).max(HEADER_SIZE as u64);
+        let new_capacity = cursor.max(config.initial_capacity);
         *mmap = MmapMut::map_anon(1)?;
         file.set_len(new_capacity)?;
         *mmap = unsafe { MmapMut::map_mut(&*file)? };
@@ -1158,6 +1216,10 @@ where
 
     fn stats(&self) -> &Self::Stats {
         &self.stats
+    }
+
+    fn config(&self) -> &Self::Config {
+        &self.config
     }
 
     fn flush(&self) -> io::Result<()> {
@@ -1577,7 +1639,10 @@ mod tests {
         assert!(ol.put_if_absent(k("a"), v("first", 1)).unwrap());
         assert!(!ol.put_if_absent(k("a"), v("second", 2)).unwrap());
         assert_eq!(ol.get(&k("a")), Some(v("first", 1)));
-        assert_eq!(ol.replace(k("a"), v("third", 3)).unwrap(), Some(v("first", 1)));
+        assert_eq!(
+            ol.replace(k("a"), v("third", 3)).unwrap(),
+            Some(v("first", 1))
+        );
         assert_eq!(ol.replace(k("b"), v("new", 4)).unwrap(), None);
         assert_eq!(ol.get(&k("a")), Some(v("third", 3)));
         assert_eq!(ol.get(&k("b")), Some(v("new", 4)));
@@ -1638,7 +1703,10 @@ mod tests {
         let mut ol = create(&p);
         ol.close_tx().unwrap();
         ol.open_tx().unwrap();
-        assert_eq!(ol.open_tx().unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            ol.open_tx().unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
         ol.close_tx().unwrap();
         ol.close_tx().unwrap();
     }
@@ -1712,7 +1780,10 @@ mod tests {
         ol.open_tx().unwrap();
         ol.bulk_put([(k("a"), v("a", 1)), (k("b"), v("b", 2))])
             .unwrap();
-        assert_eq!(ol.open_tx().unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            ol.open_tx().unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
         ol.put(k("c"), v("c", 3)).unwrap();
         ol.close_tx().unwrap();
         assert_eq!(ol.size(), 3);
@@ -1746,7 +1817,10 @@ mod tests {
         ol.open_tx().unwrap();
         ol.bulk_put_sorted([(k("a"), v("a", 1)), (k("b"), v("b", 2))])
             .unwrap();
-        assert_eq!(ol.open_tx().unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            ol.open_tx().unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
         ol.close_tx().unwrap();
         assert_eq!(ol.size(), 2);
     }
@@ -1756,7 +1830,8 @@ mod tests {
         let p = tmp_path("bulk_delete_sorted");
         let mut ol = create(&p);
         for i in 0..10u32 {
-            ol.put(format!("k{:02}", i).into_bytes(), v("p", i)).unwrap();
+            ol.put(format!("k{:02}", i).into_bytes(), v("p", i))
+                .unwrap();
         }
         let keys = vec![k("ghost"), k("k00"), k("k03"), k("k09"), k("zzz")];
         let removed = ol.bulk_delete_sorted(keys.iter()).unwrap();
@@ -1772,12 +1847,16 @@ mod tests {
         let p = tmp_path("bulk_delete_sorted_tx");
         let mut ol = create(&p);
         for i in 0..5u32 {
-            ol.put(format!("k{:02}", i).into_bytes(), v("p", i)).unwrap();
+            ol.put(format!("k{:02}", i).into_bytes(), v("p", i))
+                .unwrap();
         }
         ol.open_tx().unwrap();
         let keys = vec![k("k01"), k("k03")];
         assert_eq!(ol.bulk_delete_sorted(keys.iter()).unwrap(), 2);
-        assert_eq!(ol.open_tx().unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            ol.open_tx().unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
         ol.close_tx().unwrap();
         assert_eq!(ol.size(), 3);
     }
@@ -1822,7 +1901,8 @@ mod tests {
         let p = tmp_path("range_stream");
         let mut ol = create(&p);
         for i in 0..5000u32 {
-            ol.put(format!("k{:05}", i).into_bytes(), v("p", i)).unwrap();
+            ol.put(format!("k{:05}", i).into_bytes(), v("p", i))
+                .unwrap();
         }
         let got: Vec<_> = ol
             .range(&k("k01000"), &k("k05000"))

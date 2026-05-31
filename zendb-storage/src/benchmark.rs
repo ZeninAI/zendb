@@ -44,8 +44,7 @@
 //! measure.
 
 use std::{
-    fmt,
-    io,
+    fmt, io,
     path::Path,
     time::{Duration, Instant},
 };
@@ -185,10 +184,7 @@ fn kv_payload(keys: &[u64]) -> Vec<(u64, u64)> {
 }
 
 fn reversed_kv_payload(keys: &[u64]) -> Vec<(u64, u64)> {
-    keys.iter()
-        .rev()
-        .map(|&k| (k, k.wrapping_mul(7)))
-        .collect()
+    keys.iter().rev().map(|&k| (k, k.wrapping_mul(7))).collect()
 }
 
 /// Pre-encode every (key, value) pair for LMDB. Lets the LMDB scenario
@@ -210,6 +206,7 @@ fn lmdb_payload(keys: &[u64]) -> Vec<(Vec<u8>, Vec<u8>)> {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn keydir_writes_fresh_no_tx() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("keydir.bin");
@@ -228,6 +225,7 @@ fn keydir_writes_fresh_no_tx() -> io::Result<()> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn keydir_writes_fresh_in_tx() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("keydir.bin");
@@ -252,6 +250,7 @@ fn keydir_writes_fresh_in_tx() -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn keydir_writes_churn_no_tx() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("keydir.bin");
@@ -270,6 +269,7 @@ fn keydir_writes_churn_no_tx() -> io::Result<()> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn keydir_writes_churn_in_tx() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("keydir.bin");
@@ -294,6 +294,7 @@ fn keydir_writes_churn_in_tx() -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn keydir_reads() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("keydir.bin");
@@ -325,6 +326,7 @@ fn keydir_reads() -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn orderlog_writes_fresh_no_tx() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("orderlog.bin");
@@ -343,6 +345,7 @@ fn orderlog_writes_fresh_no_tx() -> io::Result<()> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn orderlog_writes_fresh_in_tx() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("orderlog.bin");
@@ -367,6 +370,7 @@ fn orderlog_writes_fresh_in_tx() -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn orderlog_writes_churn_no_tx() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("orderlog.bin");
@@ -385,6 +389,7 @@ fn orderlog_writes_churn_no_tx() -> io::Result<()> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn orderlog_writes_churn_in_tx() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("orderlog.bin");
@@ -409,6 +414,7 @@ fn orderlog_writes_churn_in_tx() -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn orderlog_bulk_put_sorted_fresh() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("orderlog.bin");
@@ -425,6 +431,7 @@ fn orderlog_bulk_put_sorted_fresh() -> io::Result<()> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn orderlog_bulk_put_unsorted_fresh() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("orderlog.bin");
@@ -441,6 +448,7 @@ fn orderlog_bulk_put_unsorted_fresh() -> io::Result<()> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn orderlog_bulk_put_sorted_churn() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("orderlog.bin");
@@ -458,6 +466,7 @@ fn orderlog_bulk_put_sorted_churn() -> io::Result<()> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn orderlog_bulk_put_unsorted_churn() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("orderlog.bin");
@@ -478,6 +487,7 @@ fn orderlog_bulk_put_unsorted_churn() -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn orderlog_reads() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("orderlog.bin");
@@ -503,6 +513,7 @@ fn orderlog_reads() -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn lmdb_writes_fresh_per_op() {
     let dir = TempDir::new().unwrap();
     let (env, db) = lmdb_open(dir.path());
@@ -521,6 +532,7 @@ fn lmdb_writes_fresh_per_op() {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn lmdb_writes_fresh_batch() {
     let dir = TempDir::new().unwrap();
     let (env, db) = lmdb_open(dir.path());
@@ -539,6 +551,7 @@ fn lmdb_writes_fresh_batch() {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn lmdb_reads() {
     let dir = TempDir::new().unwrap();
     let (env, db) = lmdb_open(dir.path());
@@ -614,6 +627,7 @@ fn btree_reversed_kv_payload(keys: &[Vec<u8>]) -> Vec<(Vec<u8>, u64)> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn btree_writes_fresh_no_tx() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
@@ -632,6 +646,7 @@ fn btree_writes_fresh_no_tx() -> io::Result<()> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn btree_writes_fresh_in_tx() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
@@ -652,6 +667,7 @@ fn btree_writes_fresh_in_tx() -> io::Result<()> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn btree_writes_churn_no_tx() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
@@ -670,6 +686,7 @@ fn btree_writes_churn_no_tx() -> io::Result<()> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn btree_writes_churn_in_tx() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
@@ -690,6 +707,7 @@ fn btree_writes_churn_in_tx() -> io::Result<()> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn btree_bulk_put_sorted_fresh() -> io::Result<()> {
     // Headline: bottom-up bulk-load on an empty tree. Big-endian keys
     // are already in lex sort order — perfect for bulk_put_sorted.
@@ -708,6 +726,7 @@ fn btree_bulk_put_sorted_fresh() -> io::Result<()> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn btree_bulk_put_unsorted_fresh() -> io::Result<()> {
     // Reversed input — exercises the bulk_put auto-tx loop fallback
     // (no bottom-up since the input isn't sorted in lex order from the
@@ -727,6 +746,7 @@ fn btree_bulk_put_unsorted_fresh() -> io::Result<()> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn btree_reads() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
@@ -749,6 +769,7 @@ fn btree_reads() -> io::Result<()> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn btree_range_scan() -> io::Result<()> {
     use crate::core::backend::OrderedBackend;
     let dir = TempDir::new().unwrap();
@@ -773,6 +794,7 @@ fn btree_range_scan() -> io::Result<()> {
 }
 
 #[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn btree_range_rev_scan() -> io::Result<()> {
     use crate::core::backend::OrderedBackend;
     let dir = TempDir::new().unwrap();

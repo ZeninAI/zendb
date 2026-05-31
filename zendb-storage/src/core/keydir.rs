@@ -140,7 +140,7 @@ const MAGIC: u32 = 0x4452494B;
 const HEADER_SIZE: usize = 4;
 const TOMBSTONE: u32 = u32::MAX;
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Copy, Encode, Decode)]
 pub struct KeyDirConfig {
     pub initial_capacity: u64,
     /// Auto-compaction threshold. Callers must pass a value in `[0.0, 1.0]`:
@@ -160,7 +160,7 @@ impl Default for KeyDirConfig {
 /// Append-log accounting. The live entry count is **not** tracked here —
 /// it comes straight from `index.len()` via `Backend::size`, so there's
 /// no separate counter to keep in sync on every mutation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Encode, Decode)]
 pub struct KeyDirStats {
     pub data_size: u64,
     pub dead_bytes: u64,
@@ -602,6 +602,7 @@ where
     V: Encode + Decode<()> + Clone,
 {
     type Stats = KeyDirStats;
+    type Config = KeyDirConfig;
 
     /// Open a bulk-write window. Subsequent `put` / `delete` calls stage
     /// their records into an in-memory pooled buffer; the mmap is left
@@ -1019,12 +1020,15 @@ where
     fn compact(&mut self) -> io::Result<()> {
         debug_assert!(self.tx.is_none(), "compact() called inside an open tx");
         // Collect mutable references to every entry so we can update
-        // offsets in-place — no drain/reinsert, no key clones.
-        let mut snapshot: Vec<(&K, &mut EntryMeta)> = self.index.iter_mut().collect();
-        snapshot.sort_by_key(|(_, m)| m.offset);
+        // offsets in-place — no drain/reinsert, no key clones. We only
+        // need `&mut EntryMeta`; the K borrow would just bloat the
+        // ref-tuple (2 pointers → 1) without being used by the sort or
+        // the relocation loop.
+        let mut snapshot: Vec<&mut EntryMeta> = self.index.values_mut().collect();
+        snapshot.sort_unstable_by_key(|m| m.offset);
 
         let mut cursor: usize = HEADER_SIZE;
-        for (_, meta) in snapshot.iter_mut() {
+        for meta in snapshot.iter_mut() {
             let src = meta.offset as usize;
             let len = meta.on_disk_size() as usize;
             if src != cursor {
@@ -1087,6 +1091,10 @@ where
 
     fn stats(&self) -> &Self::Stats {
         &self.stats
+    }
+
+    fn config(&self) -> &Self::Config {
+        &self.config
     }
 
     /// Schedule mmap writeback asynchronously. Returns once the OS has

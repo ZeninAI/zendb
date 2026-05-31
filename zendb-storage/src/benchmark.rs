@@ -1,4 +1,4 @@
-//! KeyDir and OrderLog bulk-write benchmarks.
+//! KeyDir, OrderLog, and BPlusTree bulk-write benchmarks.
 //!
 //! The headline comparison is **write-through vs `open_tx` / `close_tx`
 //! bulk-write mode** — same backend, same workload, two write modes.
@@ -56,6 +56,7 @@ use tempfile::TempDir;
 use crate::{
     core::{
         backend::Backend,
+        btree::{BPlusTree, BPlusTreeConfig},
         keydir::{KeyDir, KeyDirConfig},
         orderlog::{OrderLog, OrderLogConfig},
     },
@@ -93,6 +94,12 @@ fn orderlog_config() -> OrderLogConfig {
     // Match KeyDir's defaults: 1 MiB initial capacity and 0.5 compaction
     // ratio, so fresh/churn measurements line up across both backends.
     OrderLogConfig::default()
+}
+
+fn btree_config() -> BPlusTreeConfig {
+    // Default compaction ratio. BPlusTree pre-allocates 64 pages
+    // (256 KiB) so small workloads finish without a remap.
+    BPlusTreeConfig::default()
 }
 
 // ---------------------------------------------------------------------------
@@ -561,4 +568,230 @@ fn lmdb_reads() {
     let elapsed = t0.elapsed();
 
     BenchResult::new("LMDB   reads", N, elapsed).print();
+}
+
+// ---------------------------------------------------------------------------
+// BPlusTree — fresh / churn / bulk / reads / range
+//
+// BPlusTree orders entries by lexicographic bincode key bytes (not
+// `K::Ord`). Using `u64` directly with bincode's little-endian encoding
+// would NOT preserve numeric order — sorted bulk-load and range scans
+// would be misordered. So btree benchmarks use `Vec<u8>` keys filled
+// with big-endian byte representations of `u64`, which IS lex-order
+// preserving. The value side is still `u64` for parity with the other
+// backends' value payload.
+// ---------------------------------------------------------------------------
+
+/// Encode a u64 as a big-endian `Vec<u8>` (8 bytes). Lex order on the
+/// returned bytes matches numeric order on the input.
+#[inline]
+fn be_key(k: u64) -> Vec<u8> {
+    k.to_be_bytes().to_vec()
+}
+
+fn btree_fresh_keys() -> Vec<Vec<u8>> {
+    (0..N).map(be_key).collect()
+}
+
+fn btree_churn_keys() -> Vec<Vec<u8>> {
+    let domain = N / CHURN_FACTOR;
+    (0..N).map(|k| be_key(k % domain)).collect()
+}
+
+fn btree_kv_payload(keys: &[Vec<u8>]) -> Vec<(Vec<u8>, u64)> {
+    keys.iter()
+        .enumerate()
+        .map(|(i, k)| (k.clone(), (i as u64).wrapping_mul(7)))
+        .collect()
+}
+
+fn btree_reversed_kv_payload(keys: &[Vec<u8>]) -> Vec<(Vec<u8>, u64)> {
+    keys.iter()
+        .enumerate()
+        .rev()
+        .map(|(i, k)| (k.clone(), (i as u64).wrapping_mul(7)))
+        .collect()
+}
+
+#[test]
+fn btree_writes_fresh_no_tx() -> io::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("btree.bin");
+    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+    let keys = btree_fresh_keys();
+
+    let elapsed = timed(|| {
+        for (i, k) in keys.iter().enumerate() {
+            t.put(k.clone(), (i as u64).wrapping_mul(7))?;
+        }
+        t.flush()
+    })?;
+
+    BenchResult::new("BTree  fresh writes (no tx)", N, elapsed).print();
+    Ok(())
+}
+
+#[test]
+fn btree_writes_fresh_in_tx() -> io::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("btree.bin");
+    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+    let keys = btree_fresh_keys();
+
+    let elapsed = timed(|| {
+        t.open_tx()?;
+        for (i, k) in keys.iter().enumerate() {
+            t.put(k.clone(), (i as u64).wrapping_mul(7))?;
+        }
+        t.close_tx()?;
+        t.flush()
+    })?;
+
+    BenchResult::new("BTree  fresh writes (open_tx batch)", N, elapsed).print();
+    Ok(())
+}
+
+#[test]
+fn btree_writes_churn_no_tx() -> io::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("btree.bin");
+    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+    let keys = btree_churn_keys();
+
+    let elapsed = timed(|| {
+        for (i, k) in keys.iter().enumerate() {
+            t.put(k.clone(), (i as u64).wrapping_mul(7))?;
+        }
+        t.flush()
+    })?;
+
+    BenchResult::new("BTree  churn writes (no tx)", N, elapsed).print();
+    Ok(())
+}
+
+#[test]
+fn btree_writes_churn_in_tx() -> io::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("btree.bin");
+    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+    let keys = btree_churn_keys();
+
+    let elapsed = timed(|| {
+        t.open_tx()?;
+        for (i, k) in keys.iter().enumerate() {
+            t.put(k.clone(), (i as u64).wrapping_mul(7))?;
+        }
+        t.close_tx()?;
+        t.flush()
+    })?;
+
+    BenchResult::new("BTree  churn writes (open_tx batch)", N, elapsed).print();
+    Ok(())
+}
+
+#[test]
+fn btree_bulk_put_sorted_fresh() -> io::Result<()> {
+    // Headline: bottom-up bulk-load on an empty tree. Big-endian keys
+    // are already in lex sort order — perfect for bulk_put_sorted.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("btree.bin");
+    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+    let items = btree_kv_payload(&btree_fresh_keys());
+
+    let elapsed = timed(|| {
+        t.bulk_put_sorted(items)?;
+        t.flush()
+    })?;
+
+    BenchResult::new("BTree  fresh bulk_put_sorted (bottom-up)", N, elapsed).print();
+    Ok(())
+}
+
+#[test]
+fn btree_bulk_put_unsorted_fresh() -> io::Result<()> {
+    // Reversed input — exercises the bulk_put auto-tx loop fallback
+    // (no bottom-up since the input isn't sorted in lex order from the
+    // tree's perspective).
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("btree.bin");
+    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+    let items = btree_reversed_kv_payload(&btree_fresh_keys());
+
+    let elapsed = timed(|| {
+        t.bulk_put(items)?;
+        t.flush()
+    })?;
+
+    BenchResult::new("BTree  fresh bulk_put (auto-tx loop)", N, elapsed).print();
+    Ok(())
+}
+
+#[test]
+fn btree_reads() -> io::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("btree.bin");
+    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+
+    let keys = btree_fresh_keys();
+    t.bulk_put_sorted(btree_kv_payload(&keys))?;
+    t.flush()?;
+
+    let elapsed = timed(|| {
+        for (i, k) in keys.iter().enumerate() {
+            let v: u64 = t.get(k).expect("key must exist");
+            assert_eq!(v, (i as u64).wrapping_mul(7));
+        }
+        Ok(())
+    })?;
+
+    BenchResult::new("BTree  reads", N, elapsed).print();
+    Ok(())
+}
+
+#[test]
+fn btree_range_scan() -> io::Result<()> {
+    use crate::core::backend::OrderedBackend;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("btree.bin");
+    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+    let keys = btree_fresh_keys();
+    t.bulk_put_sorted(btree_kv_payload(&keys))?;
+    t.flush()?;
+
+    let lo = be_key(N / 4);
+    let hi = be_key((N * 3) / 4);
+    let span = (N * 3) / 4 - N / 4;
+
+    let elapsed = timed(|| {
+        let count = t.range(&lo, &hi).count();
+        assert_eq!(count as u64, span);
+        Ok(())
+    })?;
+
+    BenchResult::new("BTree  range scan (50% of keys)", span, elapsed).print();
+    Ok(())
+}
+
+#[test]
+fn btree_range_rev_scan() -> io::Result<()> {
+    use crate::core::backend::OrderedBackend;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("btree.bin");
+    let mut t = BPlusTree::<Vec<u8>, u64>::create(&path, btree_config())?;
+    let keys = btree_fresh_keys();
+    t.bulk_put_sorted(btree_kv_payload(&keys))?;
+    t.flush()?;
+
+    let lo = be_key(N / 4);
+    let hi = be_key((N * 3) / 4);
+    let span = (N * 3) / 4 - N / 4;
+
+    let elapsed = timed(|| {
+        let count = t.range_rev(&lo, &hi).count();
+        assert_eq!(count as u64, span);
+        Ok(())
+    })?;
+
+    BenchResult::new("BTree  range_rev scan (50% of keys)", span, elapsed).print();
+    Ok(())
 }

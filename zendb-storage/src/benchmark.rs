@@ -96,8 +96,6 @@ fn orderlog_config() -> OrderLogConfig {
 }
 
 fn btree_config() -> BPlusTreeConfig {
-    // Default compaction ratio. BPlusTree pre-allocates 64 pages
-    // (256 KiB) so small workloads finish without a remap.
     BPlusTreeConfig::default()
 }
 

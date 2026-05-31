@@ -235,14 +235,20 @@ fn compact_temp_path() -> PathBuf {
 
 #[derive(Debug, Clone, Copy, Encode, Decode)]
 pub struct BPlusTreeConfig {
+    /// Pre-allocated page count. File never shrinks below this after
+    /// creation or compaction (minimum 2: meta page + root leaf).
+    pub initial_capacity_pages: u64,
     /// Auto-compaction threshold. Values in `[0.0, 1.0]`:
     /// `0.0` compacts after every write, `1.0` disables automatic compaction.
     pub compaction_ratio: f64,
 }
 
+const DEFAULT_INITIAL_CAPACITY_PAGES: u64 = 64;
+
 impl Default for BPlusTreeConfig {
     fn default() -> Self {
         BPlusTreeConfig {
+            initial_capacity_pages: DEFAULT_INITIAL_CAPACITY_PAGES,
             compaction_ratio: DEFAULT_COMPACTION_RATIO,
         }
     }
@@ -479,7 +485,7 @@ where
     // ---- constructors -----------------------------------------------------
 
     /// Create a fresh BPlusTree at `path`, **truncating** any existing
-    /// file. Pre-allocates 64 pages (256 KiB).
+    /// file. Pre-allocates `config.initial_capacity_pages` pages.
     pub fn create(path: &Path, config: BPlusTreeConfig) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -488,7 +494,7 @@ where
             .truncate(true)
             .open(path)?;
         let np = 2u64;
-        let initial_pages = 64u64;
+        let initial_pages = config.initial_capacity_pages.max(2);
         file.set_len(initial_pages * PAGE_SIZE as u64)?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
         let m = page_offset(META_PAGE);
@@ -1783,6 +1789,7 @@ where
             let mut shadow = BPlusTree::<K, V>::create(
                 &tmp_path,
                 BPlusTreeConfig {
+                    initial_capacity_pages: 2,
                     compaction_ratio: 1.0,
                 },
             )?;
@@ -1791,15 +1798,15 @@ where
             self.mmap[..used].copy_from_slice(&shadow.mmap[..used]);
             self.stats = shadow.stats;
 
-            // Shrink the backing file to the compacted size. The shadow is always
-            // ≤ the original — never larger — so the old `if used > ...` guard
-            // was a dead branch under the compaction invariant.
-            //
-            // Same map_anon dance as KeyDir/OrderLog: Windows refuses set_len
-            // shrink while a file mapping is live, so swap in a dummy anon mapping
-            // first.
+            // Shrink the backing file to the compacted size, but never below
+            // the initial-capacity floor so the next writes don't immediately
+            // re-grow the file.
+            let new_pages = shadow
+                .pages_counter()
+                .max(self.config.initial_capacity_pages);
+            let new_size = (new_pages as usize) * PAGE_SIZE;
             self.mmap = MmapMut::map_anon(1)?;
-            self.file.set_len(used as u64)?;
+            self.file.set_len(new_size as u64)?;
             self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
 
             Ok(())
@@ -3171,6 +3178,7 @@ mod tests {
         let mut t = BPlusTree::create(
             &p,
             BPlusTreeConfig {
+                initial_capacity_pages: 64,
                 compaction_ratio: 1.0,
             },
         )
@@ -3238,6 +3246,7 @@ mod tests {
         let mut t = BPlusTree::create(
             &p,
             BPlusTreeConfig {
+                initial_capacity_pages: 64,
                 compaction_ratio: 1.0,
             },
         )
@@ -3761,6 +3770,7 @@ mod tests {
         let mut t = BPlusTree::create(
             &p,
             BPlusTreeConfig {
+                initial_capacity_pages: 64,
                 compaction_ratio: 1.0,
             },
         )
@@ -3945,6 +3955,7 @@ mod tests {
         let mut t = BPlusTree::create(
             &p,
             BPlusTreeConfig {
+                initial_capacity_pages: 64,
                 compaction_ratio: 1.0,
             },
         )

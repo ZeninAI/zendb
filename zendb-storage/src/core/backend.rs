@@ -18,10 +18,6 @@
 //!   [`bulk_delete`](Backend::bulk_delete)) default to looping the
 //!   single-item variants; backends with optimized fast paths
 //!   (BPlusTree's future bottom-up bulk-load) override the relevant one.
-//! - **Transactional bracket** ([`open_tx`](Backend::open_tx) /
-//!   [`close_tx`](Backend::close_tx)) is part of the contract but defaults
-//!   to no-op. Backends that adopt dirty-page staging override; the trait
-//!   shape is stable so callers don't change.
 //! - **Writeback** is two-tier: [`flush`](Backend::flush) schedules OS
 //!   writeback (async); [`sync`](Backend::sync) waits for it. This layer
 //!   does not provide crash recovery, corruption repair, or multi-page
@@ -79,23 +75,6 @@ where
     /// Backend configuration values. Set once at construction, read
     /// through `config()`. Immutable after creation.
     type Config: Copy + Default + Encode + Decode<()>;
-
-    // ---- transactional bracket --------------------------------------
-
-    /// Begin a batched write window. Backends that stage dirty pages in
-    /// heap implement this; the default is a no-op for backends that
-    /// write through directly. Callers should pair every `open_tx` with
-    /// a `close_tx`.
-    fn open_tx(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-
-    /// End a batched write window — commits any staged writes. No-op by
-    /// default. Idempotent: callers may call `close_tx` without a prior
-    /// `open_tx` and get `Ok(())`.
-    fn close_tx(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 
     // ---- reads --------------------------------------------------------
 

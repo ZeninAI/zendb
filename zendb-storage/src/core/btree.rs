@@ -62,10 +62,9 @@
 //! # Writes
 //!
 //! Writes mutate the mmap in place. This engine is single-threaded, so there
-//! is no isolation, no rollback, no dirty-page cache — `open_tx` / `close_tx`
-//! are inherited as no-ops from the [`Backend`] trait. Bulk paths
-//! (`bulk_put`, `bulk_put_sorted`, `bulk_delete`) just loop over the
-//! per-record method.
+//! is no isolation, no rollback, and no dirty-page cache. Bulk paths
+//! (`bulk_put`, `bulk_put_sorted`, `bulk_delete`) use backend-specific
+//! implementations only where they provide real tree-level work.
 
 use memmap2::MmapMut;
 use std::{
@@ -1953,10 +1952,6 @@ where
     type Stats = BPlusTreeStats;
     type Config = BPlusTreeConfig;
 
-    // open_tx / close_tx inherit the Backend trait's no-op defaults — this
-    // engine is single-threaded and writes go straight to mmap, so there is
-    // no batching window to open.
-
     fn get(&self, key: &K) -> Option<V> {
         with_scratch(key, |kb| {
             Ok(self
@@ -2213,15 +2208,12 @@ where
         &self.config
     }
 
-    /// Schedule mmap writeback asynchronously. During an open tx this
-    /// only flushes the committed mmap region; dirty pages become durable
-    /// only after `close_tx` followed by a fresh `flush` / `sync`.
+    /// Schedule mmap writeback asynchronously.
     fn flush(&self) -> io::Result<()> {
         self.mmap.flush_async()
     }
 
-    /// Block until pending mmap writes have been flushed. Same mid-tx
-    /// caveat as [`flush`](Self::flush).
+    /// Block until pending mmap writes have been flushed.
     fn sync(&self) -> io::Result<()> {
         self.mmap.flush()
     }
@@ -2295,8 +2287,8 @@ where
             let count = rd_u16(&self.page_bytes(page)[2..4]) as usize;
             if count != 0 {
                 let last_slot = count - 1;
-                let k: K =
-                    deserialize_from(self.key_bytes_at(page, last_slot)).expect("valid encoded key");
+                let k: K = deserialize_from(self.key_bytes_at(page, last_slot))
+                    .expect("valid encoded key");
                 let v: V = deserialize_from(self.value_bytes_at(page, last_slot))
                     .expect("valid encoded value");
                 return Some((k, v));
@@ -3276,94 +3268,6 @@ mod tests {
         assert!(got.is_empty());
     }
 
-    // -- tx --
-
-    #[test]
-    fn tx_open_close_visible_after() {
-        let p = tmp("tx_open_close");
-        {
-            let mut t = create(&p);
-            t.open_tx().unwrap();
-            for i in 0u32..100 {
-                t.put(format!("k{:04}", i).into_bytes(), vbytes("v"))
-                    .unwrap();
-            }
-            t.close_tx().unwrap();
-            t.flush().unwrap();
-        }
-        let t: BPlusTree<TestKey, TestVal> = open(&p);
-        assert_eq!(t.size(), 100);
-        for i in 0u32..100 {
-            assert_eq!(
-                vget(&t, &format!("k{:04}", i).into_bytes()),
-                Some(vbytes("v"))
-            );
-        }
-    }
-
-    #[test]
-    fn tx_read_your_own_writes() {
-        let p = tmp("tx_ryow");
-        let mut t = create(&p);
-        t.open_tx().unwrap();
-        t.put(k("staged"), vbytes("fresh")).unwrap();
-        assert_eq!(vget(&t, &k("staged")), Some(vbytes("fresh")));
-        t.close_tx().unwrap();
-        assert_eq!(vget(&t, &k("staged")), Some(vbytes("fresh")));
-    }
-
-    // tx_nested_open_errors / close_tx_without_open_is_noop removed —
-    // open_tx / close_tx are inherited no-ops from the Backend trait, so
-    // nesting and reordering are trivially safe.
-
-    #[test]
-    fn tx_extent_visible_and_persists() {
-        let p = tmp("tx_extent");
-        let big = vec![0xCC; 8_000];
-        {
-            let mut t = create(&p);
-            t.open_tx().unwrap();
-            t.put(k("big"), big.clone()).unwrap();
-            assert_eq!(vget(&t, &k("big")), Some(big.clone()));
-            t.close_tx().unwrap();
-            t.flush().unwrap();
-        }
-        let t: BPlusTree<TestKey, TestVal> = open(&p);
-        assert_eq!(vget(&t, &k("big")), Some(big));
-    }
-
-    #[test]
-    fn tx_delete_inside_tx_persists() {
-        let p = tmp("tx_delete_inside");
-        {
-            let mut t = create(&p);
-            t.put(k("doomed"), vbytes("v")).unwrap();
-            t.put(k("keeper"), vbytes("v")).unwrap();
-            t.open_tx().unwrap();
-            assert!(t.delete(&k("doomed")).unwrap());
-            assert!(!t.contains(&k("doomed")));
-            t.close_tx().unwrap();
-            t.flush().unwrap();
-        }
-        let t: BPlusTree<TestKey, TestVal> = open(&p);
-        assert!(!t.contains(&k("doomed")));
-        assert!(t.contains(&k("keeper")));
-    }
-
-    #[test]
-    fn tx_overwrite_committed_entry() {
-        let p = tmp("tx_overwrite_committed");
-        let mut t = create(&p);
-        t.put(k("a"), vbytes("mmap_v")).unwrap();
-        t.open_tx().unwrap();
-        t.put(k("a"), vbytes("staged_v")).unwrap();
-        assert_eq!(vget(&t, &k("a")), Some(vbytes("staged_v")));
-        t.close_tx().unwrap();
-        assert_eq!(vget(&t, &k("a")), Some(vbytes("staged_v")));
-    }
-
-    // bulk_put_within_existing_tx_does_not_close_it removed — tx is no-op.
-
     #[test]
     fn update_modifies_existing() {
         let p = tmp("update_exists");
@@ -3513,51 +3417,6 @@ mod tests {
     }
 
     #[test]
-    fn tx_alloc_inside_does_not_grow_file_mid_tx() {
-        // alloc_page inside a tx should bump the pages counter but not
-        // call ensure_capacity. The mmap size grows at most once at
-        // commit.
-        let p = tmp("tx_alloc_no_mid_grow");
-        let mut t = create(&p);
-        t.open_tx().unwrap();
-        // Insert enough to force several leaf splits, each allocating
-        // a fresh page that lives only in the dirty cache.
-        for i in 0u32..200 {
-            t.put(
-                format!("k{:04}", i).into_bytes(),
-                vec![0xAB; 64], // big enough to fill leaves quickly
-            )
-            .unwrap();
-        }
-        t.close_tx().unwrap();
-        // After commit, every entry must be reachable.
-        for i in 0u32..200 {
-            assert_eq!(
-                vget(&t, &format!("k{:04}", i).into_bytes()),
-                Some(vec![0xAB; 64])
-            );
-        }
-    }
-
-    #[test]
-    fn tx_freelist_consistent_after_delete_then_put() {
-        // Within a single tx: delete an entry (frees its extent
-        // pages) then put a new entry. The new entry may reuse freed
-        // pages; both deletion and insertion must commit cleanly.
-        let p = tmp("tx_freelist");
-        let mut t = create(&p);
-        // Seed with an extent-sized value so deletion triggers
-        // free_extent.
-        t.put(k("ext"), vec![0xCC; 8_000]).unwrap();
-        t.open_tx().unwrap();
-        assert!(t.delete(&k("ext")).unwrap());
-        t.put(k("ext2"), vbytes("small")).unwrap();
-        t.close_tx().unwrap();
-        assert!(vget(&t, &k("ext")).is_none());
-        assert_eq!(vget(&t, &k("ext2")), Some(vbytes("small")));
-    }
-
-    #[test]
     fn range_rev_across_leaf_boundary() {
         let p = tmp("range_rev_cross_leaf");
         let mut t = create(&p);
@@ -3570,28 +3429,6 @@ mod tests {
             .map(|(k, _)| k)
             .collect();
         let expected: Vec<Vec<u8>> = (50..250u32)
-            .rev()
-            .map(|i| format!("k{:04}", i).into_bytes())
-            .collect();
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn range_rev_during_tx_sees_dirty_pages() {
-        // Put entries inside a tx, then immediately call range_rev —
-        // it must walk the dirty pages via page_bytes() dispatch.
-        let p = tmp("range_rev_dirty");
-        let mut t = create(&p);
-        t.open_tx().unwrap();
-        for i in 0u32..20 {
-            t.put(format!("k{:04}", i).into_bytes(), vbytes("v"))
-                .unwrap();
-        }
-        let got: Vec<Vec<u8>> = OrderedBackend::range_rev(&t, &k("k0005"), &k("k0010"))
-            .map(|(k, _)| k)
-            .collect();
-        t.close_tx().unwrap();
-        let expected: Vec<Vec<u8>> = (5..10u32)
             .rev()
             .map(|i| format!("k{:04}", i).into_bytes())
             .collect();

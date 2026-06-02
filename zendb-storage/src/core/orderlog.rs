@@ -14,16 +14,14 @@
 //! # Writing
 //!
 //! Writes append either a live record or tombstone to the WAL, then mutate
-//! the in-memory skip list. During `open_tx` / `close_tx`, writes are encoded
-//! into a pooled staging buffer and copied into the mmap once on close. This
-//! is batching, not atomicity: no rollback, no isolation, no crash recovery.
+//! the in-memory skip list.
 //!
 //! # Compaction
 //!
 //! Dead bytes from overwrites and tombstones trigger in-place compaction when
-//! the configured ratio is reached. Live skip-list entries are re-encoded in
-//! ascending key order at the front of the existing file, followed by a zero
-//! sentinel for replay.
+//! the configured ratio is reached. Live skip-list records are copied by WAL
+//! offset to the front of the existing file, followed by a zero sentinel for
+//! replay.
 //!
 //! # File format
 //!
@@ -45,7 +43,6 @@ use memmap2::MmapMut;
 use crate::core::backend::{Backend, OrderedBackend};
 use crate::utils::{
     fast_rand,
-    reusables::PooledBuf,
     serdes::{deserialize_from, read_u32_le, with_scratch, with_two_scratches},
 };
 
@@ -61,6 +58,7 @@ type Heads = [Option<usize>; MAX_LEVEL];
 struct SkipNode<K, V> {
     key: K,
     value: V,
+    record_offset: u64,
     record_size: u64,
     prev: Option<usize>,
     level: usize,
@@ -172,11 +170,19 @@ impl<K: Ord, V> OrderIndex<K, V> {
         self.get(key).is_some()
     }
 
-    fn alloc_node(&mut self, key: K, value: V, record_size: u64, level: usize) -> usize {
+    fn alloc_node(
+        &mut self,
+        key: K,
+        value: V,
+        record_offset: u64,
+        record_size: u64,
+        level: usize,
+    ) -> usize {
         if let Some(idx) = self.free.pop() {
             self.arena[idx] = SkipNode {
                 key,
                 value,
+                record_offset,
                 record_size,
                 prev: None,
                 level,
@@ -194,6 +200,7 @@ impl<K: Ord, V> OrderIndex<K, V> {
             self.arena.push(SkipNode {
                 key,
                 value,
+                record_offset,
                 record_size,
                 prev: None,
                 level,
@@ -205,26 +212,34 @@ impl<K: Ord, V> OrderIndex<K, V> {
         }
     }
 
-    fn insert(&mut self, key: K, value: V, record_size: u64) -> Option<u64> {
+    fn insert(&mut self, key: K, value: V, record_offset: u64, record_size: u64) -> Option<u64> {
         let (update, found) = self.search(&key);
         if let Some(idx) = found {
             self.arena[idx].value = value;
+            self.arena[idx].record_offset = record_offset;
             return Some(std::mem::replace(
                 &mut self.arena[idx].record_size,
                 record_size,
             ));
         }
-        self.insert_with_update(key, value, record_size, update);
+        self.insert_with_update(key, value, record_offset, record_size, update);
         None
     }
 
-    fn insert_with_update(&mut self, key: K, value: V, record_size: u64, update: Heads) {
+    fn insert_with_update(
+        &mut self,
+        key: K,
+        value: V,
+        record_offset: u64,
+        record_size: u64,
+        update: Heads,
+    ) {
         let level = self.random_level();
         if level > self.height {
             self.height = level;
         }
 
-        let new_idx = self.alloc_node(key, value, record_size, level);
+        let new_idx = self.alloc_node(key, value, record_offset, record_size, level);
         self.link_new_node(new_idx, &update);
         self.len += 1;
     }
@@ -297,14 +312,6 @@ impl<K: Ord, V> OrderIndex<K, V> {
 
     fn iter(&self) -> OrderIndexIter<'_, K, V> {
         OrderIndexIter {
-            arena: &self.arena,
-            nexts: &self.nexts,
-            current: self.heads[0],
-        }
-    }
-
-    fn iter_with_nodes(&self) -> OrderIndexNodeIter<'_, K, V> {
-        OrderIndexNodeIter {
             arena: &self.arena,
             nexts: &self.nexts,
             current: self.heads[0],
@@ -398,12 +405,19 @@ impl<K: Ord, V> OrderIndex<K, V> {
         finger.cursor.is_some_and(|idx| self.arena[idx].key == *key)
     }
 
-    fn insert_at_finger(&mut self, finger: &mut Finger, key: K, value: V, record_size: u64) {
+    fn insert_at_finger(
+        &mut self,
+        finger: &mut Finger,
+        key: K,
+        value: V,
+        record_offset: u64,
+        record_size: u64,
+    ) {
         let level = self.random_level();
         if level > self.height {
             self.height = level;
         }
-        let new_idx = self.alloc_node(key, value, record_size, level);
+        let new_idx = self.alloc_node(key, value, record_offset, record_size, level);
         self.link_new_node(new_idx, &finger.update);
         for i in 0..level {
             finger.update[i] = Some(new_idx);
@@ -411,10 +425,17 @@ impl<K: Ord, V> OrderIndex<K, V> {
         self.len += 1;
     }
 
-    fn overwrite_at_finger(&mut self, finger: &Finger, value: V, record_size: u64) -> u64 {
+    fn overwrite_at_finger(
+        &mut self,
+        finger: &Finger,
+        value: V,
+        record_offset: u64,
+        record_size: u64,
+    ) -> u64 {
         let idx = finger.cursor.expect("finger cursor must point at a node");
         let old = self.arena[idx].record_size;
         self.arena[idx].value = value;
+        self.arena[idx].record_offset = record_offset;
         self.arena[idx].record_size = record_size;
         old
     }
@@ -466,23 +487,6 @@ impl<'a, K, V> Iterator for OrderIndexIter<'a, K, V> {
         let node = &self.arena[idx];
         self.current = self.nexts[idx * MAX_LEVEL];
         Some((&node.key, &node.value))
-    }
-}
-
-struct OrderIndexNodeIter<'a, K, V> {
-    arena: &'a [SkipNode<K, V>],
-    nexts: &'a [Option<usize>],
-    current: Option<usize>,
-}
-
-impl<'a, K, V> Iterator for OrderIndexNodeIter<'a, K, V> {
-    type Item = (&'a K, &'a SkipNode<K, V>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let idx = self.current?;
-        let node = &self.arena[idx];
-        self.current = self.nexts[idx * MAX_LEVEL];
-        Some((&node.key, node))
     }
 }
 
@@ -614,13 +618,8 @@ where
     }
 }
 
-struct TxState {
-    staging: PooledBuf,
-    tx_base: u64,
-}
-
 // Field-level helpers let methods hold a skip-list search result while
-// writing to disjoint mmap/file/tx/stats fields.
+// writing to disjoint mmap/file/stats fields.
 
 fn grow_into(mmap: &mut MmapMut, file: &mut File, desired: u64) -> io::Result<()> {
     let new_capacity = ((mmap.len() as u64) * 2).max(desired);
@@ -632,11 +631,10 @@ fn grow_into(mmap: &mut MmapMut, file: &mut File, desired: u64) -> io::Result<()
 fn append_entry_into<K, V>(
     mmap: &mut MmapMut,
     file: &mut File,
-    tx: &mut Option<TxState>,
     stats: &mut OrderLogStats,
     key: &K,
     value: &V,
-) -> io::Result<u64>
+) -> io::Result<(u64, u64)>
 where
     K: Encode,
     V: Encode,
@@ -647,14 +645,9 @@ where
         let total = 8usize
             .checked_add(vb.len())
             .and_then(|n| n.checked_add(kb.len()))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow"))?;
-
-        if let Some(tx_state) = tx.as_mut() {
-            let local = tx_state.staging.len();
-            tx_state.staging.resize(local + total, 0);
-            encode_live_record(&mut tx_state.staging[local..local + total], kb, vb);
-            return Ok(total as u64);
-        }
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow")
+            })?;
 
         let offset = stats.data_size as usize;
         let end = offset.checked_add(total).ok_or_else(|| {
@@ -665,14 +658,13 @@ where
         }
         encode_live_record(&mut mmap[offset..end], kb, vb);
         stats.data_size = end as u64;
-        Ok(total as u64)
+        Ok((offset as u64, total as u64))
     })
 }
 
 fn append_tombstone_into<K>(
     mmap: &mut MmapMut,
     file: &mut File,
-    tx: &mut Option<TxState>,
     stats: &mut OrderLogStats,
     key: &K,
 ) -> io::Result<u64>
@@ -683,13 +675,6 @@ where
         let total = 8usize.checked_add(kb.len()).ok_or_else(|| {
             io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow")
         })?;
-
-        if let Some(tx_state) = tx.as_mut() {
-            let local = tx_state.staging.len();
-            tx_state.staging.resize(local + total, 0);
-            encode_tombstone_record(&mut tx_state.staging[local..local + total], kb);
-            return Ok(total as u64);
-        }
 
         let offset = stats.data_size as usize;
         let end = offset.checked_add(total).ok_or_else(|| {
@@ -704,32 +689,26 @@ where
     })
 }
 
-fn append_entry_raw<K, V>(
+fn copy_live_record(
     mmap: &mut MmapMut,
     file: &mut File,
     cursor: u64,
-    key: &K,
-    value: &V,
-) -> io::Result<u64>
-where
-    K: Encode,
-    V: Encode,
-{
-    with_two_scratches(key, value, |kb, vb| {
-        let total = 8usize
-            .checked_add(vb.len())
-            .and_then(|n| n.checked_add(kb.len()))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow"))?;
-        let offset = cursor as usize;
-        let end = offset.checked_add(total).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow")
-        })?;
-        if end > mmap.len() {
-            grow_into(mmap, file, end as u64)?;
-        }
-        encode_live_record(&mut mmap[offset..end], kb, vb);
-        Ok(end as u64)
-    })
+    src: u64,
+    len: u64,
+) -> io::Result<u64> {
+    let dst = cursor as usize;
+    let src = src as usize;
+    let len = len as usize;
+    let end = dst
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow"))?;
+    if end > mmap.len() {
+        grow_into(mmap, file, end as u64)?;
+    }
+    if src != dst {
+        mmap.copy_within(src..src + len, dst);
+    }
+    Ok(end as u64)
 }
 
 /// Pack `[vlen u32][value][klen u32][key]` from pre-encoded byte slices.
@@ -780,7 +759,6 @@ pub struct OrderLog<K: Ord, V> {
     path: PathBuf,
     config: OrderLogConfig,
     stats: OrderLogStats,
-    tx: Option<TxState>,
 }
 
 impl<K, V> OrderLog<K, V>
@@ -811,7 +789,6 @@ where
                 data_size: HEADER_SIZE as u64,
                 dead_bytes: 0,
             },
-            tx: None,
         })
     }
 
@@ -840,7 +817,6 @@ where
             path: path.to_path_buf(),
             config,
             stats: OrderLogStats::default(),
-            tx: None,
         };
         this.replay_wal()?;
         Ok(this)
@@ -884,7 +860,7 @@ where
                 }
                 let value: V = deserialize_from(&self.mmap[value_start..value_end])?;
                 let record_size = 8 + value_size as u64 + key_size as u64;
-                if let Some(old) = self.index.insert(key, value, record_size) {
+                if let Some(old) = self.index.insert(key, value, cursor as u64, record_size) {
                     self.stats.dead_bytes += old;
                 }
             }
@@ -896,9 +872,6 @@ where
     }
 
     fn maybe_compact(&mut self) -> io::Result<()> {
-        if self.tx.is_some() {
-            return Ok(());
-        }
         let threshold = self.config.compaction_ratio;
         if threshold >= 1.0 {
             return Ok(());
@@ -918,10 +891,6 @@ where
             _marker: std::marker::PhantomData,
         }
     }
-
-    fn grow(&mut self, desired: u64) -> io::Result<()> {
-        grow_into(&mut self.mmap, &mut self.file, desired)
-    }
 }
 
 impl<K, V> Backend<K, V> for OrderLog<K, V>
@@ -931,40 +900,6 @@ where
 {
     type Stats = OrderLogStats;
     type Config = OrderLogConfig;
-
-    fn open_tx(&mut self) -> io::Result<()> {
-        if self.tx.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "OrderLog tx already open",
-            ));
-        }
-        self.tx = Some(TxState {
-            staging: PooledBuf::acquire(),
-            tx_base: self.stats.data_size,
-        });
-        Ok(())
-    }
-
-    fn close_tx(&mut self) -> io::Result<()> {
-        let Some(tx) = self.tx.take() else {
-            return Ok(());
-        };
-        let staged_len = tx.staging.len();
-        if staged_len > 0 {
-            let end = tx.tx_base.checked_add(staged_len as u64).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow")
-            })?;
-            if end > self.mmap.len() as u64 {
-                self.grow(end)?;
-            }
-            let start = tx.tx_base as usize;
-            self.mmap[start..start + staged_len].copy_from_slice(&tx.staging);
-            self.stats.data_size = end;
-        }
-        drop(tx);
-        self.maybe_compact()
-    }
 
     fn get(&self, key: &K) -> Option<V> {
         self.index.get(key).cloned()
@@ -978,12 +913,12 @@ where
         let encoded = append_entry_into(
             &mut self.mmap,
             &mut self.file,
-            &mut self.tx,
             &mut self.stats,
             &key,
             &value,
         )?;
-        if let Some(old) = self.index.insert(key, value, encoded) {
+        let (offset, size) = encoded;
+        if let Some(old) = self.index.insert(key, value, offset, size) {
             self.stats.dead_bytes += old;
         }
         self.maybe_compact()
@@ -998,12 +933,11 @@ where
             index,
             mmap,
             file,
-            tx,
             stats,
             ..
         } = self;
-        let encoded = append_entry_into(mmap, file, tx, stats, &key, &value)?;
-        index.insert_with_update(key, value, encoded, update);
+        let (offset, size) = append_entry_into(mmap, file, stats, &key, &value)?;
+        index.insert_with_update(key, value, offset, size, update);
         self.maybe_compact()?;
         Ok(true)
     }
@@ -1015,56 +949,41 @@ where
             index,
             mmap,
             file,
-            tx,
             stats,
             ..
         } = self;
-        let encoded = append_entry_into(mmap, file, tx, stats, &key, &value)?;
+        let (offset, size) = append_entry_into(mmap, file, stats, &key, &value)?;
         match found {
             Some(idx) => {
                 let old = index.arena[idx].record_size;
                 index.arena[idx].value = value;
-                index.arena[idx].record_size = encoded;
+                index.arena[idx].record_offset = offset;
+                index.arena[idx].record_size = size;
                 stats.dead_bytes += old;
             }
-            None => index.insert_with_update(key, value, encoded, update),
+            None => index.insert_with_update(key, value, offset, size, update),
         }
         self.maybe_compact()?;
         Ok(prev)
-    }
-
-    fn bulk_put<I>(&mut self, items: I) -> io::Result<()>
-    where
-        I: IntoIterator<Item = (K, V)>,
-    {
-        let mut sorted: Vec<(K, V)> = items.into_iter().collect();
-        sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
-        self.bulk_put_sorted(sorted)
     }
 
     fn bulk_put_sorted<I>(&mut self, sorted: I) -> io::Result<()>
     where
         I: IntoIterator<Item = (K, V)>,
     {
-        let opened_here = self.tx.is_none();
-        if opened_here {
-            self.open_tx()?;
-        }
-
         let mut first_err = None;
         {
             let Self {
                 index,
                 mmap,
                 file,
-                tx,
                 stats,
                 ..
             } = self;
             let mut finger = index.finger_at_start();
             for (k, v) in sorted {
-                let encoded = match append_entry_into(mmap, file, tx, stats, &k, &v) {
-                    Ok(size) => size,
+                let (offset, size) = match append_entry_into(mmap, file, stats, &k, &v) {
+                    Ok(meta) => meta,
                     Err(e) => {
                         first_err = Some(e);
                         break;
@@ -1072,19 +991,17 @@ where
                 };
                 index.advance_finger_to(&mut finger, &k);
                 if index.finger_matches(&finger, &k) {
-                    let old = index.overwrite_at_finger(&finger, v, encoded);
+                    let old = index.overwrite_at_finger(&finger, v, offset, size);
                     stats.dead_bytes += old;
                 } else {
-                    index.insert_at_finger(&mut finger, k, v, encoded);
+                    index.insert_at_finger(&mut finger, k, v, offset, size);
                 }
             }
         }
 
-        if opened_here {
-            if let Err(e) = self.close_tx() {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
+        if let Err(e) = self.maybe_compact() {
+            if first_err.is_none() {
+                first_err = Some(e);
             }
         }
         match first_err {
@@ -1097,26 +1014,11 @@ where
         let Some(old) = self.index.remove_drop(key) else {
             return Ok(false);
         };
-        let tombstone = append_tombstone_into(
-            &mut self.mmap,
-            &mut self.file,
-            &mut self.tx,
-            &mut self.stats,
-            key,
-        )?;
+        let tombstone =
+            append_tombstone_into(&mut self.mmap, &mut self.file, &mut self.stats, key)?;
         self.stats.dead_bytes += old + tombstone;
         self.maybe_compact()?;
         Ok(true)
-    }
-
-    fn bulk_delete<'a, I>(&mut self, keys: I) -> io::Result<usize>
-    where
-        I: IntoIterator<Item = &'a K>,
-        K: 'a,
-    {
-        let mut sorted: Vec<&K> = keys.into_iter().collect();
-        sorted.sort();
-        self.bulk_delete_sorted(sorted)
     }
 
     fn bulk_delete_sorted<'a, I>(&mut self, sorted: I) -> io::Result<usize>
@@ -1124,11 +1026,6 @@ where
         I: IntoIterator<Item = &'a K>,
         K: 'a,
     {
-        let opened_here = self.tx.is_none();
-        if opened_here {
-            self.open_tx()?;
-        }
-
         let mut removed = 0;
         let mut first_err = None;
         {
@@ -1136,7 +1033,6 @@ where
                 index,
                 mmap,
                 file,
-                tx,
                 stats,
                 ..
             } = self;
@@ -1146,7 +1042,7 @@ where
                 if !index.finger_matches(&finger, k) {
                     continue;
                 }
-                let tombstone = match append_tombstone_into(mmap, file, tx, stats, k) {
+                let tombstone = match append_tombstone_into(mmap, file, stats, k) {
                     Ok(size) => size,
                     Err(e) => {
                         first_err = Some(e);
@@ -1159,11 +1055,9 @@ where
             }
         }
 
-        if opened_here {
-            if let Err(e) = self.close_tx() {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
+        if let Err(e) = self.maybe_compact() {
+            if first_err.is_none() {
+                first_err = Some(e);
             }
         }
         match first_err {
@@ -1180,13 +1074,8 @@ where
         let current = found.map(|idx| self.index.arena[idx].value.clone());
         let Some(new_state) = f(current) else {
             if let Some(idx) = found {
-                let tombstone = append_tombstone_into(
-                    &mut self.mmap,
-                    &mut self.file,
-                    &mut self.tx,
-                    &mut self.stats,
-                    key,
-                )?;
+                let tombstone =
+                    append_tombstone_into(&mut self.mmap, &mut self.file, &mut self.stats, key)?;
                 let old = self.index.remove_found(update, idx);
                 self.stats.dead_bytes += old + tombstone;
                 self.maybe_compact()?;
@@ -1197,28 +1086,28 @@ where
         let encoded = append_entry_into(
             &mut self.mmap,
             &mut self.file,
-            &mut self.tx,
             &mut self.stats,
             key,
             &new_state,
         )?;
+        let (offset, size) = encoded;
         match found {
             Some(idx) => {
                 let old = self.index.arena[idx].record_size;
                 self.index.arena[idx].value = new_state;
-                self.index.arena[idx].record_size = encoded;
+                self.index.arena[idx].record_offset = offset;
+                self.index.arena[idx].record_size = size;
                 self.stats.dead_bytes += old;
             }
             None => self
                 .index
-                .insert_with_update(key.clone(), new_state, encoded, update),
+                .insert_with_update(key.clone(), new_state, offset, size, update),
         }
         self.maybe_compact()?;
         Ok(())
     }
 
     fn clear(&mut self) -> io::Result<()> {
-        debug_assert!(self.tx.is_none(), "clear() called inside an open tx");
         self.index.clear();
         self.stats = OrderLogStats {
             data_size: HEADER_SIZE as u64,
@@ -1232,7 +1121,6 @@ where
     }
 
     fn compact(&mut self) -> io::Result<()> {
-        debug_assert!(self.tx.is_none(), "compact() called inside an open tx");
         let Self {
             index,
             mmap,
@@ -1244,8 +1132,17 @@ where
 
         mmap[0..4].copy_from_slice(&MAGIC.to_le_bytes());
         let mut cursor = HEADER_SIZE as u64;
-        for (key, node) in index.iter_with_nodes() {
-            cursor = append_entry_raw(mmap, file, cursor, key, &node.value)?;
+        let mut nodes: Vec<usize> = Vec::with_capacity(index.len());
+        let mut current = index.heads[0];
+        while let Some(idx) = current {
+            nodes.push(idx);
+            current = index.next_at(idx, 0);
+        }
+        nodes.sort_unstable_by_key(|idx| index.arena[*idx].record_offset);
+        for idx in nodes {
+            let node = &mut index.arena[idx];
+            cursor = copy_live_record(mmap, file, cursor, node.record_offset, node.record_size)?;
+            node.record_offset = cursor - node.record_size;
         }
         if (cursor as usize) + 4 <= mmap.len() {
             let p = cursor as usize;
@@ -1717,92 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn tx_bulk_put_visible_after_close_and_reopen() {
-        let p = tmp_path("tx_bulk_put");
-        {
-            let mut ol = create(&p);
-            ol.open_tx().unwrap();
-            for i in 0..250u32 {
-                ol.put(format!("k{:04}", i).into_bytes(), v("payload", i))
-                    .unwrap();
-            }
-            ol.close_tx().unwrap();
-            ol.sync().unwrap();
-        }
-        let ol = open(&p);
-        assert_eq!(ol.size(), 250);
-        assert_eq!(ol.get(&k("k0249")), Some(v("payload", 249)));
-    }
-
-    #[test]
-    fn tx_read_your_own_writes_and_delete_survive() {
-        let p = tmp_path("tx_ryow");
-        {
-            let mut ol = create(&p);
-            ol.put(k("doomed"), v("old", 1)).unwrap();
-            ol.open_tx().unwrap();
-            ol.put(k("staged"), v("fresh", 42)).unwrap();
-            assert_eq!(ol.get(&k("staged")), Some(v("fresh", 42)));
-            assert!(ol.delete(&k("doomed")).unwrap());
-            assert!(!ol.contains(&k("doomed")));
-            ol.close_tx().unwrap();
-            ol.sync().unwrap();
-        }
-        let ol = open(&p);
-        assert_eq!(ol.get(&k("staged")), Some(v("fresh", 42)));
-        assert!(!ol.contains(&k("doomed")));
-    }
-
-    #[test]
-    fn tx_overwrite_within_tx() {
-        let p = tmp_path("tx_overwrite");
-        let mut ol = create(&p);
-        ol.open_tx().unwrap();
-        ol.put(k("a"), v("first", 1)).unwrap();
-        ol.put(k("a"), v("second", 2)).unwrap();
-        assert_eq!(ol.get(&k("a")), Some(v("second", 2)));
-        ol.close_tx().unwrap();
-        assert_eq!(ol.get(&k("a")), Some(v("second", 2)));
-    }
-
-    #[test]
-    fn nested_open_tx_errors_and_close_noop() {
-        let p = tmp_path("tx_nested");
-        let mut ol = create(&p);
-        ol.close_tx().unwrap();
-        ol.open_tx().unwrap();
-        assert_eq!(
-            ol.open_tx().unwrap_err().kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        ol.close_tx().unwrap();
-        ol.close_tx().unwrap();
-    }
-
-    #[test]
-    fn compaction_does_not_fire_during_tx() {
-        let p = tmp_path("tx_compact_deferred");
-        let mut ol = create_with(
-            &p,
-            OrderLogConfig {
-                initial_capacity: 16 * 1024,
-                compaction_ratio: 0.0,
-            },
-        );
-        ol.put(k("hot"), v("seed", 0)).unwrap();
-        assert_eq!(ol.stats().dead_bytes, 0);
-        ol.open_tx().unwrap();
-        for i in 1..20u32 {
-            ol.put(k("hot"), v("staged", i)).unwrap();
-        }
-        assert!(ol.stats().dead_bytes > 0);
-        ol.close_tx().unwrap();
-        assert_eq!(ol.stats().dead_bytes, 0);
-        assert_eq!(ol.get(&k("hot")), Some(v("staged", 19)));
-    }
-
-    #[test]
-    fn bulk_put_and_delete_auto_tx() {
+    fn bulk_put_and_delete() {
         let p = tmp_path("bulk_auto");
         let mut ol = create(&p);
         let items: Vec<_> = (0..100u32)
@@ -1816,12 +1628,10 @@ mod tests {
         let removed = ol.bulk_delete(keys.iter()).unwrap();
         assert_eq!(removed, 50);
         assert_eq!(ol.size(), 50);
-        ol.open_tx().unwrap();
-        ol.close_tx().unwrap();
     }
 
     #[test]
-    fn bulk_unsorted_routes_through_sorted_paths() {
+    fn bulk_unsorted_keeps_ordered_iteration() {
         let p = tmp_path("bulk_unsorted_sort");
         let mut ol = create(&p);
         let items = vec![
@@ -1839,22 +1649,6 @@ mod tests {
         let keys = vec![k("c"), k("missing"), k("a")];
         assert_eq!(ol.bulk_delete(keys.iter()).unwrap(), 2);
         assert_eq!(ol.keys().collect::<Vec<_>>(), vec![k("b"), k("d")]);
-    }
-
-    #[test]
-    fn bulk_put_within_existing_tx_does_not_close_it() {
-        let p = tmp_path("bulk_existing_tx");
-        let mut ol = create(&p);
-        ol.open_tx().unwrap();
-        ol.bulk_put([(k("a"), v("a", 1)), (k("b"), v("b", 2))])
-            .unwrap();
-        assert_eq!(
-            ol.open_tx().unwrap_err().kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        ol.put(k("c"), v("c", 3)).unwrap();
-        ol.close_tx().unwrap();
-        assert_eq!(ol.size(), 3);
     }
 
     #[test]
@@ -1879,21 +1673,6 @@ mod tests {
     }
 
     #[test]
-    fn bulk_put_sorted_within_existing_tx_does_not_close_it() {
-        let p = tmp_path("bulk_sorted_tx");
-        let mut ol = create(&p);
-        ol.open_tx().unwrap();
-        ol.bulk_put_sorted([(k("a"), v("a", 1)), (k("b"), v("b", 2))])
-            .unwrap();
-        assert_eq!(
-            ol.open_tx().unwrap_err().kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        ol.close_tx().unwrap();
-        assert_eq!(ol.size(), 2);
-    }
-
-    #[test]
     fn bulk_delete_sorted_removes_hits_skips_misses() {
         let p = tmp_path("bulk_delete_sorted");
         let mut ol = create(&p);
@@ -1908,25 +1687,6 @@ mod tests {
         assert!(!ol.contains(&k("k00")));
         assert!(!ol.contains(&k("k03")));
         assert!(!ol.contains(&k("k09")));
-    }
-
-    #[test]
-    fn bulk_delete_sorted_within_existing_tx_does_not_close_it() {
-        let p = tmp_path("bulk_delete_sorted_tx");
-        let mut ol = create(&p);
-        for i in 0..5u32 {
-            ol.put(format!("k{:02}", i).into_bytes(), v("p", i))
-                .unwrap();
-        }
-        ol.open_tx().unwrap();
-        let keys = vec![k("k01"), k("k03")];
-        assert_eq!(ol.bulk_delete_sorted(keys.iter()).unwrap(), 2);
-        assert_eq!(
-            ol.open_tx().unwrap_err().kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        ol.close_tx().unwrap();
-        assert_eq!(ol.size(), 3);
     }
 
     #[test]

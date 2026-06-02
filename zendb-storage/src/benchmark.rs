@@ -3,33 +3,18 @@
 //! The suite keeps the workload shape constant within each scenario and
 //! labels each backend by the write mode it actually implements:
 //!
-//! - KeyDir and OrderLog expose a real `open_tx` / `close_tx` bulk-write
-//!   window, so they are measured both as per-call writes and as one
-//!   explicit batch.
 //! - LMDB is measured as one write transaction per item and as one batch
-//!   transaction, matching the same commit-amortization axis.
-//! - BPlusTree writes directly into its mmap; `open_tx` / `close_tx` are
-//!   inherited no-ops. It is therefore measured once for direct `put`
-//!   loops, plus its meaningful `bulk_put_sorted` bottom-up load path.
-//!
-//! For the batching backends, the batch-mode win comes from amortizing
-//! the per-op overheads that the direct path pays on every call:
-//!
-//! - mmap `grow` (file `set_len` + remap) - at most one per batch, vs.
-//!   one every time the direct path crosses the current capacity boundary.
-//! - `maybe_compact` (dead-byte ratio check + possibly a full sweep) - at
-//!   most one per batch, vs. one per record in the direct path.
+//!   transaction as an external baseline.
+//! - BPlusTree is measured for direct `put` loops, plus its meaningful
+//!   `bulk_put_sorted` bottom-up load path.
 //!
 //! Two scenarios cover both axes:
 //!
 //! - **fresh** — N unique keys, no overwrites. No dead bytes, no
-//!   compaction triggers. This isolates the steady-state encode cost;
-//!   the batching path pays an extra staging-to-mmap memcpy at commit, so
-//!   it can be slightly slower than direct writes in this scenario. Worth
-//!   measuring because it sets the floor for the batching overhead.
+//!   compaction triggers. This isolates the steady-state encode cost.
 //! - **churn** — N puts spread across N/4 unique keys (4× overwrite
 //!   ratio). This generates dead bytes and exercises `maybe_compact` in
-//!   direct-write paths. Batching backends defer that work to commit.
+//!   write paths.
 //!
 //! OrderLog also has sorted bulk paths. Its unsorted bulk methods collect
 //! and sort before delegating to the sorted finger-walk implementation, so
@@ -39,8 +24,8 @@
 //! LMDB sits next to the in-tree backends as a baseline:
 //!
 //! - KeyDir/OrderLog direct writes <-> LMDB one-txn-per-op.
-//! - KeyDir/OrderLog `open_tx` batches <-> LMDB single batch txn.
-//! - BPlusTree direct writes stand alone because its tx bracket is a no-op.
+//! - LMDB single batch transaction remains a reference point for commit
+//!   amortization outside the in-tree backends.
 //!
 //! ## Running
 //!
@@ -232,27 +217,6 @@ fn keydir_writes_fresh_direct() -> io::Result<()> {
     Ok(())
 }
 
-#[test]
-#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn keydir_writes_fresh_in_tx() -> io::Result<()> {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("keydir.bin");
-    let mut kd = KeyDir::<u64, u64>::create(&path, keydir_config())?;
-    let keys = fresh_keys();
-
-    let elapsed = timed(|| {
-        kd.open_tx()?;
-        for &k in &keys {
-            kd.put(k, k.wrapping_mul(7))?;
-        }
-        kd.close_tx()?;
-        kd.flush()
-    })?;
-
-    BenchResult::new("KeyDir fresh writes (open_tx batch)", N, elapsed).print();
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // KeyDir — churn (4× overwrite ratio, exercises maybe_compact)
 // ---------------------------------------------------------------------------
@@ -276,27 +240,6 @@ fn keydir_writes_churn_direct() -> io::Result<()> {
     Ok(())
 }
 
-#[test]
-#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn keydir_writes_churn_in_tx() -> io::Result<()> {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("keydir.bin");
-    let mut kd = KeyDir::<u64, u64>::create(&path, keydir_config())?;
-    let keys = churn_keys();
-
-    let elapsed = timed(|| {
-        kd.open_tx()?;
-        for &k in &keys {
-            kd.put(k, k.wrapping_mul(7))?;
-        }
-        kd.close_tx()?;
-        kd.flush()
-    })?;
-
-    BenchResult::new("KeyDir churn writes (open_tx batch)", N, elapsed).print();
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // KeyDir — reads
 // ---------------------------------------------------------------------------
@@ -308,13 +251,8 @@ fn keydir_reads() -> io::Result<()> {
     let path = dir.path().join("keydir.bin");
     let mut kd = KeyDir::<u64, u64>::create(&path, keydir_config())?;
 
-    // Seed outside the timed region. Use the tx path because we measure
-    // read throughput, not seed throughput.
-    kd.open_tx()?;
-    for k in 0..N {
-        kd.put(k, k.wrapping_mul(7))?;
-    }
-    kd.close_tx()?;
+    // Seed outside the timed region because we measure read throughput.
+    kd.bulk_put(kv_payload(&fresh_keys()))?;
     kd.flush()?;
 
     let elapsed = timed(|| {
@@ -352,27 +290,6 @@ fn orderlog_writes_fresh_direct() -> io::Result<()> {
     Ok(())
 }
 
-#[test]
-#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn orderlog_writes_fresh_in_tx() -> io::Result<()> {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("orderlog.bin");
-    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
-    let keys = fresh_keys();
-
-    let elapsed = timed(|| {
-        ol.open_tx()?;
-        for &k in &keys {
-            ol.put(k, k.wrapping_mul(7))?;
-        }
-        ol.close_tx()?;
-        ol.flush()
-    })?;
-
-    BenchResult::new("OrderLog fresh writes (open_tx batch)", N, elapsed).print();
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // OrderLog — churn (4× overwrite ratio, exercises maybe_compact)
 // ---------------------------------------------------------------------------
@@ -393,27 +310,6 @@ fn orderlog_writes_churn_direct() -> io::Result<()> {
     })?;
 
     BenchResult::new("OrderLog churn writes (direct put)", N, elapsed).print();
-    Ok(())
-}
-
-#[test]
-#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn orderlog_writes_churn_in_tx() -> io::Result<()> {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("orderlog.bin");
-    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
-    let keys = churn_keys();
-
-    let elapsed = timed(|| {
-        ol.open_tx()?;
-        for &k in &keys {
-            ol.put(k, k.wrapping_mul(7))?;
-        }
-        ol.close_tx()?;
-        ol.flush()
-    })?;
-
-    BenchResult::new("OrderLog churn writes (open_tx batch)", N, elapsed).print();
     Ok(())
 }
 

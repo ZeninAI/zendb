@@ -257,11 +257,13 @@ impl Table {
             let current_bytes: Option<Vec<u8>> =
                 self.backend.get(&key).map(|v| v.as_slice().to_vec());
             let mut cell = decode_cell(current_bytes.as_deref()).unwrap_or_else(|| {
-                Cell::dummy(Some(zendb_types::Value::Atom(zendb_types::AtomValue::Null)))
+                Cell::dummy(zendb_types::Value::Atom(zendb_types::Atom(
+                    zendb_types::AtomValue::Null,
+                )))
             });
 
             for delta in &deltas {
-                cell.apply_delta(delta);
+                cell.apply(delta);
             }
 
             let buf = encode_to_vec(&cell, config::standard())
@@ -280,13 +282,16 @@ impl Table {
         let key_vec = key.to_vec();
         let current_bytes: Option<Vec<u8>> =
             self.backend.get(&key_vec).map(|v| v.as_slice().to_vec());
-        let mut cell = decode_cell(current_bytes.as_deref())
-            .unwrap_or_else(|| Cell::dummy(Some(zendb_types::Value::Atom(zendb_types::AtomValue::Null))));
+        let mut cell = decode_cell(current_bytes.as_deref()).unwrap_or_else(|| {
+            Cell::dummy(zendb_types::Value::Atom(zendb_types::Atom(
+                zendb_types::AtomValue::Null,
+            )))
+        });
 
         let mut modified = false;
         if let Some(deltas) = self.buffer.get(&key_vec) {
             for delta in deltas {
-                cell.apply_delta(delta);
+                cell.apply(delta);
                 modified = true;
             }
         }
@@ -378,7 +383,7 @@ mod tests {
     }
 
     fn make_delta(key: &str, val: &str, hlc_ms: u64) -> (Delta, Vec<u8>) {
-        let pk = zendb_types::AtomValue::String(key.into());
+        let pk = zendb_types::PrimaryKey::Atom(zendb_types::AtomValue::String(key.into()));
         let pk_bytes = encode_to_vec(&pk, config::standard()).unwrap();
         let d = Delta {
             table_id: "test".into(),

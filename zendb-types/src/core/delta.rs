@@ -5,10 +5,9 @@
 
 use bincode::{Decode, Encode};
 
-use crate::{types::atom::AtomValue, Hlc, Op, Path};
+use crate::{Hlc, Op, Path, PrimaryKey};
 
 pub type TableId = String;
-pub type PrimaryKey = AtomValue;
 pub type Signature = Vec<u8>;
 
 /// The unit produced by every write.

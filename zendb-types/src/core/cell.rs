@@ -2,6 +2,7 @@
 
 use bincode::{Decode, Encode};
 
+use crate::core::traits::{ContainerType, Type};
 use crate::{Hlc, Op, TypeTag, Value};
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
@@ -16,25 +17,13 @@ pub struct Cell {
 }
 
 impl Cell {
-    pub fn new(value: Value, hlc: Hlc, sync: Option<bool>) -> Cell {
+    pub fn new(value: Option<Value>, hlc: Hlc, sync: Option<bool>) -> Cell {
+        Cell { value, hlc, sync }
+    }
+
+    pub fn dummy(value: Value) -> Cell {
         Cell {
             value: Some(value),
-            hlc,
-            sync,
-        }
-    }
-
-    pub fn tombstone(hlc: Hlc, sync: Option<bool>) -> Cell {
-        Cell {
-            value: None,
-            hlc,
-            sync,
-        }
-    }
-
-    pub fn dummy(value: Option<Value>) -> Cell {
-        Cell {
-            value,
             hlc: Hlc::ZERO,
             sync: None,
         }
@@ -53,11 +42,11 @@ impl Cell {
     }
 
     /// Apply a delta/event to this cell. Returns true if state was modified.
-    pub fn apply_delta(&mut self, delta: &crate::Delta) -> bool {
+    pub fn apply(&mut self, delta: &crate::Delta) -> bool {
         let mut cursor = self;
 
         for (index, step) in delta.path.steps.iter().enumerate() {
-            if !ensure_ancestor_container(cursor, step.container_tag, delta.hlc) {
+            if !ensure_target_type(cursor, step.container_tag, delta.hlc) {
                 return false;
             }
 
@@ -72,7 +61,7 @@ impl Cell {
                 .value
                 .as_mut()
                 .expect("ensure_ancestor_container must leave cursor live");
-            cursor = match crate::descend_or_create_dispatch(value, &step.segment, child_tag) {
+            cursor = match value.child_or_insert(&step.segment, child_tag) {
                 Ok(c) => c,
                 Err(_) => return false,
             };
@@ -98,21 +87,26 @@ impl Cell {
             }
             (None, Some(_)) | (Some(_), None) => {
                 if remote.hlc.beats(self.hlc) {
+                    let sync = self.sync;
                     *self = remote.clone();
+                    self.sync = sync;
                     return true;
                 }
             }
             (Some(local), Some(remote_value)) => {
                 if local.type_tag() != remote_value.type_tag() {
                     if remote.hlc.beats(self.hlc) {
+                        let sync = self.sync;
                         *self = remote.clone();
+                        self.sync = sync;
                         return true;
                     }
                     return false;
                 }
 
                 let local_hlc = self.hlc;
-                if crate::merge_dispatch(local, local_hlc, remote_value, remote.hlc)
+                if local
+                    .merge(remote_value, local_hlc, remote.hlc)
                     .unwrap_or(false)
                 {
                     changed = true;
@@ -124,11 +118,14 @@ impl Cell {
             }
         }
 
-        if merge_sync(&mut self.sync, remote.sync) {
-            changed = true;
-        }
-
         changed
+    }
+
+    pub fn max_hlc(&self) -> Hlc {
+        match &self.value {
+            Some(value) => std::cmp::max(self.hlc, value.max_hlc()),
+            None => self.hlc,
+        }
     }
 }
 
@@ -143,7 +140,7 @@ fn apply_at_target(cursor: &mut Cell, op: &Op, op_hlc: Hlc) -> bool {
                 .value
                 .as_mut()
                 .expect("ensure_target_type must leave cursor live");
-            match crate::apply_op_dispatch(value, type_op, cursor.hlc, op_hlc) {
+            match value.apply(type_op, cursor.hlc, op_hlc) {
                 Ok(true) => {
                     if op_hlc.beats(cursor.hlc) {
                         cursor.hlc = op_hlc;
@@ -181,28 +178,13 @@ fn apply_at_target(cursor: &mut Cell, op: &Op, op_hlc: Hlc) -> bool {
     }
 }
 
-fn ensure_ancestor_container(cursor: &mut Cell, expected: TypeTag, op_hlc: Hlc) -> bool {
-    if cursor.type_tag() == Some(expected) {
-        if cursor.is_dummy() {
-            // Dummy created container because it didn't exist before
-            cursor.hlc = op_hlc;
-        }
-        return true;
-    }
-
-    retype_cell(cursor, expected, op_hlc)
-}
-
 fn ensure_target_type(cursor: &mut Cell, expected: TypeTag, op_hlc: Hlc) -> bool {
     if cursor.type_tag() == Some(expected) {
         return true;
     }
 
-    retype_cell(cursor, expected, op_hlc)
-}
-
-fn retype_cell(cursor: &mut Cell, expected: TypeTag, op_hlc: Hlc) -> bool {
-    if op_hlc.beats(cursor.hlc) {
+    if op_hlc.beats(cursor.max_hlc()) {
+        // Safe to change the value type completed to the segment's one
         cursor.value = Some(expected.empty_value());
         cursor.hlc = op_hlc;
         return true;
@@ -211,27 +193,11 @@ fn retype_cell(cursor: &mut Cell, expected: TypeTag, op_hlc: Hlc) -> bool {
     false
 }
 
-fn merge_sync(local: &mut Option<bool>, remote: Option<bool>) -> bool {
-    let merged = match (*local, remote) {
-        (Some(true), _) | (_, Some(true)) => Some(true),
-        (Some(false), _) | (_, Some(false)) => Some(false),
-        (None, None) => None,
-    };
-    if *local == merged {
-        false
-    } else {
-        *local = merged;
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::traits::Type;
-    use crate::types::atom::{AtomOp, AtomValue};
-    use crate::types::record::{RecordOp, RecordType};
-    use crate::{Path, Segment, TypeOp};
+    use crate::types::record::Record;
+    use crate::{Path, PrimaryKey, Segment};
     use bincode::{config, decode_from_slice, encode_to_vec};
 
     fn hlc(ms: u64) -> Hlc {
@@ -241,7 +207,7 @@ mod tests {
     fn delta(path: Path, op: Op, hlc: Hlc) -> crate::Delta {
         crate::Delta {
             table_id: "test".into(),
-            primary_key: AtomValue::String("pk".into()),
+            primary_key: PrimaryKey::String("pk".into()),
             path,
             op,
             hlc,
@@ -252,7 +218,7 @@ mod tests {
 
     #[test]
     fn cell_dummy() {
-        let cell = Cell::dummy(Some(Value::Atom(AtomValue::Null)));
+        let cell = Cell::dummy(Value::String(String::new()));
         assert!(cell.is_dummy());
         assert!(!cell.is_tombstone());
         assert_eq!(cell.sync, None);
@@ -260,24 +226,22 @@ mod tests {
 
     #[test]
     fn bincode_roundtrip() {
-        let cell = Cell::new(
-            Value::Atom(AtomValue::String("hi".into())),
-            hlc(100),
-            Some(true),
-        );
+        let cell = Cell::new(Some(Value::String("hi".into())), hlc(100), Some(true));
         let buf = encode_to_vec(&cell, config::standard()).unwrap();
         let (decoded, n): (Cell, usize) = decode_from_slice(&buf, config::standard()).unwrap();
         assert_eq!(n, buf.len());
         assert_eq!(decoded.hlc, cell.hlc);
-        assert_eq!(decoded.type_tag(), Some(TypeTag::Atom));
+        assert_eq!(decoded.type_tag(), Some(TypeTag::String));
     }
 
     #[test]
-    fn apply_atom() {
-        let mut cell = Cell::dummy(Some(Value::Atom(AtomValue::Null)));
-        assert!(cell.apply_delta(&delta(
+    fn replace_scalar() {
+        let mut cell = Cell::dummy(Value::String(String::new()));
+        assert!(cell.apply(&delta(
             Path::new(),
-            Op::Type(TypeOp::Atom(AtomOp::Set(AtomValue::Int(42)))),
+            Op::Replace {
+                value: Value::Int(42),
+            },
             hlc(100),
         )));
         assert_eq!(cell.hlc, hlc(100));
@@ -285,10 +249,12 @@ mod tests {
 
     #[test]
     fn apply_lww_older_no_change() {
-        let mut cell = Cell::new(Value::Atom(AtomValue::Int(1)), hlc(200), None);
-        let changed = cell.apply_delta(&delta(
+        let mut cell = Cell::new(Some(Value::Int(1)), hlc(200), None);
+        let changed = cell.apply(&delta(
             Path::new(),
-            Op::Type(TypeOp::Atom(AtomOp::Set(AtomValue::Int(2)))),
+            Op::Replace {
+                value: Value::Int(2),
+            },
             hlc(100),
         ));
         assert!(!changed);
@@ -297,18 +263,20 @@ mod tests {
 
     #[test]
     fn delete_tombstones_cell() {
-        let mut cell = Cell::new(Value::Atom(AtomValue::Int(1)), hlc(100), None);
-        assert!(cell.apply_delta(&delta(Path::new(), Op::Delete, hlc(200))));
+        let mut cell = Cell::new(Some(Value::Int(1)), hlc(100), None);
+        assert!(cell.apply(&delta(Path::new(), Op::Delete, hlc(200))));
         assert!(cell.is_tombstone());
         assert_eq!(cell.hlc, hlc(200));
     }
 
     #[test]
     fn older_write_does_not_resurrect_tombstone() {
-        let mut cell = Cell::tombstone(hlc(200), None);
-        let changed = cell.apply_delta(&delta(
+        let mut cell = Cell::new(None, hlc(200), None);
+        let changed = cell.apply(&delta(
             Path::new(),
-            Op::Type(TypeOp::Atom(AtomOp::Set(AtomValue::Int(2)))),
+            Op::Replace {
+                value: Value::Int(2),
+            },
             hlc(100),
         ));
         assert!(!changed);
@@ -317,29 +285,26 @@ mod tests {
 
     #[test]
     fn apply_set_field() {
-        let mut root = Cell::new(Value::Record(RecordType::empty()), hlc(50), None);
-        assert!(root.apply_delta(&delta(
-            Path::new(),
-            Op::Type(TypeOp::Record(RecordOp::SetField {
-                name: "x".into(),
-                value: Cell::new(Value::Atom(AtomValue::String("hi".into())), hlc(100), None),
-            })),
+        let mut root = Cell::new(Some(Value::Record(Record::new())), hlc(50), None);
+        let path = Path::new().step(TypeTag::Record, Segment::Record("x".into()));
+        assert!(root.apply(&delta(
+            path,
+            Op::Replace {
+                value: Value::String("hi".into()),
+            },
             hlc(100),
         )));
     }
 
     #[test]
     fn nested_update_does_not_bump_existing_parent_hlc() {
-        let mut root = Cell::new(Value::Record(RecordType::empty()), hlc(50), None);
-        let path = Path::new().step(
-            TypeTag::Record,
-            Segment::Record(crate::RecordSegment {
-                field_name: "x".into(),
-            }),
-        );
-        assert!(root.apply_delta(&delta(
+        let mut root = Cell::new(Some(Value::Record(Record::new())), hlc(50), None);
+        let path = Path::new().step(TypeTag::Record, Segment::Record("x".into()));
+        assert!(root.apply(&delta(
             path,
-            Op::Type(TypeOp::Atom(AtomOp::Set(AtomValue::Int(1)))),
+            Op::Replace {
+                value: Value::Int(1),
+            },
             hlc(100),
         )));
         assert_eq!(root.hlc, hlc(50));
@@ -347,16 +312,13 @@ mod tests {
 
     #[test]
     fn recreated_parent_gets_event_hlc() {
-        let mut root = Cell::tombstone(hlc(50), None);
-        let path = Path::new().step(
-            TypeTag::Record,
-            Segment::Record(crate::RecordSegment {
-                field_name: "x".into(),
-            }),
-        );
-        assert!(root.apply_delta(&delta(
+        let mut root = Cell::new(None, hlc(50), None);
+        let path = Path::new().step(TypeTag::Record, Segment::Record("x".into()));
+        assert!(root.apply(&delta(
             path,
-            Op::Type(TypeOp::Atom(AtomOp::Set(AtomValue::Int(1)))),
+            Op::Replace {
+                value: Value::Int(1),
+            },
             hlc(100),
         )));
         assert_eq!(root.hlc, hlc(100));
@@ -365,38 +327,47 @@ mod tests {
 
     #[test]
     fn merge_same_record_recurses() {
-        let mut local = Cell::new(Value::Record(RecordType::empty()), hlc(50), None);
-        let mut remote = Cell::new(Value::Record(RecordType::empty()), hlc(50), None);
-        local.apply_delta(&delta(
-            Path::new(),
-            Op::Type(TypeOp::Record(RecordOp::SetField {
-                name: "a".into(),
-                value: Cell::new(Value::Atom(AtomValue::Int(1)), hlc(100), None),
-            })),
+        let mut local = Cell::new(Some(Value::Record(Record::new())), hlc(50), None);
+        let mut remote = Cell::new(Some(Value::Record(Record::new())), hlc(50), None);
+        let local_path = Path::new().step(TypeTag::Record, Segment::Record("a".into()));
+        let remote_path = Path::new().step(TypeTag::Record, Segment::Record("b".into()));
+        local.apply(&delta(
+            local_path,
+            Op::Replace {
+                value: Value::Int(1),
+            },
             hlc(100),
         ));
-        remote.apply_delta(&delta(
-            Path::new(),
-            Op::Type(TypeOp::Record(RecordOp::SetField {
-                name: "b".into(),
-                value: Cell::new(Value::Atom(AtomValue::Int(2)), hlc(110), None),
-            })),
+        remote.apply(&delta(
+            remote_path,
+            Op::Replace {
+                value: Value::Int(2),
+            },
             hlc(110),
         ));
         assert!(local.merge(&remote));
         let Some(Value::Record(record)) = &local.value else {
             panic!("expected record");
         };
-        assert!(record.is_field_visible("a"));
-        assert!(record.is_field_visible("b"));
+        assert!(record.get("a").is_some_and(|cell| !cell.is_tombstone()));
+        assert!(record.get("b").is_some_and(|cell| !cell.is_tombstone()));
     }
 
     #[test]
-    fn merge_atom_uses_original_local_hlc() {
-        let mut local = Cell::new(Value::Atom(AtomValue::Int(1)), hlc(100), None);
-        let remote = Cell::new(Value::Atom(AtomValue::Int(2)), hlc(200), None);
+    fn merge_scalar_uses_original_local_hlc() {
+        let mut local = Cell::new(Some(Value::Int(1)), hlc(100), None);
+        let remote = Cell::new(Some(Value::Int(2)), hlc(200), None);
         assert!(local.merge(&remote));
-        assert_eq!(local.value, Some(Value::Atom(AtomValue::Int(2))));
+        assert_eq!(local.value, Some(Value::Int(2)));
         assert_eq!(local.hlc, hlc(200));
+    }
+
+    #[test]
+    fn merge_keeps_sync_local() {
+        let mut local = Cell::new(Some(Value::Int(1)), hlc(100), Some(false));
+        let remote = Cell::new(Some(Value::Record(Record::new())), hlc(200), Some(true));
+        assert!(local.merge(&remote));
+        assert_eq!(local.type_tag(), Some(TypeTag::Record));
+        assert_eq!(local.sync, Some(false));
     }
 }

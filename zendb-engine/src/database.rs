@@ -144,7 +144,7 @@ mod tests {
 
         let d1 = Delta {
             table_id: "notes".into(),
-            primary_key: AtomValue::String("n1".into()),
+            primary_key: zendb_types::PrimaryKey::Atom(AtomValue::String("n1".into())),
             path: ZPath::new(),
             op: Op::Type(TypeOp::Atom(AtomOp::Set(AtomValue::String("hello".into())))),
             hlc: Hlc::with_device_id(100, 0, [1u8; 8]).unwrap(),
@@ -154,9 +154,11 @@ mod tests {
 
         let d2 = Delta {
             table_id: "todos".into(),
-            primary_key: AtomValue::String("t1".into()),
+            primary_key: zendb_types::PrimaryKey::Atom(AtomValue::String("t1".into())),
             path: ZPath::new(),
-            op: Op::Type(TypeOp::Atom(AtomOp::Set(AtomValue::String("buy milk".into())))),
+            op: Op::Type(TypeOp::Atom(AtomOp::Set(AtomValue::String(
+                "buy milk".into(),
+            )))),
             hlc: Hlc::with_device_id(200, 0, [1u8; 8]).unwrap(),
             sync: false,
             signature: vec![],

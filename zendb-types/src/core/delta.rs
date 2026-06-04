@@ -7,16 +7,9 @@ use bincode::{Decode, Encode};
 
 use crate::{types::atom::AtomValue, Hlc, Op, Path};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
-pub struct TableId(pub String);
-
-impl TableId {}
-
-#[derive(Debug, Clone, Encode, Decode)]
-pub struct PrimaryKey(pub AtomValue);
-
-#[derive(Debug, Clone, Encode, Decode)]
-pub struct Signature(pub Vec<u8>);
+pub type TableId = String;
+pub type PrimaryKey = AtomValue;
+pub type Signature = Vec<u8>;
 
 /// The unit produced by every write.
 #[derive(Debug, Clone, Encode, Decode)]

@@ -20,8 +20,8 @@
 //!
 //! Dead bytes from overwrites and tombstones trigger in-place compaction when
 //! the configured ratio is reached. Live skip-list records are copied by WAL
-//! offset to the front of the existing file, followed by a zero sentinel for
-//! replay.
+//! offset to the front of the existing file, followed by `SENTINEL` so the
+//! next `replay_wal` terminates at the new live tail.
 //!
 //! # File format
 //!
@@ -30,11 +30,12 @@
 //! Tombstone: `[0xFFFF_FFFF: u32][key_size: u32 LE][K bytes]`
 
 use std::{
+    borrow::Cow,
     fmt,
     fs::{File, OpenOptions},
     hash::Hash,
     io::{self},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use bincode::{Decode, Encode};
@@ -43,7 +44,7 @@ use memmap2::MmapMut;
 use crate::core::backend::{Backend, OrderedBackend};
 use crate::utils::{
     fast_rand,
-    serdes::{deserialize_from, read_u32_le, with_scratch, with_two_scratches},
+    serdes::{deserialize_from, read_u32_le, with_two_scratches},
 };
 
 const DEFAULT_INITIAL_CAPACITY: u64 = 1024 * 1024;
@@ -51,15 +52,34 @@ const DEFAULT_COMPACTION_RATIO: f64 = 0.5;
 const MAGIC: u32 = 0x474F4C4F;
 const HEADER_SIZE: usize = 4;
 const TOMBSTONE: u32 = u32::MAX;
+/// Replay terminator written at the live tail by `create`, every record
+/// write, `clear`, and `compact`. Distinct from `value_size == 0` (a
+/// legitimate empty-value encoding) so a `V` whose bincode representation
+/// is 0 bytes (e.g. the unit type) round-trips correctly. Mirrors
+/// KeyDir's `SENTINEL`.
+const SENTINEL: u32 = u32::MAX - 1;
 const MAX_LEVEL: usize = 16;
 
 type Heads = [Option<usize>; MAX_LEVEL];
 
+/// Offset and total on-disk size of a live record in the WAL. Mirrors
+/// KeyDir's `EntryMeta` so the two backends speak the same vocabulary
+/// when authoring tombstones and computing dead bytes. Individual
+/// `value_size` and `key_size` live on disk and are re-read from the
+/// mmap when the tombstone writer needs to locate the encoded key
+/// inside the record.
+#[derive(Debug, Clone)]
+struct EntryMeta {
+    offset: u64,
+    /// Total bytes the live record occupies on disk: two u32 length
+    /// prefixes (8) plus the encoded key and value bytes.
+    record_size: u32,
+}
+
 struct SkipNode<K, V> {
     key: K,
     value: V,
-    record_offset: u64,
-    record_size: u64,
+    meta: EntryMeta,
     prev: Option<usize>,
     level: usize,
 }
@@ -130,6 +150,10 @@ impl<K: Ord, V> OrderIndex<K, V> {
         level
     }
 
+    /// Standard skip-list search that fills `update[]` at every level.
+    /// Returns `(predecessors, found_idx)`. Callers that need to
+    /// unlink (remove) or link in (insert at not-found) rely on the
+    /// complete `update[]` and pay the full O(height) descent.
     fn search(&self, key: &K) -> (Heads, Option<usize>) {
         let mut update: Heads = [None; MAX_LEVEL];
         let mut found: Option<usize> = None;
@@ -159,31 +183,48 @@ impl<K: Ord, V> OrderIndex<K, V> {
         (update, found)
     }
 
-    fn get(&self, key: &K) -> Option<&V> {
+    /// Short-circuiting find — returns as soon as the key matches at
+    /// any level. Used by read-only callers (`get`, `contains`) where
+    /// the predecessor path is irrelevant. Saves the descent through
+    /// the levels below the first match.
+    fn find(&self, key: &K) -> Option<usize> {
         if self.is_empty() {
             return None;
         }
-        self.search(key).1.map(|idx| &self.arena[idx].value)
+        let mut prev: Option<usize> = None;
+        for i in (0..self.height).rev() {
+            let mut x = match prev {
+                Some(p) => self.next_at(p, i),
+                None => self.heads[i],
+            };
+            while let Some(idx) = x {
+                match self.arena[idx].key.cmp(key) {
+                    std::cmp::Ordering::Less => {
+                        prev = Some(idx);
+                        x = self.next_at(idx, i);
+                    }
+                    std::cmp::Ordering::Equal => return Some(idx),
+                    std::cmp::Ordering::Greater => break,
+                }
+            }
+        }
+        None
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        self.find(key).map(|idx| &self.arena[idx].value)
     }
 
     fn contains(&self, key: &K) -> bool {
-        self.get(key).is_some()
+        self.find(key).is_some()
     }
 
-    fn alloc_node(
-        &mut self,
-        key: K,
-        value: V,
-        record_offset: u64,
-        record_size: u64,
-        level: usize,
-    ) -> usize {
+    fn alloc_node(&mut self, key: K, value: V, meta: EntryMeta, level: usize) -> usize {
         if let Some(idx) = self.free.pop() {
             self.arena[idx] = SkipNode {
                 key,
                 value,
-                record_offset,
-                record_size,
+                meta,
                 prev: None,
                 level,
             };
@@ -200,8 +241,7 @@ impl<K: Ord, V> OrderIndex<K, V> {
             self.arena.push(SkipNode {
                 key,
                 value,
-                record_offset,
-                record_size,
+                meta,
                 prev: None,
                 level,
             });
@@ -212,34 +252,26 @@ impl<K: Ord, V> OrderIndex<K, V> {
         }
     }
 
-    fn insert(&mut self, key: K, value: V, record_offset: u64, record_size: u64) -> Option<u64> {
+    /// Insert or overwrite. Returns the previous record's `EntryMeta`
+    /// if `key` was already present (so the caller can charge its
+    /// size to `dead_bytes`); returns `None` for a fresh insert.
+    fn insert(&mut self, key: K, value: V, meta: EntryMeta) -> Option<EntryMeta> {
         let (update, found) = self.search(&key);
         if let Some(idx) = found {
             self.arena[idx].value = value;
-            self.arena[idx].record_offset = record_offset;
-            return Some(std::mem::replace(
-                &mut self.arena[idx].record_size,
-                record_size,
-            ));
+            return Some(std::mem::replace(&mut self.arena[idx].meta, meta));
         }
-        self.insert_with_update(key, value, record_offset, record_size, update);
+        self.insert_with_update(key, value, meta, update);
         None
     }
 
-    fn insert_with_update(
-        &mut self,
-        key: K,
-        value: V,
-        record_offset: u64,
-        record_size: u64,
-        update: Heads,
-    ) {
+    fn insert_with_update(&mut self, key: K, value: V, meta: EntryMeta, update: Heads) {
         let level = self.random_level();
         if level > self.height {
             self.height = level;
         }
 
-        let new_idx = self.alloc_node(key, value, record_offset, record_size, level);
+        let new_idx = self.alloc_node(key, value, meta, level);
         self.link_new_node(new_idx, &update);
         self.len += 1;
     }
@@ -262,7 +294,10 @@ impl<K: Ord, V> OrderIndex<K, V> {
         }
     }
 
-    fn remove_drop(&mut self, key: &K) -> Option<u64> {
+    /// Remove `key`. Returns the removed entry's `EntryMeta` so the
+    /// caller can append a tombstone reusing the already-encoded key
+    /// bytes still living at `meta.offset`.
+    fn remove_drop(&mut self, key: &K) -> Option<EntryMeta> {
         if self.is_empty() {
             return None;
         }
@@ -270,7 +305,7 @@ impl<K: Ord, V> OrderIndex<K, V> {
         found.map(|idx| self.remove_found(update, idx))
     }
 
-    fn remove_found(&mut self, update: Heads, idx: usize) -> u64 {
+    fn remove_found(&mut self, update: Heads, idx: usize) -> EntryMeta {
         let level = self.arena[idx].level;
         let next0 = self.next_at(idx, 0);
         let prev0 = self.arena[idx].prev;
@@ -289,7 +324,7 @@ impl<K: Ord, V> OrderIndex<K, V> {
         while self.height > 0 && self.heads[self.height - 1].is_none() {
             self.height -= 1;
         }
-        let record_size = self.arena[idx].record_size;
+        let meta = self.arena[idx].meta.clone();
         // Clear this node's forward-pointer row so a future alloc_node
         // recycling this slot starts from a clean state.
         let base = idx * MAX_LEVEL;
@@ -298,7 +333,7 @@ impl<K: Ord, V> OrderIndex<K, V> {
         }
         self.free.push(idx);
         self.len -= 1;
-        record_size
+        meta
     }
 
     fn clear(&mut self) {
@@ -405,42 +440,36 @@ impl<K: Ord, V> OrderIndex<K, V> {
         finger.cursor.is_some_and(|idx| self.arena[idx].key == *key)
     }
 
-    fn insert_at_finger(
-        &mut self,
-        finger: &mut Finger,
-        key: K,
-        value: V,
-        record_offset: u64,
-        record_size: u64,
-    ) {
+    fn insert_at_finger(&mut self, finger: &mut Finger, key: K, value: V, meta: EntryMeta) {
         let level = self.random_level();
         if level > self.height {
             self.height = level;
         }
-        let new_idx = self.alloc_node(key, value, record_offset, record_size, level);
+        let new_idx = self.alloc_node(key, value, meta, level);
         self.link_new_node(new_idx, &finger.update);
         for i in 0..level {
             finger.update[i] = Some(new_idx);
         }
+        // Pin the cursor on the newly inserted node so a duplicate of
+        // `key` on the next iteration of `bulk_put_sorted` is caught
+        // by `finger_matches` and routed through `overwrite_at_finger`.
+        // Without this, the cursor stays at the first node strictly
+        // greater than `key`, and the duplicate silently lands as a
+        // second arena slot unreachable from `get`.
+        finger.cursor = Some(new_idx);
         self.len += 1;
     }
 
-    fn overwrite_at_finger(
-        &mut self,
-        finger: &Finger,
-        value: V,
-        record_offset: u64,
-        record_size: u64,
-    ) -> u64 {
+    fn overwrite_at_finger(&mut self, finger: &Finger, value: V, meta: EntryMeta) -> EntryMeta {
         let idx = finger.cursor.expect("finger cursor must point at a node");
-        let old = self.arena[idx].record_size;
         self.arena[idx].value = value;
-        self.arena[idx].record_offset = record_offset;
-        self.arena[idx].record_size = record_size;
-        old
+        std::mem::replace(&mut self.arena[idx].meta, meta)
     }
 
-    fn remove_at_finger(&mut self, finger: &mut Finger) -> u64 {
+    /// Remove the node the finger currently points at. Returns the
+    /// removed entry's `EntryMeta` so the caller can write a tombstone
+    /// reusing the encoded key bytes still living at `meta.offset`.
+    fn remove_at_finger(&mut self, finger: &mut Finger) -> EntryMeta {
         let idx = finger.cursor.expect("finger cursor must point at a node");
         let next0 = self.next_at(idx, 0);
         let prev0 = self.arena[idx].prev;
@@ -461,7 +490,7 @@ impl<K: Ord, V> OrderIndex<K, V> {
             self.height -= 1;
         }
         finger.cursor = next0;
-        let record_size = self.arena[idx].record_size;
+        let meta = self.arena[idx].meta.clone();
         // Clear this node's forward-pointer row before recycling.
         let base = idx * MAX_LEVEL;
         for slot in &mut self.nexts[base..base + MAX_LEVEL] {
@@ -469,7 +498,7 @@ impl<K: Ord, V> OrderIndex<K, V> {
         }
         self.free.push(idx);
         self.len -= 1;
-        record_size
+        meta
     }
 }
 
@@ -562,7 +591,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         let value_size = read_u32_le(self.mmap, self.cursor)?;
-        if value_size == 0 {
+        if value_size == SENTINEL {
             return None;
         }
 
@@ -572,23 +601,10 @@ where
         } else {
             self.cursor + 4 + value_size as usize
         };
-        let key_size = match read_u32_le(self.mmap, key_size_off) {
-            Some(s) => s,
-            None => {
-                return Some(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "truncated WAL entry",
-                )));
-            }
-        };
+        let key_size =
+            read_u32_le(self.mmap, key_size_off).expect("key_size header within mmap bounds");
         let key_start = key_size_off + 4;
         let entry_end = key_start + key_size as usize;
-        if entry_end > self.mmap.len() {
-            return Some(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated WAL entry",
-            )));
-        }
 
         let key: K = match deserialize_from(&self.mmap[key_start..entry_end]) {
             Ok(k) => k,
@@ -600,12 +616,6 @@ where
         } else {
             let value_start = self.cursor + 4;
             let value_end = value_start + value_size as usize;
-            if value_end > self.mmap.len() {
-                return Some(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "truncated WAL entry",
-                )));
-            }
             let value: V = match deserialize_from(&self.mmap[value_start..value_end]) {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
@@ -628,110 +638,87 @@ fn grow_into(mmap: &mut MmapMut, file: &mut File, desired: u64) -> io::Result<()
     Ok(())
 }
 
-fn append_entry_into<K, V>(
+/// Append `[vlen u32][V][klen u32][K]` at the current write tail
+/// (`stats.data_size`). Writes the trailing `SENTINEL` so a subsequent
+/// `replay_wal` terminates correctly. Returns the new record's
+/// `EntryMeta`. Mirrors KeyDir's `write_entry_into`.
+fn write_entry_into<K, V>(
     mmap: &mut MmapMut,
     file: &mut File,
     stats: &mut OrderLogStats,
     key: &K,
     value: &V,
-) -> io::Result<(u64, u64)>
+) -> io::Result<EntryMeta>
 where
     K: Encode,
     V: Encode,
 {
-    // Encode key + value once; `with_two_scratches` returns the slice
-    // lengths via `.len()` so we never re-run bincode just to count bytes.
+    // Encode key + value once into pooled scratch buffers; the slice
+    // lengths give the on-disk sizes for free.
     with_two_scratches(key, value, |kb, vb| {
-        let total = 8usize
-            .checked_add(vb.len())
-            .and_then(|n| n.checked_add(kb.len()))
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow")
-            })?;
+        let k_size = kb.len();
+        let v_size = vb.len();
+        let total = 8 + v_size + k_size;
 
         let offset = stats.data_size as usize;
-        let end = offset.checked_add(total).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow")
-        })?;
-        if end > mmap.len() {
-            grow_into(mmap, file, end as u64)?;
+        let end = offset + total;
+        // Grow with room for the trailing SENTINEL too.
+        if end + 4 > mmap.len() {
+            grow_into(mmap, file, (end + 4) as u64)?;
         }
-        encode_live_record(&mut mmap[offset..end], kb, vb);
+
+        mmap[offset..offset + 4].copy_from_slice(&(v_size as u32).to_le_bytes());
+        let v_off = offset + 4;
+        mmap[v_off..v_off + v_size].copy_from_slice(vb);
+        let k_len_off = v_off + v_size;
+        mmap[k_len_off..k_len_off + 4].copy_from_slice(&(k_size as u32).to_le_bytes());
+        let k_off = k_len_off + 4;
+        mmap[k_off..k_off + k_size].copy_from_slice(kb);
+
+        mmap[end..end + 4].copy_from_slice(&SENTINEL.to_le_bytes());
         stats.data_size = end as u64;
-        Ok((offset as u64, total as u64))
+        Ok(EntryMeta {
+            offset: offset as u64,
+            record_size: total as u32,
+        })
     })
 }
 
-fn append_tombstone_into<K>(
+/// Append a tombstone for the live record described by `old`, reusing
+/// the already-encoded key bytes that still live in the doomed record's
+/// slot — no bincode encode, no scratch `Vec<u8>`. A single
+/// `copy_within` moves the key into the tombstone payload. Charges the
+/// tombstone's own bytes to `dead_bytes` internally; the caller charges
+/// the displaced live record. Mirrors KeyDir's `write_tombstone_into`.
+fn write_tombstone_into(
     mmap: &mut MmapMut,
     file: &mut File,
     stats: &mut OrderLogStats,
-    key: &K,
-) -> io::Result<u64>
-where
-    K: Encode,
-{
-    with_scratch(key, |kb| {
-        let total = 8usize.checked_add(kb.len()).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow")
-        })?;
+    old: &EntryMeta,
+) -> io::Result<()> {
+    let value_size = read_u32_le(mmap, old.offset as usize)
+        .expect("live record header within mmap bounds") as usize;
+    let key_size = old.record_size as usize - 8 - value_size;
+    let total = 8 + key_size;
 
-        let offset = stats.data_size as usize;
-        let end = offset.checked_add(total).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow")
-        })?;
-        if end > mmap.len() {
-            grow_into(mmap, file, end as u64)?;
-        }
-        encode_tombstone_record(&mut mmap[offset..end], kb);
-        stats.data_size = end as u64;
-        Ok(total as u64)
-    })
-}
-
-fn copy_live_record(
-    mmap: &mut MmapMut,
-    file: &mut File,
-    cursor: u64,
-    src: u64,
-    len: u64,
-) -> io::Result<u64> {
-    let dst = cursor as usize;
-    let src = src as usize;
-    let len = len as usize;
-    let end = dst
-        .checked_add(len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "OrderLog offset overflow"))?;
-    if end > mmap.len() {
-        grow_into(mmap, file, end as u64)?;
+    let new_offset = stats.data_size as usize;
+    let end = new_offset + total;
+    if end + 4 > mmap.len() {
+        grow_into(mmap, file, (end + 4) as u64)?;
     }
-    if src != dst {
-        mmap.copy_within(src..src + len, dst);
-    }
-    Ok(end as u64)
+    let key_src_start = old.offset as usize + 8 + value_size;
+
+    mmap[new_offset..new_offset + 4].copy_from_slice(&TOMBSTONE.to_le_bytes());
+    mmap[new_offset + 4..new_offset + 8].copy_from_slice(&(key_size as u32).to_le_bytes());
+    mmap.copy_within(key_src_start..key_src_start + key_size, new_offset + 8);
+
+    mmap[end..end + 4].copy_from_slice(&SENTINEL.to_le_bytes());
+    stats.data_size = end as u64;
+    stats.dead_bytes += 8 + key_size as u64;
+    Ok(())
 }
 
-/// Pack `[vlen u32][value][klen u32][key]` from pre-encoded byte slices.
-/// Callers pre-encode via `with_two_scratches` (or peer scratch buffers)
-/// so neither key nor value is re-serialized inside this routine.
-fn encode_live_record(dst: &mut [u8], key_bytes: &[u8], value_bytes: &[u8]) {
-    let v_size = value_bytes.len();
-    let k_size = key_bytes.len();
-    dst[0..4].copy_from_slice(&(v_size as u32).to_le_bytes());
-    dst[4..4 + v_size].copy_from_slice(value_bytes);
-    let k_len_off = 4 + v_size;
-    dst[k_len_off..k_len_off + 4].copy_from_slice(&(k_size as u32).to_le_bytes());
-    dst[k_len_off + 4..k_len_off + 4 + k_size].copy_from_slice(key_bytes);
-}
-
-fn encode_tombstone_record(dst: &mut [u8], key_bytes: &[u8]) {
-    let k_size = key_bytes.len();
-    dst[0..4].copy_from_slice(&TOMBSTONE.to_le_bytes());
-    dst[4..8].copy_from_slice(&(k_size as u32).to_le_bytes());
-    dst[8..8 + k_size].copy_from_slice(key_bytes);
-}
-
-#[derive(Debug, Clone, Copy, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct OrderLogConfig {
     pub initial_capacity: u64,
     pub compaction_ratio: f64,
@@ -746,7 +733,7 @@ impl Default for OrderLogConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Encode, Decode)]
 pub struct OrderLogStats {
     pub data_size: u64,
     pub dead_bytes: u64,
@@ -756,7 +743,6 @@ pub struct OrderLog<K: Ord, V> {
     index: OrderIndex<K, V>,
     mmap: MmapMut,
     file: File,
-    path: PathBuf,
     config: OrderLogConfig,
     stats: OrderLogStats,
 }
@@ -774,16 +760,17 @@ where
             .truncate(true)
             .open(path)?;
 
-        let capacity = config.initial_capacity.max(HEADER_SIZE as u64);
-        file.set_len(capacity)?;
+        file.set_len(config.initial_capacity)?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+        // MAGIC at offset 0, then SENTINEL at the live tail so a
+        // subsequent reopen replays as empty.
         mmap[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        mmap[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&SENTINEL.to_le_bytes());
 
         Ok(OrderLog {
             index: OrderIndex::new(),
             mmap,
             file,
-            path: path.to_path_buf(),
             config,
             stats: OrderLogStats {
                 data_size: HEADER_SIZE as u64,
@@ -794,12 +781,6 @@ where
 
     pub fn open(path: &Path, config: OrderLogConfig) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        if file.metadata()?.len() < HEADER_SIZE as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not an OrderLog file",
-            ));
-        }
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
         let file_magic = u32::from_le_bytes(mmap[0..4].try_into().unwrap());
@@ -814,7 +795,6 @@ where
             index: OrderIndex::new(),
             mmap,
             file,
-            path: path.to_path_buf(),
             config,
             stats: OrderLogStats::default(),
         };
@@ -827,7 +807,9 @@ where
         self.stats.dead_bytes = 0;
 
         while let Some(value_size) = read_u32_le(&self.mmap, cursor) {
-            if value_size == 0 {
+            // SENTINEL marks the live tail. value_size == 0 is a
+            // legitimate empty-value encoding (e.g. V = ()).
+            if value_size == SENTINEL {
                 break;
             }
 
@@ -837,31 +819,27 @@ where
             } else {
                 cursor + 4 + value_size as usize
             };
-            let Some(key_size) = read_u32_le(&self.mmap, key_size_off) else {
-                break;
-            };
+            let key_size =
+                read_u32_le(&self.mmap, key_size_off).expect("key_size header within mmap bounds");
             let key_start = key_size_off + 4;
             let entry_end = key_start + key_size as usize;
-            if entry_end > self.mmap.len() {
-                break;
-            }
 
             let key: K = deserialize_from(&self.mmap[key_start..entry_end])?;
             if is_tombstone {
                 if let Some(old) = self.index.remove_drop(&key) {
-                    self.stats.dead_bytes += old;
+                    self.stats.dead_bytes += old.record_size as u64;
                 }
                 self.stats.dead_bytes += 8 + key_size as u64;
             } else {
                 let value_start = cursor + 4;
                 let value_end = value_start + value_size as usize;
-                if value_end > self.mmap.len() {
-                    break;
-                }
                 let value: V = deserialize_from(&self.mmap[value_start..value_end])?;
-                let record_size = 8 + value_size as u64 + key_size as u64;
-                if let Some(old) = self.index.insert(key, value, cursor as u64, record_size) {
-                    self.stats.dead_bytes += old;
+                let meta = EntryMeta {
+                    offset: cursor as u64,
+                    record_size: 8 + value_size + key_size,
+                };
+                if let Some(old) = self.index.insert(key, value, meta) {
+                    self.stats.dead_bytes += old.record_size as u64;
                 }
             }
             cursor = entry_end;
@@ -901,8 +879,8 @@ where
     type Stats = OrderLogStats;
     type Config = OrderLogConfig;
 
-    fn get(&self, key: &K) -> Option<V> {
-        self.index.get(key).cloned()
+    fn get(&self, key: &K) -> Option<Cow<'_, V>> {
+        self.index.get(key).map(Cow::Borrowed)
     }
 
     fn contains(&self, key: &K) -> bool {
@@ -910,16 +888,15 @@ where
     }
 
     fn put(&mut self, key: K, value: V) -> io::Result<()> {
-        let encoded = append_entry_into(
+        let meta = write_entry_into(
             &mut self.mmap,
             &mut self.file,
             &mut self.stats,
             &key,
             &value,
         )?;
-        let (offset, size) = encoded;
-        if let Some(old) = self.index.insert(key, value, offset, size) {
-            self.stats.dead_bytes += old;
+        if let Some(old) = self.index.insert(key, value, meta) {
+            self.stats.dead_bytes += old.record_size as u64;
         }
         self.maybe_compact()
     }
@@ -929,39 +906,37 @@ where
         if found.is_some() {
             return Ok(false);
         }
-        let Self {
-            index,
-            mmap,
-            file,
-            stats,
-            ..
-        } = self;
-        let (offset, size) = append_entry_into(mmap, file, stats, &key, &value)?;
-        index.insert_with_update(key, value, offset, size, update);
+        let meta = write_entry_into(
+            &mut self.mmap,
+            &mut self.file,
+            &mut self.stats,
+            &key,
+            &value,
+        )?;
+        self.index.insert_with_update(key, value, meta, update);
         self.maybe_compact()?;
         Ok(true)
     }
 
-    fn replace(&mut self, key: K, value: V) -> io::Result<Option<V>> {
+    /// The returned `Cow` is always `Owned`: the old value is replaced
+    /// in the skip list, so there's nothing for the caller to borrow.
+    fn replace(&mut self, key: K, value: V) -> io::Result<Option<Cow<'_, V>>> {
         let (update, found) = self.index.search(&key);
-        let prev = found.map(|idx| self.index.arena[idx].value.clone());
-        let Self {
-            index,
-            mmap,
-            file,
-            stats,
-            ..
-        } = self;
-        let (offset, size) = append_entry_into(mmap, file, stats, &key, &value)?;
+        let prev = found.map(|idx| Cow::Owned(self.index.arena[idx].value.clone()));
+        let meta = write_entry_into(
+            &mut self.mmap,
+            &mut self.file,
+            &mut self.stats,
+            &key,
+            &value,
+        )?;
         match found {
             Some(idx) => {
-                let old = index.arena[idx].record_size;
-                index.arena[idx].value = value;
-                index.arena[idx].record_offset = offset;
-                index.arena[idx].record_size = size;
-                stats.dead_bytes += old;
+                let old = std::mem::replace(&mut self.index.arena[idx].meta, meta);
+                self.index.arena[idx].value = value;
+                self.stats.dead_bytes += old.record_size as u64;
             }
-            None => index.insert_with_update(key, value, offset, size, update),
+            None => self.index.insert_with_update(key, value, meta, update),
         }
         self.maybe_compact()?;
         Ok(prev)
@@ -972,30 +947,27 @@ where
         I: IntoIterator<Item = (K, V)>,
     {
         let mut first_err = None;
-        {
-            let Self {
-                index,
-                mmap,
-                file,
-                stats,
-                ..
-            } = self;
-            let mut finger = index.finger_at_start();
-            for (k, v) in sorted {
-                let (offset, size) = match append_entry_into(mmap, file, stats, &k, &v) {
-                    Ok(meta) => meta,
-                    Err(e) => {
-                        first_err = Some(e);
-                        break;
-                    }
-                };
-                index.advance_finger_to(&mut finger, &k);
-                if index.finger_matches(&finger, &k) {
-                    let old = index.overwrite_at_finger(&finger, v, offset, size);
-                    stats.dead_bytes += old;
-                } else {
-                    index.insert_at_finger(&mut finger, k, v, offset, size);
+        let mut finger = self.index.finger_at_start();
+        for (k, v) in sorted {
+            let meta = match write_entry_into(
+                &mut self.mmap,
+                &mut self.file,
+                &mut self.stats,
+                &k,
+                &v,
+            ) {
+                Ok(meta) => meta,
+                Err(e) => {
+                    first_err = Some(e);
+                    break;
                 }
+            };
+            self.index.advance_finger_to(&mut finger, &k);
+            if self.index.finger_matches(&finger, &k) {
+                let old = self.index.overwrite_at_finger(&finger, v, meta);
+                self.stats.dead_bytes += old.record_size as u64;
+            } else {
+                self.index.insert_at_finger(&mut finger, k, v, meta);
             }
         }
 
@@ -1014,9 +986,11 @@ where
         let Some(old) = self.index.remove_drop(key) else {
             return Ok(false);
         };
-        let tombstone =
-            append_tombstone_into(&mut self.mmap, &mut self.file, &mut self.stats, key)?;
-        self.stats.dead_bytes += old + tombstone;
+        // The removed node's record bytes are still intact in the mmap
+        // (`remove_drop` only touches in-memory state). Reuse the
+        // already-encoded key bytes at `old.offset` for the tombstone.
+        self.stats.dead_bytes += old.record_size as u64;
+        write_tombstone_into(&mut self.mmap, &mut self.file, &mut self.stats, &old)?;
         self.maybe_compact()?;
         Ok(true)
     }
@@ -1028,31 +1002,30 @@ where
     {
         let mut removed = 0;
         let mut first_err = None;
-        {
-            let Self {
-                index,
-                mmap,
-                file,
-                stats,
-                ..
-            } = self;
-            let mut finger = index.finger_at_start();
-            for k in sorted {
-                index.advance_finger_to(&mut finger, k);
-                if !index.finger_matches(&finger, k) {
-                    continue;
-                }
-                let tombstone = match append_tombstone_into(mmap, file, stats, k) {
-                    Ok(size) => size,
-                    Err(e) => {
-                        first_err = Some(e);
-                        break;
-                    }
-                };
-                let old = index.remove_at_finger(&mut finger);
-                stats.dead_bytes += old + tombstone;
-                removed += 1;
+        let mut finger = self.index.finger_at_start();
+        for k in sorted {
+            self.index.advance_finger_to(&mut finger, k);
+            if !self.index.finger_matches(&finger, k) {
+                continue;
             }
+            // Snapshot the doomed record's metadata before
+            // `remove_at_finger` frees the arena slot — the mmap bytes
+            // stay live and the tombstone writer copies the encoded key
+            // from there.
+            let cur_idx = finger.cursor.expect("finger matches a node");
+            let old = self.index.arena[cur_idx].meta.clone();
+            self.stats.dead_bytes += old.record_size as u64;
+            if let Err(e) = write_tombstone_into(
+                &mut self.mmap,
+                &mut self.file,
+                &mut self.stats,
+                &old,
+            ) {
+                first_err = Some(e);
+                break;
+            }
+            let _ = self.index.remove_at_finger(&mut finger);
+            removed += 1;
         }
 
         if let Err(e) = self.maybe_compact() {
@@ -1074,34 +1047,34 @@ where
         let current = found.map(|idx| self.index.arena[idx].value.clone());
         let Some(new_state) = f(current) else {
             if let Some(idx) = found {
-                let tombstone =
-                    append_tombstone_into(&mut self.mmap, &mut self.file, &mut self.stats, key)?;
-                let old = self.index.remove_found(update, idx);
-                self.stats.dead_bytes += old + tombstone;
+                // Snapshot the existing record's metadata before the
+                // removal frees the arena slot — the tombstone writer
+                // copies the encoded key out of the mmap at this offset.
+                let old = self.index.arena[idx].meta.clone();
+                self.stats.dead_bytes += old.record_size as u64;
+                write_tombstone_into(&mut self.mmap, &mut self.file, &mut self.stats, &old)?;
+                let _ = self.index.remove_found(update, idx);
                 self.maybe_compact()?;
             }
             return Ok(());
         };
 
-        let encoded = append_entry_into(
+        let meta = write_entry_into(
             &mut self.mmap,
             &mut self.file,
             &mut self.stats,
             key,
             &new_state,
         )?;
-        let (offset, size) = encoded;
         match found {
             Some(idx) => {
-                let old = self.index.arena[idx].record_size;
+                let old = std::mem::replace(&mut self.index.arena[idx].meta, meta);
                 self.index.arena[idx].value = new_state;
-                self.index.arena[idx].record_offset = offset;
-                self.index.arena[idx].record_size = size;
-                self.stats.dead_bytes += old;
+                self.stats.dead_bytes += old.record_size as u64;
             }
             None => self
                 .index
-                .insert_with_update(key.clone(), new_state, offset, size, update),
+                .insert_with_update(key.clone(), new_state, meta, update),
         }
         self.maybe_compact()?;
         Ok(())
@@ -1114,60 +1087,83 @@ where
             dead_bytes: 0,
         };
         self.mmap[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        if self.mmap.len() >= HEADER_SIZE + 4 {
-            self.mmap[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&0u32.to_le_bytes());
-        }
+        // SENTINEL at the live tail so a subsequent reopen replays as
+        // empty. initial_capacity is always >> HEADER_SIZE + 4 so no
+        // length check is needed.
+        self.mmap[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&SENTINEL.to_le_bytes());
         Ok(())
     }
 
     fn compact(&mut self) -> io::Result<()> {
-        let Self {
-            index,
-            mmap,
-            file,
-            config,
-            stats,
-            ..
-        } = self;
-
-        mmap[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        let mut cursor = HEADER_SIZE as u64;
-        let mut nodes: Vec<usize> = Vec::with_capacity(index.len());
-        let mut current = index.heads[0];
+        // Walk the level-0 list (key order) then sort by record offset
+        // so the `copy_within` sweep always shifts records forward into
+        // the freed gap — `dst` is always ≤ `src`, so the memmove never
+        // destructively overlaps an unmoved record.
+        let mut nodes: Vec<usize> = Vec::with_capacity(self.index.len());
+        let mut current = self.index.heads[0];
         while let Some(idx) = current {
             nodes.push(idx);
-            current = index.next_at(idx, 0);
+            current = self.index.next_at(idx, 0);
         }
-        nodes.sort_unstable_by_key(|idx| index.arena[*idx].record_offset);
-        for idx in nodes {
-            let node = &mut index.arena[idx];
-            cursor = copy_live_record(mmap, file, cursor, node.record_offset, node.record_size)?;
-            node.record_offset = cursor - node.record_size;
-        }
-        if (cursor as usize) + 4 <= mmap.len() {
-            let p = cursor as usize;
-            mmap[p..p + 4].copy_from_slice(&0u32.to_le_bytes());
-        }
-        stats.data_size = cursor;
-        stats.dead_bytes = 0;
+        nodes.sort_unstable_by_key(|idx| self.index.arena[*idx].meta.offset);
 
-        let new_capacity = cursor.max(config.initial_capacity);
-        *mmap = MmapMut::map_anon(1)?;
-        file.set_len(new_capacity)?;
-        *mmap = unsafe { MmapMut::map_mut(&*file)? };
+        let mut cursor: usize = HEADER_SIZE;
+        for idx in nodes {
+            let node = &mut self.index.arena[idx];
+            let src = node.meta.offset as usize;
+            let len = node.meta.record_size as usize;
+            if src != cursor {
+                self.mmap.copy_within(src..src + len, cursor);
+            }
+            node.meta.offset = cursor as u64;
+            cursor += len;
+        }
+
+        // SENTINEL at the new tail tells `replay_wal` to stop here on
+        // next open, even if we don't shrink the file. No length check
+        // is needed: every writer maintains `mmap.len() >= data_size + 4`
+        // and `cursor <= data_size` after the pack loop, so
+        // `cursor + 4 <= mmap.len()` always holds.
+        self.mmap[cursor..cursor + 4].copy_from_slice(&SENTINEL.to_le_bytes());
+
+        self.stats.data_size = cursor as u64;
+        self.stats.dead_bytes = 0;
+
+        // Release the physical slack past the new tail. Keep at least
+        // `initial_capacity` so the next writes don't immediately re-grow
+        // the file. Windows refuses to shrink a file while a mapped
+        // section is open, so swap in a small anonymous mmap as a
+        // placeholder before the truncation, then remap onto the
+        // resized file.
+        let new_capacity = ((cursor + 4) as u64).max(self.config.initial_capacity);
+        self.mmap = MmapMut::map_anon(1)?;
+        self.file.set_len(new_capacity)?;
+        self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
         Ok(())
     }
 
-    fn keys(&self) -> impl Iterator<Item = K> + '_ {
-        self.index.iter().map(|(k, _)| k.clone())
+    fn keys<'a>(&'a self) -> impl Iterator<Item = Cow<'a, K>> + 'a
+    where
+        K: 'a,
+    {
+        self.index.iter().map(|(k, _)| Cow::Borrowed(k))
     }
 
-    fn values(&self) -> impl Iterator<Item = V> + '_ {
-        self.index.iter().map(|(_, v)| v.clone())
+    fn values<'a>(&'a self) -> impl Iterator<Item = Cow<'a, V>> + 'a
+    where
+        V: 'a,
+    {
+        self.index.iter().map(|(_, v)| Cow::Borrowed(v))
     }
 
-    fn entries(&self) -> impl Iterator<Item = (K, V)> + '_ {
-        self.index.iter().map(|(k, v)| (k.clone(), v.clone()))
+    fn entries<'a>(&'a self) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
+    where
+        K: 'a,
+        V: 'a,
+    {
+        self.index
+            .iter()
+            .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
     }
 
     fn size(&self) -> usize {
@@ -1200,40 +1196,58 @@ where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
 {
-    fn range(&self, start: &K, end: &K) -> impl Iterator<Item = (K, V)> + '_ {
+    fn range<'a>(
+        &'a self,
+        start: &K,
+        end: &K,
+    ) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
+    where
+        K: 'a,
+        V: 'a,
+    {
         self.index
             .range_owned_end(start, end.clone())
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
     }
 
-    fn first(&self) -> Option<(K, V)> {
+    fn first<'a>(&'a self) -> Option<(Cow<'a, K>, Cow<'a, V>)>
+    where
+        K: 'a,
+        V: 'a,
+    {
         let idx = self.index.first_idx()?;
         let node = &self.index.arena[idx];
-        Some((node.key.clone(), node.value.clone()))
+        Some((Cow::Borrowed(&node.key), Cow::Borrowed(&node.value)))
     }
 
-    fn last(&self) -> Option<(K, V)> {
+    fn last<'a>(&'a self) -> Option<(Cow<'a, K>, Cow<'a, V>)>
+    where
+        K: 'a,
+        V: 'a,
+    {
         let idx = self.index.last_idx()?;
         let node = &self.index.arena[idx];
-        Some((node.key.clone(), node.value.clone()))
+        Some((Cow::Borrowed(&node.key), Cow::Borrowed(&node.value)))
     }
 
-    fn entries_rev(&self) -> impl Iterator<Item = (K, V)> + '_
+    fn entries_rev(&self) -> impl Iterator<Item = (Cow<'_, K>, Cow<'_, V>)> + '_
     where
         K: 'static,
         V: 'static,
     {
-        self.index.iter_rev().map(|(k, v)| (k.clone(), v.clone()))
+        self.index
+            .iter_rev()
+            .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
     }
 
-    fn range_rev(&self, start: &K, end: &K) -> impl Iterator<Item = (K, V)> + '_
+    fn range_rev(&self, start: &K, end: &K) -> impl Iterator<Item = (Cow<'_, K>, Cow<'_, V>)> + '_
     where
         K: 'static,
         V: 'static,
     {
         self.index
             .range_rev(start.clone(), end)
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
     }
 }
 
@@ -1245,10 +1259,7 @@ impl<K: Ord, V> Drop for OrderLog<K, V> {
 
 impl<K: Ord, V> fmt::Debug for OrderLog<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OrderLog")
-            .field("path", &self.path)
-            .field("stats", &self.stats)
-            .finish()
+        fmt::Debug::fmt(&self.stats, f)
     }
 }
 
@@ -1258,7 +1269,18 @@ mod tests {
     use crate::core::backend::{Backend, OrderedBackend};
     use crate::utils::serdes::serialized_size;
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Test helper — read through the Cow-returning Backend::get API
+    /// and immediately materialize to an owned value.
+    fn get<K, V>(ol: &OrderLog<K, V>, key: &K) -> Option<V>
+    where
+        K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
+        V: Encode + Decode<()> + Clone,
+    {
+        Backend::get(ol, key).map(Cow::into_owned)
+    }
 
     type TestKey = Vec<u8>;
 
@@ -1307,14 +1329,14 @@ mod tests {
         let p = tmp_path("put_get");
         let mut ol = create(&p);
         ol.put(k("alice"), v("alice", 1)).unwrap();
-        assert_eq!(ol.get(&k("alice")), Some(v("alice", 1)));
+        assert_eq!(get(&ol, &k("alice")), Some(v("alice", 1)));
     }
 
     #[test]
     fn missing_returns_none() {
         let p = tmp_path("missing");
         let ol = create(&p);
-        assert!(ol.get(&k("ghost")).is_none());
+        assert!(get(&ol, &k("ghost")).is_none());
     }
 
     #[test]
@@ -1325,7 +1347,7 @@ mod tests {
             ol.put(k(s), v(s, 0)).unwrap();
         }
         assert_eq!(
-            ol.keys().collect::<Vec<_>>(),
+            ol.keys().map(Cow::into_owned).collect::<Vec<_>>(),
             vec![k("alpha"), k("bravo"), k("charlie"), k("delta"), k("echo")]
         );
     }
@@ -1337,7 +1359,10 @@ mod tests {
         for s in ["a", "b", "c", "d", "e", "f"] {
             ol.put(k(s), v(s, 0)).unwrap();
         }
-        let got: Vec<_> = ol.range(&k("b"), &k("e")).map(|(k, _)| k).collect();
+        let got: Vec<_> = ol
+            .range(&k("b"), &k("e"))
+            .map(|(k, _)| k.into_owned())
+            .collect();
         assert_eq!(got, vec![k("b"), k("c"), k("d")]);
     }
 
@@ -1348,8 +1373,8 @@ mod tests {
         for s in ["m", "a", "z", "f"] {
             ol.put(k(s), v(s, 0)).unwrap();
         }
-        assert_eq!(ol.first().map(|(k, _)| k), Some(k("a")));
-        assert_eq!(ol.last().map(|(k, _)| k), Some(k("z")));
+        assert_eq!(ol.first().map(|(k, _)| k.into_owned()), Some(k("a")));
+        assert_eq!(ol.last().map(|(k, _)| k.into_owned()), Some(k("z")));
     }
 
     #[test]
@@ -1364,8 +1389,8 @@ mod tests {
             ol.sync().unwrap();
         }
         let ol = open(&p);
-        assert!(ol.get(&k("a")).is_none());
-        assert_eq!(ol.get(&k("b")), Some(v("b", 2)));
+        assert!(get(&ol, &k("a")).is_none());
+        assert_eq!(get(&ol, &k("b")), Some(v("b", 2)));
     }
 
     #[test]
@@ -1377,7 +1402,7 @@ mod tests {
             ol.put(k("x"), v("v2", 2)).unwrap();
             ol.sync().unwrap();
         }
-        assert_eq!(open(&p).get(&k("x")), Some(v("v2", 2)));
+        assert_eq!(get(&open(&p), &k("x")), Some(v("v2", 2)));
     }
 
     #[test]
@@ -1389,9 +1414,9 @@ mod tests {
             .unwrap();
         ol.update(&k("counter"), |cur| Some(cur.unwrap_or(0) + 5))
             .unwrap();
-        assert_eq!(ol.get(&k("counter")), Some(6));
+        assert_eq!(get(&ol, &k("counter")), Some(6));
         ol.update(&k("counter"), |_| None).unwrap();
-        assert!(ol.get(&k("counter")).is_none());
+        assert!(get(&ol, &k("counter")).is_none());
         ol.update(&k("ghost"), |_| None).unwrap();
     }
 
@@ -1407,7 +1432,7 @@ mod tests {
         let inc2 = 4;
         ol.update(&k("counter"), move |cur| Some(cur.unwrap_or(0) + inc2))
             .unwrap();
-        assert_eq!(ol.get(&k("counter")), Some(10));
+        assert_eq!(get(&ol, &k("counter")), Some(10));
     }
 
     #[test]
@@ -1417,7 +1442,7 @@ mod tests {
             OrderLog::create(&p, OrderLogConfig::default()).unwrap();
         ol.update(&k("fresh"), |cur| Some(cur.unwrap_or(0) + 7))
             .unwrap();
-        assert_eq!(ol.get(&k("fresh")), Some(7));
+        assert_eq!(get(&ol, &k("fresh")), Some(7));
     }
 
     #[test]
@@ -1427,7 +1452,7 @@ mod tests {
             OrderLog::create(&p, OrderLogConfig::default()).unwrap();
         ol.put(k("x"), 42).unwrap();
         ol.update(&k("x"), |_| None).unwrap();
-        assert!(ol.get(&k("x")).is_none());
+        assert!(get(&ol, &k("x")).is_none());
         assert_eq!(ol.size(), 0);
     }
 
@@ -1437,7 +1462,7 @@ mod tests {
         let mut ol: OrderLog<TestKey, u32> =
             OrderLog::create(&p, OrderLogConfig::default()).unwrap();
         ol.update(&k("ghost"), |_| None).unwrap();
-        assert!(ol.get(&k("ghost")).is_none());
+        assert!(get(&ol, &k("ghost")).is_none());
         assert_eq!(ol.size(), 0);
     }
 
@@ -1454,7 +1479,7 @@ mod tests {
             Some(v)
         })
         .unwrap();
-        assert_eq!(ol.get(&k("acc")), Some(vec![1, 2, 3, 10, 20, 30]));
+        assert_eq!(get(&ol, &k("acc")), Some(vec![1, 2, 3, 10, 20, 30]));
     }
 
     #[test]
@@ -1542,7 +1567,7 @@ mod tests {
         let ol = open(&p);
         assert_eq!(ol.size(), 25);
         for i in 25..50 {
-            assert_eq!(ol.get(&k(&format!("k{:02}", i))), Some(v("update", i)));
+            assert_eq!(get(&ol, &k(&format!("k{:02}", i))), Some(v("update", i)));
         }
     }
 
@@ -1575,7 +1600,10 @@ mod tests {
             ol.sync().unwrap();
         }
         let ol = open(&p);
-        assert_eq!(ol.keys().collect::<Vec<_>>(), vec![k("a"), k("c"), k("d")]);
+        assert_eq!(
+            ol.keys().map(Cow::into_owned).collect::<Vec<_>>(),
+            vec![k("a"), k("c"), k("d")]
+        );
     }
 
     #[test]
@@ -1591,9 +1619,12 @@ mod tests {
         }
         let ol = open(&p);
         assert_eq!(ol.size(), 20);
-        assert_eq!(ol.first().unwrap().0, k("k00"));
-        assert_eq!(ol.last().unwrap().0, k("k19"));
-        let middle: Vec<_> = ol.range(&k("k05"), &k("k08")).map(|(k, _)| k).collect();
+        assert_eq!(ol.first().unwrap().0.into_owned(), k("k00"));
+        assert_eq!(ol.last().unwrap().0.into_owned(), k("k19"));
+        let middle: Vec<_> = ol
+            .range(&k("k05"), &k("k08"))
+            .map(|(k, _)| k.into_owned())
+            .collect();
         assert_eq!(middle, vec![k("k05"), k("k06"), k("k07")]);
     }
 
@@ -1603,14 +1634,16 @@ mod tests {
         let mut ol = create(&p);
         assert!(ol.put_if_absent(k("a"), v("first", 1)).unwrap());
         assert!(!ol.put_if_absent(k("a"), v("second", 2)).unwrap());
-        assert_eq!(ol.get(&k("a")), Some(v("first", 1)));
+        assert_eq!(get(&ol, &k("a")), Some(v("first", 1)));
         assert_eq!(
-            ol.replace(k("a"), v("third", 3)).unwrap(),
+            ol.replace(k("a"), v("third", 3))
+                .unwrap()
+                .map(Cow::into_owned),
             Some(v("first", 1))
         );
         assert_eq!(ol.replace(k("b"), v("new", 4)).unwrap(), None);
-        assert_eq!(ol.get(&k("a")), Some(v("third", 3)));
-        assert_eq!(ol.get(&k("b")), Some(v("new", 4)));
+        assert_eq!(get(&ol, &k("a")), Some(v("third", 3)));
+        assert_eq!(get(&ol, &k("b")), Some(v("new", 4)));
     }
 
     #[test]
@@ -1642,13 +1675,16 @@ mod tests {
         ];
         ol.bulk_put(items).unwrap();
         assert_eq!(
-            ol.keys().collect::<Vec<_>>(),
+            ol.keys().map(Cow::into_owned).collect::<Vec<_>>(),
             vec![k("a"), k("b"), k("c"), k("d")]
         );
 
         let keys = vec![k("c"), k("missing"), k("a")];
         assert_eq!(ol.bulk_delete(keys.iter()).unwrap(), 2);
-        assert_eq!(ol.keys().collect::<Vec<_>>(), vec![k("b"), k("d")]);
+        assert_eq!(
+            ol.keys().map(Cow::into_owned).collect::<Vec<_>>(),
+            vec![k("b"), k("d")]
+        );
     }
 
     #[test]
@@ -1666,10 +1702,58 @@ mod tests {
         let overwrite = vec![(k("k04"), v("new", 44)), (k("k25"), v("tail", 25))];
         ol.bulk_put_sorted(overwrite).unwrap();
         assert_eq!(ol.size(), 21);
-        assert_eq!(ol.get(&k("k04")), Some(v("new", 44)));
-        assert_eq!(ol.last().map(|(k, _)| k), Some(k("k25")));
-        let keys: Vec<_> = ol.keys().collect();
+        assert_eq!(get(&ol, &k("k04")), Some(v("new", 44)));
+        assert_eq!(ol.last().map(|(k, _)| k.into_owned()), Some(k("k25")));
+        let keys: Vec<_> = ol.keys().map(Cow::into_owned).collect();
         assert!(keys.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// Regression: duplicate keys inside a single `bulk_put_sorted`
+    /// batch used to produce orphaned arena slots because the finger
+    /// cursor didn't move onto the freshly-inserted node, so the
+    /// duplicate would re-enter `insert_at_finger` instead of going
+    /// through the overwrite path. Last-write-wins is the expected
+    /// behavior (matches looping `put`).
+    #[test]
+    fn bulk_put_sorted_dedupes_within_batch() {
+        let p = tmp_path("bulk_sorted_dupes");
+        let mut ol = create(&p);
+        ol.bulk_put_sorted([
+            (k("a"), v("first", 1)),
+            (k("a"), v("second", 2)),
+            (k("a"), v("third", 3)),
+            (k("b"), v("b", 4)),
+            (k("b"), v("b_again", 5)),
+        ])
+        .unwrap();
+        assert_eq!(ol.size(), 2);
+        assert_eq!(get(&ol, &k("a")), Some(v("third", 3)));
+        assert_eq!(get(&ol, &k("b")), Some(v("b_again", 5)));
+        // Iteration order must still be by key, with one entry per key.
+        let keys: Vec<TestKey> = ol.keys().map(Cow::into_owned).collect();
+        assert_eq!(keys, vec![k("a"), k("b")]);
+    }
+
+    /// Tombstones written via `write_tombstone_into` must survive a
+    /// reopen — the WAL bytes carry the encoded key over the
+    /// `copy_within` boundary the same way a serialized tombstone
+    /// would, and replay must mark the key as deleted.
+    #[test]
+    fn tombstone_copy_within_round_trips_through_reopen() {
+        let p = tmp_path("tombstone_copy_within");
+        {
+            let mut ol = create(&p);
+            ol.put(k("alpha"), v("a", 1)).unwrap();
+            ol.put(k("beta"), v("b", 2)).unwrap();
+            ol.put(k("gamma"), v("c", 3)).unwrap();
+            assert!(ol.delete(&k("beta")).unwrap());
+            ol.sync().unwrap();
+        }
+        let ol = open(&p);
+        assert_eq!(ol.size(), 2);
+        assert_eq!(get(&ol, &k("alpha")), Some(v("a", 1)));
+        assert!(get(&ol, &k("beta")).is_none());
+        assert_eq!(get(&ol, &k("gamma")), Some(v("c", 3)));
     }
 
     #[test]
@@ -1696,14 +1780,20 @@ mod tests {
         for s in ["a", "b", "c", "d", "e"] {
             ol.put(k(s), v(s, 0)).unwrap();
         }
-        let rev: Vec<_> = ol.entries_rev().map(|(k, _)| k).collect();
+        let rev: Vec<_> = ol.entries_rev().map(|(k, _)| k.into_owned()).collect();
         assert_eq!(rev, vec![k("e"), k("d"), k("c"), k("b"), k("a")]);
-        let forward: Vec<_> = ol.range(&k("b"), &k("e")).collect();
-        let rev_range: Vec<_> = ol.range_rev(&k("b"), &k("e")).collect();
+        let forward: Vec<(TestKey, TestVal)> = ol
+            .range(&k("b"), &k("e"))
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        let rev_range: Vec<(TestKey, TestVal)> = ol
+            .range_rev(&k("b"), &k("e"))
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
         assert_eq!(rev_range, forward.into_iter().rev().collect::<Vec<_>>());
         assert!(ol.range_rev(&k("c"), &k("c")).next().is_none());
         ol.delete(&k("c")).unwrap();
-        let rev_after: Vec<_> = ol.entries_rev().map(|(k, _)| k).collect();
+        let rev_after: Vec<_> = ol.entries_rev().map(|(k, _)| k.into_owned()).collect();
         assert_eq!(rev_after, vec![k("e"), k("d"), k("b"), k("a")]);
     }
 
@@ -1719,7 +1809,9 @@ mod tests {
         .unwrap();
         ol.bulk_put_sorted([(k("b"), v("b2", 2))]).unwrap();
         assert_eq!(
-            ol.entries_rev().map(|(k, _)| k).collect::<Vec<_>>(),
+            ol.entries_rev()
+                .map(|(k, _)| k.into_owned())
+                .collect::<Vec<_>>(),
             vec![k("c"), k("b"), k("a")]
         );
     }
@@ -1735,16 +1827,86 @@ mod tests {
         let got: Vec<_> = ol
             .range(&k("k01000"), &k("k05000"))
             .take(3)
-            .map(|(k, _)| k)
+            .map(|(k, _)| k.into_owned())
             .collect();
         assert_eq!(got, vec![k("k01000"), k("k01001"), k("k01002")]);
     }
 
+    /// OrderLog holds keys/values in its in-memory skip list, so every
+    /// retrieval method should return `Cow::Borrowed`. Verifies that
+    /// no read path materializes through `Cow::Owned`.
     #[test]
-    fn open_rejects_truncated_file_without_panicking() {
-        let p = tmp_path("truncated");
-        fs::write(&p, [1u8, 2, 3]).unwrap();
-        let err = OrderLog::<TestKey, TestVal>::open(&p, OrderLogConfig::default()).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    fn retrieval_methods_return_borrowed() {
+        let p = tmp_path("cow_borrowed");
+        let mut ol = create(&p);
+        for s in ["a", "b", "c"] {
+            ol.put(k(s), v(s, 0)).unwrap();
+        }
+
+        assert!(matches!(Backend::get(&ol, &k("a")), Some(Cow::Borrowed(_))));
+        assert!(Backend::keys(&ol).all(|c| matches!(c, Cow::Borrowed(_))));
+        assert!(Backend::values(&ol).all(|c| matches!(c, Cow::Borrowed(_))));
+        assert!(Backend::entries(&ol)
+            .all(|(k, v)| { matches!(k, Cow::Borrowed(_)) && matches!(v, Cow::Borrowed(_)) }));
+
+        assert!(OrderedBackend::range(&ol, &k("a"), &k("c"))
+            .all(|(k, v)| { matches!(k, Cow::Borrowed(_)) && matches!(v, Cow::Borrowed(_)) }));
+        let (fk, fv) = OrderedBackend::first(&ol).unwrap();
+        assert!(matches!(fk, Cow::Borrowed(_)));
+        assert!(matches!(fv, Cow::Borrowed(_)));
+        let (lk, lv) = OrderedBackend::last(&ol).unwrap();
+        assert!(matches!(lk, Cow::Borrowed(_)));
+        assert!(matches!(lv, Cow::Borrowed(_)));
+    }
+
+    /// Callers that need owned values must be able to materialize them
+    /// via `Cow::into_owned()`. Exercises both `get` and `entries`
+    /// alongside the ordered surface.
+    #[test]
+    fn into_owned_yields_correct_values() {
+        let p = tmp_path("cow_into_owned");
+        let mut ol = create(&p);
+        ol.put(k("a"), v("alpha", 1)).unwrap();
+        ol.put(k("b"), v("beta", 2)).unwrap();
+
+        let owned: TestVal = Backend::get(&ol, &k("a")).unwrap().into_owned();
+        assert_eq!(owned, v("alpha", 1));
+
+        let owned_entries: Vec<(TestKey, TestVal)> = Backend::entries(&ol)
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            owned_entries,
+            vec![(k("a"), v("alpha", 1)), (k("b"), v("beta", 2))]
+        );
+    }
+
+    /// A `V` whose bincode encoding is 0 bytes (the unit type here)
+    /// used to be silently truncated by the old `value_size == 0`
+    /// replay terminator. `SENTINEL = u32::MAX - 1` separates the
+    /// empty-value case from the live-tail case.
+    #[test]
+    fn zero_byte_value_round_trips() {
+        let p = tmp_path("zero_byte_value");
+        {
+            let mut ol: OrderLog<TestKey, ()> =
+                OrderLog::create(&p, OrderLogConfig::default()).unwrap();
+            ol.put(k("alpha"), ()).unwrap();
+            ol.put(k("beta"), ()).unwrap();
+            ol.put(k("gamma"), ()).unwrap();
+            ol.delete(&k("beta")).unwrap();
+            ol.sync().unwrap();
+        }
+        let ol: OrderLog<TestKey, ()> = OrderLog::open(&p, OrderLogConfig::default()).unwrap();
+        assert_eq!(ol.size(), 2);
+        assert_eq!(
+            Backend::get(&ol, &k("alpha")).map(Cow::into_owned),
+            Some(())
+        );
+        assert!(Backend::get(&ol, &k("beta")).is_none());
+        assert_eq!(
+            Backend::get(&ol, &k("gamma")).map(Cow::into_owned),
+            Some(())
+        );
     }
 }

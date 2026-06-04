@@ -257,7 +257,7 @@ fn keydir_reads() -> io::Result<()> {
 
     let elapsed = timed(|| {
         for k in 0..N {
-            let v: u64 = kd.get(&k).expect("key must exist");
+            let v: u64 = *kd.get(&k).expect("key must exist");
             assert_eq!(v, k.wrapping_mul(7));
         }
         Ok(())
@@ -402,7 +402,7 @@ fn orderlog_reads() -> io::Result<()> {
 
     let elapsed = timed(|| {
         for k in 0..N {
-            let v: u64 = ol.get(&k).expect("key must exist");
+            let v: u64 = *ol.get(&k).expect("key must exist");
             assert_eq!(v, k.wrapping_mul(7));
         }
         Ok(())
@@ -620,7 +620,7 @@ fn btree_reads() -> io::Result<()> {
 
     let elapsed = timed(|| {
         for (i, k) in keys.iter().enumerate() {
-            let v: u64 = t.get(k).expect("key must exist");
+            let v: u64 = *t.get(k).expect("key must exist");
             assert_eq!(v, (i as u64).wrapping_mul(7));
         }
         Ok(())

@@ -87,7 +87,7 @@ impl Database {
 
     /// Apply a delta, routing it to the correct table.
     pub fn apply(&mut self, delta: Delta) -> io::Result<()> {
-        let table_name = delta.table_id.0.clone();
+        let table_name = delta.table_id.clone();
         let table = self.table(&table_name)?;
         table.apply(delta)
     }
@@ -112,7 +112,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zendb_types::{AtomOp, AtomValue, Hlc, Op, Path as ZPath, PrimaryKey, TableId};
+    use zendb_types::{AtomOp, AtomValue, Hlc, Op, Path as ZPath, TypeOp};
 
     fn tmp_dir(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("zendb_db_{}", name));
@@ -143,23 +143,23 @@ mod tests {
         let mut db = Database::open(&dir).unwrap();
 
         let d1 = Delta {
-            table_id: TableId("notes".into()),
-            primary_key: PrimaryKey(AtomValue::String("n1".into())),
+            table_id: "notes".into(),
+            primary_key: AtomValue::String("n1".into()),
             path: ZPath::new(),
-            op: Op::Atom(AtomOp::Set(AtomValue::String("hello".into()))),
-            hlc: Hlc::new(100, 0, 1).unwrap(),
+            op: Op::Type(TypeOp::Atom(AtomOp::Set(AtomValue::String("hello".into())))),
+            hlc: Hlc::with_device_id(100, 0, [1u8; 8]).unwrap(),
             sync: false,
-            signature: zendb_types::Signature(vec![]),
+            signature: vec![],
         };
 
         let d2 = Delta {
-            table_id: TableId("todos".into()),
-            primary_key: PrimaryKey(AtomValue::String("t1".into())),
+            table_id: "todos".into(),
+            primary_key: AtomValue::String("t1".into()),
             path: ZPath::new(),
-            op: Op::Atom(AtomOp::Set(AtomValue::String("buy milk".into()))),
-            hlc: Hlc::new(200, 0, 1).unwrap(),
+            op: Op::Type(TypeOp::Atom(AtomOp::Set(AtomValue::String("buy milk".into())))),
+            hlc: Hlc::with_device_id(200, 0, [1u8; 8]).unwrap(),
             sync: false,
-            signature: zendb_types::Signature(vec![]),
+            signature: vec![],
         };
 
         db.apply(d1).unwrap();

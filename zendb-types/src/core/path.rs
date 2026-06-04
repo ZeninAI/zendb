@@ -48,21 +48,6 @@ impl Path {
         self.steps.push(PathStep::new(container_tag, segment));
         self
     }
-
-    pub fn parent(&self) -> Option<Path> {
-        if self.steps.is_empty() {
-            return None;
-        }
-        let mut steps = self.steps.clone();
-        steps.pop();
-        Some(Path { steps })
-    }
-
-    pub fn child(&self, container_tag: TypeTag, segment: Segment) -> Path {
-        let mut steps = self.steps.clone();
-        steps.push(PathStep::new(container_tag, segment));
-        Path { steps }
-    }
 }
 
 impl Default for Path {
@@ -74,33 +59,11 @@ impl Default for Path {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::record::RecordSegment;
 
     #[test]
     fn empty_path_is_root() {
         let path = Path::new();
         assert!(path.is_empty());
         assert_eq!(path.len(), 0);
-        assert!(path.parent().is_none());
-    }
-
-    #[test]
-    fn parent_returns_path_without_last_step() {
-        let path = Path::new()
-            .step(
-                TypeTag::Record,
-                Segment::Record(RecordSegment {
-                    field_name: "a".into(),
-                }),
-            )
-            .step(
-                TypeTag::Record,
-                Segment::Record(RecordSegment {
-                    field_name: "b".into(),
-                }),
-            );
-        assert_eq!(path.len(), 2);
-        let parent = path.parent().unwrap();
-        assert_eq!(parent.len(), 1);
     }
 }

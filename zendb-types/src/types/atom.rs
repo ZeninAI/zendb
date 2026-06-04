@@ -134,6 +134,10 @@ mod tests {
     use super::*;
     use bincode::{config, decode_from_slice, encode_to_vec};
 
+    fn hlc(ms: u64) -> Hlc {
+        Hlc::with_device_id(ms, 0, [1u8; 8]).unwrap()
+    }
+
     #[test]
     fn atom_float_eq_nan() {
         assert_eq!(AtomFloat(f64::NAN), AtomFloat(f64::NAN));
@@ -151,7 +155,7 @@ mod tests {
             &mut val,
             &AtomOp::Set(AtomValue::Int(42)),
             Hlc::ZERO,
-            Hlc::new(100, 0, 1).unwrap(),
+            hlc(100),
         )
         .unwrap();
         assert!(changed);
@@ -164,8 +168,8 @@ mod tests {
         let changed = AtomType::apply_op(
             &mut val,
             &AtomOp::Set(AtomValue::Int(2)),
-            Hlc::new(200, 0, 1).unwrap(),
-            Hlc::new(100, 0, 1).unwrap(),
+            hlc(200),
+            hlc(100),
         )
         .unwrap();
         assert!(!changed);
@@ -178,9 +182,9 @@ mod tests {
         let remote = AtomValue::String("remote".into());
         let changed = AtomType::merge(
             &mut local,
-            Hlc::new(100, 0, 1).unwrap(),
+            hlc(100),
             &remote,
-            Hlc::new(200, 0, 1).unwrap(),
+            hlc(200),
         )
         .unwrap();
         assert!(changed);
@@ -193,9 +197,9 @@ mod tests {
         let remote = AtomValue::String("remote".into());
         let changed = AtomType::merge(
             &mut local,
-            Hlc::new(300, 0, 1).unwrap(),
+            hlc(300),
             &remote,
-            Hlc::new(200, 0, 1).unwrap(),
+            hlc(200),
         )
         .unwrap();
         assert!(!changed);

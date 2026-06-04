@@ -19,7 +19,7 @@
 //! Generic over `K` (key) and `V` (value). Uses bincode 2 for both
 //! directions:
 //! - **Write**: [`serialize_into`] writes the encoded bytes directly into
-//!   the mmap (no intermediate `Vec<u8>` allocation). `write_entry`
+//!   the mmap (no intermediate `Vec<u8>` allocation). `write_entry_into`
 //!   measures both halves up front and grows the file at most once per
 //!   `put`, even when the new record straddles the previous capacity.
 //! - **Read**: [`deserialize_from`] materializes an owned `V` from the
@@ -71,6 +71,7 @@
 //! `refresh_stats()` call to forget to make.
 //!
 use std::{
+    borrow::Cow,
     fmt,
     fs::{File, OpenOptions},
     hash::Hash,
@@ -95,8 +96,13 @@ const MAGIC: u32 = 0x4452494B;
 /// File header size in bytes: `[MAGIC: u32 LE]`. Entry data follows immediately.
 const HEADER_SIZE: usize = 4;
 const TOMBSTONE: u32 = u32::MAX;
+/// Replay terminator written at the live tail by `create`, every
+/// record write, `clear`, and `compact`. Distinct from `value_size == 0`
+/// (which is a legitimate empty-value encoding) so a `V` whose bincode
+/// representation is 0 bytes (e.g. the unit type) round-trips correctly.
+const SENTINEL: u32 = u32::MAX - 1;
 
-#[derive(Debug, Clone, Copy, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct KeyDirConfig {
     pub initial_capacity: u64,
     /// Auto-compaction threshold. Callers must pass a value in `[0.0, 1.0]`:
@@ -116,49 +122,48 @@ impl Default for KeyDirConfig {
 /// Append-log accounting. The live entry count is **not** tracked here —
 /// it comes straight from `index.len()` via `Backend::size`, so there's
 /// no separate counter to keep in sync on every mutation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Encode, Decode)]
 pub struct KeyDirStats {
     pub data_size: u64,
     pub dead_bytes: u64,
 }
 
-/// Serialized sizes and offset of an entry in the mmap. Kept compact so the
-/// in-memory HashMap stays lean.
-#[derive(Debug, Clone, Copy)]
+/// Offset and total on-disk size of an entry in the mmap. Kept compact so
+/// the in-memory HashMap stays lean. The individual `value_size` and
+/// `key_size` live on disk and are re-read from the mmap when the
+/// tombstone writer needs to locate the encoded key inside the record.
+#[derive(Debug, Clone)]
 struct EntryMeta {
     offset: u64,
-    value_size: u32,
-    key_size: u32,
-}
-
-impl EntryMeta {
-    /// Total bytes the entry occupies on disk: two u32 length prefixes (8)
-    /// plus the encoded key and value bytes.
-    fn on_disk_size(&self) -> u64 {
-        8 + self.value_size as u64 + self.key_size as u64
-    }
+    /// Total bytes the entry occupies on disk: two u32 length prefixes
+    /// (8) plus the encoded key and value bytes.
+    record_size: u32,
 }
 
 // ---------------------------------------------------------------------------
 // Field-level free functions
 //
-// These mirror the inherent helpers (`value_bytes`, `grow`, `write_entry`,
-// `write_tombstone_for`) but take individual field borrows instead of
-// `&self` / `&mut self`. Methods that need to hold a HashMap `Entry` /
-// `RawEntryMut` open across a read-and-then-write sequence destructure
-// `self` and call these directly, so the entry's borrow on `self.index`
-// doesn't conflict with the disjoint borrows on mmap / stats / file.
+// These take individual field borrows rather than `&self` / `&mut self`,
+// so Backend methods that hold a HashMap `Entry` / `RawEntryMut` open
+// across a read-and-then-write sequence can call them with
+// `&mut self.mmap`, `&mut self.file`, `&mut self.stats` directly — the
+// disjoint-field borrows don't conflict with the entry's borrow on
+// `self.index`.
 // ---------------------------------------------------------------------------
 
-/// Borrow the raw value bytes for `meta`. The 4-byte length prefix is excluded.
+/// Borrow the raw value bytes for `meta`. The 4-byte length prefix is
+/// excluded. `value_size` is read from the live record's own header on
+/// the same cache line as the value bytes themselves — essentially free.
 fn value_bytes_in<'a>(mmap: &'a MmapMut, meta: &EntryMeta) -> &'a [u8] {
-    let start = meta.offset as usize + 4;
-    let end = start + meta.value_size as usize;
-    &mmap[start..end]
+    let offset = meta.offset as usize;
+    let value_size =
+        read_u32_le(mmap, offset).expect("live record header within mmap bounds") as usize;
+    let start = offset + 4;
+    &mmap[start..start + value_size]
 }
 
 /// Grow the file to at least `desired` bytes (`max(current * 2, desired)`)
-/// and remap. Matches the inherent [`KeyDir::grow`] semantics.
+/// and remap.
 fn grow_into(mmap: &mut MmapMut, file: &mut File, desired: u64) -> io::Result<()> {
     let new_capacity = ((mmap.len() as u64) * 2).max(desired);
     file.set_len(new_capacity)?;
@@ -167,35 +172,32 @@ fn grow_into(mmap: &mut MmapMut, file: &mut File, desired: u64) -> io::Result<()
 }
 
 /// Append `[vlen u32][V][klen u32][K]` at the current write tail —
-/// at `stats.data_size`. Returns `(offset, value_size, key_size)`.
-/// Mirrors [`KeyDir::write_entry`].
+/// at `stats.data_size`. Writes the trailing `SENTINEL` so a
+/// subsequent `replay_wal` terminates correctly. Returns the new
+/// record's `EntryMeta`.
 fn write_entry_into<K, V>(
     mmap: &mut MmapMut,
     file: &mut File,
     stats: &mut KeyDirStats,
     key: &K,
     value: &V,
-) -> io::Result<(u64, u32, u32)>
+) -> io::Result<EntryMeta>
 where
     K: Encode,
     V: Encode,
 {
     // Encode key + value once into pooled scratch buffers; the slice
-    // lengths give the on-disk sizes for free. The previous version
-    // double-encoded each side (once for `serialized_size`, once via
-    // `serialize_into` into the destination) — four bincode passes per
-    // put.
+    // lengths give the on-disk sizes for free.
     with_two_scratches(key, value, |kb, vb| {
         let k_size = kb.len();
         let v_size = vb.len();
         let total = 8 + v_size + k_size;
 
         let offset = stats.data_size as usize;
-        let end = offset
-            .checked_add(total)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir offset overflow"))?;
-        if end > mmap.len() {
-            grow_into(mmap, file, end as u64)?;
+        let end = offset + total;
+        // Grow with room for the trailing SENTINEL too.
+        if end + 4 > mmap.len() {
+            grow_into(mmap, file, (end + 4) as u64)?;
         }
 
         mmap[offset..offset + 4].copy_from_slice(&(v_size as u32).to_le_bytes());
@@ -206,36 +208,46 @@ where
         let k_off = k_len_off + 4;
         mmap[k_off..k_off + k_size].copy_from_slice(kb);
 
+        mmap[end..end + 4].copy_from_slice(&SENTINEL.to_le_bytes());
         stats.data_size = end as u64;
-        Ok((offset as u64, v_size as u32, k_size as u32))
+        Ok(EntryMeta {
+            offset: offset as u64,
+            record_size: total as u32,
+        })
     })
 }
 
-/// Append a tombstone for `old`, reusing the already-encoded key bytes
-/// from the mmap. Mirrors [`KeyDir::write_tombstone_for`].
+/// Append a tombstone for the live record described by `old`, reusing
+/// the already-encoded key bytes that still live in the doomed
+/// entry's slot — no bincode encode, no scratch `Vec<u8>`. A single
+/// `copy_within` moves the key into the tombstone payload.
 fn write_tombstone_into(
     mmap: &mut MmapMut,
     file: &mut File,
     stats: &mut KeyDirStats,
-    old: EntryMeta,
+    old: &EntryMeta,
 ) -> io::Result<()> {
-    let key_size = old.key_size as usize;
+    // value_size sits in the first 4 bytes of the live record;
+    // key_size falls out of `record_size - 8 - value_size`. We only
+    // need value_size to locate where the key bytes start.
+    let value_size = read_u32_le(mmap, old.offset as usize)
+        .expect("live record header within mmap bounds") as usize;
+    let key_size = old.record_size as usize - 8 - value_size;
     let total = 8 + key_size;
-    let key_offset_within_entry = 4 + old.value_size as usize + 4;
 
     let new_offset = stats.data_size as usize;
-    let end = new_offset
-        .checked_add(total)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "KeyDir offset overflow"))?;
-    if end > mmap.len() {
-        grow_into(mmap, file, end as u64)?;
+    let end = new_offset + total;
+    // Grow with room for the trailing SENTINEL too.
+    if end + 4 > mmap.len() {
+        grow_into(mmap, file, (end + 4) as u64)?;
     }
-    let key_src_start = old.offset as usize + key_offset_within_entry;
+    let key_src_start = old.offset as usize + 8 + value_size;
 
     mmap[new_offset..new_offset + 4].copy_from_slice(&TOMBSTONE.to_le_bytes());
     mmap[new_offset + 4..new_offset + 8].copy_from_slice(&(key_size as u32).to_le_bytes());
     mmap.copy_within(key_src_start..key_src_start + key_size, new_offset + 8);
 
+    mmap[end..end + 4].copy_from_slice(&SENTINEL.to_le_bytes());
     stats.data_size = end as u64;
     stats.dead_bytes += 8 + key_size as u64;
     Ok(())
@@ -269,8 +281,11 @@ where
         file.set_len(config.initial_capacity)?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
 
-        // Write file header: MAGIC at offset 0.
+        // Write file header: MAGIC at offset 0, then SENTINEL at the
+        // live tail so `replay_wal` on a fresh file terminates
+        // immediately at `HEADER_SIZE`.
         mmap[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        mmap[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&SENTINEL.to_le_bytes());
 
         Ok(KeyDir {
             index: HashMap::new(),
@@ -318,28 +333,11 @@ where
     // -----------------------------------------------------------------------
     // Private helpers — everything below this point is implementation
     // detail. The Backend trait impl at the bottom of the file is what
-    // callers reach through.
+    // callers reach through. The mmap-touching primitives all live as
+    // field-level free functions (`value_bytes_in`, `write_entry_into`,
+    // `write_tombstone_into`) so callers can hold a `HashMap::Entry`
+    // open across them without aliasing self.
     // -----------------------------------------------------------------------
-
-    /// Raw value bytes for the entry pointed at by `meta`.
-    fn value_bytes(&self, meta: &EntryMeta) -> &[u8] {
-        value_bytes_in(&self.mmap, meta)
-    }
-
-    /// Append `[vlen u32][V][klen u32][K]` at the current write tail.
-    /// Measures both halves up front so the mmap path `grow`s at most
-    /// once per call.
-    fn write_entry(&mut self, key: &K, value: &V) -> io::Result<(u64, u32, u32)> {
-        write_entry_into(&mut self.mmap, &mut self.file, &mut self.stats, key, value)
-    }
-
-    /// Append a tombstone for the entry described by `old`, reusing the
-    /// already-encoded key bytes already living in the doomed entry's
-    /// slot — no bincode encode, no scratch `Vec<u8>`. A single
-    /// `copy_within` moves the key into the tombstone payload.
-    fn write_tombstone_for(&mut self, old: EntryMeta) -> io::Result<()> {
-        write_tombstone_into(&mut self.mmap, &mut self.file, &mut self.stats, old)
-    }
 
     /// Auto-compaction guard. Reads the configured threshold and, if the
     /// dead-byte ratio is over it, calls the [`Backend::compact`]
@@ -368,9 +366,10 @@ where
         self.stats.dead_bytes = 0;
 
         while let Some(value_size) = read_u32_le(&self.mmap, cursor) {
-            // 0 marks the (zero-filled) tail of the pre-allocated file
-            // or the sentinel written by a prior `compact_in_place`.
-            if value_size == 0 {
+            // SENTINEL marks the live tail. value_size == 0 is a
+            // legitimate empty-value encoding (e.g. V = ()) and is NOT
+            // a stop condition.
+            if value_size == SENTINEL {
                 break;
             }
 
@@ -380,9 +379,8 @@ where
             } else {
                 cursor + 4 + value_size as usize
             };
-            let Some(key_size) = read_u32_le(&self.mmap, key_size_off) else {
-                break;
-            };
+            let key_size =
+                read_u32_le(&self.mmap, key_size_off).expect("key_size header within mmap bounds");
             let key_start = key_size_off + 4;
             let entry_end = key_start + key_size as usize;
 
@@ -390,18 +388,18 @@ where
 
             if is_tombstone {
                 if let Some(old) = self.index.remove(&key) {
-                    self.stats.dead_bytes += old.on_disk_size();
+                    self.stats.dead_bytes += old.record_size as u64;
                 }
                 self.stats.dead_bytes += 8 + key_size as u64;
             } else {
+                let record_size = 8 + value_size + key_size;
                 let meta = EntryMeta {
                     offset: cursor as u64,
-                    value_size,
-                    key_size,
+                    record_size,
                 };
                 match self.index.entry(key) {
                     Entry::Occupied(mut e) => {
-                        self.stats.dead_bytes += e.get().on_disk_size();
+                        self.stats.dead_bytes += e.get().record_size as u64;
                         *e.get_mut() = meta;
                     }
                     Entry::Vacant(e) => {
@@ -449,10 +447,12 @@ where
     type Config = KeyDirConfig;
 
     /// One HashMap lookup, then materialize the value by decoding the
-    /// mmap slice the meta points at.
-    fn get(&self, key: &K) -> Option<V> {
+    /// mmap slice the meta points at. Returns `Cow::Owned` since the
+    /// value is freshly decoded each call.
+    fn get(&self, key: &K) -> Option<Cow<'_, V>> {
         let meta = self.index.get(key)?;
-        Some(deserialize_from(self.value_bytes(meta)).expect("valid encoded value"))
+        let v: V = deserialize_from(value_bytes_in(&self.mmap, meta)).expect("valid encoded value");
+        Some(Cow::Owned(v))
     }
 
     /// HashMap probe — no mmap access, no deserialization. Faster than
@@ -466,15 +466,16 @@ where
     /// is fresh or being overwritten. (The previous `get_mut` / `insert`
     /// pair hashed twice on the cold path.)
     fn put(&mut self, key: K, value: V) -> io::Result<()> {
-        let (offset, value_size, key_size) = self.write_entry(&key, &value)?;
-        let new_meta = EntryMeta {
-            offset,
-            value_size,
-            key_size,
-        };
+        let new_meta = write_entry_into(
+            &mut self.mmap,
+            &mut self.file,
+            &mut self.stats,
+            &key,
+            &value,
+        )?;
         match self.index.entry(key) {
             Entry::Occupied(mut e) => {
-                self.stats.dead_bytes += e.get().on_disk_size();
+                self.stats.dead_bytes += e.get().record_size as u64;
                 *e.get_mut() = new_meta;
             }
             Entry::Vacant(e) => {
@@ -486,14 +487,14 @@ where
 
     /// Remove from the index, then write a tombstone using the
     /// already-encoded key bytes that still live in the deleted entry's
-    /// slot — see [`write_tombstone_for`](KeyDir::write_tombstone_for).
-    /// No bincode encode, no scratch `Vec<u8>`.
+    /// slot — see [`write_tombstone_into`]. No bincode encode, no
+    /// scratch `Vec<u8>`.
     fn delete(&mut self, key: &K) -> io::Result<bool> {
         let Some(old) = self.index.remove(key) else {
             return Ok(false);
         };
-        self.stats.dead_bytes += old.on_disk_size();
-        self.write_tombstone_for(old)?;
+        self.stats.dead_bytes += old.record_size as u64;
+        write_tombstone_into(&mut self.mmap, &mut self.file, &mut self.stats, &old)?;
         self.maybe_compact()?;
         Ok(true)
     }
@@ -503,35 +504,23 @@ where
     /// the same lookup. The default trait impl does `contains` + `put`
     /// — two hashes — which is why we override.
     fn put_if_absent(&mut self, key: K, value: V) -> io::Result<bool> {
-        let inserted;
-        {
-            let Self {
-                index,
-                mmap,
-                file,
-                stats,
-                ..
-            } = self;
-
-            match index.entry(key) {
-                Entry::Occupied(_) => {
-                    inserted = false;
-                }
-                Entry::Vacant(e) => {
-                    // The entry holds K; pass it as &K to write_entry_into
-                    // via VacantEntry::key().
-                    let key_ref: &K = e.key();
-                    let (offset, value_size, key_size) =
-                        write_entry_into(mmap, file, stats, key_ref, &value)?;
-                    e.insert(EntryMeta {
-                        offset,
-                        value_size,
-                        key_size,
-                    });
-                    inserted = true;
-                }
+        let inserted = match self.index.entry(key) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(e) => {
+                // The entry holds K; pass it as &K to write_entry_into
+                // via VacantEntry::key().
+                let key_ref: &K = e.key();
+                let meta = write_entry_into(
+                    &mut self.mmap,
+                    &mut self.file,
+                    &mut self.stats,
+                    key_ref,
+                    &value,
+                )?;
+                e.insert(meta);
+                true
             }
-        }
+        };
 
         if inserted {
             self.maybe_compact()?;
@@ -544,51 +533,47 @@ where
     /// optional value read and for the placement. The default trait
     /// impl does `get` + `put` — two hashes plus a redundant decode on
     /// the missing-key path — which is why we override.
-    fn replace(&mut self, key: K, value: V) -> io::Result<Option<V>> {
-        let prev;
-        {
-            let Self {
-                index,
-                mmap,
-                file,
-                stats,
-                ..
-            } = self;
-
-            match index.entry(key) {
-                Entry::Occupied(mut e) => {
-                    let old_meta: EntryMeta = *e.get();
-                    let prev_val: V = {
-                        let bytes = value_bytes_in(mmap, &old_meta);
-                        deserialize_from(bytes)?
-                    };
-                    let key_ref: &K = e.key();
-                    let (offset, value_size, key_size) =
-                        write_entry_into(mmap, file, stats, key_ref, &value)?;
-                    stats.dead_bytes += old_meta.on_disk_size();
-                    *e.get_mut() = EntryMeta {
-                        offset,
-                        value_size,
-                        key_size,
-                    };
-                    prev = Some(prev_val);
-                }
-                Entry::Vacant(e) => {
-                    let key_ref: &K = e.key();
-                    let (offset, value_size, key_size) =
-                        write_entry_into(mmap, file, stats, key_ref, &value)?;
-                    e.insert(EntryMeta {
-                        offset,
-                        value_size,
-                        key_size,
-                    });
-                    prev = None;
-                }
+    ///
+    /// The returned `Cow` is always `Owned`: KeyDir decodes the prior
+    /// value out of the mmap and immediately overwrites the slot, so
+    /// there's nothing borrowable left behind.
+    fn replace(&mut self, key: K, value: V) -> io::Result<Option<Cow<'_, V>>> {
+        let prev = match self.index.entry(key) {
+            Entry::Occupied(mut e) => {
+                let (prev_val, old_size) = {
+                    let old_meta = e.get();
+                    let bytes = value_bytes_in(&self.mmap, old_meta);
+                    let prev_val: V = deserialize_from(bytes)?;
+                    (prev_val, old_meta.record_size as u64)
+                };
+                let key_ref: &K = e.key();
+                let meta = write_entry_into(
+                    &mut self.mmap,
+                    &mut self.file,
+                    &mut self.stats,
+                    key_ref,
+                    &value,
+                )?;
+                self.stats.dead_bytes += old_size;
+                *e.get_mut() = meta;
+                Some(prev_val)
             }
-        }
+            Entry::Vacant(e) => {
+                let key_ref: &K = e.key();
+                let meta = write_entry_into(
+                    &mut self.mmap,
+                    &mut self.file,
+                    &mut self.stats,
+                    key_ref,
+                    &value,
+                )?;
+                e.insert(meta);
+                None
+            }
+        };
 
         self.maybe_compact()?;
-        Ok(prev)
+        Ok(prev.map(Cow::Owned))
     }
 
     /// Unified read-modify-write / insert / delete primitive. Writes at
@@ -596,78 +581,63 @@ where
     ///
     /// Hashes the key exactly **once** per call. The slot is located via
     /// `raw_entry_mut().from_key(key)` and held open across the value
-    /// read, the closure invocation, and the slot mutation — `self` is
-    /// destructured into field-level borrows so the disjoint
-    /// `mmap` / `file` / `stats` writes don't conflict with the
-    /// entry's borrow on `self.index`.
+    /// read, the closure invocation, and the slot mutation. The
+    /// disjoint-field borrows on `self.mmap` / `self.file` / `self.stats`
+    /// don't conflict with the entry's borrow on `self.index`.
     fn update<F>(&mut self, key: &K, f: F) -> io::Result<()>
     where
         F: FnOnce(Option<V>) -> Option<V>,
     {
         use hashbrown::hash_map::RawEntryMut;
 
-        // Did the closure mutate state? Used to decide whether to run
-        // maybe_compact after the destructure goes out of scope.
-        let mutated;
-
-        {
-            let Self {
-                index,
-                mmap,
-                file,
-                stats,
-                ..
-            } = self;
-
-            match index.raw_entry_mut().from_key(key) {
-                RawEntryMut::Occupied(mut e) => {
-                    // Copy out the meta (it's `Copy`) so we can drop the
-                    // immutable borrow before doing the mutable write.
-                    let old_meta: EntryMeta = *e.get();
-                    let current: V = {
-                        let bytes = value_bytes_in(mmap, &old_meta);
-                        deserialize_from(bytes)?
-                    };
-                    match f(Some(current)) {
-                        Some(new_v) => {
-                            let (offset, value_size, key_size) =
-                                write_entry_into(mmap, file, stats, key, &new_v)?;
-                            stats.dead_bytes += old_meta.on_disk_size();
-                            *e.get_mut() = EntryMeta {
-                                offset,
-                                value_size,
-                                key_size,
-                            };
-                            mutated = true;
-                        }
-                        None => {
-                            stats.dead_bytes += old_meta.on_disk_size();
-                            e.remove();
-                            write_tombstone_into(mmap, file, stats, old_meta)?;
-                            mutated = true;
-                        }
-                    }
-                }
-                RawEntryMut::Vacant(e) => match f(None) {
+        let mutated = match self.index.raw_entry_mut().from_key(key) {
+            RawEntryMut::Occupied(mut e) => {
+                let current: V = {
+                    let bytes = value_bytes_in(&self.mmap, e.get());
+                    deserialize_from(bytes)?
+                };
+                match f(Some(current)) {
                     Some(new_v) => {
-                        let (offset, value_size, key_size) =
-                            write_entry_into(mmap, file, stats, key, &new_v)?;
-                        e.insert(
-                            key.clone(),
-                            EntryMeta {
-                                offset,
-                                value_size,
-                                key_size,
-                            },
-                        );
-                        mutated = true;
+                        let old_size = e.get().record_size as u64;
+                        let meta = write_entry_into(
+                            &mut self.mmap,
+                            &mut self.file,
+                            &mut self.stats,
+                            key,
+                            &new_v,
+                        )?;
+                        self.stats.dead_bytes += old_size;
+                        *e.get_mut() = meta;
+                        true
                     }
                     None => {
-                        mutated = false;
+                        self.stats.dead_bytes += e.get().record_size as u64;
+                        write_tombstone_into(
+                            &mut self.mmap,
+                            &mut self.file,
+                            &mut self.stats,
+                            e.get(),
+                        )?;
+                        e.remove();
+                        true
                     }
-                },
+                }
             }
-        }
+            RawEntryMut::Vacant(e) => match f(None) {
+                Some(new_v) => {
+                    let meta = write_entry_into(
+                        &mut self.mmap,
+                        &mut self.file,
+                        &mut self.stats,
+                        key,
+                        &new_v,
+                    )?;
+                    e.insert(key.clone(), meta);
+                    true
+                }
+                None => false,
+            },
+        };
 
         if mutated {
             self.maybe_compact()?;
@@ -683,14 +653,11 @@ where
         self.index.clear();
         self.stats.data_size = HEADER_SIZE as u64;
         self.stats.dead_bytes = 0;
-        // Re-stamp MAGIC at offset 0 (defensive in case the header was
-        // overwritten by a prior write that read it back during recovery).
         self.mmap[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        // Zero the byte right after the header so `rebuild_index` knows
-        // the log is empty on next open.
-        if self.mmap.len() >= HEADER_SIZE + 4 {
-            self.mmap[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&0u32.to_le_bytes());
-        }
+        // SENTINEL at the live tail so a subsequent reopen replays as
+        // empty. initial_capacity is always >> HEADER_SIZE + 4 so no
+        // length check is needed.
+        self.mmap[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&SENTINEL.to_le_bytes());
         Ok(())
     }
 
@@ -715,7 +682,7 @@ where
         let mut cursor: usize = HEADER_SIZE;
         for meta in snapshot.iter_mut() {
             let src = meta.offset as usize;
-            let len = meta.on_disk_size() as usize;
+            let len = meta.record_size as usize;
             if src != cursor {
                 self.mmap.copy_within(src..src + len, cursor);
             }
@@ -723,11 +690,7 @@ where
             cursor += len;
         }
 
-        // 4-byte sentinel: tells `rebuild_index` to stop here on next open
-        // (even if we don't shrink the file).
-        if cursor + 4 <= self.mmap.len() {
-            self.mmap[cursor..cursor + 4].copy_from_slice(&0u32.to_le_bytes());
-        }
+        self.mmap[cursor..cursor + 4].copy_from_slice(&SENTINEL.to_le_bytes());
 
         self.stats.data_size = cursor as u64;
         self.stats.dead_bytes = 0;
@@ -740,27 +703,40 @@ where
         // mapped section is open. Swap in a small anonymous mmap as a
         // placeholder so the file's mapped section is dropped before
         // the truncation, then remap onto the resized file.
-        let new_capacity = (cursor as u64).max(self.config.initial_capacity);
+        let new_capacity = ((cursor + 4) as u64).max(self.config.initial_capacity);
         self.mmap = MmapMut::map_anon(1)?;
         self.file.set_len(new_capacity)?;
         self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
         Ok(())
     }
 
-    fn keys(&self) -> impl Iterator<Item = K> + '_ {
-        self.index.keys().cloned()
+    fn keys<'a>(&'a self) -> impl Iterator<Item = Cow<'a, K>> + 'a
+    where
+        K: 'a,
+    {
+        self.index.keys().map(Cow::Borrowed)
     }
 
-    fn values(&self) -> impl Iterator<Item = V> + '_ {
-        self.index
-            .values()
-            .map(|meta| deserialize_from(self.value_bytes(meta)).expect("valid encoded value"))
+    fn values<'a>(&'a self) -> impl Iterator<Item = Cow<'a, V>> + 'a
+    where
+        V: 'a,
+    {
+        self.index.values().map(|meta| {
+            let v: V =
+                deserialize_from(value_bytes_in(&self.mmap, meta)).expect("valid encoded value");
+            Cow::Owned(v)
+        })
     }
 
-    fn entries(&self) -> impl Iterator<Item = (K, V)> + '_ {
+    fn entries<'a>(&'a self) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
+    where
+        K: 'a,
+        V: 'a,
+    {
         self.index.iter().map(|(k, meta)| {
-            let v: V = deserialize_from(self.value_bytes(meta)).expect("valid encoded value");
-            (k.clone(), v)
+            let v: V =
+                deserialize_from(value_bytes_in(&self.mmap, meta)).expect("valid encoded value");
+            (Cow::Borrowed(k), Cow::Owned(v))
         })
     }
 
@@ -803,9 +779,20 @@ where
 mod tests {
     use super::*;
     use crate::core::backend::Backend;
+    use std::borrow::Cow;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Test helper — read through the Cow-returning Backend::get API
+    /// and immediately materialize to an owned value for easy compare.
+    fn get<K, V>(kd: &KeyDir<K, V>, key: &K) -> Option<V>
+    where
+        K: Encode + Decode<()> + Hash + Eq + Clone,
+        V: Encode + Decode<()> + Clone,
+    {
+        Backend::get(kd, key).map(Cow::into_owned)
+    }
 
     type TestKey = Vec<u8>;
 
@@ -860,14 +847,14 @@ mod tests {
         let p = tmp_path("put_get");
         let mut kd = create(&p);
         kd.put(k("alice"), v("alice", 1)).unwrap();
-        assert_eq!(kd.get(&k("alice")), Some(v("alice", 1)));
+        assert_eq!(get(&kd, &k("alice")), Some(v("alice", 1)));
     }
 
     #[test]
     fn get_missing_returns_none() {
         let p = tmp_path("missing");
         let kd = create(&p);
-        assert!(kd.get(&k("ghost")).is_none());
+        assert!(get(&kd, &k("ghost")).is_none());
     }
 
     #[test]
@@ -878,9 +865,9 @@ mod tests {
         kd.put(k("b"), v("beta", 2)).unwrap();
         kd.put(k("c"), v("gamma", 3)).unwrap();
         assert_eq!(kd.size(), 3);
-        assert_eq!(kd.get(&k("a")), Some(v("alpha", 1)));
-        assert_eq!(kd.get(&k("b")), Some(v("beta", 2)));
-        assert_eq!(kd.get(&k("c")), Some(v("gamma", 3)));
+        assert_eq!(get(&kd, &k("a")), Some(v("alpha", 1)));
+        assert_eq!(get(&kd, &k("b")), Some(v("beta", 2)));
+        assert_eq!(get(&kd, &k("c")), Some(v("gamma", 3)));
     }
 
     // ---- overwrite & dead-bytes accounting ----
@@ -892,7 +879,7 @@ mod tests {
         kd.put(k("a"), v("first", 1)).unwrap();
         kd.put(k("a"), v("second", 2)).unwrap();
         assert_eq!(kd.size(), 1);
-        assert_eq!(kd.get(&k("a")), Some(v("second", 2)));
+        assert_eq!(get(&kd, &k("a")), Some(v("second", 2)));
     }
 
     #[test]
@@ -921,7 +908,7 @@ mod tests {
         assert!(kd.contains(&k("a")));
         assert!(kd.delete(&k("a")).unwrap());
         assert!(!kd.contains(&k("a")));
-        assert!(kd.get(&k("a")).is_none());
+        assert!(get(&kd, &k("a")).is_none());
         assert_eq!(kd.size(), 0);
     }
 
@@ -939,7 +926,7 @@ mod tests {
         kd.put(k("a"), v("first", 1)).unwrap();
         kd.delete(&k("a")).unwrap();
         kd.put(k("a"), v("second", 2)).unwrap();
-        assert_eq!(kd.get(&k("a")), Some(v("second", 2)));
+        assert_eq!(get(&kd, &k("a")), Some(v("second", 2)));
     }
 
     // ---- introspection ----
@@ -965,8 +952,10 @@ mod tests {
         kd.put(k("c"), v("cv", 3)).unwrap();
         kd.delete(&k("b")).unwrap();
 
-        let mut collected: std::collections::HashMap<TestKey, u32> =
-            kd.entries().map(|(key, val)| (key, val.count)).collect();
+        let mut collected: std::collections::HashMap<TestKey, u32> = kd
+            .entries()
+            .map(|(key, val)| (key.into_owned(), val.count))
+            .collect();
         assert_eq!(collected.len(), 2);
         assert_eq!(collected.remove(&k("a")), Some(1));
         assert_eq!(collected.remove(&k("c")), Some(3));
@@ -985,8 +974,8 @@ mod tests {
         }
         let kd = open(&p);
         assert_eq!(kd.size(), 2);
-        assert_eq!(kd.get(&k("a")), Some(v("alpha", 1)));
-        assert_eq!(kd.get(&k("b")), Some(v("beta", 2)));
+        assert_eq!(get(&kd, &k("a")), Some(v("alpha", 1)));
+        assert_eq!(get(&kd, &k("b")), Some(v("beta", 2)));
     }
 
     #[test]
@@ -1017,7 +1006,7 @@ mod tests {
         }
         let kd = open(&p);
         assert_eq!(kd.size(), 1);
-        assert_eq!(kd.get(&k("a")), Some(v("v3", 3)));
+        assert_eq!(get(&kd, &k("a")), Some(v("v3", 3)));
     }
 
     #[test]
@@ -1075,7 +1064,7 @@ mod tests {
         );
         for i in 0..50u32 {
             let key = format!("key_{:04}", i).into_bytes();
-            assert_eq!(kd.get(&key), Some(v("payload-grows-the-file", i)));
+            assert_eq!(get(&kd, &key), Some(v("payload-grows-the-file", i)));
         }
     }
 
@@ -1105,7 +1094,7 @@ mod tests {
             kd.stats().data_size
         );
         for i in 0..10u32 {
-            let got = kd.get(&format!("k{}", i).into_bytes()).unwrap();
+            let got = get(&kd, &format!("k{}", i).into_bytes()).unwrap();
             assert_eq!(got.name, "payload");
             assert_eq!(got.count, 19 * 10 + i);
         }
@@ -1158,7 +1147,7 @@ mod tests {
         let kd: KeyDir<TestKey, TestVal> = KeyDir::open(&p, cfg).unwrap();
         assert_eq!(kd.size(), 10);
         for i in 0..10u32 {
-            let got = kd.get(&format!("k{}", i).into_bytes()).unwrap();
+            let got = get(&kd, &format!("k{}", i).into_bytes()).unwrap();
             assert_eq!(got.count, 19 * 10 + i);
         }
     }
@@ -1194,7 +1183,7 @@ mod tests {
 
         assert_eq!(kd.stats().dead_bytes, 0);
         assert_eq!(kd.size(), 2);
-        assert_eq!(kd.get(&k("a")).unwrap().count, 19);
+        assert_eq!(get(&kd, &k("a")).unwrap().count, 19);
     }
 
     /// Locks in the in-place compaction contract: after many overwrites
@@ -1226,7 +1215,7 @@ mod tests {
             post_len
         );
         assert_eq!(kd.size(), 1);
-        assert_eq!(kd.get(&k("hot")).unwrap().count, 1999);
+        assert_eq!(get(&kd, &k("hot")).unwrap().count, 1999);
         assert_eq!(kd.stats().dead_bytes, 0);
     }
 
@@ -1242,7 +1231,7 @@ mod tests {
             tags: (0..32).collect(),
         };
         kd.put(k("big"), big.clone()).unwrap();
-        assert_eq!(kd.get(&k("big")), Some(big));
+        assert_eq!(get(&kd, &k("big")), Some(big));
     }
 
     // ---- stress ----
@@ -1262,7 +1251,7 @@ mod tests {
         assert_eq!(kd.size(), n as usize);
         for i in 0..n {
             let key = format!("key_{:05}", i).into_bytes();
-            let got = kd.get(&key).unwrap();
+            let got = get(&kd, &key).unwrap();
             assert_eq!(got.name, format!("val_{}", i));
             assert_eq!(got.count, i);
         }
@@ -1287,7 +1276,7 @@ mod tests {
         assert_eq!(kd.size(), n as usize);
         for i in 0..n {
             let key = format!("key_{:04}", i).into_bytes();
-            let got = kd.get(&key).unwrap();
+            let got = get(&kd, &key).unwrap();
             assert_eq!(got.count, i);
         }
     }
@@ -1321,7 +1310,7 @@ mod tests {
         let mut kd = create(&p);
         kd.put(k("a"), v("x", 1)).unwrap();
         kd.put(k("b"), v("y", 2)).unwrap();
-        let mut keys: Vec<TestKey> = kd.keys().collect();
+        let mut keys: Vec<TestKey> = kd.keys().map(Cow::into_owned).collect();
         keys.sort();
         assert_eq!(keys, vec![k("a"), k("b")]);
     }
@@ -1351,7 +1340,7 @@ mod tests {
             Some(v)
         })
         .unwrap();
-        let got = kd.get(&k("a")).unwrap();
+        let got = get(&kd, &k("a")).unwrap();
         assert_eq!(got.count, 15);
         assert_eq!(got.tags.len(), 4);
         assert_eq!(got.tags[3], 999);
@@ -1366,7 +1355,7 @@ mod tests {
             Some(v("inserted", 1))
         })
         .unwrap();
-        assert_eq!(kd.get(&k("new")), Some(v("inserted", 1)));
+        assert_eq!(get(&kd, &k("new")), Some(v("inserted", 1)));
     }
 
     #[test]
@@ -1378,7 +1367,7 @@ mod tests {
             None
         })
         .unwrap();
-        assert!(kd.get(&k("ghost")).is_none());
+        assert!(get(&kd, &k("ghost")).is_none());
         assert_eq!(kd.size(), 0);
     }
 
@@ -1392,7 +1381,7 @@ mod tests {
             None
         })
         .unwrap();
-        assert!(kd.get(&k("a")).is_none());
+        assert!(get(&kd, &k("a")).is_none());
         assert_eq!(kd.size(), 0);
     }
 
@@ -1438,7 +1427,7 @@ mod tests {
         kd.clear().unwrap();
         assert_eq!(kd.size(), 0);
         assert!(kd.is_empty());
-        assert!(kd.get(&k("a")).is_none());
+        assert!(get(&kd, &k("a")).is_none());
         assert_eq!(kd.stats().dead_bytes, 0);
         assert_eq!(kd.stats().data_size, HEADER_SIZE as u64);
     }
@@ -1451,8 +1440,8 @@ mod tests {
         kd.clear().unwrap();
         kd.put(k("z"), v("zv", 99)).unwrap();
         assert_eq!(kd.size(), 1);
-        assert_eq!(kd.get(&k("z")), Some(v("zv", 99)));
-        assert!(kd.get(&k("a")).is_none());
+        assert_eq!(get(&kd, &k("z")), Some(v("zv", 99)));
+        assert!(get(&kd, &k("a")).is_none());
     }
 
     #[test]
@@ -1478,7 +1467,7 @@ mod tests {
         let mut kd = create(&p);
         let inserted = Backend::put_if_absent(&mut kd, k("a"), v("first", 1)).unwrap();
         assert!(inserted);
-        assert_eq!(kd.get(&k("a")), Some(v("first", 1)));
+        assert_eq!(get(&kd, &k("a")), Some(v("first", 1)));
     }
 
     #[test]
@@ -1488,7 +1477,7 @@ mod tests {
         kd.put(k("a"), v("first", 1)).unwrap();
         let inserted = Backend::put_if_absent(&mut kd, k("a"), v("second", 2)).unwrap();
         assert!(!inserted);
-        assert_eq!(kd.get(&k("a")), Some(v("first", 1)));
+        assert_eq!(get(&kd, &k("a")), Some(v("first", 1)));
     }
 
     #[test]
@@ -1496,9 +1485,11 @@ mod tests {
         let p = tmp_path("replace");
         let mut kd = create(&p);
         kd.put(k("a"), v("first", 1)).unwrap();
-        let prev = Backend::replace(&mut kd, k("a"), v("second", 2)).unwrap();
+        let prev = Backend::replace(&mut kd, k("a"), v("second", 2))
+            .unwrap()
+            .map(Cow::into_owned);
         assert_eq!(prev, Some(v("first", 1)));
-        assert_eq!(kd.get(&k("a")), Some(v("second", 2)));
+        assert_eq!(get(&kd, &k("a")), Some(v("second", 2)));
     }
 
     #[test]
@@ -1507,7 +1498,7 @@ mod tests {
         let mut kd = create(&p);
         let prev = Backend::replace(&mut kd, k("a"), v("new", 99)).unwrap();
         assert!(prev.is_none());
-        assert_eq!(kd.get(&k("a")), Some(v("new", 99)));
+        assert_eq!(get(&kd, &k("a")), Some(v("new", 99)));
     }
 
     // ---- bulk_put / bulk_delete ----
@@ -1522,7 +1513,10 @@ mod tests {
         Backend::bulk_put(&mut kd, items).unwrap();
         assert_eq!(kd.size(), 50);
         for i in 0..50u32 {
-            assert_eq!(kd.get(&format!("k{:04}", i).into_bytes()), Some(v("p", i)));
+            assert_eq!(
+                get(&kd, &format!("k{:04}", i).into_bytes()),
+                Some(v("p", i))
+            );
         }
     }
 
@@ -1556,7 +1550,7 @@ mod tests {
             kd.sync().unwrap();
         }
         let kd = open(&p);
-        assert_eq!(kd.get(&k("a")), Some(v("alpha", 1)));
+        assert_eq!(get(&kd, &k("a")), Some(v("alpha", 1)));
     }
 
     #[test]
@@ -1582,7 +1576,7 @@ mod tests {
             kd.sync().unwrap();
         }
         let kd = open(&p);
-        assert_eq!(kd.get(&k("fresh")), Some(v("inserted", 7)));
+        assert_eq!(get(&kd, &k("fresh")), Some(v("inserted", 7)));
     }
 
     #[test]
@@ -1599,9 +1593,11 @@ mod tests {
         );
         kd.put(k("a"), v("v1", 1)).unwrap();
         assert_eq!(kd.stats().dead_bytes, 0);
-        let prev = Backend::replace(&mut kd, k("a"), v("v2", 2)).unwrap();
+        let prev = Backend::replace(&mut kd, k("a"), v("v2", 2))
+            .unwrap()
+            .map(Cow::into_owned);
         assert_eq!(prev, Some(v("v1", 1)));
-        assert_eq!(kd.get(&k("a")), Some(v("v2", 2)));
+        assert_eq!(get(&kd, &k("a")), Some(v("v2", 2)));
         assert!(kd.stats().dead_bytes > 0);
     }
 
@@ -1622,10 +1618,43 @@ mod tests {
         let dead_before = kd.stats().dead_bytes;
         let inserted = Backend::put_if_absent(&mut kd, k("a"), v("second", 2)).unwrap();
         assert!(!inserted);
-        assert_eq!(kd.get(&k("a")), Some(v("first", 1)));
+        assert_eq!(get(&kd, &k("a")), Some(v("first", 1)));
         // No write happened.
         assert_eq!(kd.stats().data_size, size_before);
         assert_eq!(kd.stats().dead_bytes, dead_before);
+    }
+
+    /// KeyDir borrows keys from the in-memory index but always decodes
+    /// values from mmap, so `get`/`values` must return `Cow::Owned` and
+    /// `keys`/`entries` must borrow the key side.
+    #[test]
+    fn retrieval_cow_variants() {
+        let p = tmp_path("cow_variants");
+        let mut kd = create(&p);
+        kd.put(k("a"), v("alpha", 1)).unwrap();
+        kd.put(k("b"), v("beta", 2)).unwrap();
+
+        assert!(matches!(Backend::get(&kd, &k("a")), Some(Cow::Owned(_))));
+        assert!(Backend::keys(&kd).all(|c| matches!(c, Cow::Borrowed(_))));
+        assert!(Backend::values(&kd).all(|c| matches!(c, Cow::Owned(_))));
+        assert!(Backend::entries(&kd)
+            .all(|(k, v)| { matches!(k, Cow::Borrowed(_)) && matches!(v, Cow::Owned(_)) }));
+    }
+
+    /// Read paths must round-trip cleanly through `Cow::into_owned()`.
+    #[test]
+    fn into_owned_yields_decoded_values() {
+        let p = tmp_path("cow_into_owned");
+        let mut kd = create(&p);
+        kd.put(k("a"), v("alpha", 1)).unwrap();
+
+        let owned: TestVal = Backend::get(&kd, &k("a")).unwrap().into_owned();
+        assert_eq!(owned, v("alpha", 1));
+
+        let owned_entries: Vec<(TestKey, TestVal)> = Backend::entries(&kd)
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(owned_entries, vec![(k("a"), v("alpha", 1))]);
     }
 
     #[test]
@@ -1638,6 +1667,34 @@ mod tests {
             kd.sync().unwrap();
         }
         let kd = open(&p);
-        assert_eq!(kd.get(&k("only")), Some(v("once", 1)));
+        assert_eq!(get(&kd, &k("only")), Some(v("once", 1)));
+    }
+
+    /// A `V` whose bincode encoding is 0 bytes (the unit type here)
+    /// used to be silently truncated by the old `value_size == 0`
+    /// replay terminator. `SENTINEL = u32::MAX - 1` separates the
+    /// empty-value case from the live-tail case.
+    #[test]
+    fn zero_byte_value_round_trips() {
+        let p = tmp_path("zero_byte_value");
+        {
+            let mut kd: KeyDir<TestKey, ()> = KeyDir::create(&p, KeyDirConfig::default()).unwrap();
+            kd.put(k("alpha"), ()).unwrap();
+            kd.put(k("beta"), ()).unwrap();
+            kd.put(k("gamma"), ()).unwrap();
+            kd.delete(&k("beta")).unwrap();
+            kd.sync().unwrap();
+        }
+        let kd: KeyDir<TestKey, ()> = KeyDir::open(&p, KeyDirConfig::default()).unwrap();
+        assert_eq!(kd.size(), 2);
+        assert_eq!(
+            Backend::get(&kd, &k("alpha")).map(Cow::into_owned),
+            Some(())
+        );
+        assert!(Backend::get(&kd, &k("beta")).is_none());
+        assert_eq!(
+            Backend::get(&kd, &k("gamma")).map(Cow::into_owned),
+            Some(())
+        );
     }
 }

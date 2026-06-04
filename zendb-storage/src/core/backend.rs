@@ -43,7 +43,7 @@
 //! needs runtime dispatch over multiple backend kinds wraps them in a
 //! concrete enum that itself implements `Backend`.
 
-use std::{hash::Hash, io};
+use std::{borrow::Cow, hash::Hash, io};
 
 use bincode::{Decode, Encode};
 
@@ -70,16 +70,18 @@ where
 {
     /// Cheap backend-specific metrics snapshot. Implementations keep
     /// this in the backend object and update it as state changes.
-    type Stats: Copy + Encode + Decode<()>;
+    type Stats: Clone + Encode + Decode<()>;
 
     /// Backend configuration values. Set once at construction, read
     /// through `config()`. Immutable after creation.
-    type Config: Copy + Default + Encode + Decode<()>;
+    type Config: Clone + Default + Encode + Decode<()>;
 
     // ---- reads --------------------------------------------------------
 
-    /// Look up `key`. Returns the decoded value, or `None` if absent.
-    fn get(&self, key: &K) -> Option<V>;
+    /// Look up `key`. Returns the value (borrowed when the backend holds
+    /// it in memory, owned when materialized from bytes), or `None` if
+    /// absent.
+    fn get(&self, key: &K) -> Option<Cow<'_, V>>;
 
     /// Existence check. Default implementation calls `get`; backends
     /// with a cheaper presence check (e.g., KeyDir's in-memory index)
@@ -110,8 +112,13 @@ where
     /// existed (matching `HashMap::insert` semantics). For
     /// fire-and-forget overwrite use [`put`](Self::put); for
     /// insert-only-if-absent use [`put_if_absent`](Self::put_if_absent).
-    fn replace(&mut self, key: K, value: V) -> io::Result<Option<V>> {
-        let old = self.get(&key);
+    ///
+    /// Wraps the prior value in `Cow` for consistency with the other
+    /// retrieval methods. In practice every backend's `replace` returns
+    /// `Cow::Owned`: the old value is unconditionally evicted from the
+    /// backend, so there's nothing left to borrow against.
+    fn replace(&mut self, key: K, value: V) -> io::Result<Option<Cow<'_, V>>> {
+        let old = self.get(&key).map(|c| Cow::Owned(c.into_owned()));
         self.put(key, value)?;
         Ok(old)
     }
@@ -200,7 +207,7 @@ where
     where
         F: FnOnce(Option<V>) -> Option<V>,
     {
-        let current = self.get(key);
+        let current = self.get(key).map(Cow::into_owned);
         let had_value = current.is_some();
         match (had_value, f(current)) {
             (_, Some(new_v)) => self.put(key.clone(), new_v),
@@ -226,14 +233,22 @@ where
 
     // ---- iteration (unspecified order) -------------------------------
 
-    /// Iterate all keys. Order is backend-defined. Yields owned `K`.
-    fn keys(&self) -> impl Iterator<Item = K> + '_;
+    /// Iterate all keys. Order is backend-defined. Yields `Cow<K>` —
+    /// borrowed when the backend holds them, owned when materialized.
+    fn keys<'a>(&'a self) -> impl Iterator<Item = Cow<'a, K>> + 'a
+    where
+        K: 'a;
 
-    /// Iterate all values. Order is backend-defined. Yields owned `V`.
-    fn values(&self) -> impl Iterator<Item = V> + '_;
+    /// Iterate all values. Order is backend-defined. Yields `Cow<V>`.
+    fn values<'a>(&'a self) -> impl Iterator<Item = Cow<'a, V>> + 'a
+    where
+        V: 'a;
 
-    /// Iterate all `(key, value)` pairs. Both owned.
-    fn entries(&self) -> impl Iterator<Item = (K, V)> + '_;
+    /// Iterate all `(key, value)` pairs as `Cow` per side.
+    fn entries<'a>(&'a self) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
+    where
+        K: 'a,
+        V: 'a;
 
     // ---- bookkeeping --------------------------------------------------
 
@@ -285,19 +300,34 @@ where
     V: Encode + Decode<()> + Clone,
 {
     /// Iterate entries with keys in `[start, end)`, ascending.
-    fn range(&self, start: &K, end: &K) -> impl Iterator<Item = (K, V)> + '_;
+    fn range<'a>(
+        &'a self,
+        start: &K,
+        end: &K,
+    ) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
+    where
+        K: 'a,
+        V: 'a;
 
     /// First `(key, value)` in ascending key order, or `None` if empty.
     /// Default implementation pulls the head of `entries()`; backends
     /// with O(1) leftmost-leaf access may override.
-    fn first(&self) -> Option<(K, V)> {
+    fn first<'a>(&'a self) -> Option<(Cow<'a, K>, Cow<'a, V>)>
+    where
+        K: 'a,
+        V: 'a,
+    {
         self.entries().next()
     }
 
     /// Last `(key, value)` in ascending key order, or `None` if empty.
     /// Default implementation walks `entries()` to completion (O(n));
     /// backends with O(1) rightmost-leaf access may override.
-    fn last(&self) -> Option<(K, V)> {
+    fn last<'a>(&'a self) -> Option<(Cow<'a, K>, Cow<'a, V>)>
+    where
+        K: 'a,
+        V: 'a,
+    {
         self.entries().last()
     }
 
@@ -311,27 +341,33 @@ where
     /// `Vec::into_iter` satisfy the iterator's lifetime; all of our
     /// concrete K/V (Vec<u8>, primitives, derive-bincode structs) are
     /// `'static`.
-    fn entries_rev(&self) -> impl Iterator<Item = (K, V)> + '_
+    fn entries_rev(&self) -> impl Iterator<Item = (Cow<'_, K>, Cow<'_, V>)> + '_
     where
         K: 'static,
         V: 'static,
     {
-        let mut v: Vec<(K, V)> = self.entries().collect();
+        let mut v: Vec<(K, V)> = self
+            .entries()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
         v.reverse();
-        v.into_iter()
+        v.into_iter().map(|(k, v)| (Cow::Owned(k), Cow::Owned(v)))
     }
 
     /// Iterate entries with keys in `[start, end)` in **descending** key
     /// order. Default implementation materializes the forward range into a
     /// `Vec` then reverses (O(n) memory). Backends with prev-pointer support
     /// may override for true streaming reverse iteration.
-    fn range_rev(&self, start: &K, end: &K) -> impl Iterator<Item = (K, V)> + '_
+    fn range_rev(&self, start: &K, end: &K) -> impl Iterator<Item = (Cow<'_, K>, Cow<'_, V>)> + '_
     where
         K: 'static,
         V: 'static,
     {
-        let mut v: Vec<(K, V)> = self.range(start, end).collect();
+        let mut v: Vec<(K, V)> = self
+            .range(start, end)
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
         v.reverse();
-        v.into_iter()
+        v.into_iter().map(|(k, v)| (Cow::Owned(k), Cow::Owned(v)))
     }
 }

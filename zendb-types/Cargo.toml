@@ -9,3 +9,5 @@ description = "Core type system for ZeninDB — HLC, Cell, Value, Op, Path, Delt
 
 [dependencies]
 bincode.workspace = true
+blake3.workspace = true
+machine-uid.workspace = true

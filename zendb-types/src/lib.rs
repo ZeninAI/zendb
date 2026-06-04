@@ -132,21 +132,19 @@ macro_rules! register_types {
         }
 
         // =================================================================
-        // Op
+        // TypeOp
         // =================================================================
         #[derive(Debug, Clone, Encode, Decode)]
-        pub enum Op {
+        pub enum TypeOp {
             $($leaf_var(<$leaf_ty as $crate::Type>::Op),)*
             $($cont_var(<$cont_ty as $crate::Type>::Op),)*
-            SetSync { sync: Option<bool> },
         }
 
-        impl Op {
+        impl TypeOp {
             pub fn type_tag(&self) -> TypeTag {
                 match self {
-                    $(Op::$leaf_var(_) => TypeTag::$leaf_var,)*
-                    $(Op::$cont_var(_) => TypeTag::$cont_var,)*
-                    Op::SetSync { .. } => panic!("SetSync has no TypeTag"),
+                    $(TypeOp::$leaf_var(_) => TypeTag::$leaf_var,)*
+                    $(TypeOp::$cont_var(_) => TypeTag::$cont_var,)*
                 }
             }
         }
@@ -172,19 +170,19 @@ macro_rules! register_types {
         // =================================================================
         pub(crate) fn apply_op_dispatch(
             value: &mut Value,
-            op: &Op,
+            op: &TypeOp,
             local_hlc: $crate::Hlc,
             op_hlc: $crate::Hlc,
         ) -> Result<bool, TypeError> {
             match (value, op) {
                 $(
-                    (Value::$leaf_var(v), Op::$leaf_var(o)) => {
+                    (Value::$leaf_var(v), TypeOp::$leaf_var(o)) => {
                         <$leaf_ty as $crate::Type>::apply_op(v, o, local_hlc, op_hlc)
                             .map_err(TypeError::$leaf_var)
                     }
                 )*
                 $(
-                    (Value::$cont_var(v), Op::$cont_var(o)) => {
+                    (Value::$cont_var(v), TypeOp::$cont_var(o)) => {
                         <$cont_ty as $crate::Type>::apply_op(v, o, local_hlc, op_hlc)
                             .map_err(TypeError::$cont_var)
                     }
@@ -231,7 +229,7 @@ macro_rules! register_types {
         pub(crate) fn descend_or_create_dispatch<'a>(
             value: &'a mut Value,
             segment: &Segment,
-            child_tag: TypeTag,
+            child_tag: Option<TypeTag>,
         ) -> Result<&'a mut $crate::Cell, TypeError> {
             let tag = value.type_tag();
             match (value, segment) {
@@ -259,9 +257,10 @@ register_types! {
 // --- re-exports ---
 pub use core::cell::Cell;
 pub use core::delta::{Delta, PrimaryKey, Signature, TableId};
-pub use core::hlc::Hlc;
+pub use core::hlc::{device_id, init_device_id, DeviceId, Hlc};
+pub use core::op::Op;
 pub use core::path::{Path, PathStep};
 pub use core::traits::{ContainerType, Type};
 pub use types::atom::{AtomFloat, AtomOp, AtomType, AtomValue};
 pub use types::record::{RecordError, RecordOp, RecordSegment, RecordType, RecordValue};
-// TypeTag, Value, Op, Segment, TypeError are generated above by register_types!
+// TypeTag, Value, TypeOp, Segment, TypeError are generated above by register_types!

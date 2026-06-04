@@ -68,6 +68,7 @@
 
 use memmap2::MmapMut;
 use std::{
+    borrow::Cow,
     env, fmt,
     fs::{self, OpenOptions},
     hash::Hash,
@@ -260,7 +261,7 @@ fn compact_temp_path() -> PathBuf {
 // Public configuration / stats / state types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct BPlusTreeConfig {
     /// Pre-allocated page count. File never shrinks below this after
     /// creation or compaction (minimum 2: meta page + root leaf).
@@ -281,7 +282,7 @@ impl Default for BPlusTreeConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
 pub struct BPlusTreeStats {
     pub entries: usize,
     pub pages: u64,
@@ -647,6 +648,10 @@ where
     // ---- tree traversal ---------------------------------------------------
 
     /// Leftmost leaf — walks down from the root following `leftmost_child`.
+    /// May be empty: per-entry `delete` does not unlink emptied leaves
+    /// (only `bulk_delete_sorted` does, via `rebuild_internal_from_leaves`),
+    /// so callers that need the leaf holding the smallest live entry
+    /// should use [`leftmost_nonempty_leaf`] instead.
     fn first_leaf(&self) -> u64 {
         let mut p = self.root();
         loop {
@@ -656,6 +661,42 @@ where
             }
             p = rd_u64(&buf[8..16]);
         }
+    }
+
+    /// Walk right from `first_leaf` skipping empty leaves. Returns the leaf
+    /// containing the smallest live key, or `None` if the tree is empty.
+    ///
+    /// **Why:** per-entry `delete` decrements `count` but does not free the
+    /// leaf or unlink it from the chain. If every key in the leftmost leaf
+    /// has been deleted, descending via `leftmost_child` lands on an empty
+    /// leaf even though `size() > 0`. Iterators handle this naturally by
+    /// walking `next_leaf` in their loop; point queries like `first()` need
+    /// to do the same.
+    fn leftmost_nonempty_leaf(&self) -> Option<u64> {
+        let mut page = self.first_leaf();
+        while page != 0 {
+            let count = rd_u16(&self.page_bytes(page)[2..4]) as usize;
+            if count != 0 {
+                return Some(page);
+            }
+            page = rd_u64(&self.page_bytes(page)[8..16]);
+        }
+        None
+    }
+
+    /// Walk left from `rightmost_leaf` skipping empty leaves. Symmetric to
+    /// [`leftmost_nonempty_leaf`] — see that helper for why an empty leaf
+    /// can appear at either end of the chain.
+    fn rightmost_nonempty_leaf(&self) -> Option<u64> {
+        let mut page = self.rightmost_leaf();
+        while page != 0 {
+            let count = rd_u16(&self.page_bytes(page)[2..4]) as usize;
+            if count != 0 {
+                return Some(page);
+            }
+            page = rd_u64(&self.page_bytes(page)[16..24]);
+        }
+        None
     }
 
     /// Walk from `root` down to the leaf page that would contain `key`.
@@ -968,37 +1009,46 @@ where
 
     fn delete_bytes(&mut self, key: &[u8]) -> io::Result<bool> {
         let leaf_page = self.find_leaf(self.root(), key);
-        let (count, data_off) = {
-            let leaf = self.page_bytes(leaf_page);
-            (rd_u16(&leaf[2..4]) as usize, rd_u32(&leaf[4..8]) as usize)
-        };
+        let count = rd_u16(&self.page_bytes(leaf_page)[2..4]) as usize;
         match self.leaf_find_slot(leaf_page, count, key) {
             Ok(i) => {
-                // Read the slot's extent metadata before mutating anything.
-                let (raw_vl, kl, extent_start) = {
-                    let leaf = self.page_bytes(leaf_page);
-                    let sp = LEAF_HEADER_SIZE + i * SLOT_SIZE;
-                    let eo = rd_u16(&leaf[sp..sp + 2]) as usize;
-                    let kl = rd_u16(&leaf[eo..eo + 2]) as usize;
-                    let raw_vl = rd_u32(&leaf[eo + 2..eo + 6]);
-                    let ext = if raw_vl & OVFL_FLAG != 0 {
-                        rd_u64(&leaf[eo + 6 + kl..eo + 6 + kl + 8])
-                    } else {
-                        0
-                    };
-                    (raw_vl, kl, ext)
-                };
-                if raw_vl & OVFL_FLAG != 0 {
-                    let real_len = raw_vl & !OVFL_FLAG;
-                    self.free_extent(extent_start, real_len);
-                    let _ = kl; // suppress unused warning on the no-extent branch
-                }
-                self.leaf_remove_entry(leaf_page, i, count, data_off);
-                self.dec_entries();
+                self.delete_at(leaf_page, i);
                 Ok(true)
             }
             Err(_) => Ok(false),
         }
+    }
+
+    /// Remove the entry at `slot` of `leaf_page`. Caller has already
+    /// resolved the slot, so unlike [`delete_bytes`] this skips the
+    /// descent + `leaf_find_slot`. Used by descent-aware overrides that
+    /// already hold a `DescentHint` (`update`'s delete branch).
+    ///
+    /// Does not unlink an emptied leaf — see [`first_leaf`] for the
+    /// consequences and [`leftmost_nonempty_leaf`] for how callers cope.
+    fn delete_at(&mut self, leaf_page: u64, slot: usize) {
+        let (count, data_off) = {
+            let leaf = self.page_bytes(leaf_page);
+            (rd_u16(&leaf[2..4]) as usize, rd_u32(&leaf[4..8]) as usize)
+        };
+        let (raw_vl, extent_start) = {
+            let leaf = self.page_bytes(leaf_page);
+            let sp = LEAF_HEADER_SIZE + slot * SLOT_SIZE;
+            let eo = rd_u16(&leaf[sp..sp + 2]) as usize;
+            let raw_vl = rd_u32(&leaf[eo + 2..eo + 6]);
+            let ext = if raw_vl & OVFL_FLAG != 0 {
+                let kl = rd_u16(&leaf[eo..eo + 2]) as usize;
+                rd_u64(&leaf[eo + 6 + kl..eo + 6 + kl + 8])
+            } else {
+                0
+            };
+            (raw_vl, ext)
+        };
+        if raw_vl & OVFL_FLAG != 0 {
+            self.free_extent(extent_start, raw_vl & !OVFL_FLAG);
+        }
+        self.leaf_remove_entry(leaf_page, slot, count, data_off);
+        self.dec_entries();
     }
 
     // ---- leaf-level mutations ---------------------------------------------
@@ -1663,10 +1713,10 @@ where
                     compaction_ratio: 1.0,
                 },
             )?;
-            shadow.bottom_up_build_raw(RawBTreeEntries::new(self, self.first_leaf()))?;
+            shadow.bottom_up_build_raw(RawBTreeEntries::new(self, self.first_leaf()).map(Ok))?;
             let used = (shadow.pages_counter() as usize) * PAGE_SIZE;
             self.mmap[..used].copy_from_slice(&shadow.mmap[..used]);
-            self.stats = shadow.stats;
+            self.stats = shadow.stats.clone();
 
             // Shrink the backing file to the compacted size, but never below
             // the initial-capacity floor so the next writes don't immediately
@@ -1725,16 +1775,18 @@ where
 
     /// Build the tree bottom-up from raw `(key_bytes, value_bytes)` pairs
     /// in ascending key order. Tree must be empty on entry.
+    ///
+    /// Items are wrapped in `io::Result` so a streaming encoder (used by
+    /// `bulk_put_sorted`) can surface bincode errors without materializing
+    /// the whole encoded dataset upfront. Infallible sources (the
+    /// `do_compact` shadow-rebuild walks `RawBTreeEntries`, which yields
+    /// borrowed page slices) wrap each item with `Ok`.
     fn bottom_up_build_raw<I, K2, V2>(&mut self, items: I) -> io::Result<()>
     where
-        I: IntoIterator<Item = (K2, V2)>,
+        I: IntoIterator<Item = io::Result<(K2, V2)>>,
         K2: AsRef<[u8]>,
         V2: AsRef<[u8]>,
     {
-        let mut items = items.into_iter().peekable();
-        if items.peek().is_none() {
-            return Ok(());
-        }
         // Tree must be empty: `do_clear()` produces this state.
         debug_assert!(self.size() == 0, "bottom_up_build requires empty tree");
 
@@ -1755,7 +1807,8 @@ where
         let mut current_last_key: Option<Vec<u8>> = None;
         let mut entry_count: u64 = 0;
 
-        for (k, v) in items {
+        for item in items {
+            let (k, v) = item?;
             entry_count += 1;
             let kb = k.as_ref();
             let vb = v.as_ref();
@@ -1952,14 +2005,15 @@ where
     type Stats = BPlusTreeStats;
     type Config = BPlusTreeConfig;
 
-    fn get(&self, key: &K) -> Option<V> {
+    fn get(&self, key: &K) -> Option<Cow<'_, V>> {
         with_scratch(key, |kb| {
             Ok(self
                 .value_bytes_for(kb)
-                .map(|slice| deserialize_from(slice).expect("valid encoded value")))
+                .map(|slice| deserialize_from::<V>(slice).expect("valid encoded value")))
         })
         .ok()
         .flatten()
+        .map(Cow::Owned)
     }
 
     fn contains(&self, key: &K) -> bool {
@@ -1992,8 +2046,10 @@ where
     }
 
     /// One descent: probe + read old value via the descent's slot; then
-    /// pass the same descent to `insert_bytes`.
-    fn replace(&mut self, key: K, value: V) -> io::Result<Option<V>> {
+    /// pass the same descent to `insert_bytes`. Returned value is
+    /// always `Cow::Owned` — decoded out of the page bytes before the
+    /// slot gets overwritten.
+    fn replace(&mut self, key: K, value: V) -> io::Result<Option<Cow<'_, V>>> {
         let prev: Option<V> = with_two_scratches(&key, &value, |kb, vb| {
             let hint = self.descend_to_leaf(kb);
             let prev = if let Ok(slot) = hint.slot {
@@ -2006,7 +2062,7 @@ where
             Ok(prev)
         })?;
         self.maybe_compact()?;
-        Ok(prev)
+        Ok(prev.map(Cow::Owned))
     }
 
     fn delete(&mut self, key: &K) -> io::Result<bool> {
@@ -2018,8 +2074,10 @@ where
     }
 
     /// One descent that's reused for the read AND the write. Reads the
-    /// current value via the descent's slot; passes the descent to
-    /// `insert_bytes` (overwrite/insert) or `delete_bytes` (delete).
+    /// current value via the descent's slot, then routes to
+    /// [`insert_bytes`] (overwrite/insert) or [`delete_at`] (delete) —
+    /// both consume the resolved `(leaf_page, slot)` directly so the
+    /// descent isn't repeated.
     fn update<F>(&mut self, key: &K, f: F) -> io::Result<()>
     where
         F: FnOnce(Option<V>) -> Option<V>,
@@ -2039,7 +2097,8 @@ where
                     self.maybe_compact()?;
                 }
                 (true, None) => {
-                    self.delete_bytes(kb)?;
+                    let slot = hint.slot.expect("had_value ⇒ slot is Ok");
+                    self.delete_at(hint.leaf_page, slot);
                     self.maybe_compact()?;
                 }
                 (false, None) => {}
@@ -2062,6 +2121,11 @@ where
 
     /// Bottom-up bulk-load when the tree is empty. Falls back to
     /// `bulk_put` when non-empty.
+    ///
+    /// Streams: keys/values are encoded on the fly by the iterator passed
+    /// to `bottom_up_build_raw`, so peak memory is one `(Vec<u8>,
+    /// Vec<u8>)` pair rather than the whole encoded dataset. Encoding
+    /// errors short-circuit the build via the `Result`-bearing iterator.
     fn bulk_put_sorted<I>(&mut self, sorted: I) -> io::Result<()>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -2069,10 +2133,9 @@ where
         if self.size() != 0 {
             return self.bulk_put(sorted);
         }
-        let mut encoded: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for (k, v) in sorted {
-            encoded.push((serialize_to_vec(&k)?, serialize_to_vec(&v)?));
-        }
+        let encoded = sorted
+            .into_iter()
+            .map(|(k, v)| Ok((serialize_to_vec(&k)?, serialize_to_vec(&v)?)));
         self.bottom_up_build_raw(encoded)
     }
 
@@ -2173,15 +2236,25 @@ where
         self.do_compact()
     }
 
-    fn keys(&self) -> impl Iterator<Item = K> + '_ {
+    fn keys<'a>(&'a self) -> impl Iterator<Item = Cow<'a, K>> + 'a
+    where
+        K: 'a,
+    {
         self.entries().map(|(k, _)| k)
     }
 
-    fn values(&self) -> impl Iterator<Item = V> + '_ {
+    fn values<'a>(&'a self) -> impl Iterator<Item = Cow<'a, V>> + 'a
+    where
+        V: 'a,
+    {
         self.entries().map(|(_, v)| v)
     }
 
-    fn entries(&self) -> impl Iterator<Item = (K, V)> + '_ {
+    fn entries<'a>(&'a self) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
+    where
+        K: 'a,
+        V: 'a,
+    {
         let page = self.first_leaf();
         let count = if page == 0 {
             0
@@ -2228,7 +2301,15 @@ where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
 {
-    fn range(&self, start: &K, end: &K) -> impl Iterator<Item = (K, V)> + '_ {
+    fn range<'a>(
+        &'a self,
+        start: &K,
+        end: &K,
+    ) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
+    where
+        K: 'a,
+        V: 'a,
+    {
         let Ok(start_bytes) = serialize_to_vec(start) else {
             return BTreeRange {
                 tree: self,
@@ -2261,45 +2342,44 @@ where
         }
     }
 
-    /// O(height) first via leftmost descent + first slot.
-    fn first(&self) -> Option<(K, V)> {
+    /// Smallest live entry. Walks right from the leftmost leaf via
+    /// [`leftmost_nonempty_leaf`] to skip leaves that `delete` may have
+    /// drained but not unlinked.
+    fn first<'a>(&'a self) -> Option<(Cow<'a, K>, Cow<'a, V>)>
+    where
+        K: 'a,
+        V: 'a,
+    {
         if self.size() == 0 {
             return None;
         }
-        let leaf_page = self.first_leaf();
-        let count = rd_u16(&self.page_bytes(leaf_page)[2..4]) as usize;
-        if count == 0 {
-            return None;
-        }
-        let k: K = deserialize_from(self.key_bytes_at(leaf_page, 0)).expect("valid encoded key");
-        let v: V =
-            deserialize_from(self.value_bytes_at(leaf_page, 0)).expect("valid encoded value");
-        Some((k, v))
+        let page = self.leftmost_nonempty_leaf()?;
+        let k: K = deserialize_from(self.key_bytes_at(page, 0)).expect("valid encoded key");
+        let v: V = deserialize_from(self.value_bytes_at(page, 0)).expect("valid encoded value");
+        Some((Cow::Owned(k), Cow::Owned(v)))
     }
 
-    /// Walks left from `rightmost_leaf` skipping empty leaves.
-    fn last(&self) -> Option<(K, V)> {
+    /// Largest live entry. Mirror of [`first`] — walks left via
+    /// [`rightmost_nonempty_leaf`].
+    fn last<'a>(&'a self) -> Option<(Cow<'a, K>, Cow<'a, V>)>
+    where
+        K: 'a,
+        V: 'a,
+    {
         if self.size() == 0 {
             return None;
         }
-        let mut page = self.rightmost_leaf();
-        while page != 0 {
-            let count = rd_u16(&self.page_bytes(page)[2..4]) as usize;
-            if count != 0 {
-                let last_slot = count - 1;
-                let k: K = deserialize_from(self.key_bytes_at(page, last_slot))
-                    .expect("valid encoded key");
-                let v: V = deserialize_from(self.value_bytes_at(page, last_slot))
-                    .expect("valid encoded value");
-                return Some((k, v));
-            }
-            page = rd_u64(&self.page_bytes(page)[16..24]);
-        }
-        None
+        let page = self.rightmost_nonempty_leaf()?;
+        let last_slot = rd_u16(&self.page_bytes(page)[2..4]) as usize - 1;
+        let k: K =
+            deserialize_from(self.key_bytes_at(page, last_slot)).expect("valid encoded key");
+        let v: V =
+            deserialize_from(self.value_bytes_at(page, last_slot)).expect("valid encoded value");
+        Some((Cow::Owned(k), Cow::Owned(v)))
     }
 
     /// Streaming reverse iteration via `prev_leaf`.
-    fn entries_rev(&self) -> impl Iterator<Item = (K, V)> + '_
+    fn entries_rev(&self) -> impl Iterator<Item = (Cow<'_, K>, Cow<'_, V>)> + '_
     where
         K: 'static,
         V: 'static,
@@ -2323,7 +2403,11 @@ where
     }
 
     /// Streaming `[start, end)` in descending order.
-    fn range_rev(&self, start: &K, end: &K) -> impl Iterator<Item = (K, V)> + '_
+    fn range_rev(
+        &self,
+        start: &K,
+        end: &K,
+    ) -> impl Iterator<Item = (Cow<'_, K>, Cow<'_, V>)> + '_
     where
         K: 'static,
         V: 'static,
@@ -2524,10 +2608,10 @@ pub struct BTreeIter<'a, K, V> {
 
 impl<'a, K, V> Iterator for BTreeIter<'a, K, V>
 where
-    K: Decode<()>,
-    V: Decode<()>,
+    K: Decode<()> + Clone,
+    V: Decode<()> + Clone,
 {
-    type Item = (K, V);
+    type Item = (Cow<'a, K>, Cow<'a, V>);
     fn next(&mut self) -> Option<Self::Item> {
         while self.page != 0 {
             if self.slot < self.count {
@@ -2536,7 +2620,7 @@ where
                 let v: V = deserialize_from(self.tree.value_bytes_at(self.page, self.slot))
                     .expect("valid encoded value");
                 self.slot += 1;
-                return Some((k, v));
+                return Some((Cow::Owned(k), Cow::Owned(v)));
             }
             self.page = rd_u64(&self.tree.page_bytes(self.page)[8..16]);
             self.slot = 0;
@@ -2560,10 +2644,10 @@ pub struct BTreeIterRev<'a, K, V> {
 
 impl<'a, K, V> Iterator for BTreeIterRev<'a, K, V>
 where
-    K: Decode<()>,
-    V: Decode<()>,
+    K: Decode<()> + Clone,
+    V: Decode<()> + Clone,
 {
-    type Item = (K, V);
+    type Item = (Cow<'a, K>, Cow<'a, V>);
     fn next(&mut self) -> Option<Self::Item> {
         while self.page != 0 {
             if self.slot < self.count {
@@ -2573,7 +2657,7 @@ where
                 let v: V = deserialize_from(self.tree.value_bytes_at(self.page, idx))
                     .expect("valid encoded value");
                 self.slot += 1;
-                return Some((k, v));
+                return Some((Cow::Owned(k), Cow::Owned(v)));
             }
             self.page = rd_u64(&self.tree.page_bytes(self.page)[16..24]);
             self.slot = 0;
@@ -2598,10 +2682,10 @@ pub struct BTreeRange<'a, K, V> {
 
 impl<'a, K, V> Iterator for BTreeRange<'a, K, V>
 where
-    K: Decode<()>,
-    V: Decode<()>,
+    K: Decode<()> + Clone,
+    V: Decode<()> + Clone,
 {
-    type Item = (K, V);
+    type Item = (Cow<'a, K>, Cow<'a, V>);
     fn next(&mut self) -> Option<Self::Item> {
         while self.page != 0 {
             if self.slot < self.count {
@@ -2613,7 +2697,7 @@ where
                 let v: V = deserialize_from(self.tree.value_bytes_at(self.page, self.slot))
                     .expect("valid encoded value");
                 self.slot += 1;
-                return Some((k, v));
+                return Some((Cow::Owned(k), Cow::Owned(v)));
             }
             self.page = rd_u64(&self.tree.page_bytes(self.page)[8..16]);
             self.slot = 0;
@@ -2641,10 +2725,10 @@ pub struct BTreeRangeRev<'a, K, V> {
 
 impl<'a, K, V> Iterator for BTreeRangeRev<'a, K, V>
 where
-    K: Decode<()>,
-    V: Decode<()>,
+    K: Decode<()> + Clone,
+    V: Decode<()> + Clone,
 {
-    type Item = (K, V);
+    type Item = (Cow<'a, K>, Cow<'a, V>);
     fn next(&mut self) -> Option<Self::Item> {
         while self.page != 0 {
             if self.slot_from_end < self.count {
@@ -2657,7 +2741,7 @@ where
                 let v: V = deserialize_from(self.tree.value_bytes_at(self.page, idx))
                     .expect("valid encoded value");
                 self.slot_from_end += 1;
-                return Some((k, v));
+                return Some((Cow::Owned(k), Cow::Owned(v)));
             }
             self.page = rd_u64(&self.tree.page_bytes(self.page)[16..24]);
             self.slot_from_end = 0;
@@ -2728,7 +2812,7 @@ mod tests {
         s.as_bytes().to_vec()
     }
     fn vget(t: &BPlusTree<TestKey, TestVal>, key: &TestKey) -> Option<Vec<u8>> {
-        t.get(key)
+        t.get(key).map(Cow::into_owned)
     }
 
     // -- basic --
@@ -2791,7 +2875,7 @@ mod tests {
         t.put(k("c"), vbytes("3")).unwrap();
         t.put(k("a"), vbytes("1")).unwrap();
         t.put(k("b"), vbytes("2")).unwrap();
-        let keys: Vec<Vec<u8>> = t.entries().map(|(k, _)| k).collect();
+        let keys: Vec<Vec<u8>> = t.entries().map(|(k, _)| k.into_owned()).collect();
         assert_eq!(keys, vec![k("a"), k("b"), k("c")]);
     }
 
@@ -2805,7 +2889,7 @@ mod tests {
         }
         let keys: Vec<String> = t
             .range(&k("k0005"), &k("k0010"))
-            .map(|(k, _)| String::from_utf8(k).unwrap())
+            .map(|(k, _)| String::from_utf8(k.into_owned()).unwrap())
             .collect();
         assert_eq!(keys, ["k0005", "k0006", "k0007", "k0008", "k0009"]);
     }
@@ -2817,7 +2901,10 @@ mod tests {
         t.put(k("b"), vbytes("2")).unwrap();
         t.put(k("d"), vbytes("4")).unwrap();
         assert_eq!(t.range(&k("e"), &k("z")).count(), 0);
-        let keys: Vec<Vec<u8>> = t.range(&k("a"), &k("c")).map(|(k, _)| k).collect();
+        let keys: Vec<Vec<u8>> = t
+            .range(&k("a"), &k("c"))
+            .map(|(k, _)| k.into_owned())
+            .collect();
         assert_eq!(keys, vec![k("b")]);
     }
 
@@ -2918,10 +3005,10 @@ mod tests {
                 assert!(t.delete(&format!("k{:04}", i).into_bytes()).unwrap());
             }
             t.flush().unwrap();
-            *t.stats()
+            t.stats().clone()
         };
         let t: BPlusTree<TestKey, TestVal> = open(&p);
-        assert_eq!(*t.stats(), stats_before);
+        assert_eq!(t.stats(), &stats_before);
     }
 
     #[test]
@@ -3003,7 +3090,9 @@ mod tests {
         let p = tmp("replace");
         let mut t = create(&p);
         t.put(k("a"), vbytes("first")).unwrap();
-        let prev = Backend::replace(&mut t, k("a"), vbytes("second")).unwrap();
+        let prev = Backend::replace(&mut t, k("a"), vbytes("second"))
+            .unwrap()
+            .map(Cow::into_owned);
         assert_eq!(prev, Some(vbytes("first")));
         assert_eq!(vget(&t, &k("a")), Some(vbytes("second")));
     }
@@ -3047,7 +3136,7 @@ mod tests {
             );
         }
         // Iteration order is correct.
-        let collected: Vec<Vec<u8>> = t.entries().map(|(k, _)| k).collect();
+        let collected: Vec<Vec<u8>> = t.entries().map(|(k, _)| k.into_owned()).collect();
         assert_eq!(collected.len(), 500);
         for i in 0..500 {
             assert_eq!(collected[i], format!("k{:04}", i).into_bytes());
@@ -3208,8 +3297,8 @@ mod tests {
         }
         let (fk, _) = OrderedBackend::first(&t).unwrap();
         let (lk, _) = OrderedBackend::last(&t).unwrap();
-        assert_eq!(fk, k("k0000"));
-        assert_eq!(lk, k("k0029"));
+        assert_eq!(fk.into_owned(), k("k0000"));
+        assert_eq!(lk.into_owned(), k("k0029"));
     }
 
     #[test]
@@ -3220,6 +3309,38 @@ mod tests {
         assert!(OrderedBackend::last(&t).is_none());
     }
 
+    /// Regression: per-entry `delete` does not unlink emptied leaves
+    /// (only `bulk_delete_sorted` does, via `rebuild_internal_from_leaves`),
+    /// so the leaf at the end of the leftmost-child descent can be empty
+    /// while `size() > 0`. `first()` must walk `next_leaf` past it; the
+    /// previous implementation returned `None` and falsely reported an
+    /// empty tree. `last()` is the symmetric case via `prev_leaf`.
+    #[test]
+    fn first_and_last_skip_empty_endpoint_leaves() {
+        let p = tmp("first_last_skip_empty");
+        let mut t = create(&p);
+        // Span several leaves so deleting a prefix/suffix of keys can
+        // fully drain the leaf at either end of the chain.
+        for i in 0u32..500 {
+            t.put(format!("k{:04}", i).into_bytes(), vbytes("v"))
+                .unwrap();
+        }
+        // Drain the smallest 200 keys — definitely empties the leftmost
+        // leaf (and likely more). first() must walk to k0200.
+        for i in 0u32..200 {
+            assert!(t.delete(&format!("k{:04}", i).into_bytes()).unwrap());
+        }
+        // Same on the upper end for last().
+        for i in 300u32..500 {
+            assert!(t.delete(&format!("k{:04}", i).into_bytes()).unwrap());
+        }
+        assert_eq!(t.size(), 100);
+        let (fk, _) = OrderedBackend::first(&t).expect("first should find k0200");
+        let (lk, _) = OrderedBackend::last(&t).expect("last should find k0299");
+        assert_eq!(fk.into_owned(), k("k0200"));
+        assert_eq!(lk.into_owned(), k("k0299"));
+    }
+
     #[test]
     fn entries_rev_yields_descending_order() {
         let p = tmp("entries_rev");
@@ -3228,7 +3349,9 @@ mod tests {
             t.put(format!("k{:04}", i).into_bytes(), vbytes("v"))
                 .unwrap();
         }
-        let keys: Vec<Vec<u8>> = OrderedBackend::entries_rev(&t).map(|(k, _)| k).collect();
+        let keys: Vec<Vec<u8>> = OrderedBackend::entries_rev(&t)
+            .map(|(k, _)| k.into_owned())
+            .collect();
         let expected: Vec<Vec<u8>> = (0..10u32)
             .rev()
             .map(|i| format!("k{:04}", i).into_bytes())
@@ -3245,7 +3368,7 @@ mod tests {
                 .unwrap();
         }
         let got: Vec<Vec<u8>> = OrderedBackend::range_rev(&t, &k("k0005"), &k("k0010"))
-            .map(|(k, _)| k)
+            .map(|(k, _)| k.into_owned())
             .collect();
         let expected: Vec<Vec<u8>> = (5..10u32)
             .rev()
@@ -3263,7 +3386,7 @@ mod tests {
                 .unwrap();
         }
         let got: Vec<Vec<u8>> = OrderedBackend::range_rev(&t, &k("k0002"), &k("k0002"))
-            .map(|(k, _)| k)
+            .map(|(k, _)| k.into_owned())
             .collect();
         assert!(got.is_empty());
     }
@@ -3426,7 +3549,7 @@ mod tests {
         }
         // Pick a range that spans multiple leaves.
         let got: Vec<Vec<u8>> = OrderedBackend::range_rev(&t, &k("k0050"), &k("k0250"))
-            .map(|(k, _)| k)
+            .map(|(k, _)| k.into_owned())
             .collect();
         let expected: Vec<Vec<u8>> = (50..250u32)
             .rev()
@@ -3485,6 +3608,61 @@ mod tests {
                 Some(vec![0xAB; 32])
             );
         }
+    }
+
+    /// BPlusTree decodes both keys and values from page bytes, so all
+    /// retrieval methods must return `Cow::Owned`.
+    #[test]
+    fn retrieval_methods_return_owned() {
+        let p = tmp("cow_owned");
+        let mut t = create(&p);
+        for i in 0u32..5 {
+            t.put(format!("k{:02}", i).into_bytes(), vbytes("v"))
+                .unwrap();
+        }
+
+        assert!(matches!(t.get(&k("k00")), Some(Cow::Owned(_))));
+        assert!(t.keys().all(|c| matches!(c, Cow::Owned(_))));
+        assert!(t.values().all(|c| matches!(c, Cow::Owned(_))));
+        assert!(t
+            .entries()
+            .all(|(k, v)| matches!(k, Cow::Owned(_)) && matches!(v, Cow::Owned(_))));
+
+        assert!(t
+            .range(&k("k00"), &k("k05"))
+            .all(|(k, v)| matches!(k, Cow::Owned(_)) && matches!(v, Cow::Owned(_))));
+        assert!(matches!(
+            OrderedBackend::first(&t),
+            Some((Cow::Owned(_), Cow::Owned(_)))
+        ));
+        assert!(matches!(
+            OrderedBackend::last(&t),
+            Some((Cow::Owned(_), Cow::Owned(_)))
+        ));
+        assert!(OrderedBackend::entries_rev(&t)
+            .all(|(k, v)| matches!(k, Cow::Owned(_)) && matches!(v, Cow::Owned(_))));
+    }
+
+    /// Round-trip retrieval through `Cow::into_owned()` returns the
+    /// same decoded bytes.
+    #[test]
+    fn into_owned_yields_decoded_values() {
+        let p = tmp("cow_into_owned");
+        let mut t = create(&p);
+        t.put(k("alpha"), vbytes("1")).unwrap();
+        t.put(k("bravo"), vbytes("2")).unwrap();
+
+        let owned: TestVal = t.get(&k("alpha")).unwrap().into_owned();
+        assert_eq!(owned, vbytes("1"));
+
+        let owned_entries: Vec<(TestKey, TestVal)> = t
+            .entries()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            owned_entries,
+            vec![(k("alpha"), vbytes("1")), (k("bravo"), vbytes("2"))]
+        );
     }
 
     #[test]

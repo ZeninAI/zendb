@@ -257,7 +257,7 @@ impl Table {
             let current_bytes: Option<Vec<u8>> =
                 self.backend.get(&key).map(|v| v.as_slice().to_vec());
             let mut cell = decode_cell(current_bytes.as_deref()).unwrap_or_else(|| {
-                Cell::dummy(zendb_types::Value::Atom(zendb_types::AtomValue::Null))
+                Cell::dummy(Some(zendb_types::Value::Atom(zendb_types::AtomValue::Null)))
             });
 
             for delta in &deltas {
@@ -281,7 +281,7 @@ impl Table {
         let current_bytes: Option<Vec<u8>> =
             self.backend.get(&key_vec).map(|v| v.as_slice().to_vec());
         let mut cell = decode_cell(current_bytes.as_deref())
-            .unwrap_or_else(|| Cell::dummy(zendb_types::Value::Atom(zendb_types::AtomValue::Null)));
+            .unwrap_or_else(|| Cell::dummy(Some(zendb_types::Value::Atom(zendb_types::AtomValue::Null))));
 
         let mut modified = false;
         if let Some(deltas) = self.buffer.get(&key_vec) {
@@ -354,7 +354,7 @@ impl Table {
 }
 
 fn primary_key_bytes(pk: &PrimaryKey) -> Vec<u8> {
-    encode_to_vec(&pk.0, config::standard()).expect("primary key encode")
+    encode_to_vec(pk, config::standard()).expect("primary key encode")
 }
 
 fn decode_cell(bytes: Option<&[u8]>) -> Option<Cell> {
@@ -369,7 +369,7 @@ fn decode_cell(bytes: Option<&[u8]>) -> Option<Cell> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use zendb_types::{AtomOp, AtomValue, Hlc, Op};
+    use zendb_types::{AtomOp, AtomValue, Hlc, Op, TypeOp};
 
     fn tmp_dir(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("zendb_engine_{}", name));
@@ -378,16 +378,16 @@ mod tests {
     }
 
     fn make_delta(key: &str, val: &str, hlc_ms: u64) -> (Delta, Vec<u8>) {
-        let pk = PrimaryKey(zendb_types::AtomValue::String(key.into()));
-        let pk_bytes = encode_to_vec(&pk.0, config::standard()).unwrap();
+        let pk = zendb_types::AtomValue::String(key.into());
+        let pk_bytes = encode_to_vec(&pk, config::standard()).unwrap();
         let d = Delta {
-            table_id: zendb_types::TableId("test".into()),
+            table_id: "test".into(),
             primary_key: pk,
             path: zendb_types::Path::new(),
-            op: Op::Atom(AtomOp::Set(AtomValue::String(val.into()))),
-            hlc: Hlc::new(hlc_ms, 0, 1).unwrap(),
+            op: Op::Type(TypeOp::Atom(AtomOp::Set(AtomValue::String(val.into())))),
+            hlc: Hlc::with_device_id(hlc_ms, 0, [1u8; 8]).unwrap(),
             sync: false,
-            signature: zendb_types::Signature(vec![]),
+            signature: vec![],
         };
         (d, pk_bytes)
     }

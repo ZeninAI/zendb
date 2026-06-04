@@ -23,5 +23,8 @@ hashbrown = "0.15"
 bincode = { version = "2", features = ["derive"] }
 rkyv = "0.8"
 
+# zendb-types
+machine-uid = "0.5"
+
 # zendb-engine
 blake3 = "1"

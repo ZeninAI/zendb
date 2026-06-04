@@ -48,10 +48,14 @@ pub trait Type {
 pub trait ContainerType: Type {
     type Segment: Encode + Decode<()>;
 
-    /// Navigate into a child, creating a dummy if absent.
+    /// Navigate into a child, creating a placeholder if absent.
+    ///
+    /// `child_tag = Some(tag)` creates a live empty child of that type.
+    /// `child_tag = None` creates a tombstone placeholder, useful for path
+    /// targeted cell operations such as delete where no value type is known.
     fn descend_or_create<'a>(
         value: &'a mut Self::Value,
         segment: &Self::Segment,
-        child_tag: TypeTag,
+        child_tag: Option<TypeTag>,
     ) -> Result<&'a mut Cell, Self::Error>;
 }

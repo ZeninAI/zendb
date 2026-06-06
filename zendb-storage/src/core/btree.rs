@@ -2002,7 +2002,10 @@ where
     K: Encode + Decode<()> + Hash + Eq + Clone,
     V: Encode + Decode<()> + Clone,
 {
-    type Stats = BPlusTreeStats;
+    type Stats<'a>
+        = &'a BPlusTreeStats
+    where
+        Self: 'a;
     type Config = BPlusTreeConfig;
 
     fn get(&self, key: &K) -> Option<Cow<'_, V>> {
@@ -2273,7 +2276,7 @@ where
         self.stats.entries
     }
 
-    fn stats(&self) -> &Self::Stats {
+    fn stats(&self) -> Self::Stats<'_> {
         &self.stats
     }
 

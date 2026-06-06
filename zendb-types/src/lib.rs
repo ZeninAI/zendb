@@ -274,7 +274,10 @@ register_types! {
     leaf String => crate::types::string::String,
     leaf Timestamp => crate::types::timestamp::Timestamp,
     leaf Blob => crate::types::blob::Blob,
+    leaf Set => crate::types::set::Set,
+    leaf Text => crate::types::text::Text,
     container Record => crate::types::record::Record,
+    container List => crate::types::list::List,
 }
 
 // --- re-exports ---
@@ -287,7 +290,15 @@ pub use core::traits::{ContainerType, Type};
 pub use types::blob::{Blob, BlobError, BlobOp};
 pub use types::bool::{Bool, BoolError, BoolOp};
 pub use types::int::{Int, IntError, IntOp};
+pub use types::list::{
+    list_cell_at, list_id_at, list_visible_ids, List, ListEntry, ListError, ListId, ListOp,
+    ListSegment,
+};
 pub use types::record::{Record, RecordError, RecordOp, RecordSegment};
+pub use types::set::{set_contains, set_values, Set, SetEntry, SetError, SetOp, SetValue};
 pub use types::string::{String, StringError, StringOp};
+pub use types::text::{
+    text_id_at, text_string, text_visible_ids, Text, TextEntry, TextError, TextId, TextOp,
+};
 pub use types::timestamp::{Timestamp, TimestampError, TimestampOp};
 // TypeTag, Value, TypeOp, Segment, TypeError are generated above by register_types!

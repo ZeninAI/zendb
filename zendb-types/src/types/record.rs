@@ -92,6 +92,24 @@ mod tests {
         Hlc::with_device_id(ms, 0, [1u8; 8]).unwrap()
     }
 
+    fn clock(ms: u64, device: u8) -> Hlc {
+        Hlc::with_device_id(ms, 0, [device; 8]).unwrap()
+    }
+
+    fn record(entries: impl IntoIterator<Item = (&'static str, Cell)>) -> Record {
+        entries
+            .into_iter()
+            .map(|(name, cell)| (name.into(), cell))
+            .collect()
+    }
+
+    fn merge_order(records: &[Record; 3], order: [usize; 3]) -> Record {
+        let mut merged = records[order[0]].clone();
+        Type::merge(&mut merged, &records[order[1]], Hlc::ZERO, Hlc::ZERO).unwrap();
+        Type::merge(&mut merged, &records[order[2]], Hlc::ZERO, Hlc::ZERO).unwrap();
+        merged
+    }
+
     #[test]
     fn record_child_or_default_creates_field() {
         let mut state = Record::new();
@@ -101,6 +119,29 @@ mod tests {
             .unwrap();
         assert_eq!(child.type_tag(), Some(TypeTag::Int));
         assert!(state.get("x").is_some_and(|cell| !cell.is_tombstone()));
+    }
+
+    #[test]
+    fn record_child_or_default_preserves_existing_field() {
+        let mut state = record([(
+            "x",
+            Cell::new(Some(Value::String("existing".into())), hlc(100), Some(true)),
+        )]);
+        let original = state.get("x").unwrap().clone();
+
+        let child = state
+            .child_or_default(&"x".into(), Some(TypeTag::Int))
+            .unwrap();
+
+        assert_eq!(child, &original);
+    }
+
+    #[test]
+    fn record_child_or_default_can_create_tombstone_placeholder() {
+        let mut state = Record::new();
+        let child = state.child_or_default(&"missing".into(), None).unwrap();
+        assert!(child.is_tombstone());
+        assert!(child.is_dummy());
     }
 
     #[test]
@@ -122,7 +163,100 @@ mod tests {
         remote.insert("x".into(), Cell::new(None, hlc(200), None));
         let changed = Type::merge(&mut local, &remote, hlc(100), hlc(200)).unwrap();
         assert!(changed);
-        assert!(!local.get("x").is_some_and(|cell| !cell.is_tombstone()));
+        assert!(local.get("x").is_none_or(Cell::is_tombstone));
+    }
+
+    #[test]
+    fn record_merge_is_idempotent() {
+        let mut local = record([
+            ("live", Cell::new(Some(Value::Int(1)), clock(100, 1), None)),
+            ("deleted", Cell::new(None, clock(200, 1), None)),
+        ]);
+        let snapshot = local.clone();
+
+        assert!(!Type::merge(&mut local, &snapshot, Hlc::ZERO, Hlc::ZERO).unwrap());
+        assert_eq!(local, snapshot);
+    }
+
+    #[test]
+    fn record_merge_is_commutative_for_independent_and_conflicting_fields() {
+        let left = record([
+            (
+                "left",
+                Cell::new(Some(Value::Bool(true)), clock(100, 1), None),
+            ),
+            (
+                "shared",
+                Cell::new(Some(Value::Int(1)), clock(100, 1), None),
+            ),
+        ]);
+        let right = record([
+            (
+                "right",
+                Cell::new(Some(Value::String("right".into())), clock(100, 2), None),
+            ),
+            (
+                "shared",
+                Cell::new(Some(Value::Int(2)), clock(100, 2), None),
+            ),
+        ]);
+
+        let mut left_first = left.clone();
+        Type::merge(&mut left_first, &right, Hlc::ZERO, Hlc::ZERO).unwrap();
+        let mut right_first = right;
+        Type::merge(&mut right_first, &left, Hlc::ZERO, Hlc::ZERO).unwrap();
+
+        assert_eq!(left_first, right_first);
+        assert_eq!(left_first.get("shared").unwrap().value, Some(Value::Int(2)));
+    }
+
+    #[test]
+    fn record_merge_converges_for_every_replica_order() {
+        let records = [
+            record([("field", Cell::new(Some(Value::Int(1)), clock(100, 1), None))]),
+            record([("field", Cell::new(None, clock(200, 2), None))]),
+            record([
+                ("field", Cell::new(Some(Value::Int(3)), clock(300, 3), None)),
+                (
+                    "extra",
+                    Cell::new(Some(Value::Bool(true)), clock(150, 3), None),
+                ),
+            ]),
+        ];
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let expected = merge_order(&records, orders[0]);
+
+        for order in orders.into_iter().skip(1) {
+            assert_eq!(merge_order(&records, order), expected);
+        }
+    }
+
+    #[test]
+    fn record_merge_recursively_combines_nested_records() {
+        let left_nested = record([("left", Cell::new(Some(Value::Int(1)), clock(100, 1), None))]);
+        let right_nested = record([("right", Cell::new(Some(Value::Int(2)), clock(100, 2), None))]);
+        let mut left = record([(
+            "nested",
+            Cell::new(Some(Value::Record(left_nested)), clock(50, 1), None),
+        )]);
+        let right = record([(
+            "nested",
+            Cell::new(Some(Value::Record(right_nested)), clock(50, 2), None),
+        )]);
+
+        assert!(Type::merge(&mut left, &right, Hlc::ZERO, Hlc::ZERO).unwrap());
+        let Some(Value::Record(nested)) = &left.get("nested").unwrap().value else {
+            panic!("expected nested record");
+        };
+        assert!(nested.contains_key("left"));
+        assert!(nested.contains_key("right"));
     }
 
     #[test]

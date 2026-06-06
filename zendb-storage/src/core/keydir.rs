@@ -443,7 +443,10 @@ where
     K: Encode + Decode<()> + Hash + Eq + Clone,
     V: Encode + Decode<()> + Clone,
 {
-    type Stats = KeyDirStats;
+    type Stats<'a>
+        = &'a KeyDirStats
+    where
+        Self: 'a;
     type Config = KeyDirConfig;
 
     /// One HashMap lookup, then materialize the value by decoding the
@@ -750,7 +753,7 @@ where
         self.index.is_empty()
     }
 
-    fn stats(&self) -> &Self::Stats {
+    fn stats(&self) -> Self::Stats<'_> {
         &self.stats
     }
 

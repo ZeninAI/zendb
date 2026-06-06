@@ -68,9 +68,11 @@ where
     K: Encode + Decode<()> + Hash + Eq + Clone,
     V: Encode + Decode<()> + Clone,
 {
-    /// Cheap backend-specific metrics snapshot. Implementations keep
-    /// this in the backend object and update it as state changes.
-    type Stats: Clone + Encode + Decode<()>;
+    /// Cheap backend-specific metrics view. Implementations keep the
+    /// underlying stats in the backend object and update them as state changes.
+    type Stats<'a>
+    where
+        Self: 'a;
 
     /// Backend configuration values. Set once at construction, read
     /// through `config()`. Immutable after creation.
@@ -259,8 +261,8 @@ where
         self.size() == 0
     }
 
-    /// Return the backend's current in-memory stats snapshot.
-    fn stats(&self) -> &Self::Stats;
+    /// Return the backend's current in-memory stats view.
+    fn stats(&self) -> Self::Stats<'_>;
 
     /// Return the backend's configuration.
     fn config(&self) -> &Self::Config;

@@ -3,12 +3,9 @@ name = "zendb-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ZeninDB storage engine — table abstraction, delta buffering, anti-entropy Merkle tree"
+description = "ZeninDB table engine"
 
 [dependencies]
 zendb-types = { path = "../zendb-types" }
 zendb-storage = { path = "../zendb-storage" }
-blake3.workspace = true
-hashbrown.workspace = true
-rkyv.workspace = true
 bincode.workspace = true

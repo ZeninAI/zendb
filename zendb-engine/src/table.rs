@@ -1,469 +1,539 @@
-//! Table — one logical table backed by WAL + delta buffer + storage.
+//! Table abstraction over materialized state and an ordered delta log.
 
-use std::{fs, io, path::Path};
-
-use bincode::{config, decode_from_slice, encode_to_vec};
-use rkyv::Archived;
-use zendb_storage::{
-    core::{
-        backend::Backend,
-        btree::{BPlusTree, BPlusTreeConfig, BTreeRange},
-        keydir::KeyDir,
-        skiplist::SkipList,
-        wal::{Wal, WalConfig},
-    },
-    utils::serdes::ValueRef,
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+    fs, io,
+    path::Path,
 };
-use zendb_types::{Cell, Delta, PrimaryKey};
 
-use crate::config::{TableConfig, TableKind};
+use bincode::{Decode, Encode};
+use zendb_storage::core::{
+    backend::{Backend, OrderedBackend},
+    btree::{BPlusTree, BPlusTreeConfig, BPlusTreeStats},
+    keydir::{KeyDir, KeyDirConfig, KeyDirStats},
+    orderlog::{OrderLog, OrderLogConfig, OrderLogStats},
+};
+use zendb_types::{Cell, Delta, Hlc, Path as ValuePath, PrimaryKey};
 
-const FLUSH_THRESHOLD: usize = 10_000;
+type OrderedState = BPlusTree<PrimaryKey, Cell>;
+type UnorderedState = KeyDir<PrimaryKey, Cell>;
+type EventLog = OrderLog<EventKey, Delta>;
 
-// ---------------------------------------------------------------------------
-// Storage — concrete enum wrapping the two backend kinds and implementing
-// `Backend<Vec<u8>, Vec<u8>>` so engine code can program against the trait
-// without `dyn` (the trait is not object-safe).
-//
-// Iterator methods unify the two backends' concrete iterator types via a
-// small `Either` enum.
-// ---------------------------------------------------------------------------
-
-type BytesKeyDir = KeyDir<Vec<u8>, Vec<u8>>;
-type BytesBPlusTree = BPlusTree<Vec<u8>, Vec<u8>>;
-
-pub enum Storage {
-    Ordered(BytesBPlusTree),
-    Unordered(BytesKeyDir),
+/// Controls when in-flight deltas are materialized into table state.
+#[derive(Debug, Clone, Encode, Decode)]
+pub enum FlushConfig {
+    Manual,
+    EventCount { max_events: usize },
 }
 
-/// Two-variant iterator: yields `Option<A::Item>` from whichever variant
-/// is active. Used to unify the concrete iterator types each backend
-/// returns under a single `impl Iterator` return.
-enum Either<A, B> {
-    Left(A),
-    Right(B),
-}
-
-impl<A, B, Item> Iterator for Either<A, B>
-where
-    A: Iterator<Item = Item>,
-    B: Iterator<Item = Item>,
-{
-    type Item = Item;
-    fn next(&mut self) -> Option<Item> {
-        match self {
-            Either::Left(a) => a.next(),
-            Either::Right(b) => b.next(),
-        }
+impl Default for FlushConfig {
+    fn default() -> Self {
+        Self::Manual
     }
 }
 
-impl Backend<Vec<u8>, Vec<u8>> for Storage {
-    fn get(&self, key: &Vec<u8>) -> Option<ValueRef<'_, Vec<u8>>> {
-        match self {
-            Storage::Ordered(t) => t.get(key),
-            Storage::Unordered(k) => k.get(key),
-        }
-    }
+/// Configures the table's materialized-state backend.
+#[derive(Debug, Clone, Encode, Decode)]
+pub enum StateConfig {
+    Ordered(BPlusTreeConfig),
+    Unordered(KeyDirConfig),
+}
 
-    fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> io::Result<()> {
-        match self {
-            Storage::Ordered(t) => t.put(key, value),
-            Storage::Unordered(k) => k.put(key, value),
-        }
-    }
-
-    fn delete(&mut self, key: &Vec<u8>) -> io::Result<bool> {
-        match self {
-            Storage::Ordered(t) => t.delete(key),
-            Storage::Unordered(k) => k.delete(key),
-        }
-    }
-
-    fn update<F>(&mut self, key: &Vec<u8>, f: F) -> io::Result<bool>
-    where
-        F: FnOnce(Vec<u8>) -> Vec<u8>,
-    {
-        match self {
-            Storage::Ordered(t) => Backend::update(t, key, f),
-            Storage::Unordered(k) => Backend::update(k, key, f),
-        }
-    }
-
-    fn update_in_place<F>(&mut self, key: &Vec<u8>, f: F) -> io::Result<bool>
-    where
-        F: FnOnce(&mut Archived<Vec<u8>>),
-    {
-        match self {
-            Storage::Ordered(t) => Backend::update_in_place(t, key, f),
-            Storage::Unordered(k) => Backend::update_in_place(k, key, f),
-        }
-    }
-
-    fn keys(&self) -> impl Iterator<Item = Vec<u8>> + '_ {
-        match self {
-            Storage::Ordered(t) => Either::Left(Backend::keys(t)),
-            Storage::Unordered(k) => Either::Right(Backend::keys(k)),
-        }
-    }
-
-    fn values(&self) -> impl Iterator<Item = ValueRef<'_, Vec<u8>>> + '_ {
-        match self {
-            Storage::Ordered(t) => Either::Left(Backend::values(t)),
-            Storage::Unordered(k) => Either::Right(Backend::values(k)),
-        }
-    }
-
-    fn entries(&self) -> impl Iterator<Item = (Vec<u8>, ValueRef<'_, Vec<u8>>)> + '_ {
-        match self {
-            Storage::Ordered(t) => Either::Left(Backend::entries(t)),
-            Storage::Unordered(k) => Either::Right(Backend::entries(k)),
-        }
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Storage::Ordered(t) => t.len(),
-            Storage::Unordered(k) => k.len(),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        match self {
-            Storage::Ordered(t) => t.is_empty(),
-            Storage::Unordered(k) => k.is_empty(),
-        }
-    }
-
-    fn flush(&self) -> io::Result<()> {
-        match self {
-            Storage::Ordered(t) => t.flush(),
-            Storage::Unordered(k) => k.flush(),
-        }
+impl Default for StateConfig {
+    fn default() -> Self {
+        Self::Ordered(BPlusTreeConfig::default())
     }
 }
 
-impl Storage {
-    /// Range scan over `[start, end)`. Only the `Ordered` (BPlusTree) variant
-    /// supports range queries; calling this on `Unordered` panics — KeyDir's
-    /// hash index has no usable key ordering, so the request is meaningless.
-    pub fn range<'a>(&'a self, start: &Vec<u8>, end: &Vec<u8>) -> BTreeRange<'a, Vec<u8>, Vec<u8>> {
-        match self {
-            Storage::Ordered(t) => t.range(start, end),
-            Storage::Unordered(_) => {
-                panic!("Unordered backend (KeyDir) does not support range queries")
-            }
+/// Declares a derived index that should be owned by the table.
+///
+/// Index implementations are intentionally deferred; the configuration is
+/// part of the table contract now so creation/opening remains stable later.
+#[derive(Debug, Clone, Encode, Decode)]
+pub enum IndexConfig {
+    Value {
+        name: String,
+        path: ValuePath,
+    },
+    FullText {
+        name: String,
+        paths: Vec<ValuePath>,
+    },
+    Vector {
+        name: String,
+        path: ValuePath,
+        dimensions: usize,
+    },
+}
+
+/// Complete configuration required to create or open a table.
+#[derive(Debug, Clone, Default, Encode, Decode)]
+pub struct TableConfig {
+    pub sync: bool,
+    pub flush: FlushConfig,
+    pub state: StateConfig,
+    pub events: OrderLogConfig,
+    pub indexes: Vec<IndexConfig>,
+}
+
+/// Stats from the configured materialized-state backend.
+#[derive(Debug)]
+pub enum StateStats<'a> {
+    Ordered(&'a BPlusTreeStats),
+    Unordered(&'a KeyDirStats),
+}
+
+/// Current stats view over the delegated backends.
+#[derive(Debug)]
+pub struct TableStats<'a> {
+    pub state: StateStats<'a>,
+    pub events: &'a OrderLogStats,
+}
+
+/// Position of an event within one row's ordered event range.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub enum EventPosition {
+    Start,
+    Event(Hlc),
+    End,
+}
+
+/// OrderLog key that groups events by row and orders each row by HLC.
+///
+/// HLC includes the originating device ID and acts as the event identity.
+/// The path stays in the delta value because ordering by path could reorder
+/// parent and descendant operations within a row.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub struct EventKey {
+    pub primary_key: PrimaryKey,
+    pub position: EventPosition,
+}
+
+impl EventKey {
+    pub fn from_delta(delta: &Delta) -> Self {
+        Self {
+            primary_key: delta.primary_key.clone(),
+            position: EventPosition::Event(delta.hlc),
         }
+    }
+
+    pub fn bounds(primary_key: &PrimaryKey) -> (Self, Self) {
+        (
+            Self {
+                primary_key: primary_key.clone(),
+                position: EventPosition::Start,
+            },
+            Self {
+                primary_key: primary_key.clone(),
+                position: EventPosition::End,
+            },
+        )
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertResult {
+    Inserted,
+    Duplicate,
+    InsertedAndMaterialized,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaterializeResult {
+    pub events: usize,
+    pub rows: usize,
+}
+
+enum State {
+    Ordered(OrderedState),
+    Unordered(UnorderedState),
+}
+
+/// A table presents a resolved `PrimaryKey -> Cell` backend while owning the
+/// materialized backend and durable in-flight event log used to produce it.
 pub struct Table {
-    name: String,
-    sync_enabled: bool,
-    wal: Wal,
-    buffer: SkipList<Vec<u8>, Vec<Delta>>,
-    backend: Storage,
-    buffered_count: usize,
+    config: TableConfig,
+    state: State,
+    events: EventLog,
 }
 
 impl Table {
-    /// Open an existing table (or create if missing) with the given config.
-    pub fn open(base: &Path, config: &TableConfig) -> io::Result<Table> {
-        let path = base.join(&config.name);
-        fs::create_dir_all(&path)?;
+    pub fn create(path: &Path, config: TableConfig) -> io::Result<Self> {
+        fs::create_dir_all(path)?;
 
-        let wal_path = path.join("wal");
-        let buffer = Self::recover_wal(&wal_path)?;
-
-        let wal = Wal::create(&wal_path, config.wal.clone())?;
-
-        let backend: Storage = match &config.kind {
-            TableKind::Ordered => {
-                let tree_path = path.join("tree");
-                let tree: BytesBPlusTree = if tree_path.exists() {
-                    BPlusTree::open(&tree_path, BPlusTreeConfig::default())?
-                } else {
-                    BPlusTree::create(&tree_path, BPlusTreeConfig::default())?
-                };
-                Storage::Ordered(tree)
-            }
-            TableKind::Unordered(kd_config) => {
-                let kd_path = path.join("data");
-                let kd: BytesKeyDir = if kd_path.exists() {
-                    KeyDir::open(&kd_path, kd_config.clone())?
-                } else {
-                    KeyDir::create(&kd_path, kd_config.clone())?
-                };
-                Storage::Unordered(kd)
+        let state = match &config.state {
+            StateConfig::Ordered(state_config) => State::Ordered(BPlusTree::create(
+                &path.join("state"),
+                state_config.clone(),
+            )?),
+            StateConfig::Unordered(state_config) => {
+                State::Unordered(KeyDir::create(&path.join("state"), state_config.clone())?)
             }
         };
+        let events = OrderLog::create(&path.join("events"), config.events.clone())?;
 
-        let count = buffer.iter().map(|(_, deltas)| deltas.len()).sum();
-
-        Ok(Table {
-            name: config.name.clone(),
-            sync_enabled: config.sync_enabled,
-            wal,
-            buffer,
-            backend,
-            buffered_count: count,
+        Ok(Self {
+            config,
+            state,
+            events,
         })
     }
 
-    /// Apply a delta: write to WAL, buffer in memory, optionally flush.
-    pub fn apply(&mut self, delta: Delta) -> io::Result<()> {
-        let buf = encode_to_vec(&delta, config::standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        self.wal.append(&buf)?;
-
-        let key = primary_key_bytes(&delta.primary_key);
-        let existing = self.buffer.get(&key).cloned();
-        self.buffer.remove(&key);
-        self.buffered_count += 1;
-
-        match existing {
-            Some(mut deltas) => {
-                deltas.push(delta);
-                self.buffer.insert(key, deltas);
+    pub fn open(path: &Path, config: TableConfig) -> io::Result<Self> {
+        let state = match &config.state {
+            StateConfig::Ordered(state_config) => {
+                State::Ordered(BPlusTree::open(&path.join("state"), state_config.clone())?)
             }
-            None => {
-                self.buffer.insert(key, vec![delta]);
+            StateConfig::Unordered(state_config) => {
+                State::Unordered(KeyDir::open(&path.join("state"), state_config.clone())?)
             }
-        }
+        };
+        let events = OrderLog::open(&path.join("events"), config.events.clone())?;
 
-        if self.buffered_count >= FLUSH_THRESHOLD {
-            self.flush()?;
-        }
-
-        Ok(())
+        Ok(Self {
+            config,
+            state,
+            events,
+        })
     }
 
-    /// Flush buffered deltas to the backend.
-    pub fn flush(&mut self) -> io::Result<()> {
-        if self.buffered_count == 0 {
-            return Ok(());
+    pub fn config(&self) -> &TableConfig {
+        &self.config
+    }
+
+    pub fn insert_delta(&mut self, delta: Delta) -> io::Result<InsertResult> {
+        let key = EventKey::from_delta(&delta);
+        if !self.events.put_if_absent(key, delta)? {
+            return Ok(InsertResult::Duplicate);
         }
 
-        let entries: Vec<(Vec<u8>, Vec<Delta>)> = self
-            .buffer
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        self.buffer = SkipList::new();
-        self.buffered_count = 0;
+        if self.should_materialize() {
+            self.materialize()?;
+            Ok(InsertResult::InsertedAndMaterialized)
+        } else {
+            Ok(InsertResult::Inserted)
+        }
+    }
 
-        for (key, deltas) in entries {
-            let current_bytes: Option<Vec<u8>> =
-                self.backend.get(&key).map(|v| v.as_slice().to_vec());
-            let mut cell = decode_cell(current_bytes.as_deref()).unwrap_or_else(|| {
-                Cell::dummy(zendb_types::Value::Atom(zendb_types::Atom(
-                    zendb_types::AtomValue::Null,
-                )))
-            });
+    pub fn insert_deltas(
+        &mut self,
+        deltas: impl IntoIterator<Item = Delta>,
+    ) -> io::Result<Vec<InsertResult>> {
+        deltas
+            .into_iter()
+            .map(|delta| self.insert_delta(delta))
+            .collect()
+    }
 
+    pub fn events_for(&self, key: &PrimaryKey) -> Vec<Delta> {
+        let (start, end) = EventKey::bounds(key);
+        self.events
+            .range(&start, &end)
+            .map(|(_, delta)| delta.into_owned())
+            .collect()
+    }
+
+    pub fn materialize(&mut self) -> io::Result<MaterializeResult> {
+        let mut grouped: BTreeMap<PrimaryKey, Vec<Delta>> = BTreeMap::new();
+        for (event_key, delta) in self.events.entries() {
+            grouped
+                .entry(event_key.primary_key.clone())
+                .or_default()
+                .push(delta.into_owned());
+        }
+
+        let event_count = grouped.values().map(Vec::len).sum();
+        let row_count = grouped.len();
+        let mut rows = Vec::with_capacity(row_count);
+
+        for (primary_key, deltas) in grouped {
+            let mut cell = match &self.state {
+                State::Ordered(state) => state.get(&primary_key).map(Cow::into_owned),
+                State::Unordered(state) => state.get(&primary_key).map(Cow::into_owned),
+            }
+            .unwrap_or_else(|| Cell::new(None, Hlc::ZERO, None));
             for delta in &deltas {
                 cell.apply(delta);
             }
-
-            let buf = encode_to_vec(&cell, config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            self.backend.put(key, buf)?;
+            rows.push((primary_key, cell));
         }
 
-        self.backend.flush()?;
-        self.wal.sync()?;
+        match &mut self.state {
+            State::Ordered(state) => state.bulk_put(rows)?,
+            State::Unordered(state) => state.bulk_put(rows)?,
+        }
+        match &self.state {
+            State::Ordered(state) => state.sync()?,
+            State::Unordered(state) => state.sync()?,
+        }
+        self.events.clear()?;
+        self.events.sync()?;
+
+        Ok(MaterializeResult {
+            events: event_count,
+            rows: row_count,
+        })
+    }
+
+    fn should_materialize(&self) -> bool {
+        match self.config.flush {
+            FlushConfig::Manual => false,
+            FlushConfig::EventCount { max_events } => self.events.size() >= max_events,
+        }
+    }
+}
+
+impl Backend<PrimaryKey, Cell> for Table {
+    type Stats<'a>
+        = TableStats<'a>
+    where
+        Self: 'a;
+    type Config = TableConfig;
+
+    fn get(&self, key: &PrimaryKey) -> Option<Cow<'_, Cell>> {
+        let previous = match &self.state {
+            State::Ordered(state) => state.get(key).map(Cow::into_owned),
+            State::Unordered(state) => state.get(key).map(Cow::into_owned),
+        };
+        let mut current = previous
+            .clone()
+            .unwrap_or_else(|| Cell::new(None, Hlc::ZERO, None));
+
+        let mut changed = false;
+        let (start, end) = EventKey::bounds(key);
+        for (_, delta) in self.events.range(&start, &end) {
+            changed |= current.apply(&delta);
+        }
+
+        if previous.is_none() && !changed {
+            None
+        } else {
+            Some(Cow::Owned(current))
+        }
+    }
+
+    fn contains(&self, key: &PrimaryKey) -> bool {
+        Backend::get(self, key).is_some()
+    }
+
+    fn put(&mut self, key: PrimaryKey, value: Cell) -> io::Result<()> {
+        let (start, end) = EventKey::bounds(&key);
+        let event_keys: Vec<EventKey> = self
+            .events
+            .range(&start, &end)
+            .map(|(event_key, _)| event_key.into_owned())
+            .collect();
+        self.events.bulk_delete_sorted(event_keys.iter())?;
+
+        match &mut self.state {
+            State::Ordered(state) => state.put(key, value)?,
+            State::Unordered(state) => state.put(key, value)?,
+        }
 
         Ok(())
     }
 
-    /// Get the current value for a key, merging buffered deltas on top.
-    pub fn get(&self, key: &[u8]) -> Option<Cell> {
-        let key_vec = key.to_vec();
-        let current_bytes: Option<Vec<u8>> =
-            self.backend.get(&key_vec).map(|v| v.as_slice().to_vec());
-        let mut cell = decode_cell(current_bytes.as_deref()).unwrap_or_else(|| {
-            Cell::dummy(zendb_types::Value::Atom(zendb_types::Atom(
-                zendb_types::AtomValue::Null,
-            )))
-        });
+    fn delete(&mut self, key: &PrimaryKey) -> io::Result<bool> {
+        let existed = Backend::contains(self, key);
+        let (start, end) = EventKey::bounds(key);
+        let event_keys: Vec<EventKey> = self
+            .events
+            .range(&start, &end)
+            .map(|(event_key, _)| event_key.into_owned())
+            .collect();
+        self.events.bulk_delete_sorted(event_keys.iter())?;
 
-        let mut modified = false;
-        if let Some(deltas) = self.buffer.get(&key_vec) {
-            for delta in deltas {
-                cell.apply(delta);
-                modified = true;
+        match &mut self.state {
+            State::Ordered(state) => {
+                state.delete(key)?;
+            }
+            State::Unordered(state) => {
+                state.delete(key)?;
             }
         }
 
-        if modified || !cell.is_dummy() {
-            Some(cell)
-        } else {
-            None
+        Ok(existed)
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        match &mut self.state {
+            State::Ordered(state) => state.clear()?,
+            State::Unordered(state) => state.clear()?,
         }
+        self.events.clear()?;
+
+        Ok(())
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-    pub fn sync_enabled(&self) -> bool {
-        self.sync_enabled
-    }
-
-    /// Borrow the backend for read-only operations (range scans, iteration, etc.).
-    pub fn backend(&self) -> &Storage {
-        &self.backend
-    }
-
-    pub fn sync(&mut self) -> io::Result<()> {
-        self.backend.flush()?;
-        self.wal.sync()
-    }
-
-    // --- internal ---
-
-    fn recover_wal(path: &Path) -> io::Result<SkipList<Vec<u8>, Vec<Delta>>> {
-        let mut buffer: SkipList<Vec<u8>, Vec<Delta>> = SkipList::new();
-        if !path.exists() {
-            return Ok(buffer);
+    fn compact(&mut self) -> io::Result<()> {
+        match &mut self.state {
+            State::Ordered(state) => state.compact()?,
+            State::Unordered(state) => state.compact()?,
         }
+        self.events.compact()?;
 
-        let wal = match Wal::open(path, WalConfig::default()) {
-            Ok(w) => w,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(buffer),
-            Err(e) => return Err(e),
-        };
+        Ok(())
+    }
 
-        for entry in wal.into_iter() {
-            let bytes = entry?.data;
-            let (delta, _) = decode_from_slice(&bytes, config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    fn keys<'a>(&'a self) -> impl Iterator<Item = Cow<'a, PrimaryKey>> + 'a
+    where
+        PrimaryKey: 'a,
+    {
+        Backend::entries(self).map(|(key, _)| key)
+    }
 
-            let key = primary_key_bytes(&delta.primary_key);
-            let existing = buffer.get(&key).cloned();
-            buffer.remove(&key);
-            match existing {
-                Some(mut deltas) => {
-                    deltas.push(delta);
-                    buffer.insert(key, deltas);
-                }
-                None => {
-                    buffer.insert(key, vec![delta]);
-                }
+    fn values<'a>(&'a self) -> impl Iterator<Item = Cow<'a, Cell>> + 'a
+    where
+        Cell: 'a,
+    {
+        Backend::entries(self).map(|(_, cell)| cell)
+    }
+
+    fn entries<'a>(&'a self) -> impl Iterator<Item = (Cow<'a, PrimaryKey>, Cow<'a, Cell>)> + 'a
+    where
+        PrimaryKey: 'a,
+        Cell: 'a,
+    {
+        let mut keys = BTreeSet::new();
+        match &self.state {
+            State::Ordered(state) => {
+                keys.extend(state.keys().map(Cow::into_owned));
+            }
+            State::Unordered(state) => {
+                keys.extend(state.keys().map(Cow::into_owned));
             }
         }
+        keys.extend(self.events.keys().map(|key| key.primary_key.clone()));
 
-        let _ = fs::remove_file(path);
-        Ok(buffer)
+        keys.into_iter()
+            .filter_map(|key| Backend::get(self, &key).map(|cell| (Cow::Owned(key), cell)))
     }
-}
 
-fn primary_key_bytes(pk: &PrimaryKey) -> Vec<u8> {
-    encode_to_vec(pk, config::standard()).expect("primary key encode")
-}
+    fn size(&self) -> usize {
+        Backend::entries(self).count()
+    }
 
-fn decode_cell(bytes: Option<&[u8]>) -> Option<Cell> {
-    bytes.and_then(|b| {
-        decode_from_slice(b, config::standard())
-            .ok()
-            .map(|(c, _)| c)
-    })
+    fn stats(&self) -> Self::Stats<'_> {
+        TableStats {
+            state: match &self.state {
+                State::Ordered(state) => StateStats::Ordered(state.stats()),
+                State::Unordered(state) => StateStats::Unordered(state.stats()),
+            },
+            events: self.events.stats(),
+        }
+    }
+
+    fn config(&self) -> &Self::Config {
+        &self.config
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        match &self.state {
+            State::Ordered(state) => state.flush()?,
+            State::Unordered(state) => state.flush()?,
+        }
+        self.events.flush()
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        match &self.state {
+            State::Ordered(state) => state.sync()?,
+            State::Unordered(state) => state.sync()?,
+        }
+        self.events.sync()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use zendb_types::{AtomOp, AtomValue, Hlc, Op, TypeOp};
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    use zendb_types::{Op, Path, Value};
 
-    fn tmp_dir(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("zendb_engine_{}", name));
-        let _ = fs::remove_dir_all(&p);
-        p
+    static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+
+    fn hlc(ms: u64) -> Hlc {
+        Hlc::with_device_id(ms, 0, [1u8; 8]).unwrap()
     }
 
-    fn make_delta(key: &str, val: &str, hlc_ms: u64) -> (Delta, Vec<u8>) {
-        let pk = zendb_types::PrimaryKey::Atom(zendb_types::AtomValue::String(key.into()));
-        let pk_bytes = encode_to_vec(&pk, config::standard()).unwrap();
-        let d = Delta {
-            table_id: "test".into(),
-            primary_key: pk,
-            path: zendb_types::Path::new(),
-            op: Op::Type(TypeOp::Atom(AtomOp::Set(AtomValue::String(val.into())))),
-            hlc: Hlc::with_device_id(hlc_ms, 0, [1u8; 8]).unwrap(),
+    fn tmp_path(name: &str) -> PathBuf {
+        let id = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("zendb_engine_{name}_{id}"))
+    }
+
+    fn delta(key: &str, value: i64, hlc: Hlc) -> Delta {
+        Delta {
+            table_id: "ignored".into(),
+            primary_key: PrimaryKey::String(key.into()),
+            path: Path::new(),
+            op: Op::Replace {
+                value: Value::Int(value),
+            },
+            hlc,
             sync: false,
-            signature: vec![],
-        };
-        (d, pk_bytes)
+            signature: Vec::new(),
+        }
     }
 
     #[test]
-    fn ordered_table() {
-        let dir = tmp_dir("ordered");
-        let cfg = TableConfig::ordered("test");
-        let mut table = Table::open(&dir, &cfg).unwrap();
-        let (d1, k1) = make_delta("k1", "v1", 100);
-        table.apply(d1).unwrap();
-        table.flush().unwrap();
-        assert!(table.get(&k1).is_some());
+    fn event_keys_group_rows_and_order_by_hlc() {
+        let early_delta = delta("a", 1, hlc(100));
+        let late_delta = delta("a", 2, hlc(200));
+        let next_row_delta = delta("b", 3, hlc(50));
+        let (start, end) = EventKey::bounds(&early_delta.primary_key);
+
+        let early = EventKey::from_delta(&early_delta);
+        let late = EventKey::from_delta(&late_delta);
+        let next_row = EventKey::from_delta(&next_row_delta);
+
+        assert!(start < early);
+        assert!(early < late);
+        assert!(late < end);
+        assert!(end < next_row);
     }
 
     #[test]
-    fn unordered_table() {
-        let dir = tmp_dir("unordered");
-        let cfg = TableConfig::unordered("test");
-        let mut table = Table::open(&dir, &cfg).unwrap();
-        let (d1, k1) = make_delta("k1", "v1", 100);
-        table.apply(d1).unwrap();
-        table.flush().unwrap();
-        assert!(table.get(&k1).is_some());
+    fn create_owns_configured_backends() {
+        let path = tmp_path("create");
+        let mut table = Table::create(
+            &path,
+            TableConfig {
+                state: StateConfig::Unordered(KeyDirConfig::default()),
+                ..TableConfig::default()
+            },
+        )
+        .unwrap();
+
+        table.insert_delta(delta("a", 1, hlc(100))).unwrap();
+        let key = PrimaryKey::String("a".into());
+        assert_eq!(
+            Backend::get(&table, &key).unwrap().into_owned().value,
+            Some(Value::Int(1))
+        );
+        let stats = Backend::stats(&table);
+        assert!(matches!(&stats.state, StateStats::Unordered(_)));
+        assert!(stats.events.data_size > 0);
     }
 
     #[test]
-    fn reopen_persists() {
-        let dir = tmp_dir("persist");
-        let cfg = TableConfig::ordered("test");
+    fn open_recovers_state_and_events() {
+        let path = tmp_path("open");
+        let config = TableConfig::default();
         {
-            let mut table = Table::open(&dir, &cfg).unwrap();
-            let (d, _k) = make_delta("k", "val", 100);
-            table.apply(d).unwrap();
-            table.flush().unwrap();
+            let mut table = Table::create(&path, config.clone()).unwrap();
+            table.insert_delta(delta("a", 1, hlc(100))).unwrap();
+            Backend::sync(&table).unwrap();
         }
-        let table = Table::open(&dir, &cfg).unwrap();
-        let (_, k) = make_delta("k", "", 0);
-        assert!(table.get(&k).is_some());
-    }
 
-    #[test]
-    fn ordered_backend_supports_range() {
-        let dir = tmp_dir("range_ordered");
-        let cfg = TableConfig::ordered("test");
-        let mut table = Table::open(&dir, &cfg).unwrap();
-        let mut keys = Vec::new();
-        for i in 0u32..10 {
-            let (d, k) = make_delta(&format!("k{:02}", i), "v", 100 + i as u64);
-            keys.push(k);
-            table.apply(d).unwrap();
-        }
-        table.flush().unwrap();
-        // keys[i] are the encoded PrimaryKey bytes; query the encoded range.
-        let count = table.backend().range(&keys[2], &keys[7]).count();
-        assert_eq!(count, 5);
-    }
-
-    #[test]
-    #[should_panic(expected = "does not support range queries")]
-    fn unordered_backend_panics_on_range() {
-        let dir = tmp_dir("range_unordered");
-        let cfg = TableConfig::unordered("test");
-        let mut table = Table::open(&dir, &cfg).unwrap();
-        let (d, _) = make_delta("k", "v", 100);
-        table.apply(d).unwrap();
-        table.flush().unwrap();
-        // Should panic with `unimplemented!`.
-        let _ = table
-            .backend()
-            .range(&b"a".to_vec(), &b"z".to_vec())
-            .count();
+        let table = Table::open(&path, config).unwrap();
+        let key = PrimaryKey::String("a".into());
+        assert_eq!(
+            Backend::get(&table, &key).unwrap().into_owned().value,
+            Some(Value::Int(1))
+        );
     }
 }

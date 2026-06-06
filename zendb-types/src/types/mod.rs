@@ -1,6 +1,9 @@
 pub mod blob;
 pub mod bool;
 pub mod int;
+pub mod list;
 pub mod record;
+pub mod set;
 pub mod string;
+pub mod text;
 pub mod timestamp;

@@ -876,7 +876,10 @@ where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
 {
-    type Stats = OrderLogStats;
+    type Stats<'a>
+        = &'a OrderLogStats
+    where
+        Self: 'a;
     type Config = OrderLogConfig;
 
     fn get(&self, key: &K) -> Option<Cow<'_, V>> {
@@ -1174,7 +1177,7 @@ where
         self.index.is_empty()
     }
 
-    fn stats(&self) -> &Self::Stats {
+    fn stats(&self) -> Self::Stats<'_> {
         &self.stats
     }
 

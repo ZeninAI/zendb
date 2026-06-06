@@ -5,7 +5,7 @@
 //! ```text
 //! Type          ── Self: Encode + Decode,
 //!                  Op: Encode + Decode, Error, apply(), merge(), max_hlc()
-//! ContainerType ── Type + Segment: Encode + Decode, child_or_insert()
+//! ContainerType ── Type + Segment: Encode + Decode, child_or_default()
 //! ```
 
 use bincode::{Decode, Encode};
@@ -43,7 +43,7 @@ pub trait ContainerType: Type {
     /// `child_tag = Some(tag)` creates a live empty child of that type.
     /// `child_tag = None` creates a tombstone placeholder, useful for path
     /// targeted cell operations such as delete where no value type is known.
-    fn child_or_insert<'a>(
+    fn child_or_default<'a>(
         &'a mut self,
         segment: &Self::Segment,
         child_tag: Option<TypeTag>,

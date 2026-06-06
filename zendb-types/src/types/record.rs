@@ -67,7 +67,7 @@ impl Type for Record {
 impl ContainerType for Record {
     type Segment = RecordSegment;
 
-    fn child_or_insert<'a>(
+    fn child_or_default<'a>(
         &'a mut self,
         segment: &RecordSegment,
         child_tag: Option<TypeTag>,
@@ -93,10 +93,12 @@ mod tests {
     }
 
     #[test]
-    fn record_child_or_insert_creates_field() {
+    fn record_child_or_default_creates_field() {
         let mut state = Record::new();
         let segment: RecordSegment = "x".into();
-        let child = state.child_or_insert(&segment, Some(TypeTag::Int)).unwrap();
+        let child = state
+            .child_or_default(&segment, Some(TypeTag::Int))
+            .unwrap();
         assert_eq!(child.type_tag(), Some(TypeTag::Int));
         assert!(state.get("x").is_some_and(|cell| !cell.is_tombstone()));
     }

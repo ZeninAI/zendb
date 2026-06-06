@@ -61,13 +61,58 @@ impl Cell {
                 .value
                 .as_mut()
                 .expect("ensure_ancestor_container must leave cursor live");
-            cursor = match value.child_or_insert(&step.segment, child_tag) {
+            cursor = match value.child_or_default(&step.segment, child_tag) {
                 Ok(c) => c,
                 Err(_) => return false,
             };
         }
 
-        apply_at_target(cursor, &delta.op, delta.hlc)
+        match &delta.op {
+            Op::Type(type_op) => {
+                let expected = type_op.type_tag();
+                if !ensure_target_type(cursor, expected, delta.hlc) {
+                    return false;
+                }
+                let value = cursor
+                    .value
+                    .as_mut()
+                    .expect("ensure_target_type must leave cursor live");
+                match value.apply(type_op, cursor.hlc, delta.hlc) {
+                    Ok(true) => {
+                        if delta.hlc.beats(cursor.hlc) {
+                            cursor.hlc = delta.hlc;
+                        }
+                        true
+                    }
+                    Ok(false) | Err(_) => false,
+                }
+            }
+            Op::SetSync { sync } => {
+                if cursor.hlc.beats(delta.hlc) {
+                    return false;
+                }
+                cursor.sync = *sync;
+                cursor.hlc = delta.hlc;
+                true
+            }
+            Op::Delete => {
+                if cursor.hlc.beats(delta.hlc) {
+                    return false;
+                }
+                cursor.value = None;
+                cursor.hlc = delta.hlc;
+                true
+            }
+            Op::Replace { value } => {
+                if cursor.hlc.beats(delta.hlc) {
+                    return false;
+                }
+                cursor.value = Some(value.clone());
+                cursor.hlc = delta.hlc;
+                true
+            }
+            Op::Merge { cell } => cursor.merge(cell),
+        }
     }
 
     /// Merge a remote cell into this one.
@@ -129,62 +174,14 @@ impl Cell {
     }
 }
 
-fn apply_at_target(cursor: &mut Cell, op: &Op, op_hlc: Hlc) -> bool {
-    match op {
-        Op::Type(type_op) => {
-            let expected = type_op.type_tag();
-            if !ensure_target_type(cursor, expected, op_hlc) {
-                return false;
-            }
-            let value = cursor
-                .value
-                .as_mut()
-                .expect("ensure_target_type must leave cursor live");
-            match value.apply(type_op, cursor.hlc, op_hlc) {
-                Ok(true) => {
-                    if op_hlc.beats(cursor.hlc) {
-                        cursor.hlc = op_hlc;
-                    }
-                    true
-                }
-                Ok(false) | Err(_) => false,
-            }
-        }
-        Op::SetSync { sync } => {
-            if cursor.hlc.beats(op_hlc) {
-                return false;
-            }
-            cursor.sync = *sync;
-            cursor.hlc = op_hlc;
-            true
-        }
-        Op::Delete => {
-            if cursor.hlc.beats(op_hlc) {
-                return false;
-            }
-            cursor.value = None;
-            cursor.hlc = op_hlc;
-            true
-        }
-        Op::Replace { value } => {
-            if cursor.hlc.beats(op_hlc) {
-                return false;
-            }
-            cursor.value = Some(value.clone());
-            cursor.hlc = op_hlc;
-            true
-        }
-        Op::Merge { cell } => cursor.merge(cell),
-    }
-}
-
 fn ensure_target_type(cursor: &mut Cell, expected: TypeTag, op_hlc: Hlc) -> bool {
     if cursor.type_tag() == Some(expected) {
         return true;
     }
 
     if op_hlc.beats(cursor.max_hlc()) {
-        // Safe to change the value type completed to the segment's one
+        // If types are wrong but the edit is beyond the max_hlc point
+        // Rare occurance
         cursor.value = Some(expected.empty_value());
         cursor.hlc = op_hlc;
         return true;

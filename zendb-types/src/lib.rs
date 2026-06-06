@@ -239,7 +239,7 @@ macro_rules! register_types {
         impl $crate::ContainerType for Value {
             type Segment = Segment;
 
-            fn child_or_insert<'a>(
+            fn child_or_default<'a>(
                 &'a mut self,
                 segment: &Segment,
                 child_tag: Option<TypeTag>,
@@ -248,7 +248,7 @@ macro_rules! register_types {
                 match (self, segment) {
                     $(
                         (Value::$cont_var(v), Segment::$cont_var(s)) => {
-                            v.child_or_insert(s, child_tag)
+                            v.child_or_default(s, child_tag)
                                 .map_err(TypeError::$cont_var)
                         }
                     )*

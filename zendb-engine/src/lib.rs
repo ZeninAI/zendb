@@ -1,8 +1,9 @@
 //! ZeninDB table engine.
 
+pub mod database;
 pub mod table;
 
+pub use database::Database;
 pub use table::{
-    EventKey, EventPosition, FlushConfig, IndexConfig, InsertResult, MaterializeResult,
-    StateConfig, StateStats, Table, TableConfig, TableStats,
+    FlushConfig, StateConfig, StateStats, Table, TableConfig, TableStats, DEFAULT_MAX_EVENTS,
 };

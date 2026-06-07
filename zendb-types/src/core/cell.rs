@@ -21,9 +21,9 @@ impl Cell {
         Cell { value, hlc, sync }
     }
 
-    pub fn dummy(value: Value) -> Cell {
+    pub fn dummy(value: Option<Value>) -> Cell {
         Cell {
-            value: Some(value),
+            value,
             hlc: Hlc::ZERO,
             sync: None,
         }
@@ -215,9 +215,17 @@ mod tests {
 
     #[test]
     fn cell_dummy() {
-        let cell = Cell::dummy(Value::String(String::new()));
+        let cell = Cell::dummy(Some(Value::String(String::new())));
         assert!(cell.is_dummy());
         assert!(!cell.is_tombstone());
+        assert_eq!(cell.sync, None);
+    }
+
+    #[test]
+    fn cell_dummy_tombstone() {
+        let cell = Cell::dummy(None);
+        assert!(cell.is_dummy());
+        assert!(cell.is_tombstone());
         assert_eq!(cell.sync, None);
     }
 
@@ -233,7 +241,7 @@ mod tests {
 
     #[test]
     fn replace_scalar() {
-        let mut cell = Cell::dummy(Value::String(String::new()));
+        let mut cell = Cell::dummy(Some(Value::String(String::new())));
         assert!(cell.apply(&delta(
             Path::new(),
             Op::Replace {

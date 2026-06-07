@@ -74,7 +74,7 @@ impl ContainerType for Record {
     ) -> Result<&'a mut Cell, RecordError> {
         if !self.contains_key(segment) {
             let cell = child_tag
-                .map(|tag| Cell::dummy(tag.empty_value()))
+                .map(|tag| Cell::dummy(Some(tag.empty_value())))
                 .unwrap_or_else(|| Cell::new(None, Hlc::ZERO, None));
             self.insert(segment.clone(), cell);
         }

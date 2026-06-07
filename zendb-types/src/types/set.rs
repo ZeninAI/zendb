@@ -1,75 +1,56 @@
-//! Set - an HLC-based last-writer-wins element set.
+//! Set - a deduplicated collection of primary-key-typed values.
+//!
+//! Every element is identified by its [`PrimaryKey`]. Membership is resolved
+//! via per-element LWW metadata: an element is live when `updated > deleted`.
 
 use std::collections::BTreeMap;
 
 use bincode::{Decode, Encode};
 
-use crate::{core::traits::Type, Hlc};
+use crate::{core::traits::Type, Hlc, PrimaryKey};
 
-/// Scalar values accepted as set members.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
-pub enum SetValue {
-    Bool(bool),
-    Int(i64),
-    String(String),
-    Timestamp(u64),
-    Blob(Vec<u8>),
+/// Per-element LWW clock pair that determines set membership.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct Meta {
+    /// HLC of the latest Add operation targeting this element.
+    pub updated: Hlc,
+    /// HLC of the latest Remove operation targeting this element.
+    pub deleted: Hlc,
 }
 
-impl From<bool> for SetValue {
-    fn from(value: bool) -> SetValue {
-        SetValue::Bool(value)
+impl Meta {
+    pub const fn new(updated: Hlc, deleted: Hlc) -> Self {
+        Self { updated, deleted }
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.updated > self.deleted
     }
 }
 
-impl From<i64> for SetValue {
-    fn from(value: i64) -> SetValue {
-        SetValue::Int(value)
+impl Default for Meta {
+    fn default() -> Self {
+        Self {
+            updated: Hlc::ZERO,
+            deleted: Hlc::ZERO,
+        }
     }
 }
 
-impl From<String> for SetValue {
-    fn from(value: String) -> SetValue {
-        SetValue::String(value)
-    }
-}
-
-impl From<&str> for SetValue {
-    fn from(value: &str) -> SetValue {
-        SetValue::String(value.into())
-    }
-}
-
-impl From<Vec<u8>> for SetValue {
-    fn from(value: Vec<u8>) -> SetValue {
-        SetValue::Blob(value)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Encode, Decode)]
-pub struct SetEntry {
-    pub added_at: Option<Hlc>,
-    pub removed_at: Option<Hlc>,
-}
-
-pub type Set = BTreeMap<SetValue, SetEntry>;
+pub type Set = BTreeMap<PrimaryKey, Meta>;
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum SetOp {
-    Add(SetValue),
-    Remove(SetValue),
+    Add { key: PrimaryKey },
+    Remove { key: PrimaryKey },
 }
 
 #[derive(Debug)]
-pub enum SetError {
-    ZeroClock,
-}
+pub enum SetError {}
 
 impl std::fmt::Display for SetError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SetError::ZeroClock => f.write_str("set operation HLC cannot be Hlc::ZERO"),
-        }
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {}
     }
 }
 
@@ -80,39 +61,47 @@ impl Type for Set {
     type Error = SetError;
 
     fn apply(&mut self, op: &SetOp, _local_hlc: Hlc, op_hlc: Hlc) -> Result<bool, SetError> {
-        if op_hlc == Hlc::ZERO {
-            return Err(SetError::ZeroClock);
-        }
-
-        let (value, is_add) = match op {
-            SetOp::Add(value) => (value, true),
-            SetOp::Remove(value) => (value, false),
-        };
-        let entry = self.entry(value.clone()).or_default();
-        let clock = if is_add {
-            &mut entry.added_at
-        } else {
-            &mut entry.removed_at
-        };
-
-        if clock.is_none_or(|current| op_hlc.beats(current)) {
-            *clock = Some(op_hlc);
-            Ok(true)
-        } else {
-            Ok(false)
+        match op {
+            SetOp::Add { key } => {
+                let meta = self.entry(key.clone()).or_default();
+                if op_hlc.beats(meta.updated) {
+                    meta.updated = op_hlc;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            SetOp::Remove { key } => {
+                let meta = self.entry(key.clone()).or_default();
+                if op_hlc.beats(meta.deleted) {
+                    meta.deleted = op_hlc;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
         }
     }
 
     fn merge(&mut self, remote: &Set, _local_hlc: Hlc, _remote_hlc: Hlc) -> Result<bool, SetError> {
         let mut changed = false;
 
-        for (value, remote_entry) in remote {
-            let local_entry = self.entry(value.clone()).or_default();
-            if merge_clock(&mut local_entry.added_at, remote_entry.added_at) {
-                changed = true;
-            }
-            if merge_clock(&mut local_entry.removed_at, remote_entry.removed_at) {
-                changed = true;
+        for (key, remote_meta) in remote {
+            match self.get_mut(key) {
+                Some(local_meta) => {
+                    if remote_meta.updated.beats(local_meta.updated) {
+                        local_meta.updated = remote_meta.updated;
+                        changed = true;
+                    }
+                    if remote_meta.deleted.beats(local_meta.deleted) {
+                        local_meta.deleted = remote_meta.deleted;
+                        changed = true;
+                    }
+                }
+                None => {
+                    self.insert(key.clone(), remote_meta.clone());
+                    changed = true;
+                }
             }
         }
 
@@ -120,40 +109,19 @@ impl Type for Set {
     }
 
     fn max_hlc(&self) -> Hlc {
-        self.values().fold(Hlc::ZERO, |max, entry| {
-            std::cmp::max(
-                max,
-                std::cmp::max(
-                    entry.added_at.unwrap_or(Hlc::ZERO),
-                    entry.removed_at.unwrap_or(Hlc::ZERO),
-                ),
-            )
+        self.values().fold(Hlc::ZERO, |max, meta| {
+            max.max(meta.updated).max(meta.deleted)
         })
     }
 }
 
-/// True when the latest add is at least as new as the latest remove.
-pub fn set_contains(set: &Set, value: &SetValue) -> bool {
-    set.get(value).is_some_and(|entry| match entry.added_at {
-        Some(added) => entry.removed_at.is_none_or(|removed| added >= removed),
-        None => false,
-    })
+pub fn set_contains_key(set: &Set, key: &PrimaryKey) -> bool {
+    set.get(key).is_some_and(|meta| meta.is_live())
 }
 
-pub fn set_values(set: &Set) -> impl Iterator<Item = &SetValue> {
-    set.keys().filter(|value| set_contains(set, value))
-}
-
-fn merge_clock(local: &mut Option<Hlc>, remote: Option<Hlc>) -> bool {
-    let Some(remote) = remote else {
-        return false;
-    };
-    if local.is_none_or(|current| remote.beats(current)) {
-        *local = Some(remote);
-        true
-    } else {
-        false
-    }
+pub fn set_keys(set: &Set) -> impl Iterator<Item = &PrimaryKey> {
+    set.iter()
+        .filter_map(|(key, meta)| meta.is_live().then_some(key))
 }
 
 #[cfg(test)]
@@ -177,53 +145,158 @@ mod tests {
     }
 
     #[test]
-    fn add_remove_and_readd_follow_latest_clock() {
-        let value = SetValue::String("tag".into());
+    fn add_makes_element_live() {
         let mut set = Set::new();
-        assert!(apply(&mut set, SetOp::Add(value.clone()), hlc(100, 1)));
-        assert!(set_contains(&set, &value));
-        assert!(apply(&mut set, SetOp::Remove(value.clone()), hlc(200, 1)));
-        assert!(!set_contains(&set, &value));
-        assert!(apply(&mut set, SetOp::Add(value.clone()), hlc(300, 1)));
-        assert!(set_contains(&set, &value));
+        apply(
+            &mut set,
+            SetOp::Add {
+                key: PrimaryKey::Int(1),
+            },
+            hlc(100, 1),
+        );
+
+        assert!(set_contains_key(&set, &PrimaryKey::Int(1)));
+        assert_eq!(set_keys(&set).count(), 1);
     }
 
     #[test]
-    fn stale_and_duplicate_operations_are_ignored() {
-        let value = SetValue::Int(1);
+    fn remove_tombstones_element() {
+        let key = PrimaryKey::String("x".into());
         let mut set = Set::new();
-        assert!(apply(&mut set, SetOp::Add(value.clone()), hlc(200, 1)));
-        assert!(!apply(&mut set, SetOp::Add(value.clone()), hlc(100, 1)));
-        assert!(!apply(&mut set, SetOp::Add(value.clone()), hlc(200, 1)));
-        assert!(set_contains(&set, &value));
+        apply(&mut set, SetOp::Add { key: key.clone() }, hlc(100, 1));
+        apply(&mut set, SetOp::Remove { key: key.clone() }, hlc(200, 1));
+
+        assert!(!set_contains_key(&set, &key));
+        assert_eq!(set_keys(&set).count(), 0);
     }
 
     #[test]
-    fn exact_tie_is_add_wins() {
-        let value = SetValue::Bool(true);
-        let at = hlc(100, 1);
+    fn duplicate_add_is_idempotent() {
+        let key = PrimaryKey::Bool(true);
         let mut set = Set::new();
-        apply(&mut set, SetOp::Remove(value.clone()), at);
-        apply(&mut set, SetOp::Add(value.clone()), at);
-        assert!(set_contains(&set, &value));
+        assert!(apply(
+            &mut set,
+            SetOp::Add { key: key.clone() },
+            hlc(100, 1)
+        ));
+        assert!(!apply(
+            &mut set,
+            SetOp::Add { key: key.clone() },
+            hlc(100, 1)
+        ));
+        assert_eq!(set.len(), 1);
     }
 
     #[test]
-    fn remove_before_add_is_retained() {
-        let value = SetValue::Timestamp(42);
+    fn stale_add_does_not_resurrect_tombstone() {
+        let key = PrimaryKey::Timestamp(42);
         let mut set = Set::new();
-        apply(&mut set, SetOp::Remove(value.clone()), hlc(200, 2));
-        apply(&mut set, SetOp::Add(value.clone()), hlc(100, 1));
-        assert!(!set_contains(&set, &value));
+        apply(&mut set, SetOp::Add { key: key.clone() }, hlc(100, 1));
+        apply(&mut set, SetOp::Remove { key: key.clone() }, hlc(200, 2));
+        // Stale Add at 150 beats the old Add at 100, so meta.updated is raised.
+        // But deleted=200 still dominates, so the element stays dead.
+        assert!(apply(
+            &mut set,
+            SetOp::Add { key: key.clone() },
+            hlc(150, 3)
+        ));
+        assert!(!set_contains_key(&set, &key));
+    }
+
+    #[test]
+    fn newer_add_beats_stale_remove() {
+        let key = PrimaryKey::Blob(vec![1, 2, 3]);
+        let mut set = Set::new();
+        apply(&mut set, SetOp::Remove { key: key.clone() }, hlc(100, 1));
+        apply(&mut set, SetOp::Add { key: key.clone() }, hlc(200, 2));
+
+        assert!(set_contains_key(&set, &key));
+    }
+
+    #[test]
+    fn remove_before_first_add_is_visible_as_tombstone() {
+        let key = PrimaryKey::Int(0);
+        let mut set = Set::new();
+        apply(&mut set, SetOp::Remove { key: key.clone() }, hlc(200, 2));
+        apply(&mut set, SetOp::Add { key: key.clone() }, hlc(100, 1));
+
+        assert!(!set_contains_key(&set, &key));
+    }
+
+    #[test]
+    fn different_types_are_distinct_elements() {
+        let mut set = Set::new();
+        apply(
+            &mut set,
+            SetOp::Add {
+                key: PrimaryKey::String("42".into()),
+            },
+            hlc(100, 1),
+        );
+        apply(
+            &mut set,
+            SetOp::Add {
+                key: PrimaryKey::Int(42),
+            },
+            hlc(100, 2),
+        );
+
+        assert_eq!(set_keys(&set).count(), 2);
+    }
+
+    #[test]
+    fn all_primary_key_types_are_accepted() {
+        let mut set = Set::new();
+        apply(
+            &mut set,
+            SetOp::Add {
+                key: PrimaryKey::Bool(true),
+            },
+            hlc(100, 1),
+        );
+        apply(
+            &mut set,
+            SetOp::Add {
+                key: PrimaryKey::Int(1),
+            },
+            hlc(100, 1),
+        );
+        apply(
+            &mut set,
+            SetOp::Add {
+                key: PrimaryKey::String("s".into()),
+            },
+            hlc(100, 1),
+        );
+        apply(
+            &mut set,
+            SetOp::Add {
+                key: PrimaryKey::Timestamp(0),
+            },
+            hlc(100, 1),
+        );
+        apply(
+            &mut set,
+            SetOp::Add {
+                key: PrimaryKey::Blob(vec![1, 2, 3]),
+            },
+            hlc(100, 1),
+        );
+
+        assert_eq!(set_keys(&set).count(), 5);
     }
 
     #[test]
     fn merge_converges_for_every_replica_order() {
-        let value = SetValue::Blob(vec![1, 2, 3]);
+        let key = PrimaryKey::String("shared".into());
         let mut sets = [Set::new(), Set::new(), Set::new()];
-        apply(&mut sets[0], SetOp::Add(value.clone()), hlc(100, 1));
-        apply(&mut sets[1], SetOp::Remove(value.clone()), hlc(200, 2));
-        apply(&mut sets[2], SetOp::Add(value.clone()), hlc(300, 3));
+        apply(&mut sets[0], SetOp::Add { key: key.clone() }, hlc(100, 1));
+        apply(
+            &mut sets[1],
+            SetOp::Remove { key: key.clone() },
+            hlc(200, 2),
+        );
+        apply(&mut sets[2], SetOp::Add { key: key.clone() }, hlc(300, 3));
 
         let orders = [
             [0, 1, 2],
@@ -237,43 +310,64 @@ mod tests {
         for order in orders.into_iter().skip(1) {
             assert_eq!(merge_order(&sets, order), expected);
         }
-        assert!(set_contains(&expected, &value));
+        // hlc(300,3) Add beats hlc(200,2) Remove — element is live
+        assert!(set_contains_key(&expected, &key));
     }
 
     #[test]
-    fn values_returns_only_visible_members_in_key_order() {
-        let mut set = Set::new();
-        apply(&mut set, SetOp::Add(SetValue::Int(2)), hlc(100, 1));
-        apply(&mut set, SetOp::Add(SetValue::Int(1)), hlc(100, 2));
-        apply(&mut set, SetOp::Remove(SetValue::Int(2)), hlc(200, 1));
+    fn merge_deleted_then_readded_by_different_peers_converges() {
+        let key = PrimaryKey::String("tag".into());
+        let mut sets = [Set::new(), Set::new(), Set::new()];
+        apply(&mut sets[0], SetOp::Add { key: key.clone() }, hlc(100, 1)); // add
+        apply(
+            &mut sets[1],
+            SetOp::Remove { key: key.clone() },
+            hlc(200, 2),
+        ); // remove
+        apply(&mut sets[2], SetOp::Add { key: key.clone() }, hlc(150, 3)); // stale add
 
-        assert_eq!(
-            set_values(&set).cloned().collect::<Vec<_>>(),
-            vec![SetValue::Int(1)]
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let expected = merge_order(&sets, orders[0]);
+        for order in orders.into_iter().skip(1) {
+            assert_eq!(merge_order(&sets, order), expected);
+        }
+        // hlc(200,2) Remove beats hlc(150,3) stale Add — element is dead
+        assert!(!set_contains_key(&expected, &key));
+    }
+
+    #[test]
+    fn max_hlc_tracks_highest_clock_across_both_fields() {
+        let mut set = Set::new();
+        apply(
+            &mut set,
+            SetOp::Add {
+                key: PrimaryKey::Int(1),
+            },
+            hlc(100, 1),
         );
-    }
+        apply(
+            &mut set,
+            SetOp::Remove {
+                key: PrimaryKey::Int(1),
+            },
+            hlc(300, 2),
+        );
+        apply(
+            &mut set,
+            SetOp::Add {
+                key: PrimaryKey::Int(2),
+            },
+            hlc(200, 1),
+        );
 
-    #[test]
-    fn common_scalar_values_convert_directly() {
-        assert_eq!(SetValue::from(true), SetValue::Bool(true));
-        assert_eq!(SetValue::from(42_i64), SetValue::Int(42));
-        assert_eq!(SetValue::from("tag"), SetValue::String("tag".into()));
-        assert_eq!(SetValue::from(vec![1, 2, 3]), SetValue::Blob(vec![1, 2, 3]));
-    }
-
-    #[test]
-    fn zero_clock_is_rejected() {
-        let mut set = Set::new();
-        assert!(matches!(
-            Type::apply(
-                &mut set,
-                &SetOp::Add(SetValue::Bool(true)),
-                Hlc::ZERO,
-                Hlc::ZERO,
-            ),
-            Err(SetError::ZeroClock)
-        ));
-        assert!(set.is_empty());
+        assert_eq!(set.max_hlc(), hlc(300, 2));
     }
 
     #[test]
@@ -281,12 +375,23 @@ mod tests {
         let mut set = Set::new();
         apply(
             &mut set,
-            SetOp::Add(SetValue::String("visible".into())),
+            SetOp::Add {
+                key: PrimaryKey::String("live".into()),
+            },
             hlc(100, 1),
         );
         apply(
             &mut set,
-            SetOp::Remove(SetValue::String("deleted".into())),
+            SetOp::Add {
+                key: PrimaryKey::String("dead".into()),
+            },
+            hlc(100, 2),
+        );
+        apply(
+            &mut set,
+            SetOp::Remove {
+                key: PrimaryKey::String("dead".into()),
+            },
             hlc(200, 2),
         );
 

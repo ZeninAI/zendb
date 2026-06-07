@@ -1233,20 +1233,24 @@ where
         Some((Cow::Borrowed(&node.key), Cow::Borrowed(&node.value)))
     }
 
-    fn entries_rev(&self) -> impl Iterator<Item = (Cow<'_, K>, Cow<'_, V>)> + '_
+    fn entries_rev<'a>(&'a self) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
     where
-        K: 'static,
-        V: 'static,
+        K: 'a,
+        V: 'a,
     {
         self.index
             .iter_rev()
             .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
     }
 
-    fn range_rev(&self, start: &K, end: &K) -> impl Iterator<Item = (Cow<'_, K>, Cow<'_, V>)> + '_
+    fn range_rev<'a>(
+        &'a self,
+        start: &K,
+        end: &K,
+    ) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
     where
-        K: 'static,
-        V: 'static,
+        K: 'a,
+        V: 'a,
     {
         self.index
             .range_rev(start.clone(), end)

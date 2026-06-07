@@ -339,14 +339,10 @@ where
     /// in their on-disk format may override for true streaming reverse
     /// iteration.
     ///
-    /// The `'static` bound on `K` and `V` lets the default's owned
-    /// `Vec::into_iter` satisfy the iterator's lifetime; all of our
-    /// concrete K/V (Vec<u8>, primitives, derive-bincode structs) are
-    /// `'static`.
-    fn entries_rev(&self) -> impl Iterator<Item = (Cow<'_, K>, Cow<'_, V>)> + '_
+    fn entries_rev<'a>(&'a self) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
     where
-        K: 'static,
-        V: 'static,
+        K: 'a,
+        V: 'a,
     {
         let mut v: Vec<(K, V)> = self
             .entries()
@@ -360,10 +356,14 @@ where
     /// order. Default implementation materializes the forward range into a
     /// `Vec` then reverses (O(n) memory). Backends with prev-pointer support
     /// may override for true streaming reverse iteration.
-    fn range_rev(&self, start: &K, end: &K) -> impl Iterator<Item = (Cow<'_, K>, Cow<'_, V>)> + '_
+    fn range_rev<'a>(
+        &'a self,
+        start: &K,
+        end: &K,
+    ) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
     where
-        K: 'static,
-        V: 'static,
+        K: 'a,
+        V: 'a,
     {
         let mut v: Vec<(K, V)> = self
             .range(start, end)

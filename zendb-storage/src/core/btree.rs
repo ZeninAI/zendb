@@ -2374,18 +2374,17 @@ where
         }
         let page = self.rightmost_nonempty_leaf()?;
         let last_slot = rd_u16(&self.page_bytes(page)[2..4]) as usize - 1;
-        let k: K =
-            deserialize_from(self.key_bytes_at(page, last_slot)).expect("valid encoded key");
+        let k: K = deserialize_from(self.key_bytes_at(page, last_slot)).expect("valid encoded key");
         let v: V =
             deserialize_from(self.value_bytes_at(page, last_slot)).expect("valid encoded value");
         Some((Cow::Owned(k), Cow::Owned(v)))
     }
 
     /// Streaming reverse iteration via `prev_leaf`.
-    fn entries_rev(&self) -> impl Iterator<Item = (Cow<'_, K>, Cow<'_, V>)> + '_
+    fn entries_rev<'a>(&'a self) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
     where
-        K: 'static,
-        V: 'static,
+        K: 'a,
+        V: 'a,
     {
         let page = if self.size() == 0 {
             0
@@ -2406,14 +2405,14 @@ where
     }
 
     /// Streaming `[start, end)` in descending order.
-    fn range_rev(
-        &self,
+    fn range_rev<'a>(
+        &'a self,
         start: &K,
         end: &K,
-    ) -> impl Iterator<Item = (Cow<'_, K>, Cow<'_, V>)> + '_
+    ) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
     where
-        K: 'static,
-        V: 'static,
+        K: 'a,
+        V: 'a,
     {
         let Ok(start_bytes) = serialize_to_vec(start) else {
             return BTreeRangeRev {

@@ -295,7 +295,7 @@ pub use types::list::{
     ListSegment,
 };
 pub use types::record::{Record, RecordError, RecordOp, RecordSegment};
-pub use types::set::{set_contains, set_values, Set, SetEntry, SetError, SetOp, SetValue};
+pub use types::set::{set_contains_key, set_keys, Meta, Set, SetError, SetOp};
 pub use types::string::{String, StringError, StringOp};
 pub use types::text::{
     text_id_at, text_string, text_visible_ids, Text, TextEntry, TextError, TextId, TextOp,

@@ -1,7 +1,7 @@
 # ZeninDB Product Requirements and Architectural Design
 
-> **Document status:** Living product and architecture specification  
-> **Repository status reflected:** Current working tree, including the in-progress `Database` implementation  
+> **Document status:** Living product and architecture specification
+> **Repository status reflected:** Current working tree, including the in-progress `Database` implementation
 > **Primary audience:** ZeninDB maintainers and contributors designing the type system, storage engine, table engine, replication layer, and future streaming consumer runtime
 
 ---

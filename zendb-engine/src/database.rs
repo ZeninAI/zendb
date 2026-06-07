@@ -15,7 +15,8 @@
 //! table on demand without the caller re-supplying its config.
 
 use std::{
-    collections::{HashMap, HashSet},
+    borrow::Cow,
+    collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
 };
@@ -33,10 +34,6 @@ const META_FILE: &str = "_meta";
 pub struct Database {
     path: PathBuf,
     catalog: KeyDir<String, TableConfig>,
-    /// Mirror of the catalog's key set so we can hand out borrowed
-    /// `&str`s in `all_tables()` without depending on what `Cow`
-    /// variant `KeyDir::keys` happens to yield.
-    names: HashSet<String>,
     tables: HashMap<String, Table>,
 }
 
@@ -49,7 +46,6 @@ impl Database {
         Ok(Self {
             path: path.to_path_buf(),
             catalog,
-            names: HashSet::new(),
             tables: HashMap::new(),
         })
     }
@@ -60,11 +56,9 @@ impl Database {
     pub fn open(path: &Path) -> io::Result<Self> {
         let catalog: KeyDir<String, TableConfig> =
             KeyDir::open(&path.join(META_FILE), KeyDirConfig::default())?;
-        let names = catalog.keys().map(|k| k.into_owned()).collect();
         Ok(Self {
             path: path.to_path_buf(),
             catalog,
-            names,
             tables: HashMap::new(),
         })
     }
@@ -89,8 +83,6 @@ impl Database {
                 format!("table {name:?} already exists in catalog"),
             ));
         }
-        self.catalog.sync()?;
-        self.names.insert(name.to_string());
 
         let table = Table::create(&self.path.join(name), config)?;
         Ok(self.tables.entry(name.to_string()).or_insert(table))
@@ -128,14 +120,52 @@ impl Database {
         self.tables.get_mut(name)
     }
 
+    /// Drop the table named `name`: closes its in-memory handle (if
+    /// any), removes its catalog entry, and recursively deletes its
+    /// on-disk directory. Returns `NotFound` if the catalog has no
+    /// entry for `name`.
+    ///
+    /// Ordering matters: the in-memory handle is closed first so the
+    /// underlying mmaps are unmapped before we try to remove the
+    /// files (Windows refuses to delete files backed by an open
+    /// mapping). A missing on-disk directory is tolerated — that just
+    /// means a previous drop attempt was interrupted after the
+    /// catalog write.
+    pub fn drop_table(&mut self, name: &str) -> io::Result<()> {
+        if !self.catalog.contains(&name.to_string()) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no table {name:?} in catalog"),
+            ));
+        }
+
+        // 1. Close the in-memory handle so mmaps are unmapped.
+        self.tables.remove(name);
+
+        // 2. Remove the catalog entry. If this fails, the on-disk
+        //    directory is still intact and the user can retry.
+        self.catalog.delete(&name.to_string())?;
+
+        // 3. Remove the on-disk directory. Tolerate `NotFound` so a
+        //    previously-interrupted drop can be completed cleanly.
+        match fs::remove_dir_all(self.path.join(name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Names of every table known to the catalog (loaded or not).
-    pub fn all_tables(&self) -> impl Iterator<Item = &str> + '_ {
-        self.names.iter().map(String::as_str)
+    pub fn all_tables(&self) -> impl Iterator<Item = Cow<'_, str>> + '_ {
+        self.catalog.keys().map(|k| match k {
+            Cow::Borrowed(s) => Cow::Borrowed(s.as_str()),
+            Cow::Owned(s) => Cow::Owned(s),
+        })
     }
 
     /// Names of tables currently held in memory.
-    pub fn all_open_tables(&self) -> impl Iterator<Item = &str> + '_ {
-        self.tables.keys().map(String::as_str)
+    pub fn all_open_tables(&self) -> impl Iterator<Item = Cow<'_, str>> + '_ {
+        self.tables.keys().map(|s| Cow::Borrowed(s.as_str()))
     }
 }
 
@@ -279,20 +309,91 @@ mod tests {
             db.create_table("c", TableConfig::default()).unwrap();
         }
         let mut db = Database::open(&path).unwrap();
-        let mut all: Vec<&str> = db.all_tables().collect();
+        let mut all: Vec<String> = db.all_tables().map(|c| c.into_owned()).collect();
         all.sort();
         assert_eq!(all, vec!["a", "b", "c"]);
         assert_eq!(db.all_open_tables().count(), 0);
 
         db.open_table("b").unwrap();
         db.open_table("a").unwrap();
-        let mut open: Vec<&str> = db.all_open_tables().collect();
+        let mut open: Vec<String> = db.all_open_tables().map(|c| c.into_owned()).collect();
         open.sort();
         assert_eq!(open, vec!["a", "b"]);
 
         // Catalog list is unchanged by what's open.
-        let mut all: Vec<&str> = db.all_tables().collect();
+        let mut all: Vec<String> = db.all_tables().map(|c| c.into_owned()).collect();
         all.sort();
         assert_eq!(all, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn drop_table_removes_handle_catalog_and_directory() {
+        let path = tmp_db("drop_basic");
+        let mut db = Database::create(&path).unwrap();
+        let t = db.create_table("victim", TableConfig::default()).unwrap();
+        t.insert_delta(delta("victim", "k", 1, hlc(100))).unwrap();
+        assert!(path.join("victim").is_dir());
+
+        db.drop_table("victim").unwrap();
+
+        assert!(db.get_table("victim").is_none());
+        assert_eq!(db.all_tables().count(), 0);
+        assert_eq!(db.all_open_tables().count(), 0);
+        assert!(!path.join("victim").exists());
+    }
+
+    #[test]
+    fn drop_table_works_when_table_was_never_loaded() {
+        let path = tmp_db("drop_unloaded");
+        {
+            let mut db = Database::create(&path).unwrap();
+            db.create_table("t", TableConfig::default()).unwrap();
+        }
+        let mut db = Database::open(&path).unwrap();
+        assert!(db.get_table("t").is_none(), "lazy");
+        db.drop_table("t").unwrap();
+        assert!(!path.join("t").exists());
+        assert_eq!(db.all_tables().count(), 0);
+    }
+
+    #[test]
+    fn drop_table_errors_on_missing() {
+        let path = tmp_db("drop_missing");
+        let mut db = Database::create(&path).unwrap();
+        let err = db.drop_table("ghost").err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn drop_table_then_recreate_with_same_name() {
+        let path = tmp_db("drop_recreate");
+        let mut db = Database::create(&path).unwrap();
+        {
+            let t = db.create_table("t", TableConfig::default()).unwrap();
+            t.insert_delta(delta("t", "k", 7, hlc(100))).unwrap();
+        }
+        db.drop_table("t").unwrap();
+
+        // Recreating must not see any of the old data.
+        let t = db.create_table("t", TableConfig::default()).unwrap();
+        assert!(Backend::get(t, &PrimaryKey::String("k".into())).is_none());
+        assert_eq!(Backend::size(t), 0);
+    }
+
+    #[test]
+    fn drop_table_tolerates_missing_directory() {
+        let path = tmp_db("drop_no_dir");
+        let mut db = Database::create(&path).unwrap();
+        db.create_table("t", TableConfig::default()).unwrap();
+        // Close the handle and nuke the directory out from under the
+        // catalog to simulate an interrupted previous drop.
+        db.get_table_mut("t");
+        // Drop the handle so mmaps release before we delete files.
+        let _ = db.tables.remove("t");
+        fs::remove_dir_all(path.join("t")).unwrap();
+
+        // Should still succeed, leaving the catalog clean.
+        db.drop_table("t").unwrap();
+        assert_eq!(db.all_tables().count(), 0);
     }
 }

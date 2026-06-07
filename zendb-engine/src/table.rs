@@ -318,22 +318,28 @@ impl Table {
         // mid-loop I/O failure leaves the in-memory cache intact —
         // otherwise reads in this process would no longer see pending
         // edits even though the events log still contains them.
+        //
+        // Durability uses `flush` (async writeback hint), not `sync`.
+        // Under app-only crash failure modes the kernel still owns the
+        // dirty pages and will finish writeback regardless of our
+        // process exiting; under OS crash / power loss we'd need
+        // ordered `sync`s to be safe, but that's out of scope.
         match &mut self.state {
             State::Ordered(state) => {
                 for (pk, (cell, _)) in &self.cache {
                     state.put(pk.clone(), cell.clone())?;
                 }
-                state.sync()?;
+                state.flush()?;
             }
             State::Unordered(state) => {
                 for (pk, (cell, _)) in &self.cache {
                     state.put(pk.clone(), cell.clone())?;
                 }
-                state.sync()?;
+                state.flush()?;
             }
         }
         self.events.clear()?;
-        self.events.sync()?;
+        self.events.flush()?;
         self.cache.clear();
         self.novel_pending = 0;
 

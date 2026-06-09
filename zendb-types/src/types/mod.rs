@@ -1,7 +1,11 @@
 pub mod blob;
 pub mod bool;
+pub mod counter;
 pub mod int;
 pub mod list;
+pub mod mv_register;
+pub mod or_set;
+pub mod priority_queue;
 pub mod record;
 pub mod set;
 pub mod string;

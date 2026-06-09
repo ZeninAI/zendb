@@ -4,19 +4,38 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bincode::{Decode, Encode};
 
-use crate::{core::traits::Type, Hlc};
+use crate::{core::traits::Type, Hlc, Value};
 
 /// Stable character identity: insert operation HLC plus character offset.
 pub type TextId = (Hlc, u32);
 pub type Text = BTreeMap<TextId, TextEntry>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct TextEntry {
     pub after: Option<TextId>,
     pub character: Option<char>,
     pub content_known: bool,
     pub deleted_at: Option<Hlc>,
+    /// Per-character formatting attributes with per-key LWW clocks.
+    /// Each entry is (format_value, operation_hlc). Merge picks the value
+    /// with the higher HLC for each key, so concurrent format operations
+    /// targeting the same key converge deterministically.
+    ///
+    /// Reference: Litt, Lim, Kleppmann & van Hardenberg. "Peritext: A CRDT
+    /// for collaborative rich text editing." CSCW 2022.
+    pub attrs: std::collections::BTreeMap<String, (Value, Hlc)>,
 }
+
+impl PartialEq for TextEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.after == other.after
+            && self.character == other.character
+            && self.content_known == other.content_known
+            && self.deleted_at == other.deleted_at
+    }
+}
+
+impl Eq for TextEntry {}
 
 impl TextEntry {
     fn inserted(after: Option<TextId>, character: char) -> TextEntry {
@@ -25,6 +44,7 @@ impl TextEntry {
             character: Some(character),
             content_known: true,
             deleted_at: None,
+            attrs: BTreeMap::new(),
         }
     }
 
@@ -34,14 +54,34 @@ impl TextEntry {
             character: None,
             content_known: false,
             deleted_at: Some(deleted_at),
+            attrs: BTreeMap::new(),
         }
+    }
+
+    /// Look up a formatting attribute value.
+    pub fn attr(&self, key: &str) -> Option<&Value> {
+        self.attrs.get(key).map(|(v, _)| v)
     }
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum TextOp {
-    Insert { after: Option<TextId>, text: String },
-    Delete { ids: Vec<TextId> },
+    Insert {
+        after: Option<TextId>,
+        text: String,
+    },
+    Delete {
+        ids: Vec<TextId>,
+    },
+    /// Apply or remove formatting on a character range.
+    /// `start` is inclusive, `end` is exclusive.
+    /// `value = None` removes the key from affected characters.
+    Format {
+        start: Option<TextId>,
+        end: Option<TextId>,
+        key: String,
+        value: Option<Value>,
+    },
 }
 
 #[derive(Debug)]
@@ -51,6 +91,7 @@ pub enum TextError {
     SelfAnchor,
     TooLong,
     InsertConflict { id: TextId },
+    FormatTargetUnknown { id: TextId },
 }
 
 impl std::fmt::Display for TextError {
@@ -62,6 +103,9 @@ impl std::fmt::Display for TextError {
             TextError::TooLong => f.write_str("text insert exceeds u32::MAX characters"),
             TextError::InsertConflict { id } => {
                 write!(f, "text character {id:?} has conflicting insert content")
+            }
+            TextError::FormatTargetUnknown { id } => {
+                write!(f, "format target character {id:?} does not exist")
             }
         }
     }
@@ -132,6 +176,49 @@ impl Type for Text {
                 }
                 Ok(changed)
             }
+            TextOp::Format {
+                start,
+                end,
+                key,
+                value,
+            } => {
+                let visible = text_visible_ids(self);
+                let in_range = visible
+                    .iter()
+                    .skip_while(|id| start.is_some_and(|s| **id < s))
+                    .take_while(|id| end.is_none_or(|e| **id < e));
+
+                let mut changed = false;
+                for id in in_range {
+                    let entry = self
+                        .get_mut(id)
+                        .ok_or(TextError::FormatTargetUnknown { id: *id })?;
+                    match value {
+                        Some(v) => {
+                            let should_update = match entry.attrs.get(key) {
+                                Some((_, existing_hlc)) => op_hlc.beats(*existing_hlc),
+                                None => true,
+                            };
+                            if should_update {
+                                entry.attrs.insert(key.clone(), (v.clone(), op_hlc));
+                                changed = true;
+                            }
+                        }
+                        None => {
+                            // Remove only if this op's HLC beats the existing attr's HLC.
+                            let should_remove = match entry.attrs.get(key) {
+                                Some((_, existing_hlc)) => op_hlc.beats(*existing_hlc),
+                                None => true,
+                            };
+                            if should_remove {
+                                entry.attrs.remove(key);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                Ok(changed)
+            }
         }
     }
 
@@ -156,6 +243,17 @@ impl Type for Text {
                     if merge_clock(&mut local_entry.deleted_at, remote_entry.deleted_at) {
                         changed = true;
                     }
+                    for (key, (remote_value, remote_hlc)) in &remote_entry.attrs {
+                        match local_entry.attrs.get(key) {
+                            Some((_, local_hlc)) if !remote_hlc.beats(*local_hlc) => {}
+                            _ => {
+                                local_entry
+                                    .attrs
+                                    .insert(key.clone(), (remote_value.clone(), *remote_hlc));
+                                changed = true;
+                            }
+                        }
+                    }
                 }
                 None => {
                     self.insert(*id, remote_entry.clone());
@@ -169,9 +267,17 @@ impl Type for Text {
 
     fn max_hlc(&self) -> Hlc {
         self.iter().fold(Hlc::ZERO, |max, (id, entry)| {
+            let entry_max = entry
+                .attrs
+                .values()
+                .map(|(_, h)| *h)
+                .fold(Hlc::ZERO, Hlc::max);
             std::cmp::max(
                 max,
-                std::cmp::max(id.0, entry.deleted_at.unwrap_or(Hlc::ZERO)),
+                std::cmp::max(
+                    std::cmp::max(id.0, entry.deleted_at.unwrap_or(Hlc::ZERO)),
+                    entry_max,
+                ),
             )
         })
     }
@@ -203,6 +309,18 @@ pub fn text_string(text: &Text) -> String {
         .into_iter()
         .filter_map(|id| text.get(&id).and_then(|entry| entry.character))
         .collect()
+}
+
+/// Return a snapshot of active formatting attributes at a character index.
+pub fn text_format_at(text: &Text, index: usize) -> Option<BTreeMap<String, Value>> {
+    let id = text_id_at(text, index)?;
+    let entry = text.get(&id)?;
+    let attrs: BTreeMap<String, Value> = entry
+        .attrs
+        .iter()
+        .map(|(k, (v, _))| (k.clone(), v.clone()))
+        .collect();
+    Some(attrs)
 }
 
 fn validate_insert(
@@ -679,5 +797,278 @@ mod tests {
             decode_from_slice(&encoded, config::standard()).unwrap();
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded, text);
+    }
+
+    // --- Rich text formatting tests ---
+
+    #[test]
+    fn format_applies_to_visible_characters_in_range() {
+        let mut text = Text::new();
+        let a = hlc(100, 1);
+        let b = hlc(200, 1);
+        apply(
+            &mut text,
+            TextOp::Insert {
+                after: None,
+                text: "abc".into(),
+            },
+            a,
+        );
+        apply(
+            &mut text,
+            TextOp::Insert {
+                after: Some((a, 2)),
+                text: "d".into(),
+            },
+            b,
+        );
+        // text = "abcd"
+
+        let ids = text_visible_ids(&text);
+        apply(
+            &mut text,
+            TextOp::Format {
+                start: Some(ids[1]),
+                end: Some(ids[3]),
+                key: "bold".into(),
+                value: Some(Value::Bool(true)),
+            },
+            hlc(300, 1),
+        );
+
+        // b and c should be bold (ids[1] and ids[2]); a and d should not.
+        assert_eq!(text_format_at(&text, 0).unwrap().get("bold"), None);
+        assert_eq!(
+            text_format_at(&text, 1).unwrap().get("bold"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            text_format_at(&text, 2).unwrap().get("bold"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(text_format_at(&text, 3).unwrap().get("bold"), None);
+    }
+
+    #[test]
+    fn format_remove_clears_attribute() {
+        let mut text = Text::new();
+        let a = hlc(100, 1);
+        apply(
+            &mut text,
+            TextOp::Insert {
+                after: None,
+                text: "x".into(),
+            },
+            a,
+        );
+        let ids = text_visible_ids(&text);
+
+        apply(
+            &mut text,
+            TextOp::Format {
+                start: Some(ids[0]),
+                end: None,
+                key: "bold".into(),
+                value: Some(Value::Bool(true)),
+            },
+            hlc(200, 1),
+        );
+        assert!(text_format_at(&text, 0).unwrap().contains_key("bold"));
+
+        apply(
+            &mut text,
+            TextOp::Format {
+                start: Some(ids[0]),
+                end: None,
+                key: "bold".into(),
+                value: None,
+            },
+            hlc(300, 1),
+        );
+        assert!(!text_format_at(&text, 0).unwrap().contains_key("bold"));
+    }
+
+    #[test]
+    fn stale_format_does_not_overwrite_newer_format() {
+        let mut text = Text::new();
+        let a = hlc(100, 1);
+        apply(
+            &mut text,
+            TextOp::Insert {
+                after: None,
+                text: "x".into(),
+            },
+            a,
+        );
+        let ids = text_visible_ids(&text);
+
+        apply(
+            &mut text,
+            TextOp::Format {
+                start: Some(ids[0]),
+                end: None,
+                key: "color".into(),
+                value: Some(Value::String("red".into())),
+            },
+            hlc(300, 1),
+        );
+        // Stale format with older HLC should not replace.
+        apply(
+            &mut text,
+            TextOp::Format {
+                start: Some(ids[0]),
+                end: None,
+                key: "color".into(),
+                value: Some(Value::String("blue".into())),
+            },
+            hlc(200, 2),
+        );
+        assert_eq!(
+            text_format_at(&text, 0).unwrap().get("color"),
+            Some(&Value::String("red".into()))
+        );
+    }
+
+    #[test]
+    fn format_merged_across_replicas() {
+        let mut left = Text::new();
+        let mut right = Text::new();
+        let a = hlc(100, 1);
+        apply(
+            &mut left,
+            TextOp::Insert {
+                after: None,
+                text: "hi".into(),
+            },
+            a,
+        );
+
+        let ids = text_visible_ids(&left);
+        apply(
+            &mut left,
+            TextOp::Format {
+                start: Some(ids[0]),
+                end: Some(ids[1]), // only first character
+                key: "bold".into(),
+                value: Some(Value::Bool(true)),
+            },
+            hlc(200, 1),
+        );
+
+        // Right has same text but format on second character.
+        apply(
+            &mut right,
+            TextOp::Insert {
+                after: None,
+                text: "hi".into(),
+            },
+            a,
+        );
+        apply(
+            &mut right,
+            TextOp::Format {
+                start: Some(ids[1]),
+                end: None,
+                key: "italic".into(),
+                value: Some(Value::Bool(true)),
+            },
+            hlc(200, 2),
+        );
+
+        Type::merge(&mut left, &right, Hlc::ZERO, Hlc::ZERO).unwrap();
+        assert!(text_format_at(&left, 0).unwrap().contains_key("bold"));
+        assert!(!text_format_at(&left, 0).unwrap().contains_key("italic"));
+        assert!(!text_format_at(&left, 1).unwrap().contains_key("bold"));
+        assert!(text_format_at(&left, 1).unwrap().contains_key("italic"));
+    }
+
+    #[test]
+    fn format_survives_concurrent_insert_inside_range() {
+        // User A: formats "a..z" as bold across the whole range.
+        // User B: inserts "x" inside the range.
+        // The inserted "x" does NOT automatically inherit bold — formatting
+        // must be explicitly applied. This test verifies that existing
+        // formatting on surrounding characters is preserved.
+        let mut left = Text::new();
+        let a = hlc(100, 1);
+        apply(
+            &mut left,
+            TextOp::Insert {
+                after: None,
+                text: "az".into(),
+            },
+            a,
+        );
+        let left_ids = text_visible_ids(&left);
+
+        // Format the full range
+        apply(
+            &mut left,
+            TextOp::Format {
+                start: Some(left_ids[0]),
+                end: None,
+                key: "bold".into(),
+                value: Some(Value::Bool(true)),
+            },
+            hlc(200, 1),
+        );
+
+        // Replica B: insert 'b' between 'a' and 'z'
+        let mut right = Text::new();
+        apply(
+            &mut right,
+            TextOp::Insert {
+                after: None,
+                text: "az".into(),
+            },
+            a,
+        );
+        apply(
+            &mut right,
+            TextOp::Insert {
+                after: Some((a, 0)),
+                text: "b".into(),
+            },
+            hlc(150, 2),
+        );
+
+        Type::merge(&mut left, &right, Hlc::ZERO, Hlc::ZERO).unwrap();
+        assert_eq!(text_string(&left), "abz");
+        // 'a' and 'z' still bold; 'b' has no formatting (insert didn't carry it).
+        assert!(text_format_at(&left, 0).unwrap().contains_key("bold"));
+        assert!(!text_format_at(&left, 1).unwrap().contains_key("bold"));
+        assert!(text_format_at(&left, 2).unwrap().contains_key("bold"));
+    }
+
+    #[test]
+    fn text_bincode_roundtrip_with_formatting() {
+        let mut text = Text::new();
+        let a = hlc(100, 1);
+        apply(
+            &mut text,
+            TextOp::Insert {
+                after: None,
+                text: "hi".into(),
+            },
+            a,
+        );
+        let ids = text_visible_ids(&text);
+        apply(
+            &mut text,
+            TextOp::Format {
+                start: Some(ids[0]),
+                end: None,
+                key: "bold".into(),
+                value: Some(Value::Bool(true)),
+            },
+            hlc(200, 1),
+        );
+
+        let encoded = encode_to_vec(&text, config::standard()).unwrap();
+        let (decoded, consumed): (Text, usize) =
+            decode_from_slice(&encoded, config::standard()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, text);
+        assert!(decoded.get(&(a, 0)).unwrap().attrs.contains_key("bold"));
     }
 }

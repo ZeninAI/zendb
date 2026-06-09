@@ -274,6 +274,10 @@ register_types! {
     leaf String => crate::types::string::String,
     leaf Timestamp => crate::types::timestamp::Timestamp,
     leaf Blob => crate::types::blob::Blob,
+    leaf Counter => crate::types::counter::Counter,
+    leaf MvRegister => crate::types::mv_register::MvRegister,
+    leaf OrSet => crate::types::or_set::OrSet,
+    leaf PriorityQueue => crate::types::priority_queue::PriorityQueue,
     leaf Set => crate::types::set::Set,
     leaf Text => crate::types::text::Text,
     container Record => crate::types::record::Record,
@@ -289,16 +293,21 @@ pub use core::path::{Path, PathStep};
 pub use core::traits::{ContainerType, Type};
 pub use types::blob::{Blob, BlobError, BlobOp};
 pub use types::bool::{Bool, BoolError, BoolOp};
+pub use types::counter::{counter_value, Counter, CounterError, CounterOp};
 pub use types::int::{Int, IntError, IntOp};
 pub use types::list::{
     list_cell_at, list_id_at, list_visible_ids, List, ListEntry, ListError, ListId, ListOp,
     ListSegment,
 };
+pub use types::mv_register::{mv_register_values, MvRegister, MvRegisterError, MvRegisterOp};
+pub use types::or_set::{or_set_contains_key, or_set_keys, OrSet, OrSetEntry, OrSetError, OrSetOp};
+pub use types::priority_queue::{pq_live, PqEntry, PqError, PqOp, PriorityQueue};
 pub use types::record::{Record, RecordError, RecordOp, RecordSegment};
 pub use types::set::{set_contains_key, set_keys, Meta, Set, SetError, SetOp};
 pub use types::string::{String, StringError, StringOp};
 pub use types::text::{
-    text_id_at, text_string, text_visible_ids, Text, TextEntry, TextError, TextId, TextOp,
+    text_format_at, text_id_at, text_string, text_visible_ids, Text, TextEntry, TextError, TextId,
+    TextOp,
 };
 pub use types::timestamp::{Timestamp, TimestampError, TimestampOp};
 // TypeTag, Value, TypeOp, Segment, TypeError are generated above by register_types!

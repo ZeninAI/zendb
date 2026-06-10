@@ -28,33 +28,7 @@ impl PathStep {
 }
 
 /// A sequence of path steps from a row root to a target cell.
-#[derive(Debug, Clone, Encode, Decode)]
-pub struct Path {
-    pub steps: Vec<PathStep>,
-}
-
-impl Path {
-    pub fn new() -> Path {
-        Path { steps: Vec::new() }
-    }
-    pub fn is_empty(&self) -> bool {
-        self.steps.is_empty()
-    }
-    pub fn len(&self) -> usize {
-        self.steps.len()
-    }
-
-    pub fn step(mut self, container_tag: TypeTag, segment: Segment) -> Path {
-        self.steps.push(PathStep::new(container_tag, segment));
-        self
-    }
-}
-
-impl Default for Path {
-    fn default() -> Path {
-        Path::new()
-    }
-}
+pub type Path = Vec<PathStep>;
 
 #[cfg(test)]
 mod tests {

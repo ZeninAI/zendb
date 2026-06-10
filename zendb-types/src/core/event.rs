@@ -1,6 +1,6 @@
-//! Delta — the unit of mutation.
+//! Event — the unit of mutation.
 //!
-//! Every write produces a `Delta`. It contains everything needed to apply the
+//! Every write produces an `Event`. It contains everything needed to apply the
 //! write locally and (if `sync = true`) replicate it to peers.
 
 use bincode::{Decode, Encode};
@@ -12,7 +12,7 @@ pub type Signature = Vec<u8>;
 
 /// The unit produced by every write.
 #[derive(Debug, Clone, Encode, Decode)]
-pub struct Delta {
+pub struct Event {
     pub table_id: TableId,
     pub primary_key: PrimaryKey,
     pub path: Path,

@@ -13,9 +13,9 @@ src/
 │   ├── mod.rs
 │   ├── cell.rs         # Cell + apply_walk + merge
 │   ├── hlc.rs          # 10-byte Hybrid Logical Clock
-│   ├── traits.rs       # Type, ContainerType
+│   ├── traits.rs       # Type, MergeClocks
 │   ├── path.rs         # Path + PathStep
-│   └── delta.rs        # Delta + TableId + PrimaryKey + Signature
+│   └── event.rs        # Event + TableId + PrimaryKey + Signature
 ├── types/
 │   ├── mod.rs
 │   ├── atom.rs         # AtomValue, AtomOp, AtomFloat, AtomError, AtomType
@@ -58,9 +58,11 @@ The universal addressable value wrapper.
 
 ```rust
 pub struct Cell {
-    pub value: Value,
+    pub value: Option<Value>,
     pub hlc: Hlc,
     pub sync: Option<bool>,   // None = inherit, Some(true) = sync, Some(false) = local
+    sync_hlc: Hlc,            // does not participate in value conflict resolution
+    generation: Hlc,          // whole-value replacement generation
 }
 
 impl Cell {
@@ -69,8 +71,8 @@ impl Cell {
     pub fn is_dummy(&self) -> bool;
     pub fn type_tag(&self) -> TypeTag;
 
-    // Apply a delta to this cell (root of the path).
-    pub fn apply_delta(&mut self, delta: &Delta) -> bool;
+    // Apply a event to this cell (root of the path).
+    pub fn apply_event(&mut self, event: &Event) -> bool;
 
     // Merge a remote cell into this one.
     pub fn merge(&mut self, remote: &Cell);
@@ -79,11 +81,11 @@ impl Cell {
 
 ### Apply walk
 
-`apply_delta` descends recursively through the path, materializing missing intermediate containers as dummy cells. At the leaf, it dispatches to the type-specific `Type::apply_op`. Returns `true` if the state was modified.
+`apply_event` delegates recursive path routing to `ContainerType::apply_walk`, materializing missing intermediate containers as dummy cells. At the leaf, it dispatches to the type-specific `Type::apply`. Returns `true` if the state was modified.
 
-`ensure_type` handles type conflicts: if the cursor has the wrong type, LWW decides whether to replace with a dummy of the expected type. HLC is only bumped when `op_hlc.beats(cursor.hlc)`.
+`ensure_type` handles type conflicts: if the cursor has the wrong type, LWW decides whether to replace with a dummy of the expected type. Whole-value replacements establish a new generation. Same-type recursive state merges occur only within the same generation, preventing older descendants from being resurrected after replacement.
 
-`SetSync` bypasses the apply walk entirely — the engine handles it by directly setting `Cell.sync`.
+`SetSync` uses `sync_hlc`; sync metadata never advances the value HLC or affects value conflict resolution.
 
 ### Merge
 
@@ -103,63 +105,50 @@ Three states on `Cell.sync`:
 
 A child can override its parent: `Some(false)` on a field under a `Some(true)` record keeps just that field local.
 
-`Delta.sync` is always a plain `bool`, resolved at creation time from the `Option<bool>` chain.
+`Event.sync` is always a plain `bool`, resolved at creation time from the `Option<bool>` chain.
 
-`SetSync` is **local-only** (`Delta.sync = false`). Sync policy is per-device. Turning sync ON re-admits the subtree to the state-hash index; the next anti-entropy round detects divergence and converges. Turning sync OFF removes the subtree from the state-hash; peers keep syncing their version.
+`SetSync` is **local-only** (`Event.sync = false`). Sync policy is per-device. Turning sync ON re-admits the subtree to the state-hash index; the next anti-entropy round detects divergence and converges. Turning sync OFF removes the subtree from the state-hash; peers keep syncing their version.
 
 ---
 
 ## 5. Trait Hierarchy
 
 ```
-Type          ── TAG, NAME, KEYABLE, IS_CONTAINER,
-                 Value: Encode + Decode, Op: Encode + Decode,
+Type          ── Self: Encode + Decode, Op: Encode + Decode,
                  Error: std::error::Error,
-                 empty(), apply_op(), merge()
-
-ContainerType ── Type + Segment: Encode + Decode,
-                 descend_or_create()
+                 apply(), merge(), is_synced(), compact(), max_hlc()
+ContainerType ── Type + apply_walk()
 ```
 
 ### Type
 
 ```rust
-pub trait Type {
-    const TAG: TypeTag;
-    const NAME: &'static str;
-    const KEYABLE: bool;
-    const IS_CONTAINER: bool;
-    type Value: Encode + Decode<()>;
+pub trait Type: Sized + Encode + Decode<()> {
     type Op: Encode + Decode<()>;
     type Error: std::error::Error;
 
-    fn empty() -> Self::Value;
-
-    /// Apply an operation. Receives mutable access to the value.
-    /// Returns Ok(true) if state was modified, Ok(false) if rejected (e.g. LWW loss).
-    fn apply_op(value: &mut Self::Value, op: &Self::Op, local_hlc: Hlc, op_hlc: Hlc)
+    fn apply(&mut self, op: &Self::Op, op_hlc: Hlc)
         -> Result<bool, Self::Error>;
-
-    /// Merge remote into local. Returns Ok(true) if local was modified.
-    fn merge(local: &mut Self::Value, local_hlc: Hlc, remote: &Self::Value, remote_hlc: Hlc)
+    fn merge(&mut self, remote: &Self, clocks: MergeClocks)
         -> Result<bool, Self::Error>;
+    fn is_synced(&self, inherited: bool, path: &[PathStep]) -> bool;
+    fn compact(&mut self, watermark: Hlc) -> Result<bool, Self::Error>;
+    fn max_hlc(&self) -> Hlc;
 }
 ```
 
-### ContainerType
+Container types implement `ContainerType::apply_walk`. They consume their own path segment and delegate to the selected child `Cell`.
 
-```rust
-pub trait ContainerType: Type {
-    type Segment: Encode + Decode<()>;
+Complex CRDT representations are structs with private backing state. Atomic primitives remain aliases. Consumer reads use semantic methods such as `Counter::value`, `Set::contains`, `Text::string`, and `List::cell_at`.
 
-    /// Navigate into a child, creating a dummy if absent.
-    fn descend_or_create<'a>(
-        value: &'a mut Self::Value,
-        segment: &Self::Segment,
-        child_tag: TypeTag,
-    ) -> Result<&'a mut Cell, Self::Error>;
-}
-```
+Receiver-state-dependent mutations are resolved when constructing events:
+
+- `OrSet::remove` captures the observed add tags in `OrSetOp::Remove`.
+- `PriorityQueue::pop` captures the selected element ID in `PqOp::Pop`.
+- `Text::format` captures explicit character IDs in `TextOp::Format`.
+- `MvRegister::assign` captures the assignments causally replaced by the new assignment.
+
+`compact(watermark)` removes tombstones and obsolete metadata known to be stable at or before the watermark. Containers recursively compact live children. Sequence tombstones that remain anchors are retained until no entry references them.
 
 ---
 
@@ -205,7 +194,8 @@ register_types! {
 - `Value` enum (with `type_tag()`, `encode()`, `decode()`)
 - `Op` enum (with `type_tag()`, `encode()`, `decode()`, `SetSync` variant)
 - `Segment` enum (with `type_tag()`, `encode()`, `decode()`)
-- `apply_op_dispatch(&mut Value, &Op, local_hlc, op_hlc) -> Result<bool, TypeError>`
+- local `Type::apply` dispatch for registered `TypeOp` variants
+- recursive `ContainerType::apply_walk` dispatch for registered containers
 - `merge_dispatch(&mut Value, &Value, local_hlc, remote_hlc) -> Result<bool, TypeError>`
 - `descend_or_create_dispatch(&mut Value, &Segment, child_tag) -> Result<&mut Cell, TypeError>`
 

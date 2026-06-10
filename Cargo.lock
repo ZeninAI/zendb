@@ -625,6 +625,7 @@ name = "zendb-engine"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "hashbrown 0.15.5",
  "zendb-storage",
  "zendb-types",
 ]

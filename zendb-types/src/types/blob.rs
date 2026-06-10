@@ -24,12 +24,12 @@ impl Type for Blob {
     type Op = BlobOp;
     type Error = BlobError;
 
-    fn apply(&mut self, op: &BlobOp, _local_hlc: Hlc, _op_hlc: Hlc) -> Result<bool, BlobError> {
+    fn apply(&mut self, op: &BlobOp, _op_hlc: Hlc) -> Result<bool, BlobError> {
         match *op {}
     }
 
-    fn merge(&mut self, remote: &Blob, local_hlc: Hlc, remote_hlc: Hlc) -> Result<bool, BlobError> {
-        if remote_hlc.beats(local_hlc) {
+    fn merge(&mut self, remote: &Blob, clocks: crate::MergeClocks) -> Result<bool, BlobError> {
+        if clocks.remote.beats(clocks.local) {
             *self = remote.clone();
             Ok(true)
         } else {
@@ -51,7 +51,12 @@ mod tests {
     fn newer_remote_replaces_with_an_independent_clone() {
         let remote = vec![1, 2, 3];
         let mut local = vec![9];
-        assert!(Type::merge(&mut local, &remote, hlc(100, 1), hlc(200, 1)).unwrap());
+        assert!(Type::merge(
+            &mut local,
+            &remote,
+            crate::MergeClocks::new(hlc(100, 1), hlc(200, 1)),
+        )
+        .unwrap());
         assert_eq!(local, remote);
         assert_ne!(local.as_ptr(), remote.as_ptr());
     }
@@ -59,7 +64,12 @@ mod tests {
     #[test]
     fn stale_remote_blob_is_ignored() {
         let mut local = vec![1, 2, 3];
-        assert!(!Type::merge(&mut local, &vec![9], hlc(200, 1), hlc(100, 2)).unwrap());
+        assert!(!Type::merge(
+            &mut local,
+            &vec![9],
+            crate::MergeClocks::new(hlc(200, 1), hlc(100, 2)),
+        )
+        .unwrap());
         assert_eq!(local, vec![1, 2, 3]);
     }
 

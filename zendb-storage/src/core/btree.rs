@@ -434,83 +434,6 @@ where
     K: Encode + Decode<()> + Hash + Eq + Clone,
     V: Encode + Decode<()> + Clone,
 {
-    // ---- constructors -----------------------------------------------------
-
-    /// Create a fresh BPlusTree at `path`, **truncating** any existing
-    /// file. Pre-allocates `config.initial_capacity_pages` pages.
-    pub fn create(path: &Path, config: BPlusTreeConfig) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
-        let np = 2u64;
-        let initial_pages = config.initial_capacity_pages.max(2);
-        file.set_len(initial_pages * PAGE_SIZE as u64)?;
-        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-        let m = page_offset(META_PAGE);
-        wr_u32(&mut mmap[m..m + 4], MAGIC);
-        wr_u64(&mut mmap[m + META_ROOT..m + META_ROOT + 8], 1);
-        wr_u64(&mut mmap[m + META_FREE_HEAD..m + META_FREE_HEAD + 8], 0);
-        wr_u64(&mut mmap[m + META_PAGES..m + META_PAGES + 8], np);
-        wr_u64(&mut mmap[m + META_ENTRIES..m + META_ENTRIES + 8], 0);
-        wr_u64(
-            &mut mmap[m + META_RIGHTMOST_LEAF..m + META_RIGHTMOST_LEAF + 8],
-            1,
-        );
-        // Persisted stats counters: one leaf page (the root), no entry
-        // bytes, no free pages.
-        wr_u64(&mut mmap[m + META_LEAF_PAGES..m + META_LEAF_PAGES + 8], 1);
-        wr_u64(
-            &mut mmap[m + META_LEAF_ENTRY_BYTES..m + META_LEAF_ENTRY_BYTES + 8],
-            0,
-        );
-        wr_u64(&mut mmap[m + META_FREE_PAGES..m + META_FREE_PAGES + 8], 0);
-        let r = page_offset(1);
-        mmap[r] = PAGE_LEAF;
-        mmap[r + 1] = FLAG_ROOT;
-        wr_u16(&mut mmap[r + 2..r + 4], 0);
-        wr_u32(&mut mmap[r + 4..r + 8], PAGE_SIZE as u32);
-        wr_u64(&mut mmap[r + 8..r + 16], 0);
-        wr_u64(&mut mmap[r + 16..r + 24], 0);
-        Ok(BPlusTree {
-            mmap,
-            file,
-            config,
-            stats: BPlusTreeStats {
-                entries: 0,
-                pages: np,
-                free_pages: 0,
-                leaf_pages: 1,
-                leaf_entry_bytes: 0,
-            },
-            _phantom: PhantomData,
-        })
-    }
-
-    /// Open an existing BPlusTree at `path`. Validates the MAGIC header at
-    /// offset 0 (returns `InvalidData` if missing/mismatched).
-    pub fn open(path: &Path, config: BPlusTreeConfig) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-        if rd_u32(&mmap[0..4]) != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not a BPlusTree file (bad magic)",
-            ));
-        }
-        let mut this = BPlusTree {
-            mmap,
-            file,
-            config,
-            stats: BPlusTreeStats::default(),
-            _phantom: PhantomData,
-        };
-        this.refresh_stats_from_meta();
-        Ok(this)
-    }
-
     /// Current estimated reclaimable-page ratio. Public so callers can
     /// observe fragmentation without grabbing internal counters.
     pub fn fragmentation_ratio(&self) -> f64 {
@@ -2007,6 +1930,75 @@ where
     where
         Self: 'a;
     type Config = BPlusTreeConfig;
+
+    fn create(path: &Path, config: Self::Config) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        let np = 2u64;
+        let initial_pages = config.initial_capacity_pages.max(2);
+        file.set_len(initial_pages * PAGE_SIZE as u64)?;
+        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+        let m = page_offset(META_PAGE);
+        wr_u32(&mut mmap[m..m + 4], MAGIC);
+        wr_u64(&mut mmap[m + META_ROOT..m + META_ROOT + 8], 1);
+        wr_u64(&mut mmap[m + META_FREE_HEAD..m + META_FREE_HEAD + 8], 0);
+        wr_u64(&mut mmap[m + META_PAGES..m + META_PAGES + 8], np);
+        wr_u64(&mut mmap[m + META_ENTRIES..m + META_ENTRIES + 8], 0);
+        wr_u64(
+            &mut mmap[m + META_RIGHTMOST_LEAF..m + META_RIGHTMOST_LEAF + 8],
+            1,
+        );
+        wr_u64(&mut mmap[m + META_LEAF_PAGES..m + META_LEAF_PAGES + 8], 1);
+        wr_u64(
+            &mut mmap[m + META_LEAF_ENTRY_BYTES..m + META_LEAF_ENTRY_BYTES + 8],
+            0,
+        );
+        wr_u64(&mut mmap[m + META_FREE_PAGES..m + META_FREE_PAGES + 8], 0);
+        let r = page_offset(1);
+        mmap[r] = PAGE_LEAF;
+        mmap[r + 1] = FLAG_ROOT;
+        wr_u16(&mut mmap[r + 2..r + 4], 0);
+        wr_u32(&mut mmap[r + 4..r + 8], PAGE_SIZE as u32);
+        wr_u64(&mut mmap[r + 8..r + 16], 0);
+        wr_u64(&mut mmap[r + 16..r + 24], 0);
+        Ok(BPlusTree {
+            mmap,
+            file,
+            config,
+            stats: BPlusTreeStats {
+                entries: 0,
+                pages: np,
+                free_pages: 0,
+                leaf_pages: 1,
+                leaf_entry_bytes: 0,
+            },
+            _phantom: PhantomData,
+        })
+    }
+
+    fn open(path: &Path, config: Self::Config) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        if rd_u32(&mmap[0..4]) != MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a BPlusTree file (bad magic)",
+            ));
+        }
+        let mut this = BPlusTree {
+            mmap,
+            file,
+            config,
+            stats: BPlusTreeStats::default(),
+            _phantom: PhantomData,
+        };
+        this.refresh_stats_from_meta();
+        Ok(this)
+    }
 
     fn get(&self, key: &K) -> Option<Cow<'_, V>> {
         with_scratch(key, |kb| {

@@ -7,10 +7,9 @@
 //! priority value. The total order is `(priority, hlc)` — lower priority values
 //! come first, with the insertion HLC breaking ties deterministically.
 //!
-//! A `Pop` marks the minimum visible element as deleted (LWW on the deletion
-//! clock). Concurrent pops of the same element converge; concurrent pops of
-//! different elements both take effect because the surviving minimum is
-//! determined by the global total order.
+//! `PriorityQueue::pop` resolves the minimum visible element when constructing
+//! the operation. The resulting `Pop { id }` marks that stable element ID as
+//! deleted, so delivery order cannot change the target.
 //!
 //! ## Reference
 //!
@@ -23,16 +22,11 @@ use bincode::{Decode, Encode};
 
 use crate::{core::traits::Type, Hlc, Value};
 
-/// Compare two HLCs for causal dominance, ignoring device_id.
-fn hlc_dominates(a: Hlc, b: Hlc) -> bool {
-    (a.physical_ms(), a.logical()) > (b.physical_ms(), b.logical())
-}
-
 #[derive(Debug, Clone, Encode, Decode)]
-pub struct PqEntry {
-    pub priority: i64,
-    pub value: Value,
-    pub deleted_at: Option<Hlc>,
+struct PqEntry {
+    priority: i64,
+    value: Value,
+    deleted_at: Option<Hlc>,
 }
 
 impl PartialEq for PqEntry {
@@ -46,28 +40,53 @@ impl PartialEq for PqEntry {
 impl Eq for PqEntry {}
 
 impl PqEntry {
-    pub fn is_live(&self) -> bool {
+    fn is_live(&self) -> bool {
         self.deleted_at.is_none()
     }
 }
 
-pub type PriorityQueue = BTreeMap<Hlc, PqEntry>;
+#[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
+pub struct PriorityQueue {
+    entries: BTreeMap<Hlc, PqEntry>,
+    popped: BTreeMap<Hlc, Hlc>,
+}
+
+impl PriorityQueue {
+    /// Return all live elements in priority order.
+    pub fn live(&self) -> Vec<(i64, Hlc, &Value)> {
+        let mut entries: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.is_live())
+            .map(|(&id, entry)| (entry.priority, id, &entry.value))
+            .collect();
+        entries.sort_by(|(pa, ha, _), (pb, hb, _)| pa.cmp(pb).then_with(|| ha.cmp(hb)));
+        entries
+    }
+
+    /// Build a pop operation targeting the minimum element observed locally.
+    pub fn pop(&self) -> Option<PqOp> {
+        self.live().first().map(|(_, id, _)| PqOp::Pop { id: *id })
+    }
+}
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum PqOp {
     Push { priority: i64, value: Value },
-    Pop,
+    Pop { id: Hlc },
 }
 
 #[derive(Debug)]
 pub enum PqError {
-    Empty,
+    PushConflict { id: Hlc },
 }
 
 impl std::fmt::Display for PqError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PqError::Empty => f.write_str("cannot pop from an empty priority queue"),
+            PqError::PushConflict { id } => {
+                write!(f, "priority queue push {id} has conflicting content")
+            }
         }
     }
 }
@@ -78,38 +97,34 @@ impl Type for PriorityQueue {
     type Op = PqOp;
     type Error = PqError;
 
-    fn apply(&mut self, op: &PqOp, _local_hlc: Hlc, op_hlc: Hlc) -> Result<bool, PqError> {
+    fn apply(&mut self, op: &PqOp, op_hlc: Hlc) -> Result<bool, PqError> {
         match op {
             PqOp::Push { priority, value } => {
-                self.insert(
-                    op_hlc,
-                    PqEntry {
-                        priority: *priority,
-                        value: value.clone(),
-                        deleted_at: None,
-                    },
-                );
-                Ok(true)
-            }
-            PqOp::Pop => {
-                let candidate =
-                    self.iter()
-                        .filter(|(_, e)| e.is_live())
-                        .min_by(|(a_h, a_e), (b_h, b_e)| {
-                            a_e.priority.cmp(&b_e.priority).then_with(|| a_h.cmp(b_h))
-                        });
-
-                match candidate {
-                    Some((&id, _)) => {
-                        // Reject stale pop: op must be causally after the push.
-                        if !hlc_dominates(op_hlc, id) {
-                            return Ok(false);
-                        }
-                        let entry = self.get_mut(&id).unwrap();
-                        Ok(merge_hcl(&mut entry.deleted_at, Some(op_hlc)))
+                let incoming = PqEntry {
+                    priority: *priority,
+                    value: value.clone(),
+                    deleted_at: self.popped.get(&op_hlc).copied(),
+                };
+                match self.entries.get(&op_hlc) {
+                    Some(existing) if existing != &incoming => {
+                        Err(PqError::PushConflict { id: op_hlc })
                     }
-                    None => Ok(false),
+                    Some(_) => Ok(false),
+                    None => {
+                        self.entries.insert(op_hlc, incoming);
+                        Ok(true)
+                    }
                 }
+            }
+            PqOp::Pop { id } => {
+                if !op_hlc.beats(*id) {
+                    return Ok(false);
+                }
+                let mut changed = merge_required_clock(&mut self.popped, *id, op_hlc);
+                if let Some(entry) = self.entries.get_mut(id) {
+                    changed |= merge_clock(&mut entry.deleted_at, Some(op_hlc));
+                }
+                Ok(changed)
             }
         }
     }
@@ -117,41 +132,68 @@ impl Type for PriorityQueue {
     fn merge(
         &mut self,
         remote: &PriorityQueue,
-        _local_hlc: Hlc,
-        _remote_hlc: Hlc,
+        _clocks: crate::MergeClocks,
     ) -> Result<bool, PqError> {
         let mut changed = false;
 
-        for (&id, remote_entry) in remote {
-            match self.get_mut(&id) {
+        for (&id, &popped_at) in &remote.popped {
+            changed |= merge_required_clock(&mut self.popped, id, popped_at);
+        }
+
+        for (&id, remote_entry) in &remote.entries {
+            match self.entries.get_mut(&id) {
                 Some(local_entry) => {
+                    if local_entry.priority != remote_entry.priority
+                        || local_entry.value != remote_entry.value
+                    {
+                        return Err(PqError::PushConflict { id });
+                    }
                     // Priority and value are immutable once pushed.
                     // Only the deletion clock may advance.
-                    if merge_hcl(&mut local_entry.deleted_at, remote_entry.deleted_at) {
+                    if merge_clock(&mut local_entry.deleted_at, remote_entry.deleted_at) {
                         changed = true;
                     }
                 }
                 None => {
-                    self.insert(id, remote_entry.clone());
+                    let mut entry = remote_entry.clone();
+                    merge_clock(&mut entry.deleted_at, self.popped.get(&id).copied());
+                    self.entries.insert(id, entry);
                     changed = true;
                 }
+            }
+        }
+        for (&id, &popped_at) in &self.popped {
+            if let Some(entry) = self.entries.get_mut(&id) {
+                changed |= merge_clock(&mut entry.deleted_at, Some(popped_at));
             }
         }
 
         Ok(changed)
     }
 
+    fn compact(&mut self, watermark: Hlc) -> Result<bool, PqError> {
+        let before_entries = self.entries.len();
+        let before_popped = self.popped.len();
+        self.entries
+            .retain(|_, entry| entry.deleted_at.is_none_or(|deleted| deleted > watermark));
+        self.popped.retain(|_, popped_at| *popped_at > watermark);
+        Ok(self.entries.len() != before_entries || self.popped.len() != before_popped)
+    }
+
     fn max_hlc(&self) -> Hlc {
-        self.iter().fold(Hlc::ZERO, |max, (&id, entry)| {
+        let entries = self.entries.iter().fold(Hlc::ZERO, |max, (&id, entry)| {
             std::cmp::max(
                 max,
                 std::cmp::max(id, entry.deleted_at.unwrap_or(Hlc::ZERO)),
             )
-        })
+        });
+        self.popped
+            .values()
+            .fold(entries, |max, &popped_at| max.max(popped_at))
     }
 }
 
-fn merge_hcl(local: &mut Option<Hlc>, remote: Option<Hlc>) -> bool {
+fn merge_clock(local: &mut Option<Hlc>, remote: Option<Hlc>) -> bool {
     let Some(remote) = remote else {
         return false;
     };
@@ -163,15 +205,16 @@ fn merge_hcl(local: &mut Option<Hlc>, remote: Option<Hlc>) -> bool {
     }
 }
 
-/// Return all live elements in priority order: (priority, hlc, value).
-pub fn pq_live(queue: &PriorityQueue) -> Vec<(i64, Hlc, &Value)> {
-    let mut entries: Vec<_> = queue
-        .iter()
-        .filter(|(_, e)| e.is_live())
-        .map(|(&id, e)| (e.priority, id, &e.value))
-        .collect();
-    entries.sort_by(|(pa, ha, _), (pb, hb, _)| pa.cmp(pb).then_with(|| ha.cmp(hb)));
-    entries
+fn merge_required_clock(clocks: &mut BTreeMap<Hlc, Hlc>, id: Hlc, incoming: Hlc) -> bool {
+    if clocks
+        .get(&id)
+        .is_none_or(|existing| incoming.beats(*existing))
+    {
+        clocks.insert(id, incoming);
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -188,12 +231,12 @@ mod tests {
     }
 
     fn apply(queue: &mut PriorityQueue, op: PqOp, at: Hlc) -> Result<bool, PqError> {
-        Type::apply(queue, &op, Hlc::ZERO, at)
+        Type::apply(queue, &op, at)
     }
 
     #[test]
     fn push_and_pop_single_element() {
-        let mut q = PriorityQueue::new();
+        let mut q = PriorityQueue::default();
         apply(
             &mut q,
             PqOp::Push {
@@ -203,15 +246,57 @@ mod tests {
             hlc(100, 1),
         )
         .unwrap();
-        assert_eq!(pq_live(&q).len(), 1);
+        assert_eq!(q.live().len(), 1);
 
-        apply(&mut q, PqOp::Pop, hlc(200, 1)).unwrap();
-        assert_eq!(pq_live(&q).len(), 0);
+        let pop = q.pop().unwrap();
+        apply(&mut q, pop, hlc(200, 1)).unwrap();
+        assert_eq!(q.live().len(), 0);
+    }
+
+    #[test]
+    fn compact_removes_stably_deleted_entries() {
+        let mut queue = PriorityQueue::default();
+        apply(
+            &mut queue,
+            PqOp::Push {
+                priority: 1,
+                value: val(1),
+            },
+            hlc(100, 1),
+        )
+        .unwrap();
+        let pop = queue.pop().unwrap();
+        apply(&mut queue, pop, hlc(200, 1)).unwrap();
+
+        assert!(!Type::compact(&mut queue, hlc(150, 1)).unwrap());
+        assert!(Type::compact(&mut queue, hlc(200, 1)).unwrap());
+        assert!(queue.entries.is_empty());
+    }
+
+    #[test]
+    fn pop_before_push_converges_with_push_before_pop() {
+        let id = hlc(100, 1);
+        let push = PqOp::Push {
+            priority: 1,
+            value: val(1),
+        };
+        let pop = PqOp::Pop { id };
+
+        let mut push_first = PriorityQueue::default();
+        apply(&mut push_first, push.clone(), id).unwrap();
+        apply(&mut push_first, pop.clone(), hlc(200, 2)).unwrap();
+
+        let mut pop_first = PriorityQueue::default();
+        apply(&mut pop_first, pop, hlc(200, 2)).unwrap();
+        apply(&mut pop_first, push, id).unwrap();
+
+        assert_eq!(push_first, pop_first);
+        assert!(push_first.live().is_empty());
     }
 
     #[test]
     fn pop_returns_lowest_priority_first() {
-        let mut q = PriorityQueue::new();
+        let mut q = PriorityQueue::default();
         apply(
             &mut q,
             PqOp::Push {
@@ -240,7 +325,7 @@ mod tests {
         )
         .unwrap();
 
-        let live = pq_live(&q);
+        let live = q.live();
         assert_eq!(live[0].0, 3);
         assert_eq!(live[1].0, 7);
         assert_eq!(live[2].0, 10);
@@ -248,7 +333,7 @@ mod tests {
 
     #[test]
     fn equal_priorities_ordered_by_insertion_hlc() {
-        let mut q = PriorityQueue::new();
+        let mut q = PriorityQueue::default();
         apply(
             &mut q,
             PqOp::Push {
@@ -277,7 +362,7 @@ mod tests {
         )
         .unwrap();
 
-        let live = pq_live(&q);
+        let live = q.live();
         assert_eq!(live[0].2, &val(20)); // hlc(100) first
         assert_eq!(live[1].2, &val(10)); // hlc(200) second
         assert_eq!(live[2].2, &val(30)); // hlc(300) third
@@ -285,13 +370,13 @@ mod tests {
 
     #[test]
     fn pop_on_empty_queue_returns_false() {
-        let mut q = PriorityQueue::new();
-        assert!(!apply(&mut q, PqOp::Pop, hlc(100, 1)).unwrap());
+        let q = PriorityQueue::default();
+        assert!(q.pop().is_none());
     }
 
     #[test]
     fn duplicate_pop_is_idempotent() {
-        let mut q = PriorityQueue::new();
+        let mut q = PriorityQueue::default();
         apply(
             &mut q,
             PqOp::Push {
@@ -301,14 +386,15 @@ mod tests {
             hlc(100, 1),
         )
         .unwrap();
-        assert!(apply(&mut q, PqOp::Pop, hlc(200, 1)).unwrap());
-        assert!(!apply(&mut q, PqOp::Pop, hlc(200, 1)).unwrap());
+        let pop = q.pop().unwrap();
+        assert!(apply(&mut q, pop.clone(), hlc(200, 1)).unwrap());
+        assert!(!apply(&mut q, pop, hlc(200, 1)).unwrap());
     }
 
     #[test]
     fn merge_combines_elements_from_both_replicas() {
-        let mut left = PriorityQueue::new();
-        let mut right = PriorityQueue::new();
+        let mut left = PriorityQueue::default();
+        let mut right = PriorityQueue::default();
         apply(
             &mut left,
             PqOp::Push {
@@ -328,16 +414,16 @@ mod tests {
         )
         .unwrap();
 
-        Type::merge(&mut left, &right, Hlc::ZERO, Hlc::ZERO).unwrap();
-        let live = pq_live(&left);
+        Type::merge(&mut left, &right, crate::MergeClocks::ZERO).unwrap();
+        let live = left.live();
         assert_eq!(live.len(), 2);
         assert_eq!(live[0].0, 3);
     }
 
     #[test]
     fn merge_propagates_deletions() {
-        let mut left = PriorityQueue::new();
-        let mut right = PriorityQueue::new();
+        let mut left = PriorityQueue::default();
+        let mut right = PriorityQueue::default();
         apply(
             &mut left,
             PqOp::Push {
@@ -356,16 +442,17 @@ mod tests {
             hlc(100, 1),
         )
         .unwrap();
-        apply(&mut right, PqOp::Pop, hlc(200, 2)).unwrap();
+        let pop = right.pop().unwrap();
+        apply(&mut right, pop, hlc(200, 2)).unwrap();
 
-        Type::merge(&mut left, &right, Hlc::ZERO, Hlc::ZERO).unwrap();
-        assert_eq!(pq_live(&left).len(), 0);
+        Type::merge(&mut left, &right, crate::MergeClocks::ZERO).unwrap();
+        assert_eq!(left.live().len(), 0);
     }
 
     #[test]
     fn concurrent_pops_of_same_element_converge() {
-        let mut left = PriorityQueue::new();
-        let mut right = PriorityQueue::new();
+        let mut left = PriorityQueue::default();
+        let mut right = PriorityQueue::default();
         apply(
             &mut left,
             PqOp::Push {
@@ -386,16 +473,18 @@ mod tests {
         .unwrap();
 
         // Concurrent pops with different HLCs
-        apply(&mut left, PqOp::Pop, hlc(200, 1)).unwrap();
-        apply(&mut right, PqOp::Pop, hlc(150, 2)).unwrap();
+        let left_pop = left.pop().unwrap();
+        let right_pop = right.pop().unwrap();
+        apply(&mut left, left_pop, hlc(200, 1)).unwrap();
+        apply(&mut right, right_pop, hlc(150, 2)).unwrap();
 
-        Type::merge(&mut left, &right, Hlc::ZERO, Hlc::ZERO).unwrap();
-        assert_eq!(pq_live(&left).len(), 0);
+        Type::merge(&mut left, &right, crate::MergeClocks::ZERO).unwrap();
+        assert_eq!(left.live().len(), 0);
     }
 
     #[test]
     fn stale_pop_does_not_delete_newer_push() {
-        let mut q = PriorityQueue::new();
+        let mut q = PriorityQueue::default();
         apply(
             &mut q,
             PqOp::Push {
@@ -406,16 +495,16 @@ mod tests {
         )
         .unwrap();
         // Stale pop at earlier clock
-        assert!(!apply(&mut q, PqOp::Pop, hlc(100, 1)).unwrap());
-        assert_eq!(pq_live(&q).len(), 1);
+        assert!(!apply(&mut q, PqOp::Pop { id: hlc(200, 1) }, hlc(100, 1)).unwrap());
+        assert_eq!(q.live().len(), 1);
     }
 
     #[test]
     fn merge_converges_for_every_replica_order() {
         let mut queues = [
-            PriorityQueue::new(),
-            PriorityQueue::new(),
-            PriorityQueue::new(),
+            PriorityQueue::default(),
+            PriorityQueue::default(),
+            PriorityQueue::default(),
         ];
         apply(
             &mut queues[0],
@@ -447,8 +536,8 @@ mod tests {
 
         let merge_order = |order: [usize; 3]| -> PriorityQueue {
             let mut merged = queues[order[0]].clone();
-            Type::merge(&mut merged, &queues[order[1]], Hlc::ZERO, Hlc::ZERO).unwrap();
-            Type::merge(&mut merged, &queues[order[2]], Hlc::ZERO, Hlc::ZERO).unwrap();
+            Type::merge(&mut merged, &queues[order[1]], crate::MergeClocks::ZERO).unwrap();
+            Type::merge(&mut merged, &queues[order[2]], crate::MergeClocks::ZERO).unwrap();
             merged
         };
 
@@ -456,13 +545,13 @@ mod tests {
         for order in [[0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
             assert_eq!(merge_order(order), expected);
         }
-        let live = pq_live(&expected);
+        let live = expected.live();
         assert_eq!(live.len(), 3);
     }
 
     #[test]
     fn priority_queue_bincode_roundtrip() {
-        let mut q = PriorityQueue::new();
+        let mut q = PriorityQueue::default();
         apply(
             &mut q,
             PqOp::Push {
@@ -481,7 +570,8 @@ mod tests {
             hlc(200, 2),
         )
         .unwrap();
-        apply(&mut q, PqOp::Pop, hlc(300, 1)).unwrap();
+        let pop = q.pop().unwrap();
+        apply(&mut q, pop, hlc(300, 1)).unwrap();
 
         let encoded = encode_to_vec(&q, config::standard()).unwrap();
         let (decoded, consumed): (PriorityQueue, usize) =

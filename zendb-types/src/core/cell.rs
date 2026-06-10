@@ -2,8 +2,8 @@
 
 use bincode::{Decode, Encode};
 
-use crate::core::traits::{ContainerType, Type};
-use crate::{Hlc, Op, TypeTag, Value};
+use crate::core::traits::{ContainerType, MergeClocks, Type};
+use crate::{Hlc, Op, PathStep, TypeError, TypeTag, Value};
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct Cell {
@@ -17,10 +17,6 @@ pub struct Cell {
 }
 
 impl Cell {
-    pub fn new(value: Option<Value>, hlc: Hlc, sync: Option<bool>) -> Cell {
-        Cell { value, hlc, sync }
-    }
-
     pub fn dummy(value: Option<Value>) -> Cell {
         Cell {
             value,
@@ -41,86 +37,100 @@ impl Cell {
         self.value.as_ref().map(Value::type_tag)
     }
 
-    /// Apply a delta/event to this cell. Returns true if state was modified.
-    pub fn apply(&mut self, delta: &crate::Delta) -> bool {
-        let mut cursor = self;
-
-        for (index, step) in delta.path.steps.iter().enumerate() {
-            if !ensure_target_type(cursor, step.container_tag, delta.hlc) {
-                return false;
-            }
-
-            let child_tag = delta
-                .path
-                .steps
-                .get(index + 1)
-                .map(|s| s.container_tag)
-                .or_else(|| delta.op.target_type());
-
-            let value = cursor
-                .value
-                .as_mut()
-                .expect("ensure_ancestor_container must leave cursor live");
-            cursor = match value.child_or_default(&step.segment, child_tag) {
-                Ok(c) => c,
-                Err(_) => return false,
-            };
+    /// Ensure this cell contains `expected`, replacing stale state when the
+    /// incoming operation is newer than all state currently below this cell.
+    pub(crate) fn ensure_type(&mut self, expected: TypeTag, op_hlc: Hlc) -> bool {
+        if self.type_tag() == Some(expected) {
+            return true;
         }
 
-        match &delta.op {
+        if op_hlc.beats(self.max_hlc()) {
+            self.value = Some(expected.empty_value());
+            self.hlc = op_hlc;
+            return true;
+        }
+
+        false
+    }
+
+    /// Apply an event to this cell. Returns true if state was modified.
+    ///
+    /// `sync` is the mandatory sync policy inherited from the owning table.
+    /// The nearest explicit cell sync flag on the target path overrides it.
+    /// Remote-device events cannot mutate local-only values, except that
+    /// `SetSync` is always allowed to update the policy itself.
+    pub fn apply_event(&mut self, event: &crate::Event, sync: bool) -> bool {
+        self.try_apply_event(event, sync).unwrap_or(false)
+    }
+
+    /// Apply an event while preserving type and container errors.
+    pub fn try_apply_event(&mut self, event: &crate::Event, sync: bool) -> Result<bool, TypeError> {
+        if !matches!(&event.op, Op::SetSync { .. })
+            && !self.is_synced(sync, &event.path)
+            && event.hlc.device_id() != crate::device_id()
+        {
+            return Ok(false);
+        }
+
+        ContainerType::apply_walk(self, &event.op, event.hlc, &event.path)
+    }
+}
+
+impl Type for Cell {
+    type Op = Op;
+    type Error = TypeError;
+
+    fn apply(&mut self, op: &Op, op_hlc: Hlc) -> Result<bool, TypeError> {
+        let changed = match op {
             Op::Type(type_op) => {
                 let expected = type_op.type_tag();
-                if !ensure_target_type(cursor, expected, delta.hlc) {
-                    return false;
+                if !self.ensure_type(expected, op_hlc) {
+                    return Ok(false);
                 }
-                let value = cursor
+                let value = self
                     .value
                     .as_mut()
-                    .expect("ensure_target_type must leave cursor live");
-                match value.apply(type_op, cursor.hlc, delta.hlc) {
-                    Ok(true) => {
-                        if delta.hlc.beats(cursor.hlc) {
-                            cursor.hlc = delta.hlc;
+                    .expect("ensure_type must leave cursor live");
+                match value.apply(type_op, op_hlc)? {
+                    true => {
+                        if op_hlc.beats(self.hlc) {
+                            self.hlc = op_hlc;
                         }
                         true
                     }
-                    Ok(false) | Err(_) => false,
+                    false => false,
                 }
             }
             Op::SetSync { sync } => {
-                if cursor.hlc.beats(delta.hlc) {
-                    return false;
+                if !op_hlc.beats(self.hlc) {
+                    return Ok(false);
                 }
-                cursor.sync = *sync;
-                cursor.hlc = delta.hlc;
+                self.sync = *sync;
+                self.hlc = op_hlc;
                 true
             }
             Op::Delete => {
-                if cursor.hlc.beats(delta.hlc) {
-                    return false;
+                if !op_hlc.beats(self.hlc) {
+                    return Ok(false);
                 }
-                cursor.value = None;
-                cursor.hlc = delta.hlc;
+                self.value = None;
+                self.hlc = op_hlc;
                 true
             }
             Op::Replace { value } => {
-                if cursor.hlc.beats(delta.hlc) {
-                    return false;
+                if !op_hlc.beats(self.hlc) {
+                    return Ok(false);
                 }
-                cursor.value = Some(value.clone());
-                cursor.hlc = delta.hlc;
+                self.value = Some(value.clone());
+                self.hlc = op_hlc;
                 true
             }
-            Op::Merge { cell } => cursor.merge(cell),
-        }
+            Op::Merge { cell } => Type::merge(self, cell, MergeClocks::ZERO)?,
+        };
+        Ok(changed)
     }
 
-    /// Merge a remote cell into this one.
-    ///
-    /// Tombstone/live and type conflicts are resolved by this cell's structural
-    /// HLC. When both cells are live with the same type, merge is delegated to
-    /// the type implementation so containers can recursively merge children.
-    pub fn merge(&mut self, remote: &Cell) -> bool {
+    fn merge(&mut self, remote: &Cell, _clocks: MergeClocks) -> Result<bool, TypeError> {
         let mut changed = false;
 
         match (&mut self.value, &remote.value) {
@@ -135,7 +145,7 @@ impl Cell {
                     let sync = self.sync;
                     *self = remote.clone();
                     self.sync = sync;
-                    return true;
+                    return Ok(true);
                 }
             }
             (Some(local), Some(remote_value)) => {
@@ -144,16 +154,12 @@ impl Cell {
                         let sync = self.sync;
                         *self = remote.clone();
                         self.sync = sync;
-                        return true;
+                        return Ok(true);
                     }
-                    return false;
+                    return Ok(false);
                 }
 
-                let local_hlc = self.hlc;
-                if local
-                    .merge(remote_value, local_hlc, remote.hlc)
-                    .unwrap_or(false)
-                {
+                if local.merge(remote_value, MergeClocks::new(self.hlc, remote.hlc))? {
                     changed = true;
                 }
                 if remote.hlc.beats(self.hlc) {
@@ -163,46 +169,83 @@ impl Cell {
             }
         }
 
-        changed
+        Ok(changed)
     }
 
-    pub fn max_hlc(&self) -> Hlc {
+    fn is_synced(&self, inherited: bool, path: &[PathStep]) -> bool {
+        let effective = self.sync.unwrap_or(inherited);
+        if path.is_empty() {
+            return effective;
+        }
+        if self.type_tag() != Some(path[0].container_tag) {
+            return effective;
+        }
+        self.value
+            .as_ref()
+            .map(|value| value.is_synced(effective, path))
+            .unwrap_or(effective)
+    }
+
+    fn compact(&mut self, watermark: Hlc) -> Result<bool, TypeError> {
+        let Some(value) = self.value.as_mut() else {
+            return Ok(false);
+        };
+        value.compact(watermark)
+    }
+
+    fn max_hlc(&self) -> Hlc {
         match &self.value {
-            Some(value) => std::cmp::max(self.hlc, value.max_hlc()),
+            Some(value) => self.hlc.max(value.max_hlc()),
             None => self.hlc,
         }
     }
 }
 
-fn ensure_target_type(cursor: &mut Cell, expected: TypeTag, op_hlc: Hlc) -> bool {
-    if cursor.type_tag() == Some(expected) {
-        return true;
-    }
+impl ContainerType for Cell {
+    fn apply_walk(&mut self, op: &Op, op_hlc: Hlc, path: &[PathStep]) -> Result<bool, TypeError> {
+        let Some((step, _)) = path.split_first() else {
+            return self.apply(op, op_hlc);
+        };
 
-    if op_hlc.beats(cursor.max_hlc()) {
-        // If types are wrong but the edit is beyond the max_hlc point
-        // Rare occurance
-        cursor.value = Some(expected.empty_value());
-        cursor.hlc = op_hlc;
-        return true;
+        if !self.ensure_type(step.container_tag, op_hlc) {
+            return Ok(false);
+        }
+        self.value
+            .as_mut()
+            .expect("ensure_type must leave the cell live")
+            .apply_walk(op, op_hlc, path)
     }
-
-    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::record::Record;
-    use crate::{Path, PrimaryKey, Segment};
+    use crate::{Path, PathStep, PrimaryKey, Segment};
     use bincode::{config, decode_from_slice, encode_to_vec};
 
     fn hlc(ms: u64) -> Hlc {
         Hlc::with_device_id(ms, 0, [1u8; 8]).unwrap()
     }
 
-    fn delta(path: Path, op: Op, hlc: Hlc) -> crate::Delta {
-        crate::Delta {
+    fn cell(value: Option<Value>, hlc: Hlc, sync: Option<bool>) -> Cell {
+        Cell { value, hlc, sync }
+    }
+
+    fn local_hlc(ms: u64) -> Hlc {
+        crate::init_device_id();
+        Hlc::with_device_id(ms, 0, crate::device_id()).unwrap()
+    }
+
+    fn remote_hlc(ms: u64) -> Hlc {
+        crate::init_device_id();
+        let mut remote = crate::device_id();
+        remote[0] ^= u8::MAX;
+        Hlc::with_device_id(ms, 0, remote).unwrap()
+    }
+
+    fn event(path: Path, op: Op, hlc: Hlc) -> crate::Event {
+        crate::Event {
             table_id: "test".into(),
             primary_key: PrimaryKey::String("pk".into()),
             path,
@@ -231,7 +274,7 @@ mod tests {
 
     #[test]
     fn bincode_roundtrip() {
-        let cell = Cell::new(Some(Value::String("hi".into())), hlc(100), Some(true));
+        let cell = cell(Some(Value::String("hi".into())), hlc(100), Some(true));
         let buf = encode_to_vec(&cell, config::standard()).unwrap();
         let (decoded, n): (Cell, usize) = decode_from_slice(&buf, config::standard()).unwrap();
         assert_eq!(n, buf.len());
@@ -242,115 +285,236 @@ mod tests {
     #[test]
     fn replace_scalar() {
         let mut cell = Cell::dummy(Some(Value::String(String::new())));
-        assert!(cell.apply(&delta(
-            Path::new(),
-            Op::Replace {
-                value: Value::Int(42),
-            },
-            hlc(100),
-        )));
+        assert!(cell.apply_event(
+            &event(
+                Path::new(),
+                Op::Replace {
+                    value: Value::Int(42),
+                },
+                hlc(100),
+            ),
+            true
+        ));
         assert_eq!(cell.hlc, hlc(100));
     }
 
     #[test]
     fn apply_lww_older_no_change() {
-        let mut cell = Cell::new(Some(Value::Int(1)), hlc(200), None);
-        let changed = cell.apply(&delta(
-            Path::new(),
-            Op::Replace {
-                value: Value::Int(2),
-            },
-            hlc(100),
-        ));
+        let mut cell = cell(Some(Value::Int(1)), hlc(200), None);
+        let changed = cell.apply_event(
+            &event(
+                Path::new(),
+                Op::Replace {
+                    value: Value::Int(2),
+                },
+                hlc(100),
+            ),
+            true,
+        );
         assert!(!changed);
         assert_eq!(cell.hlc, hlc(200));
     }
 
     #[test]
     fn delete_tombstones_cell() {
-        let mut cell = Cell::new(Some(Value::Int(1)), hlc(100), None);
-        assert!(cell.apply(&delta(Path::new(), Op::Delete, hlc(200))));
+        let mut cell = cell(Some(Value::Int(1)), hlc(100), None);
+        assert!(cell.apply_event(&event(Path::new(), Op::Delete, hlc(200)), true));
         assert!(cell.is_tombstone());
         assert_eq!(cell.hlc, hlc(200));
     }
 
     #[test]
     fn older_write_does_not_resurrect_tombstone() {
-        let mut cell = Cell::new(None, hlc(200), None);
-        let changed = cell.apply(&delta(
-            Path::new(),
-            Op::Replace {
-                value: Value::Int(2),
-            },
-            hlc(100),
-        ));
+        let mut cell = cell(None, hlc(200), None);
+        let changed = cell.apply_event(
+            &event(
+                Path::new(),
+                Op::Replace {
+                    value: Value::Int(2),
+                },
+                hlc(100),
+            ),
+            true,
+        );
         assert!(!changed);
         assert!(cell.is_tombstone());
     }
 
     #[test]
     fn apply_set_field() {
-        let mut root = Cell::new(Some(Value::Record(Record::new())), hlc(50), None);
-        let path = Path::new().step(TypeTag::Record, Segment::Record("x".into()));
-        assert!(root.apply(&delta(
-            path,
-            Op::Replace {
-                value: Value::String("hi".into()),
-            },
-            hlc(100),
-        )));
+        let mut root = cell(Some(Value::Record(Record::default())), hlc(50), None);
+        let path = vec![PathStep::new(TypeTag::Record, Segment::Record("x".into()))];
+        assert!(root.apply_event(
+            &event(
+                path,
+                Op::Replace {
+                    value: Value::String("hi".into()),
+                },
+                hlc(100),
+            ),
+            true
+        ));
+    }
+
+    #[test]
+    fn remote_event_is_rejected_by_nearest_local_only_ancestor() {
+        let mut nested = Record::default();
+        nested.insert(
+            "field".into(),
+            cell(Some(Value::Int(1)), local_hlc(100), None),
+        );
+        let mut root_record = Record::default();
+        root_record.insert(
+            "nested".into(),
+            cell(Some(Value::Record(nested)), local_hlc(100), Some(false)),
+        );
+        let mut root = cell(Some(Value::Record(root_record)), local_hlc(100), Some(true));
+        let path = vec![
+            PathStep::new(TypeTag::Record, Segment::Record("nested".into())),
+            PathStep::new(TypeTag::Record, Segment::Record("field".into())),
+        ];
+
+        assert!(!root.apply_event(
+            &event(
+                path,
+                Op::Replace {
+                    value: Value::Int(2),
+                },
+                remote_hlc(200),
+            ),
+            true,
+        ));
+
+        let Some(Value::Record(root_record)) = &root.value else {
+            panic!("expected root record");
+        };
+        let Some(Value::Record(nested)) = &root_record.get("nested").unwrap().value else {
+            panic!("expected nested record");
+        };
+        assert_eq!(nested.get("field").unwrap().value, Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn rejected_remote_event_does_not_create_missing_children() {
+        let mut root = cell(
+            Some(Value::Record(Record::default())),
+            local_hlc(100),
+            Some(false),
+        );
+        let path = vec![PathStep::new(
+            TypeTag::Record,
+            Segment::Record("missing".into()),
+        )];
+
+        assert!(!root.apply_event(
+            &event(
+                path,
+                Op::Replace {
+                    value: Value::Int(1),
+                },
+                remote_hlc(200),
+            ),
+            true,
+        ));
+
+        let Some(Value::Record(record)) = &root.value else {
+            panic!("expected record");
+        };
+        assert!(!record.contains("missing"));
+    }
+
+    #[test]
+    fn remote_set_sync_is_allowed_on_local_only_target() {
+        let mut root = cell(Some(Value::Int(1)), local_hlc(100), Some(false));
+
+        assert!(root.apply_event(
+            &event(
+                Path::new(),
+                Op::SetSync { sync: Some(true) },
+                remote_hlc(200),
+            ),
+            false,
+        ));
+        assert_eq!(root.sync, Some(true));
+    }
+
+    #[test]
+    fn set_sync_uses_hlc_for_clock_check() {
+        let mut local = cell(Some(Value::Int(1)), hlc(100), None);
+        // SetSync at 300 bumps hlc; older remote value is rejected.
+        Type::apply(&mut local, &Op::SetSync { sync: Some(false) }, hlc(300)).unwrap();
+        let remote = cell(Some(Value::Int(2)), hlc(200), None);
+
+        let changed = Type::merge(&mut local, &remote, MergeClocks::ZERO).unwrap();
+        // Remote at 200 doesn't beat the SetSync-bumped hlc of 300.
+        assert!(!changed);
+        assert_eq!(local.value, Some(Value::Int(1)));
+        assert_eq!(local.hlc, hlc(300));
+        assert_eq!(local.sync, Some(false));
     }
 
     #[test]
     fn nested_update_does_not_bump_existing_parent_hlc() {
-        let mut root = Cell::new(Some(Value::Record(Record::new())), hlc(50), None);
-        let path = Path::new().step(TypeTag::Record, Segment::Record("x".into()));
-        assert!(root.apply(&delta(
-            path,
-            Op::Replace {
-                value: Value::Int(1),
-            },
-            hlc(100),
-        )));
+        let mut root = cell(Some(Value::Record(Record::default())), hlc(50), None);
+        let path = vec![PathStep::new(TypeTag::Record, Segment::Record("x".into()))];
+        assert!(root.apply_event(
+            &event(
+                path,
+                Op::Replace {
+                    value: Value::Int(1),
+                },
+                hlc(100),
+            ),
+            true
+        ));
         assert_eq!(root.hlc, hlc(50));
     }
 
     #[test]
     fn recreated_parent_gets_event_hlc() {
-        let mut root = Cell::new(None, hlc(50), None);
-        let path = Path::new().step(TypeTag::Record, Segment::Record("x".into()));
-        assert!(root.apply(&delta(
-            path,
-            Op::Replace {
-                value: Value::Int(1),
-            },
-            hlc(100),
-        )));
+        let mut root = cell(None, hlc(50), None);
+        let path = vec![PathStep::new(TypeTag::Record, Segment::Record("x".into()))];
+        assert!(root.apply_event(
+            &event(
+                path,
+                Op::Replace {
+                    value: Value::Int(1),
+                },
+                hlc(100),
+            ),
+            true
+        ));
         assert_eq!(root.hlc, hlc(100));
         assert_eq!(root.type_tag(), Some(TypeTag::Record));
     }
 
     #[test]
     fn merge_same_record_recurses() {
-        let mut local = Cell::new(Some(Value::Record(Record::new())), hlc(50), None);
-        let mut remote = Cell::new(Some(Value::Record(Record::new())), hlc(50), None);
-        let local_path = Path::new().step(TypeTag::Record, Segment::Record("a".into()));
-        let remote_path = Path::new().step(TypeTag::Record, Segment::Record("b".into()));
-        local.apply(&delta(
-            local_path,
-            Op::Replace {
-                value: Value::Int(1),
-            },
-            hlc(100),
-        ));
-        remote.apply(&delta(
-            remote_path,
-            Op::Replace {
-                value: Value::Int(2),
-            },
-            hlc(110),
-        ));
-        assert!(local.merge(&remote));
+        let mut local = cell(Some(Value::Record(Record::default())), hlc(50), None);
+        let mut remote = cell(Some(Value::Record(Record::default())), hlc(50), None);
+        let local_path = vec![PathStep::new(TypeTag::Record, Segment::Record("a".into()))];
+        let remote_path = vec![PathStep::new(TypeTag::Record, Segment::Record("b".into()))];
+        local.apply_event(
+            &event(
+                local_path,
+                Op::Replace {
+                    value: Value::Int(1),
+                },
+                hlc(100),
+            ),
+            true,
+        );
+        remote.apply_event(
+            &event(
+                remote_path,
+                Op::Replace {
+                    value: Value::Int(2),
+                },
+                hlc(110),
+            ),
+            true,
+        );
+        assert!(Type::merge(&mut local, &remote, MergeClocks::ZERO).unwrap());
         let Some(Value::Record(record)) = &local.value else {
             panic!("expected record");
         };
@@ -360,18 +524,18 @@ mod tests {
 
     #[test]
     fn merge_scalar_uses_original_local_hlc() {
-        let mut local = Cell::new(Some(Value::Int(1)), hlc(100), None);
-        let remote = Cell::new(Some(Value::Int(2)), hlc(200), None);
-        assert!(local.merge(&remote));
+        let mut local = cell(Some(Value::Int(1)), hlc(100), None);
+        let remote = cell(Some(Value::Int(2)), hlc(200), None);
+        assert!(Type::merge(&mut local, &remote, MergeClocks::ZERO).unwrap());
         assert_eq!(local.value, Some(Value::Int(2)));
         assert_eq!(local.hlc, hlc(200));
     }
 
     #[test]
     fn merge_keeps_sync_local() {
-        let mut local = Cell::new(Some(Value::Int(1)), hlc(100), Some(false));
-        let remote = Cell::new(Some(Value::Record(Record::new())), hlc(200), Some(true));
-        assert!(local.merge(&remote));
+        let mut local = cell(Some(Value::Int(1)), hlc(100), Some(false));
+        let remote = cell(Some(Value::Record(Record::default())), hlc(200), Some(true));
+        assert!(Type::merge(&mut local, &remote, MergeClocks::ZERO).unwrap());
         assert_eq!(local.type_tag(), Some(TypeTag::Record));
         assert_eq!(local.sync, Some(false));
     }

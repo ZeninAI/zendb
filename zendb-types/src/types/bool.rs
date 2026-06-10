@@ -24,12 +24,12 @@ impl Type for Bool {
     type Op = BoolOp;
     type Error = BoolError;
 
-    fn apply(&mut self, op: &BoolOp, _local_hlc: Hlc, _op_hlc: Hlc) -> Result<bool, BoolError> {
+    fn apply(&mut self, op: &BoolOp, _op_hlc: Hlc) -> Result<bool, BoolError> {
         match *op {}
     }
 
-    fn merge(&mut self, remote: &Bool, local_hlc: Hlc, remote_hlc: Hlc) -> Result<bool, BoolError> {
-        if remote_hlc.beats(local_hlc) {
+    fn merge(&mut self, remote: &Bool, clocks: crate::MergeClocks) -> Result<bool, BoolError> {
+        if clocks.remote.beats(clocks.local) {
             *self = *remote;
             Ok(true)
         } else {
@@ -50,22 +50,42 @@ mod tests {
     #[test]
     fn newer_remote_value_wins() {
         let mut local = false;
-        assert!(Type::merge(&mut local, &true, hlc(100, 1), hlc(200, 2)).unwrap());
+        assert!(Type::merge(
+            &mut local,
+            &true,
+            crate::MergeClocks::new(hlc(100, 1), hlc(200, 2)),
+        )
+        .unwrap());
         assert!(local);
     }
 
     #[test]
     fn older_and_equal_clock_values_are_ignored() {
         let mut local = true;
-        assert!(!Type::merge(&mut local, &false, hlc(200, 2), hlc(100, 1)).unwrap());
-        assert!(!Type::merge(&mut local, &false, hlc(200, 2), hlc(200, 2)).unwrap());
+        assert!(!Type::merge(
+            &mut local,
+            &false,
+            crate::MergeClocks::new(hlc(200, 2), hlc(100, 1)),
+        )
+        .unwrap());
+        assert!(!Type::merge(
+            &mut local,
+            &false,
+            crate::MergeClocks::new(hlc(200, 2), hlc(200, 2)),
+        )
+        .unwrap());
         assert!(local);
     }
 
     #[test]
     fn device_id_breaks_same_time_ties() {
         let mut local = false;
-        assert!(Type::merge(&mut local, &true, hlc(100, 1), hlc(100, 2)).unwrap());
+        assert!(Type::merge(
+            &mut local,
+            &true,
+            crate::MergeClocks::new(hlc(100, 1), hlc(100, 2)),
+        )
+        .unwrap());
         assert!(local);
     }
 

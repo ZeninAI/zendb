@@ -24,22 +24,16 @@ impl Type for Timestamp {
     type Op = TimestampOp;
     type Error = TimestampError;
 
-    fn apply(
-        &mut self,
-        op: &TimestampOp,
-        _local_hlc: Hlc,
-        _op_hlc: Hlc,
-    ) -> Result<bool, TimestampError> {
+    fn apply(&mut self, op: &TimestampOp, _op_hlc: Hlc) -> Result<bool, TimestampError> {
         match *op {}
     }
 
     fn merge(
         &mut self,
         remote: &Timestamp,
-        local_hlc: Hlc,
-        remote_hlc: Hlc,
+        clocks: crate::MergeClocks,
     ) -> Result<bool, TimestampError> {
-        if remote_hlc.beats(local_hlc) {
+        if clocks.remote.beats(clocks.local) {
             *self = *remote;
             Ok(true)
         } else {
@@ -60,14 +54,24 @@ mod tests {
     #[test]
     fn merge_uses_write_clock_not_timestamp_value() {
         let mut local = u64::MAX;
-        assert!(Type::merge(&mut local, &0, hlc(100, 1), hlc(200, 1)).unwrap());
+        assert!(Type::merge(
+            &mut local,
+            &0,
+            crate::MergeClocks::new(hlc(100, 1), hlc(200, 1)),
+        )
+        .unwrap());
         assert_eq!(local, 0);
     }
 
     #[test]
     fn stale_remote_timestamp_is_ignored() {
         let mut local = 1;
-        assert!(!Type::merge(&mut local, &u64::MAX, hlc(200, 1), hlc(100, 2)).unwrap());
+        assert!(!Type::merge(
+            &mut local,
+            &u64::MAX,
+            crate::MergeClocks::new(hlc(200, 1), hlc(100, 2)),
+        )
+        .unwrap());
         assert_eq!(local, 1);
     }
 

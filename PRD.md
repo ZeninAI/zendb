@@ -10,17 +10,17 @@
 
 ZeninDB is an embedded, local-first, eventually consistent database for applications that need rich collaborative data structures, offline mutation, deterministic convergence, and local materialized views.
 
-The central abstraction is a table containing rows addressed by primary keys. Each row is a recursive `Cell` tree. Cells contain typed values, structural Hybrid Logical Clock metadata, and an optional synchronization policy. All collaborative writes are represented as self-contained `Delta` values that identify a table, row, recursive path, operation, HLC, sync decision, and opaque signature.
+The central abstraction is a table containing rows addressed by primary keys. Each row is a recursive `Cell` tree. Cells contain typed values, structural Hybrid Logical Clock metadata, and an optional synchronization policy. All collaborative writes are represented as self-contained `Event` values that identify a table, row, recursive path, operation, HLC, sync decision, and opaque signature.
 
 The current repository implements three major layers:
 
-1. **`zendb-types`** implements the recursive cell model, HLCs, deltas, paths, operations, generated type dispatch, scalar values, records, LWW sets, RGA-style lists, and RGA-style collaborative text.
+1. **`zendb-types`** implements the recursive cell model, HLCs, events, paths, operations, generated type dispatch, scalar values, records, LWW sets, RGA-style lists, and RGA-style collaborative text.
 2. **`zendb-storage`** implements reusable persistent storage backends: an unordered Bitcask-style `KeyDir`, an ordered memory-mapped `BPlusTree`, and an in-memory ordered `OrderLog` with a durable write-ahead log.
-3. **`zendb-engine`** implements a `Table` that combines materialized row state with an in-flight delta journal and an in-memory resolved-row cache. An in-progress `Database` implementation owns a persistent table catalog and lazily opened tables.
+3. **`zendb-engine`** implements a `Table` that combines materialized row state with an in-flight event journal and an in-memory resolved-row cache. An in-progress `Database` implementation owns a persistent table catalog and lazily opened tables.
 
 The next major product capability is a **stateful streaming consumer runtime**. External owners of a database must be able to register computations that:
 
-- observe accepted deltas or resolved state changes;
+- observe accepted events or resolved state changes;
 - filter events by table, row, path, operation, or resolved state;
 - bootstrap from an existing table snapshot and then continue incrementally;
 - maintain private durable state;
@@ -54,7 +54,7 @@ ZeninDB should make collaborative and reactive local applications possible witho
 - stateful derived views;
 - eventual peer-to-peer convergence.
 
-An application should be able to embed ZeninDB, create tables, apply local or remote deltas, query resolved rows, and attach long-running computations to those tables. Those computations should behave like small local streaming jobs: they first process existing state, then continuously process new changes, and optionally maintain or publish derived state.
+An application should be able to embed ZeninDB, create tables, apply local or remote events, query resolved rows, and attach long-running computations to those tables. Those computations should behave like small local streaming jobs: they first process existing state, then continuously process new changes, and optionally maintain or publish derived state.
 
 ZeninDB is not intended to require a central coordination service. A server may be used as a transport relay, backup target, or authority in a particular deployment, but the data model and merge semantics must remain usable by independently operating replicas.
 
@@ -77,7 +77,7 @@ ZeninDB is not intended to require a central coordination service. A server may 
 - Provide embedded, file-backed storage without requiring an external service.
 - Provide both ordered and unordered state backends.
 - Make reads available from resolved table state before journal materialization.
-- Recover pending table deltas after reopening.
+- Recover pending table events after reopening.
 - Support compaction and bounded in-flight table journals.
 - Keep storage primitives generic and reusable outside the ZeninDB table abstraction.
 
@@ -93,9 +93,9 @@ ZeninDB is not intended to require a central coordination service. A server may 
 
 ### 3.4 Replication goals
 
-- Keep `Delta` transport-independent.
-- Accept local and remote deltas through the same conflict-resolution path.
-- Support eventual state-based convergence without requiring infinite delta retention.
+- Keep `Event` transport-independent.
+- Accept local and remote events through the same conflict-resolution path.
+- Support eventual state-based convergence without requiring infinite event retention.
 - Preserve signatures as opaque data at the type layer.
 
 Replication orchestration, signing, verification, transport, anti-entropy, and cold sync are planned but are not implemented in the current repository.
@@ -123,9 +123,9 @@ ZeninDB may later add some of these capabilities, but the current architecture m
 
 | Crate | Current responsibility | Status |
 |---|---|---|
-| `zendb-types` | Pure data model, HLC, cells, deltas, operations, paths, CRDT types, generated dispatch | Implemented |
+| `zendb-types` | Pure data model, HLC, cells, events, operations, paths, CRDT types, generated dispatch | Implemented |
 | `zendb-storage` | Generic persistent key/value and ordered storage backends | Implemented |
-| `zendb-engine` | Tables, materialized state, in-flight delta journal, resolved cache, database catalog | Implemented / partial |
+| `zendb-engine` | Tables, materialized state, in-flight event journal, resolved cache, database catalog | Implemented / partial |
 | `zendb-replication` | Transport-independent synchronization, signatures, anti-entropy, cold sync | Planned |
 | consumer runtime module or crate | Durable subscriptions, managed state, lifecycle, scheduling | Planned |
 
@@ -162,21 +162,21 @@ replication / consumers / application adapters
 | Type system | LWW set | Implemented | Per-element add and remove clocks |
 | Type system | RGA-style list | Implemented | Stable HLC element IDs and immutable placement |
 | Type system | Collaborative text | Implemented | Stable `(Hlc, offset)` character IDs |
-| Type system | Delta signatures | Data field only | Verification is not implemented |
+| Type system | Event signatures | Data field only | Verification is not implemented |
 | Storage | Generic backend contract | Implemented | CRUD, bulk operations, iteration, stats, flush, sync |
 | Storage | Unordered `KeyDir` | Implemented | Hash index plus append-only mmap data file |
 | Storage | Ordered `BPlusTree` | Implemented | mmap, page splits, extents, ranges, reverse iteration |
 | Storage | Ordered `OrderLog` | Implemented | In-memory skip list plus durable WAL |
 | Storage | Database transactions | Missing | No atomic multi-backend transaction boundary |
 | Engine | Materialized table state | Implemented | Ordered or unordered backend |
-| Engine | In-flight table delta journal | Implemented | Ordered by row then HLC |
+| Engine | In-flight table event journal | Implemented | Ordered by row then HLC |
 | Engine | Resolved pending-row cache | Implemented | Rebuilt from the journal on open |
 | Engine | Automatic materialization | Implemented | Manual or event-count threshold |
 | Engine | Persistent table catalog | Partial | Current working tree includes `Database` |
-| Engine | Observable-only mutation API | Missing | Direct backend writes can bypass deltas |
+| Engine | Observable-only mutation API | Missing | Direct backend writes can bypass events |
 | Engine | Durable consumer commit log | Missing | Required before durable consumers |
 | Engine | Stateful consumer runtime | Missing | Designed in this PRD |
-| Replication | Live delta sync | Missing | Planned |
+| Replication | Live event sync | Missing | Planned |
 | Replication | State-based anti-entropy | Missing | Planned |
 | Replication | Sync-policy enforcement | Missing | Metadata exists, policy behavior does not |
 
@@ -195,6 +195,8 @@ pub struct Cell {
     pub value: Option<Value>,
     pub hlc: Hlc,
     pub sync: Option<bool>,
+    sync_hlc: Hlc,
+    generation: Hlc,
 }
 ```
 
@@ -203,6 +205,9 @@ Semantics:
 - `value = Some(value)` means the cell is live.
 - `value = None` means the cell is a tombstone.
 - `hlc` is the structural clock for that cell.
+- `generation` identifies the whole-value replacement generation. Recursive
+  same-type merges occur only within the same generation.
+- `sync_hlc` orders sync-policy changes without affecting value conflicts.
 - `sync = None` means no explicit local sync policy is attached at that cell.
 - `sync = Some(true)` or `Some(false)` stores an explicit local sync decision.
 
@@ -213,7 +218,6 @@ A cell's structural HLC covers direct structural operations against that cell:
 - replacement;
 - type replacement;
 - direct type operation where the type implementation changes state;
-- sync metadata changes.
 
 Descendant-only writes do not automatically bump ancestor HLCs. This is necessary so an independent newer write to one field does not prevent valid writes to another field.
 
@@ -225,9 +229,11 @@ Descendant-only writes do not automatically bump ancestor HLCs. This is necessar
 
 Deletion is represented by `Cell { value: None, hlc, ... }`, not by physically removing a child from a collaborative container.
 
-Tombstones are required to prevent an old peer or out-of-order delta from resurrecting deleted state. Containers such as records retain tombstoned child cells as part of compacted state. Sets, lists, and text maintain their own type-specific deletion metadata.
+Tombstones are required to prevent an old peer or out-of-order event from resurrecting deleted state. Containers such as records retain tombstoned child cells as part of compacted state. Sets, lists, and text maintain their own type-specific deletion metadata.
 
-Physical garbage collection of tombstones is not implemented. Any future tombstone compaction mechanism must prove that removed causal metadata can no longer be needed by any replica.
+`Type::compact(watermark)` removes tombstones and causal metadata only after
+their relevant removal clocks are stable. Sequence anchors remain until no
+entry references them.
 
 ### 7.3 Hybrid Logical Clock
 
@@ -271,12 +277,12 @@ Primary keys are generated by the type registration macro and currently support:
 
 Primary-key variants are also used as set members.
 
-### 7.5 Delta
+### 7.5 Event
 
 **Status: Implemented as a data structure**
 
 ```rust
-pub struct Delta {
+pub struct Event {
     pub table_id: TableId,
     pub primary_key: PrimaryKey,
     pub path: Path,
@@ -287,7 +293,7 @@ pub struct Delta {
 }
 ```
 
-A delta is intended to contain everything required to apply one mutation:
+A event is intended to contain everything required to apply one mutation:
 
 - destination table;
 - destination row;
@@ -299,11 +305,11 @@ A delta is intended to contain everything required to apply one mutation:
 
 Current engine limitations:
 
-- `Table::insert_delta` does not validate that `delta.table_id` matches the owning table.
+- `Table::insert_event` does not validate that `event.table_id` matches the owning table.
 - Signature verification is not implemented.
 - The current table event identity is `(primary_key, hlc)`. This assumes one unique HLC per row mutation. Two different operations for the same row with the same HLC collide even if their paths differ.
 
-Before replication and consumers become production features, event identity must be made explicit. Options include guaranteeing globally unique HLCs per delta or introducing a dedicated `DeltaId`.
+Before replication and consumers become production features, event identity must be made explicit. Options include guaranteeing globally unique HLCs per event or introducing a dedicated `EventId`.
 
 ### 7.6 Path
 
@@ -317,9 +323,7 @@ pub struct PathStep {
     pub segment: Segment,
 }
 
-pub struct Path {
-    pub steps: Vec<PathStep>,
-}
+pub type Path = Vec<PathStep>;
 ```
 
 An empty path addresses the row root. Each step says:
@@ -359,7 +363,7 @@ The `register_types!` macro is the central type registry. It generates:
 - `Value`;
 - `TypeOp`;
 - `Segment`;
-- dispatch implementations for `Type` and `ContainerType`.
+- recursive dispatch implementations for `Type`.
 
 The current registration is:
 
@@ -374,7 +378,7 @@ Adding a type requires:
 1. defining its value representation;
 2. defining its operation and error types;
 3. implementing `Type`;
-4. optionally implementing `ContainerType`;
+4. implementing recursive methods when it is a container;
 5. registering it in the macro invocation.
 
 ### 8.2 `Type` contract
@@ -386,43 +390,25 @@ pub trait Type: Sized + Encode + Decode<()> {
     type Op: Encode + Decode<()>;
     type Error: std::error::Error;
 
-    fn apply(
-        &mut self,
-        op: &Self::Op,
-        local_hlc: Hlc,
-        op_hlc: Hlc,
-    ) -> Result<bool, Self::Error>;
-
-    fn merge(
-        &mut self,
-        remote: &Self,
-        local_hlc: Hlc,
-        remote_hlc: Hlc,
-    ) -> Result<bool, Self::Error>;
-
+    fn apply(&mut self, op: &Self::Op, op_hlc: Hlc)
+        -> Result<bool, Self::Error>;
+    fn merge(&mut self, remote: &Self, clocks: MergeClocks)
+        -> Result<bool, Self::Error>;
+    fn is_synced(&self, inherited: bool, path: &[PathStep]) -> bool;
+    fn compact(&mut self, watermark: Hlc) -> Result<bool, Self::Error>;
     fn max_hlc(&self) -> Hlc;
 }
 ```
 
-`apply` and `merge` return whether represented CRDT state changed. This does not necessarily mean the user-visible value changed. For example, a stale set add may advance the stored add clock while the element remains hidden by a newer remove clock.
+`apply`, `merge`, and `compact` return whether represented CRDT state changed. This does not necessarily mean the user-visible value changed. For example, a stale set add may advance the stored add clock while the element remains hidden by a newer remove clock.
 
 That distinction is essential for the future consumer runtime.
 
-### 8.3 `ContainerType` contract
+### 8.3 Container recursion
 
 **Status: Implemented**
 
-Containers provide mutable child traversal:
-
-```rust
-fn child_or_default(
-    &mut self,
-    segment: &Segment,
-    child_tag: Option<TypeTag>,
-) -> Result<&mut Cell, Error>;
-```
-
-`child_tag = Some(tag)` requests a live empty child of the specified type when absent. `child_tag = None` requests a tombstone placeholder when no target value type is known, such as an out-of-order delete.
+`ContainerType::apply_walk` owns recursive operation routing. Containers consume the path segment they own, create or auto-heal the selected child when required, and delegate the remaining path to that child. `Cell` handles root and cell-level operations while `Value` dispatches registered container implementations.
 
 ### 8.4 Scalar values
 
@@ -450,14 +436,7 @@ Record field deletion uses the field cell's tombstone rather than a separate rec
 
 **Status: Implemented**
 
-`Set` is a `BTreeMap<PrimaryKey, Meta>`, where each member stores:
-
-```rust
-pub struct Meta {
-    pub updated: Hlc,
-    pub deleted: Hlc,
-}
-```
+`Set` encapsulates a private `BTreeMap<PrimaryKey, Meta>`. Consumers inspect membership through `Set::contains` and `Set::keys`; per-member CRDT metadata is not public.
 
 Membership is visible when `updated > deleted`.
 
@@ -510,7 +489,7 @@ The unit is a Rust `char`, meaning a Unicode scalar value, not a grapheme cluste
 
 **Status: Implemented**
 
-`Cell::apply(&Delta) -> bool`:
+`Cell::apply(&Event) -> bool`:
 
 1. starts at the row root;
 2. walks each path step;
@@ -574,7 +553,7 @@ The engine should eventually introduce a richer internal mutation result while p
 | `Some(true)` | Synchronize this subtree by default |
 | `Some(false)` | Keep this subtree local by default |
 
-`Delta.sync` is a resolved boolean captured when the delta is created. It answers whether that delta should be offered to replication.
+`Event.sync` is a resolved boolean captured when the event is created. It answers whether that event should be offered to replication.
 
 ### 10.2 Required behavior
 
@@ -584,7 +563,7 @@ The intended write-time resolution is:
 2. walk from target toward root;
 3. use the nearest explicit sync policy;
 4. fall back to table or database default;
-5. store the result in `Delta.sync`.
+5. store the result in `Event.sync`.
 
 `SetSync` is expected to remain local-only because sync policy belongs to the local replica.
 
@@ -593,7 +572,7 @@ The intended write-time resolution is:
 The repository currently stores and merges sync metadata but does not implement:
 
 - inherited policy resolution;
-- rejection of incoming deltas for local-only subtrees;
+- rejection of incoming events for local-only subtrees;
 - replicated-state views;
 - state hashing;
 - anti-entropy;
@@ -705,7 +684,7 @@ Callers must choose a serialization whose byte order matches the desired semanti
 
 It is suitable for durable ordered working sets and journals where values should remain immediately available in memory after replay.
 
-The current table uses `OrderLog<EventKey, Delta>` as an in-flight delta journal. That journal is not a durable consumer stream because materialization clears it.
+The current table uses `OrderLog<EventKey, Event>` as an in-flight event journal. That journal is not a durable consumer stream because materialization clears it.
 
 ---
 
@@ -719,7 +698,7 @@ A `Table` owns:
 
 ```text
 state   = materialized PrimaryKey -> Cell backend
-events  = durable in-flight EventKey -> Delta journal
+events  = durable in-flight EventKey -> Event journal
 cache   = in-memory PrimaryKey -> fully resolved pending Cell
 ```
 
@@ -763,19 +742,19 @@ Each cache entry also remembers whether the row existed in materialized state wh
 
 On open, the table replays the in-flight event journal into the cache one row at a time.
 
-### 12.4 Delta insertion
+### 12.4 Event insertion
 
 **Status: Implemented**
 
-`insert_delta`:
+`insert_event`:
 
 1. builds an `EventKey`;
-2. inserts the delta only if the key is absent;
-3. applies the delta to the resolved cache entry or a state-seeded cell;
+2. inserts the event only if the key is absent;
+3. applies the event to the resolved cache entry or a state-seeded cell;
 4. avoids making an absent row visible when the only operation is ineffective;
 5. conditionally materializes according to flush configuration.
 
-`bulk_insert_delta` sorts and deduplicates events, then performs equivalent insert-if-absent behavior.
+`bulk_insert_event` sorts and deduplicates events, then performs equivalent insert-if-absent behavior.
 
 ### 12.5 Materialization
 
@@ -812,7 +791,7 @@ Because `Table` implements `Backend<PrimaryKey, Cell>`, callers can use `put`, `
 
 These methods:
 
-- bypass the delta journal;
+- bypass the event journal;
 - bypass deduplication;
 - bypass future replication;
 - bypass future consumer events;
@@ -823,7 +802,7 @@ This is the largest current API integrity issue.
 Required direction:
 
 - define a clearly named internal or administrative direct-state API;
-- make normal observable table mutation delta-based;
+- make normal observable table mutation event-based;
 - prevent consumers and replication from silently missing normal application writes.
 
 ### 12.8 Table configuration
@@ -913,7 +892,7 @@ The runtime must support both stateless and stateful computations. It must proce
 
 ### 14.2 Architectural boundary
 
-The runtime must not execute arbitrary callbacks directly inside `Table::insert_delta`.
+The runtime must not execute arbitrary callbacks directly inside `Table::insert_event`.
 
 Direct callback execution would create:
 
@@ -929,7 +908,7 @@ Direct callback execution would create:
 Instead, table mutation and consumer processing are separate stages:
 
 ```text
-incoming Delta
+incoming Event
     -> resolve against table state
     -> append durable ChangeRecord with CommitSeq
     -> make change available to independently scheduled consumers
@@ -944,7 +923,7 @@ This is the most important consumer design decision.
 
 HLC cannot safely serve as a consumer cursor because:
 
-- remote deltas can arrive late;
+- remote events can arrive late;
 - an older HLC may still change an independent nested field;
 - HLC order is causal/conflict metadata, not local arrival order;
 - multiple rows need one stable database stream order;
@@ -962,7 +941,7 @@ Requirements:
 - monotonically increasing within one database history;
 - never reused after durable assignment;
 - encoded in a byte-order-preserving form when stored in `BPlusTree`;
-- independent from the delta's HLC;
+- independent from the event's HLC;
 - suitable as the durable checkpoint for every consumer.
 
 ### 14.4 Accepted events versus effective changes
@@ -970,12 +949,12 @@ Requirements:
 The runtime must distinguish three concepts:
 
 1. **Duplicate:** the event identity already exists and is not accepted again.
-2. **Accepted delta:** the event is new to this database, even if it does not alter resolved state.
+2. **Accepted event:** the event is new to this database, even if it does not alter resolved state.
 3. **Resolved change:** application changes represented or user-visible state.
 
 A stale operation can be accepted but ineffective. A set add can update metadata but not visible membership. A root replacement can change membership without containing a set add operation.
 
-Therefore consumers cannot be correct if they only receive raw deltas.
+Therefore consumers cannot be correct if they only receive raw events.
 
 ### 14.5 ChangeRecord
 
@@ -986,7 +965,7 @@ pub struct ChangeRecord {
     pub cursor: CommitSeq,
     pub table_id: TableId,
     pub primary_key: PrimaryKey,
-    pub delta: Delta,
+    pub event: Event,
     pub effect: ChangeEffect,
 }
 
@@ -999,7 +978,7 @@ pub enum ChangeEffect {
 }
 ```
 
-`before` and `after` represent resolved row state around the accepted delta.
+`before` and `after` represent resolved row state around the accepted event.
 
 Whole-row snapshots may be expensive, but they establish unambiguous semantics. Later optimizations may store:
 
@@ -1016,14 +995,14 @@ Consumers should declare their required event semantics:
 
 ```rust
 pub enum DeliveryMode {
-    AcceptedDeltas,
+    AcceptedEvents,
     ResolvedChanges,
 }
 ```
 
-`AcceptedDeltas`:
+`AcceptedEvents`:
 
-- receives each unique accepted delta;
+- receives each unique accepted event;
 - includes `NoEffect` changes;
 - useful for auditing, metrics, and replication-related tooling.
 
@@ -1046,7 +1025,7 @@ after contains X  = true
 It must not merely match:
 
 ```text
-delta.op == SetOp::Add { key: X }
+event.op == SetOp::Add { key: X }
 ```
 
 Reasons:
@@ -1143,7 +1122,7 @@ Provide a capability-limited context:
 ```rust
 pub trait ConsumerContext {
     fn state(&mut self) -> &mut dyn StateStore;
-    fn emit_delta(&mut self, delta: Delta) -> Result<(), ConsumerError>;
+    fn emit_event(&mut self, event: Event) -> Result<(), ConsumerError>;
     fn emit_action(&mut self, action: ExternalAction) -> Result<(), ConsumerError>;
 }
 ```
@@ -1164,7 +1143,7 @@ Use cases:
 - bootstrap progress;
 - pending external actions.
 
-Private managed state should use direct key/value updates, not CRDT deltas.
+Private managed state should use direct key/value updates, not CRDT events.
 
 Reasons:
 
@@ -1180,7 +1159,7 @@ Likely initial backend:
 
 ### 14.12 Public derived state
 
-If another consumer or application must observe a consumer's output, that output should be published to a normal ZeninDB table through normal deltas.
+If another consumer or application must observe a consumer's output, that output should be published to a normal ZeninDB table through normal events.
 
 Examples:
 
@@ -1198,7 +1177,7 @@ Public derived tables:
 
 This produces a clear rule:
 
-> Private state is directly managed and checkpointed. Shared observable state is written as normal table deltas.
+> Private state is directly managed and checkpointed. Shared observable state is written as normal table events.
 
 ### 14.13 Consumer chaining
 
@@ -1229,7 +1208,7 @@ Proposed protocol:
 7. Catch up to the live head.
 8. Transition to `Running`.
 
-Snapshot rows are not fake deltas:
+Snapshot rows are not fake events:
 
 ```rust
 pub struct SnapshotRow {
@@ -1393,14 +1372,14 @@ Initial supported guarantee:
 Consumers may see the same input again after failure. Therefore:
 
 - private state mutations should be idempotent or guarded by processed event identity;
-- derived deltas should have deterministic identities;
+- derived events should have deterministic identities;
 - external actions should use a durable outbox and idempotency key.
 
 Future exactly-once local processing requires a database transaction or commit batch that atomically records:
 
 - source `ChangeRecord`;
 - private state mutations;
-- derived table deltas;
+- derived table events;
 - external outbox entries;
 - consumer checkpoint advancement.
 
@@ -1446,7 +1425,7 @@ otherwise:
 Publishing:
 
 - keep the count only in private state if no other component needs it;
-- emit a delta into `user_note_counts` if applications or consumers must observe it.
+- emit a event into `user_note_counts` if applications or consumers must observe it.
 
 ### 14.22 Consumer API decisions summary
 
@@ -1458,7 +1437,7 @@ Publishing:
 | Default input | Resolved before/after change | Correct business semantics |
 | Filtering | Runtime structural + consumer semantic | Efficiency without premature query language |
 | Private state | Direct managed KV | Local ownership; no CRDT overhead |
-| Shared state | Normal derived tables through deltas | Observable and chainable |
+| Shared state | Normal derived tables through events | Observable and chainable |
 | Bootstrap | Snapshot at fence, then replay tail | No gaps between batch and stream |
 | Initial guarantee | At-least-once | No atomic cross-backend transaction yet |
 | Runtime-native logic | Registered compiled factories | Idiomatic and safe |
@@ -1474,20 +1453,20 @@ Publishing:
 
 ZeninDB replication should combine:
 
-- low-latency delta propagation;
+- low-latency event propagation;
 - state-based anti-entropy for authoritative repair;
 - cold sync for a new replica;
 - transport independence.
 
-### 15.2 Live delta propagation
+### 15.2 Live event propagation
 
-Local deltas whose resolved `sync` flag is true may be broadcast to reachable peers. Remote deltas enter the same table conflict-resolution path as local deltas.
+Local events whose resolved `sync` flag is true may be broadcast to reachable peers. Remote events enter the same table conflict-resolution path as local events.
 
 Live delivery is best effort. It must not be the only convergence mechanism.
 
 ### 15.3 State-based anti-entropy
 
-Compacted state must contain enough causal metadata to converge without retaining every historical delta forever.
+Compacted state must contain enough causal metadata to converge without retaining every historical event forever.
 
 Planned anti-entropy:
 
@@ -1504,7 +1483,7 @@ ZeninDB should not own peer discovery or network connection policy. The embedder
 
 ### 15.5 Relationship to consumers
 
-Consumers observe local commit order, including accepted remote deltas after they arrive locally.
+Consumers observe local commit order, including accepted remote events after they arrive locally.
 
 Consequences:
 
@@ -1577,7 +1556,7 @@ Concurrency must not compromise deterministic commit sequence assignment or cons
 
 ## 18. API Design Principles
 
-1. **Observable writes use deltas.** Direct state mutation is administrative or internal.
+1. **Observable writes use events.** Direct state mutation is administrative or internal.
 2. **Conflict time and stream time are separate.** HLC and `CommitSeq` have different jobs.
 3. **Compacted state is authoritative.** Journals may be bounded when snapshots can rebuild consumers and peers.
 4. **Status is explicit.** APIs and documentation must distinguish implemented guarantees from planned semantics.
@@ -1640,11 +1619,11 @@ Future tooling should inspect:
 
 ### 20.1 Current status
 
-Signatures are opaque bytes in `Delta`. No verification, authorization, encryption, or sandbox exists.
+Signatures are opaque bytes in `Event`. No verification, authorization, encryption, or sandbox exists.
 
 ### 20.2 Required direction
 
-- Verify replicated delta signatures before acceptance.
+- Verify replicated event signatures before acceptance.
 - Define table- and path-level authorization outside the pure type layer.
 - Treat WASM consumers as untrusted code.
 - Restrict consumer host capabilities.
@@ -1675,7 +1654,7 @@ The repository has extensive unit tests for:
 The consumer runtime must include:
 
 - no-gap snapshot-to-stream bootstrap tests;
-- stale delta versus resolved transition tests;
+- stale event versus resolved transition tests;
 - set metadata change without visible membership change;
 - duplicate delivery and recovery tests;
 - filtered-event cursor advancement;
@@ -1744,10 +1723,10 @@ After the whole-row `ChangeRecord` semantics are proven:
 
 Priority: immediate
 
-- Make the normal public mutation path delta-based.
+- Make the normal public mutation path event-based.
 - Separate direct state administration from observable writes.
 - Validate table identity.
-- Define explicit delta identity.
+- Define explicit event identity.
 - Replace boolean-only internal mutation results with a richer effect result.
 - Document and test crash windows around materialization.
 - Complete and stabilize `Database`.
@@ -1780,7 +1759,7 @@ Priority: immediate
 
 ### Phase 5: Derived tables and outbox
 
-- Queue consumer-emitted deltas.
+- Queue consumer-emitted events.
 - Apply outputs after successful callbacks.
 - Track origin consumer.
 - Add dependency graph and cycle restrictions.
@@ -1796,7 +1775,7 @@ Priority: immediate
 
 - Implement sync-policy resolution.
 - Implement signature verification.
-- Add live delta transport integration.
+- Add live event transport integration.
 - Add state hashes, anti-entropy, and cold sync.
 
 ### Phase 8: Dynamic sandboxed consumers
@@ -1813,7 +1792,7 @@ Priority: immediate
 
 The following decisions require prototypes or additional design work:
 
-1. Should `DeltaId` be distinct from HLC, and what is its encoded form?
+1. Should `EventId` be distinct from HLC, and what is its encoded form?
 2. Should `CommitSeq` be database-wide or partitioned while preserving a database-wide logical cursor?
 3. What exact durability protocol makes state, commit log, and journal recovery atomic?
 4. How should before/after effects be represented without cloning large rows?
@@ -1839,10 +1818,10 @@ The first consumer-runtime milestone is complete when all of the following are t
 - The consumer can subscribe to one or more tables.
 - A new consumer scans existing resolved rows and then consumes all later changes without a gap.
 - The runtime provides a monotonic durable cursor independent from HLC.
-- The consumer can distinguish accepted no-op deltas from resolved row changes.
+- The consumer can distinguish accepted no-op events from resolved row changes.
 - The user-assignment example triggers only on a resolved absent-to-present transition.
 - A stateful consumer can durably maintain a count.
-- A consumer can publish a derived delta after successful processing.
+- A consumer can publish a derived event after successful processing.
 - Consumer state and cursor survive database reopen.
 - Pause, resume, restart, reset, and drop have documented and tested semantics.
 - Duplicate replay does not corrupt the example aggregate.
@@ -1864,20 +1843,20 @@ zendb-storage
     Persists generic ordered and unordered data structures.
 
 Table
-    Resolves row deltas into materialized state and emits precise mutation effects.
+    Resolves row events into materialized state and emits precise mutation effects.
 
 Database
     Owns tables, commit order, durable change records, consumers, and cross-table outputs.
 
 Consumer runtime
-    Turns durable changes into private managed state, derived table deltas, and outbox actions.
+    Turns durable changes into private managed state, derived table events, and outbox actions.
 
 Replication
-    Moves deltas and compacted state between replicas without redefining local semantics.
+    Moves events and compacted state between replicas without redefining local semantics.
 ```
 
 The foundational rule for the next phase is:
 
 > **HLC determines whether and how collaborative state changes. A durable local `CommitSeq` determines what a consumer processes next.**
 
-Keeping those two notions of time separate allows ZeninDB to remain correct under stale deltas, late remote delivery, materialization, replay, bootstrap, independently paced consumers, and future replication.
+Keeping those two notions of time separate allows ZeninDB to remain correct under stale events, late remote delivery, materialization, replay, bootstrap, independently paced consumers, and future replication.

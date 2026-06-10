@@ -6,7 +6,7 @@
 //! ## Adding a type
 //!
 //! 1. Create a module (e.g., `src/map.rs`) with a value struct implementing
-//!    `Type` (and `ContainerType` if the type has children)
+//!    `Type`
 //! 2. Add one line to `register_types!` below
 
 // --- hand-written modules ---
@@ -22,7 +22,7 @@ macro_rules! register_types {
     (
         $( key $key_var:ident => $key_ty:ty, )*
         $( leaf $leaf_var:ident => $leaf_ty:ty, )*
-        $( container $cont_var:ident => $cont_ty:ty, )*
+        $( container $cont_var:ident ($seg_ty:ty) => $cont_ty:ty, )*
     ) => {
         // =================================================================
         // TypeTag
@@ -145,19 +145,18 @@ macro_rules! register_types {
             fn apply(
                 &mut self,
                 op: &TypeOp,
-                local_hlc: $crate::Hlc,
                 op_hlc: $crate::Hlc,
             ) -> Result<bool, TypeError> {
                 match (self, op) {
                     $(
                         (Value::$leaf_var(v), TypeOp::$leaf_var(o)) => {
-                            v.apply(o, local_hlc, op_hlc)
+                            v.apply(o, op_hlc)
                                 .map_err(TypeError::$leaf_var)
                         }
                     )*
                     $(
                         (Value::$cont_var(v), TypeOp::$cont_var(o)) => {
-                            v.apply(o, local_hlc, op_hlc)
+                            v.apply(o, op_hlc)
                                 .map_err(TypeError::$cont_var)
                         }
                     )*
@@ -171,19 +170,18 @@ macro_rules! register_types {
             fn merge(
                 &mut self,
                 remote: &Value,
-                local_hlc: $crate::Hlc,
-                remote_hlc: $crate::Hlc,
+                clocks: $crate::MergeClocks,
             ) -> Result<bool, TypeError> {
                 match (self, remote) {
                     $(
                         (Value::$leaf_var(l), Value::$leaf_var(r)) => {
-                            $crate::Type::merge(l, r, local_hlc, remote_hlc)
+                            $crate::Type::merge(l, r, clocks)
                                 .map_err(TypeError::$leaf_var)
                         }
                     )*
                     $(
                         (Value::$cont_var(l), Value::$cont_var(r)) => {
-                            $crate::Type::merge(l, r, local_hlc, remote_hlc)
+                            $crate::Type::merge(l, r, clocks)
                                 .map_err(TypeError::$cont_var)
                         }
                     )*
@@ -194,10 +192,44 @@ macro_rules! register_types {
                 }
             }
 
+            fn is_synced(&self, inherited: bool, path: &[$crate::PathStep]) -> bool {
+                match self {
+                    $(Value::$leaf_var(v) => v.is_synced(inherited, path),)*
+                    $(Value::$cont_var(v) => v.is_synced(inherited, path),)*
+                }
+            }
+
+            fn compact(
+                &mut self,
+                watermark: $crate::Hlc,
+            ) -> Result<bool, TypeError> {
+                match self {
+                    $(Value::$leaf_var(v) => v.compact(watermark).map_err(TypeError::$leaf_var),)*
+                    $(Value::$cont_var(v) => v.compact(watermark).map_err(TypeError::$cont_var),)*
+                }
+            }
+
             fn max_hlc(&self) -> $crate::Hlc {
                 match self {
                     $(Value::$leaf_var(v) => v.max_hlc(),)*
                     $(Value::$cont_var(v) => v.max_hlc(),)*
+                }
+            }
+        }
+
+        impl $crate::ContainerType for Value {
+            fn apply_walk(
+                &mut self,
+                op: &$crate::Op,
+                op_hlc: $crate::Hlc,
+                path: &[$crate::PathStep],
+            ) -> Result<bool, TypeError> {
+                match self {
+                    $(Value::$cont_var(v) => {
+                        $crate::ContainerType::apply_walk(v, op, op_hlc, path)
+                            .map_err(TypeError::$cont_var)
+                    },)*
+                    _ => Ok(false),
                 }
             }
         }
@@ -225,7 +257,7 @@ macro_rules! register_types {
         // =================================================================
         #[derive(Debug, Clone, Encode, Decode)]
         pub enum Segment {
-            $($cont_var(<$cont_ty as $crate::ContainerType>::Segment),)*
+            $($cont_var($seg_ty),)*
         }
 
         impl Segment {
@@ -236,29 +268,6 @@ macro_rules! register_types {
             }
         }
 
-        impl $crate::ContainerType for Value {
-            type Segment = Segment;
-
-            fn child_or_default<'a>(
-                &'a mut self,
-                segment: &Segment,
-                child_tag: Option<TypeTag>,
-            ) -> Result<&'a mut $crate::Cell, TypeError> {
-                let tag = self.type_tag();
-                match (self, segment) {
-                    $(
-                        (Value::$cont_var(v), Segment::$cont_var(s)) => {
-                            v.child_or_default(s, child_tag)
-                                .map_err(TypeError::$cont_var)
-                        }
-                    )*
-                    _ => Err(TypeError::TypeMismatch {
-                        expected: segment.type_tag(),
-                        actual: tag,
-                    }),
-                }
-            }
-        }
     };
 }
 
@@ -280,34 +289,28 @@ register_types! {
     leaf PriorityQueue => crate::types::priority_queue::PriorityQueue,
     leaf Set => crate::types::set::Set,
     leaf Text => crate::types::text::Text,
-    container Record => crate::types::record::Record,
-    container List => crate::types::list::List,
+    container Record(crate::types::record::RecordSegment) => crate::types::record::Record,
+    container List(crate::types::list::ListSegment) => crate::types::list::List,
 }
 
 // --- re-exports ---
 pub use core::cell::Cell;
-pub use core::delta::{Delta, Signature, TableId};
+pub use core::event::{Event, Signature, TableId};
 pub use core::hlc::{device_id, init_device_id, DeviceId, Hlc};
 pub use core::op::Op;
 pub use core::path::{Path, PathStep};
-pub use core::traits::{ContainerType, Type};
+pub use core::traits::{ContainerType, MergeClocks, Type};
 pub use types::blob::{Blob, BlobError, BlobOp};
 pub use types::bool::{Bool, BoolError, BoolOp};
-pub use types::counter::{counter_value, Counter, CounterError, CounterOp};
+pub use types::counter::{Counter, CounterError, CounterOp};
 pub use types::int::{Int, IntError, IntOp};
-pub use types::list::{
-    list_cell_at, list_id_at, list_visible_ids, List, ListEntry, ListError, ListId, ListOp,
-    ListSegment,
-};
-pub use types::mv_register::{mv_register_values, MvRegister, MvRegisterError, MvRegisterOp};
-pub use types::or_set::{or_set_contains_key, or_set_keys, OrSet, OrSetEntry, OrSetError, OrSetOp};
-pub use types::priority_queue::{pq_live, PqEntry, PqError, PqOp, PriorityQueue};
+pub use types::list::{List, ListError, ListId, ListOp, ListSegment};
+pub use types::mv_register::{MvRegister, MvRegisterError, MvRegisterOp};
+pub use types::or_set::{OrSet, OrSetError, OrSetOp};
+pub use types::priority_queue::{PqError, PqOp, PriorityQueue};
 pub use types::record::{Record, RecordError, RecordOp, RecordSegment};
-pub use types::set::{set_contains_key, set_keys, Meta, Set, SetError, SetOp};
+pub use types::set::{Set, SetError, SetOp};
 pub use types::string::{String, StringError, StringOp};
-pub use types::text::{
-    text_format_at, text_id_at, text_string, text_visible_ids, Text, TextEntry, TextError, TextId,
-    TextOp,
-};
+pub use types::text::{Text, TextError, TextId, TextOp};
 pub use types::timestamp::{Timestamp, TimestampError, TimestampOp};
 // TypeTag, Value, TypeOp, Segment, TypeError are generated above by register_types!

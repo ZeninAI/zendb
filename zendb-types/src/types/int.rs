@@ -24,12 +24,12 @@ impl Type for Int {
     type Op = IntOp;
     type Error = IntError;
 
-    fn apply(&mut self, op: &IntOp, _local_hlc: Hlc, _op_hlc: Hlc) -> Result<bool, IntError> {
+    fn apply(&mut self, op: &IntOp, _op_hlc: Hlc) -> Result<bool, IntError> {
         match *op {}
     }
 
-    fn merge(&mut self, remote: &Int, local_hlc: Hlc, remote_hlc: Hlc) -> Result<bool, IntError> {
-        if remote_hlc.beats(local_hlc) {
+    fn merge(&mut self, remote: &Int, clocks: crate::MergeClocks) -> Result<bool, IntError> {
+        if clocks.remote.beats(clocks.local) {
             *self = *remote;
             Ok(true)
         } else {
@@ -50,21 +50,36 @@ mod tests {
     #[test]
     fn newer_remote_replaces_regardless_of_numeric_order() {
         let mut local = i64::MAX;
-        assert!(Type::merge(&mut local, &i64::MIN, hlc(100, 1), hlc(200, 1)).unwrap());
+        assert!(Type::merge(
+            &mut local,
+            &i64::MIN,
+            crate::MergeClocks::new(hlc(100, 1), hlc(200, 1)),
+        )
+        .unwrap());
         assert_eq!(local, i64::MIN);
     }
 
     #[test]
     fn stale_remote_cannot_replace_local() {
         let mut local: Int = -10;
-        assert!(!Type::merge(&mut local, &100_i64, hlc(200, 1), hlc(100, 2)).unwrap());
+        assert!(!Type::merge(
+            &mut local,
+            &100_i64,
+            crate::MergeClocks::new(hlc(200, 1), hlc(100, 2)),
+        )
+        .unwrap());
         assert_eq!(local, -10);
     }
 
     #[test]
     fn merging_same_state_and_clock_is_idempotent() {
         let mut local: Int = 42;
-        assert!(!Type::merge(&mut local, &42_i64, hlc(100, 1), hlc(100, 1)).unwrap());
+        assert!(!Type::merge(
+            &mut local,
+            &42_i64,
+            crate::MergeClocks::new(hlc(100, 1), hlc(100, 1)),
+        )
+        .unwrap());
         assert_eq!(local, 42);
     }
 

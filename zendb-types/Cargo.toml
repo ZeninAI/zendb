@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Core type system for ZeninDB — HLC, Cell, Value, Op, Path, Delta, and the Type/ContainerType traits"
+description = "Core type system for ZeninDB — HLC, Cell, Value, Op, Path, Event, Type, and ContainerType"
 
 [dependencies]
 bincode.workspace = true

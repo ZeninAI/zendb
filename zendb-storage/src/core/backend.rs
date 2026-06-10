@@ -43,7 +43,7 @@
 //! needs runtime dispatch over multiple backend kinds wraps them in a
 //! concrete enum that itself implements `Backend`.
 
-use std::{borrow::Cow, hash::Hash, io};
+use std::{borrow::Cow, hash::Hash, io, path::Path};
 
 use bincode::{Decode, Encode};
 
@@ -77,6 +77,18 @@ where
     /// Backend configuration values. Set once at construction, read
     /// through `config()`. Immutable after creation.
     type Config: Clone + Default + Encode + Decode<()>;
+
+    // ---- construction -------------------------------------------------
+
+    /// Create a fresh backend at `path`, replacing any existing backend file.
+    fn create(path: &Path, config: Self::Config) -> io::Result<Self>
+    where
+        Self: Sized;
+
+    /// Open an existing backend at `path`.
+    fn open(path: &Path, config: Self::Config) -> io::Result<Self>
+    where
+        Self: Sized;
 
     // ---- reads --------------------------------------------------------
 

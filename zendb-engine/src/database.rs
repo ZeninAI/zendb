@@ -16,10 +16,11 @@
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
 };
+
+use hashbrown::HashMap;
 
 use zendb_storage::core::{
     backend::Backend,
@@ -174,7 +175,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use zendb_storage::core::backend::Backend;
-    use zendb_types::{Delta, Hlc, Op, Path as ValuePath, PrimaryKey, Value};
+    use zendb_types::{
+        device_id, init_device_id, Event, Hlc, Op, Path as ValuePath, PrimaryKey, Value,
+    };
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 
@@ -184,11 +187,12 @@ mod tests {
     }
 
     fn hlc(ms: u64) -> Hlc {
-        Hlc::with_device_id(ms, 0, [1u8; 8]).unwrap()
+        init_device_id();
+        Hlc::with_device_id(ms, 0, device_id()).unwrap()
     }
 
-    fn delta(table: &str, key: &str, value: i64, hlc: Hlc) -> Delta {
-        Delta {
+    fn event(table: &str, key: &str, value: i64, hlc: Hlc) -> Event {
+        Event {
             table_id: table.into(),
             primary_key: PrimaryKey::String(key.into()),
             path: ValuePath::new(),
@@ -216,9 +220,9 @@ mod tests {
         let path = tmp_db("create_table");
         let mut db = Database::create(&path).unwrap();
         let table = db.create_table("users", TableConfig::default()).unwrap();
-        // Round-trip a delta to confirm we got a real table.
+        // Round-trip an event to confirm we got a real table.
         table
-            .insert_delta(delta("users", "u1", 1, hlc(100)))
+            .insert_event(event("users", "u1", 1, hlc(100)))
             .unwrap();
         let got = Backend::get(table, &PrimaryKey::String("u1".into())).unwrap();
         assert_eq!(got.into_owned().value, Some(Value::Int(1)));
@@ -244,7 +248,7 @@ mod tests {
         {
             let mut db = Database::create(&path).unwrap();
             let table = db.create_table("t", TableConfig::default()).unwrap();
-            table.insert_delta(delta("t", "k", 7, hlc(100))).unwrap();
+            table.insert_event(event("t", "k", 7, hlc(100))).unwrap();
             Backend::sync(table).unwrap();
         }
 
@@ -270,7 +274,7 @@ mod tests {
         // first call's state — proving they returned the same handle.
         db.open_table("t")
             .unwrap()
-            .insert_delta(delta("t", "k", 1, hlc(100)))
+            .insert_event(event("t", "k", 1, hlc(100)))
             .unwrap();
         let table = db.open_table("t").unwrap();
         let got = Backend::get(table, &PrimaryKey::String("k".into())).unwrap();
@@ -331,7 +335,7 @@ mod tests {
         let path = tmp_db("drop_basic");
         let mut db = Database::create(&path).unwrap();
         let t = db.create_table("victim", TableConfig::default()).unwrap();
-        t.insert_delta(delta("victim", "k", 1, hlc(100))).unwrap();
+        t.insert_event(event("victim", "k", 1, hlc(100))).unwrap();
         assert!(path.join("victim").is_dir());
 
         db.drop_table("victim").unwrap();
@@ -370,7 +374,7 @@ mod tests {
         let mut db = Database::create(&path).unwrap();
         {
             let t = db.create_table("t", TableConfig::default()).unwrap();
-            t.insert_delta(delta("t", "k", 7, hlc(100))).unwrap();
+            t.insert_event(event("t", "k", 7, hlc(100))).unwrap();
         }
         db.drop_table("t").unwrap();
 

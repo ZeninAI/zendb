@@ -1,34 +1,45 @@
-//! Core traits for the ZeninDB type system.
-//!
-//! ## Trait hierarchy
-//!
-//! ```text
-//! Type          ── Self: Encode + Decode,
-//!                  Op: Encode + Decode, Error, apply(), merge(), max_hlc()
-//! ContainerType ── Type + Segment: Encode + Decode, child_or_default()
-//! ```
+//! Core traits for the ZenDB type system.
 
 use bincode::{Decode, Encode};
 
-use crate::{Cell, Hlc, TypeTag};
+use crate::{Hlc, Op, PathStep};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeClocks {
+    pub local: Hlc,
+    pub remote: Hlc,
+}
+
+impl MergeClocks {
+    pub const ZERO: Self = Self {
+        local: Hlc::ZERO,
+        remote: Hlc::ZERO,
+    };
+
+    pub const fn new(local: Hlc, remote: Hlc) -> Self {
+        Self { local, remote }
+    }
+}
 
 pub trait Type: Sized + Encode + Decode<()> {
     type Op: Encode + Decode<()>;
     type Error: std::error::Error;
 
-    /// Apply an operation, mutating this value in place.
-    /// Returns `Ok(true)` if state was modified, `Ok(false)` if the op was
-    /// rejected (e.g. LWW loss — local HLC beats op HLC).
-    fn apply(&mut self, op: &Self::Op, local_hlc: Hlc, op_hlc: Hlc) -> Result<bool, Self::Error>;
+    /// Apply this type's local operation.
+    fn apply(&mut self, op: &Self::Op, op_hlc: Hlc) -> Result<bool, Self::Error>;
 
-    /// Merge `remote` into this value.
-    /// Returns `Ok(true)` if this value was modified.
-    fn merge(
-        &mut self,
-        remote: &Self,
-        local_hlc: Hlc,
-        remote_hlc: Hlc,
-    ) -> Result<bool, Self::Error>;
+    /// Merge same-type state. Containers recursively merge their child cells.
+    fn merge(&mut self, remote: &Self, clocks: MergeClocks) -> Result<bool, Self::Error>;
+
+    /// Resolve sync policy recursively for a path.
+    fn is_synced(&self, inherited: bool, _path: &[PathStep]) -> bool {
+        inherited
+    }
+
+    /// Compact type-owned state below a trusted watermark.
+    fn compact(&mut self, _watermark: Hlc) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
 
     fn max_hlc(&self) -> Hlc {
         Hlc::ZERO
@@ -36,16 +47,9 @@ pub trait Type: Sized + Encode + Decode<()> {
 }
 
 pub trait ContainerType: Type {
-    type Segment: Encode + Decode<()>;
-
-    /// Navigate into a child, creating a placeholder if absent.
+    /// Apply a global operation recursively.
     ///
-    /// `child_tag = Some(tag)` creates a live empty child of that type.
-    /// `child_tag = None` creates a tombstone placeholder, useful for path
-    /// targeted cell operations such as delete where no value type is known.
-    fn child_or_default<'a>(
-        &'a mut self,
-        segment: &Self::Segment,
-        child_tag: Option<TypeTag>,
-    ) -> Result<&'a mut Cell, Self::Error>;
+    /// Implementations consume the path segment they own and delegate the
+    /// remaining path to the selected child container.
+    fn apply_walk(&mut self, op: &Op, op_hlc: Hlc, path: &[PathStep]) -> Result<bool, Self::Error>;
 }

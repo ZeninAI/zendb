@@ -267,69 +267,6 @@ where
     K: Encode + Decode<()> + Hash + Eq + Clone,
     V: Encode + Decode<()> + Clone,
 {
-    /// Create a fresh KeyDir at `path`, **truncating** any existing
-    /// file. Pre-allocates `config.initial_capacity` bytes and stamps
-    /// the file header MAGIC at offset 0. The in-memory index is empty.
-    pub fn create(path: &Path, config: KeyDirConfig) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
-
-        file.set_len(config.initial_capacity)?;
-        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-
-        // Write file header: MAGIC at offset 0, then SENTINEL at the
-        // live tail so `replay_wal` on a fresh file terminates
-        // immediately at `HEADER_SIZE`.
-        mmap[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        mmap[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&SENTINEL.to_le_bytes());
-
-        Ok(KeyDir {
-            index: HashMap::new(),
-            mmap,
-            file,
-            config,
-            stats: KeyDirStats {
-                data_size: HEADER_SIZE as u64,
-                dead_bytes: 0,
-            },
-            _phantom: PhantomData,
-        })
-    }
-
-    /// Open an existing KeyDir at `path`. Validates the MAGIC header
-    /// (returns `InvalidData` if missing/mismatched) and rebuilds the
-    /// in-memory index by scanning every live entry and tombstone in
-    /// the file from `HEADER_SIZE` onward.
-    pub fn open(path: &Path, config: KeyDirConfig) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-
-        // Validate the file header MAGIC.
-        let file_magic = u32::from_le_bytes(mmap[0..4].try_into().unwrap());
-        if file_magic != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not a KeyDir file",
-            ));
-        }
-
-        let mut this = KeyDir {
-            index: HashMap::new(),
-            mmap,
-            file,
-            config,
-            stats: KeyDirStats::default(),
-            _phantom: PhantomData,
-        };
-
-        this.rebuild_index()?;
-        Ok(this)
-    }
-
     // -----------------------------------------------------------------------
     // Private helpers — everything below this point is implementation
     // detail. The Backend trait impl at the bottom of the file is what
@@ -448,6 +385,58 @@ where
     where
         Self: 'a;
     type Config = KeyDirConfig;
+
+    fn create(path: &Path, config: Self::Config) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+
+        file.set_len(config.initial_capacity)?;
+        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+
+        mmap[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        mmap[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&SENTINEL.to_le_bytes());
+
+        Ok(KeyDir {
+            index: HashMap::new(),
+            mmap,
+            file,
+            config,
+            stats: KeyDirStats {
+                data_size: HEADER_SIZE as u64,
+                dead_bytes: 0,
+            },
+            _phantom: PhantomData,
+        })
+    }
+
+    fn open(path: &Path, config: Self::Config) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
+
+        let file_magic = u32::from_le_bytes(mmap[0..4].try_into().unwrap());
+        if file_magic != MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a KeyDir file",
+            ));
+        }
+
+        let mut this = KeyDir {
+            index: HashMap::new(),
+            mmap,
+            file,
+            config,
+            stats: KeyDirStats::default(),
+            _phantom: PhantomData,
+        };
+
+        this.rebuild_index()?;
+        Ok(this)
+    }
 
     /// One HashMap lookup, then materialize the value by decoding the
     /// mmap slice the meta points at. Returns `Cow::Owned` since the

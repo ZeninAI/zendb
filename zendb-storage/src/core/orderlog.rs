@@ -752,56 +752,6 @@ where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
 {
-    pub fn create(path: &Path, config: OrderLogConfig) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
-
-        file.set_len(config.initial_capacity)?;
-        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-        // MAGIC at offset 0, then SENTINEL at the live tail so a
-        // subsequent reopen replays as empty.
-        mmap[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        mmap[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&SENTINEL.to_le_bytes());
-
-        Ok(OrderLog {
-            index: OrderIndex::new(),
-            mmap,
-            file,
-            config,
-            stats: OrderLogStats {
-                data_size: HEADER_SIZE as u64,
-                dead_bytes: 0,
-            },
-        })
-    }
-
-    pub fn open(path: &Path, config: OrderLogConfig) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-
-        let file_magic = u32::from_le_bytes(mmap[0..4].try_into().unwrap());
-        if file_magic != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not an OrderLog file",
-            ));
-        }
-
-        let mut this = OrderLog {
-            index: OrderIndex::new(),
-            mmap,
-            file,
-            config,
-            stats: OrderLogStats::default(),
-        };
-        this.replay_wal()?;
-        Ok(this)
-    }
-
     fn replay_wal(&mut self) -> io::Result<()> {
         let mut cursor = HEADER_SIZE;
         self.stats.dead_bytes = 0;
@@ -882,6 +832,54 @@ where
         Self: 'a;
     type Config = OrderLogConfig;
 
+    fn create(path: &Path, config: Self::Config) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+
+        file.set_len(config.initial_capacity)?;
+        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+        mmap[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        mmap[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&SENTINEL.to_le_bytes());
+
+        Ok(OrderLog {
+            index: OrderIndex::new(),
+            mmap,
+            file,
+            config,
+            stats: OrderLogStats {
+                data_size: HEADER_SIZE as u64,
+                dead_bytes: 0,
+            },
+        })
+    }
+
+    fn open(path: &Path, config: Self::Config) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
+
+        let file_magic = u32::from_le_bytes(mmap[0..4].try_into().unwrap());
+        if file_magic != MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not an OrderLog file",
+            ));
+        }
+
+        let mut this = OrderLog {
+            index: OrderIndex::new(),
+            mmap,
+            file,
+            config,
+            stats: OrderLogStats::default(),
+        };
+        this.replay_wal()?;
+        Ok(this)
+    }
+
     fn get(&self, key: &K) -> Option<Cow<'_, V>> {
         self.index.get(key).map(Cow::Borrowed)
     }
@@ -952,19 +950,14 @@ where
         let mut first_err = None;
         let mut finger = self.index.finger_at_start();
         for (k, v) in sorted {
-            let meta = match write_entry_into(
-                &mut self.mmap,
-                &mut self.file,
-                &mut self.stats,
-                &k,
-                &v,
-            ) {
-                Ok(meta) => meta,
-                Err(e) => {
-                    first_err = Some(e);
-                    break;
-                }
-            };
+            let meta =
+                match write_entry_into(&mut self.mmap, &mut self.file, &mut self.stats, &k, &v) {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        first_err = Some(e);
+                        break;
+                    }
+                };
             self.index.advance_finger_to(&mut finger, &k);
             if self.index.finger_matches(&finger, &k) {
                 let old = self.index.overwrite_at_finger(&finger, v, meta);
@@ -1018,12 +1011,9 @@ where
             let cur_idx = finger.cursor.expect("finger matches a node");
             let old = self.index.arena[cur_idx].meta.clone();
             self.stats.dead_bytes += old.record_size as u64;
-            if let Err(e) = write_tombstone_into(
-                &mut self.mmap,
-                &mut self.file,
-                &mut self.stats,
-                &old,
-            ) {
+            if let Err(e) =
+                write_tombstone_into(&mut self.mmap, &mut self.file, &mut self.stats, &old)
+            {
                 first_err = Some(e);
                 break;
             }

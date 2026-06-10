@@ -24,17 +24,12 @@ impl Type for String {
     type Op = StringOp;
     type Error = StringError;
 
-    fn apply(&mut self, op: &StringOp, _local_hlc: Hlc, _op_hlc: Hlc) -> Result<bool, StringError> {
+    fn apply(&mut self, op: &StringOp, _op_hlc: Hlc) -> Result<bool, StringError> {
         match *op {}
     }
 
-    fn merge(
-        &mut self,
-        remote: &String,
-        local_hlc: Hlc,
-        remote_hlc: Hlc,
-    ) -> Result<bool, StringError> {
-        if remote_hlc.beats(local_hlc) {
+    fn merge(&mut self, remote: &String, clocks: crate::MergeClocks) -> Result<bool, StringError> {
+        if clocks.remote.beats(clocks.local) {
             *self = remote.clone();
             Ok(true)
         } else {
@@ -56,7 +51,12 @@ mod tests {
     fn newer_remote_replaces_with_an_independent_clone() {
         let remote = std::string::String::from("remote");
         let mut local = std::string::String::from("local");
-        assert!(Type::merge(&mut local, &remote, hlc(100, 1), hlc(200, 1)).unwrap());
+        assert!(Type::merge(
+            &mut local,
+            &remote,
+            crate::MergeClocks::new(hlc(100, 1), hlc(200, 1)),
+        )
+        .unwrap());
         assert_eq!(local, remote);
         assert_ne!(local.as_ptr(), remote.as_ptr());
     }
@@ -67,8 +67,7 @@ mod tests {
         assert!(!Type::merge(
             &mut local,
             &std::string::String::from("old"),
-            hlc(200, 1),
-            hlc(100, 2),
+            crate::MergeClocks::new(hlc(200, 1), hlc(100, 2)),
         )
         .unwrap());
         assert_eq!(local, "new");

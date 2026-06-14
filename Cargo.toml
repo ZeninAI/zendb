@@ -28,3 +28,6 @@ machine-uid = "0.5"
 
 # zendb-engine
 blake3 = "1"
+
+# concurrency
+parking_lot = "0.12"

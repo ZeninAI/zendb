@@ -10,3 +10,4 @@ zendb-types = { path = "../zendb-types" }
 zendb-storage = { path = "../zendb-storage" }
 bincode.workspace = true
 hashbrown.workspace = true
+parking_lot.workspace = true

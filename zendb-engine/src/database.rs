@@ -13,14 +13,25 @@
 //! methods of its own — those live on [`Table`]. The catalog persists
 //! `(table_name → TableConfig)` so that `open_table` can rehydrate a
 //! table on demand without the caller re-supplying its config.
+//!
+//! ## Concurrency
+//!
+//! Every table is wrapped in `Arc<RwLock<Table>>`. Multiple readers can
+//! access a table concurrently; a writer gets exclusive access. Different
+//! tables never contend with each other.
+//!
+//! Structural mutations (`create_table`, `open_table`, `drop_table`) take
+//! `&mut self` on the `Database` and are single-threaded by construction.
 
 use std::{
     borrow::Cow,
     fs, io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use hashbrown::HashMap;
+use parking_lot::RwLock;
 
 use zendb_storage::core::{
     backend::Backend,
@@ -32,10 +43,16 @@ use crate::table::{Table, TableConfig};
 /// Filename of the catalog KeyDir inside the database directory.
 const META_FILE: &str = "_meta";
 
+/// A shared handle to a table, protected by a read-write lock.
+///
+/// Clone is cheap — it bumps the `Arc` refcount. The inner `RwLock`
+/// allows many concurrent readers or one exclusive writer.
+pub type TableHandle = Arc<RwLock<Table>>;
+
 pub struct Database {
     path: PathBuf,
     catalog: KeyDir<String, TableConfig>,
-    tables: HashMap<String, Table>,
+    tables: HashMap<String, TableHandle>,
 }
 
 impl Database {
@@ -66,9 +83,10 @@ impl Database {
 
     /// Create a new table named `name` with the given config. Writes
     /// the config into the catalog and creates the table on disk under
-    /// `<db_path>/<name>/`. Errors with `AlreadyExists` if a table with
-    /// that name is already in the catalog.
-    pub fn create_table(&mut self, name: &str, config: TableConfig) -> io::Result<&mut Table> {
+    /// `<db_path>/<name>/`. Returns a handle protected by a read-write
+    /// lock. Errors with `AlreadyExists` if a table with that name is
+    /// already in the catalog.
+    pub fn create_table(&mut self, name: &str, config: TableConfig) -> io::Result<TableHandle> {
         if self.tables.contains_key(name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -86,39 +104,38 @@ impl Database {
         }
 
         let table = Table::create(&self.path.join(name), config)?;
-        Ok(self.tables.entry(name.to_string()).or_insert(table))
+        let handle = Arc::new(RwLock::new(table));
+        self.tables.insert(name.to_string(), Arc::clone(&handle));
+        Ok(handle)
     }
 
     /// Open the table named `name`. If already loaded in memory, returns
     /// the existing handle. Otherwise looks up the table's config in the
     /// catalog and opens the on-disk table. Errors with `NotFound` if no
     /// catalog entry exists for `name`.
-    pub fn open_table(&mut self, name: &str) -> io::Result<&mut Table> {
-        if !self.tables.contains_key(name) {
-            let config = match self.catalog.get(&name.to_string()) {
-                Some(c) => c.into_owned(),
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("no table {name:?} in catalog"),
-                    ));
-                }
-            };
-            let table = Table::open(&self.path.join(name), config)?;
-            self.tables.insert(name.to_string(), table);
+    pub fn open_table(&mut self, name: &str) -> io::Result<TableHandle> {
+        if let Some(handle) = self.tables.get(name) {
+            return Ok(Arc::clone(handle));
         }
-        Ok(self.tables.get_mut(name).unwrap())
+        let config = match self.catalog.get(&name.to_string()) {
+            Some(c) => c.into_owned(),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no table {name:?} in catalog"),
+                ));
+            }
+        };
+        let table = Table::open(&self.path.join(name), config)?;
+        let handle = Arc::new(RwLock::new(table));
+        self.tables.insert(name.to_string(), Arc::clone(&handle));
+        Ok(handle)
     }
 
     /// Borrow an in-memory table handle, if it has been loaded.
     /// Does **not** consult the on-disk catalog.
-    pub fn get_table(&self, name: &str) -> Option<&Table> {
-        self.tables.get(name)
-    }
-
-    /// Mutably borrow an in-memory table handle, if it has been loaded.
-    pub fn get_table_mut(&mut self, name: &str) -> Option<&mut Table> {
-        self.tables.get_mut(name)
+    pub fn get_table(&self, name: &str) -> Option<TableHandle> {
+        self.tables.get(name).map(Arc::clone)
     }
 
     /// Drop the table named `name`: closes its in-memory handle (if
@@ -141,6 +158,9 @@ impl Database {
         }
 
         // 1. Close the in-memory handle so mmaps are unmapped.
+        //    Dropping our Arc is enough if nobody else holds a clone;
+        //    if someone does, we still proceed — the catalog removal
+        //    and directory deletion signal that the table is gone.
         self.tables.remove(name);
 
         // 2. Remove the catalog entry. If this fails, the on-disk
@@ -222,9 +242,11 @@ mod tests {
         let table = db.create_table("users", TableConfig::default()).unwrap();
         // Round-trip an event to confirm we got a real table.
         table
+            .write()
             .insert_event(event("users", "u1", 1, hlc(100)))
             .unwrap();
-        let got = Backend::get(table, &PrimaryKey::String("u1".into())).unwrap();
+        let table_lock = table.read();
+        let got = Backend::get(&*table_lock, &PrimaryKey::String("u1".into())).unwrap();
         assert_eq!(got.into_owned().value, Some(Value::Int(1)));
 
         // Catalog now holds the entry.
@@ -248,15 +270,19 @@ mod tests {
         {
             let mut db = Database::create(&path).unwrap();
             let table = db.create_table("t", TableConfig::default()).unwrap();
-            table.insert_event(event("t", "k", 7, hlc(100))).unwrap();
-            Backend::sync(table).unwrap();
+            table
+                .write()
+                .insert_event(event("t", "k", 7, hlc(100)))
+                .unwrap();
+            Backend::sync(&*table.read()).unwrap();
         }
 
         let mut db = Database::open(&path).unwrap();
         assert!(db.get_table("t").is_none(), "tables open lazily");
         let table = db.open_table("t").unwrap();
+        let table_lock = table.read();
         assert_eq!(
-            Backend::get(table, &PrimaryKey::String("k".into()))
+            Backend::get(&*table_lock, &PrimaryKey::String("k".into()))
                 .unwrap()
                 .into_owned()
                 .value,
@@ -274,10 +300,12 @@ mod tests {
         // first call's state — proving they returned the same handle.
         db.open_table("t")
             .unwrap()
+            .write()
             .insert_event(event("t", "k", 1, hlc(100)))
             .unwrap();
         let table = db.open_table("t").unwrap();
-        let got = Backend::get(table, &PrimaryKey::String("k".into())).unwrap();
+        let table_lock = table.read();
+        let got = Backend::get(&*table_lock, &PrimaryKey::String("k".into())).unwrap();
         assert_eq!(got.into_owned().value, Some(Value::Int(1)));
     }
 
@@ -300,7 +328,6 @@ mod tests {
         assert!(db.get_table("t").is_none());
         db.open_table("t").unwrap();
         assert!(db.get_table("t").is_some());
-        assert!(db.get_table_mut("t").is_some());
     }
 
     #[test]
@@ -335,7 +362,9 @@ mod tests {
         let path = tmp_db("drop_basic");
         let mut db = Database::create(&path).unwrap();
         let t = db.create_table("victim", TableConfig::default()).unwrap();
-        t.insert_event(event("victim", "k", 1, hlc(100))).unwrap();
+        t.write()
+            .insert_event(event("victim", "k", 1, hlc(100)))
+            .unwrap();
         assert!(path.join("victim").is_dir());
 
         db.drop_table("victim").unwrap();
@@ -374,14 +403,17 @@ mod tests {
         let mut db = Database::create(&path).unwrap();
         {
             let t = db.create_table("t", TableConfig::default()).unwrap();
-            t.insert_event(event("t", "k", 7, hlc(100))).unwrap();
+            t.write()
+                .insert_event(event("t", "k", 7, hlc(100)))
+                .unwrap();
         }
         db.drop_table("t").unwrap();
 
         // Recreating must not see any of the old data.
         let t = db.create_table("t", TableConfig::default()).unwrap();
-        assert!(Backend::get(t, &PrimaryKey::String("k".into())).is_none());
-        assert_eq!(Backend::size(t), 0);
+        let table_lock = t.read();
+        assert!(Backend::get(&*table_lock, &PrimaryKey::String("k".into())).is_none());
+        assert_eq!(Backend::size(&*table_lock), 0);
     }
 
     #[test]
@@ -389,10 +421,9 @@ mod tests {
         let path = tmp_db("drop_no_dir");
         let mut db = Database::create(&path).unwrap();
         db.create_table("t", TableConfig::default()).unwrap();
-        // Close the handle and nuke the directory out from under the
-        // catalog to simulate an interrupted previous drop.
-        db.get_table_mut("t");
-        // Drop the handle so mmaps release before we delete files.
+        // Nuke the directory out from under the catalog to simulate an
+        // interrupted previous drop. Drop our handle first so mmaps
+        // release before we delete files.
         let _ = db.tables.remove("t");
         fs::remove_dir_all(path.join("t")).unwrap();
 

@@ -9,7 +9,7 @@ use zendb_storage::core::{
 };
 use zendb_types::{Cell, Event, Hlc, PrimaryKey};
 
-use crate::state::{State, StateConfig, StateStats};
+use zendb_storage::core::state::{State, StateConfig, StateStats};
 
 type EventLog = OrderLog<EventKey, Event>;
 
@@ -91,10 +91,6 @@ pub struct Table {
 }
 
 impl Table {
-    pub fn config(&self) -> &TableConfig {
-        &self.config
-    }
-
     /// Insert an event if it is not already present (by `EventKey`).
     ///
     /// Returns whether the event was inserted.
@@ -320,72 +316,69 @@ impl Backend<PrimaryKey, Cell> for Table {
         self.state.contains(key)
     }
 
-    // ---- writes (delegated straight to the state backend) ------------
+    // ---- writes (blocked) -------------------------------------------
     //
-    // These bypass the events log and the resolved-Cell cache, so the
-    // cache may become stale for keys touched here. This is intentional
-    // for now; callers who mix direct writes with `insert_event` are
-    // responsible for ordering / consistency.
+    // Direct backend writes are forbidden on Table. All mutations must
+    // go through `insert_event` (or `bulk_insert_event`) so the event
+    // log and the resolved-Cell cache stay consistent.
 
-    fn put(&mut self, key: PrimaryKey, value: Cell) -> io::Result<()> {
-        self.state.put(key, value)
+    fn put(&mut self, _key: PrimaryKey, _value: Cell) -> io::Result<()> {
+        panic!("Table::put is disabled — use insert_event instead")
     }
 
-    fn put_if_absent(&mut self, key: PrimaryKey, value: Cell) -> io::Result<bool> {
-        self.state.put_if_absent(key, value)
+    fn put_if_absent(&mut self, _key: PrimaryKey, _value: Cell) -> io::Result<bool> {
+        panic!("Table::put_if_absent is disabled — use insert_event instead")
     }
 
-    fn replace(&mut self, key: PrimaryKey, value: Cell) -> io::Result<Option<Cow<'_, Cell>>> {
-        self.state.replace(key, value)
+    fn replace(&mut self, _key: PrimaryKey, _value: Cell) -> io::Result<Option<Cow<'_, Cell>>> {
+        panic!("Table::replace is disabled — use insert_event instead")
     }
 
-    fn bulk_put<I>(&mut self, items: I) -> io::Result<()>
+    fn bulk_put<I>(&mut self, _items: I) -> io::Result<()>
     where
         I: IntoIterator<Item = (PrimaryKey, Cell)>,
     {
-        self.state.bulk_put(items)
+        panic!("Table::bulk_put is disabled — use bulk_insert_event instead")
     }
 
-    fn bulk_put_sorted<I>(&mut self, sorted: I) -> io::Result<()>
+    fn bulk_put_sorted<I>(&mut self, _sorted: I) -> io::Result<()>
     where
         I: IntoIterator<Item = (PrimaryKey, Cell)>,
     {
-        self.state.bulk_put_sorted(sorted)
+        panic!("Table::bulk_put_sorted is disabled — use bulk_insert_event instead")
     }
 
-    fn delete(&mut self, key: &PrimaryKey) -> io::Result<bool> {
-        self.state.delete(key)
+    fn delete(&mut self, _key: &PrimaryKey) -> io::Result<bool> {
+        panic!("Table::delete is disabled — use insert_event with a tombstone op instead")
     }
 
-    fn bulk_delete<'a, I>(&mut self, keys: I) -> io::Result<usize>
+    fn bulk_delete<'a, I>(&mut self, _keys: I) -> io::Result<usize>
     where
         I: IntoIterator<Item = &'a PrimaryKey>,
         PrimaryKey: 'a,
     {
-        self.state.bulk_delete(keys)
+        panic!("Table::bulk_delete is disabled — use insert_event with a tombstone op instead")
     }
 
-    fn bulk_delete_sorted<'a, I>(&mut self, sorted: I) -> io::Result<usize>
+    fn bulk_delete_sorted<'a, I>(&mut self, _sorted: I) -> io::Result<usize>
     where
         I: IntoIterator<Item = &'a PrimaryKey>,
         PrimaryKey: 'a,
     {
-        self.state.bulk_delete_sorted(sorted)
+        panic!(
+            "Table::bulk_delete_sorted is disabled — use insert_event with a tombstone op instead"
+        )
     }
 
-    fn update<F>(&mut self, key: &PrimaryKey, f: F) -> io::Result<()>
+    fn update<F>(&mut self, _key: &PrimaryKey, _f: F) -> io::Result<()>
     where
         F: FnOnce(Option<Cell>) -> Option<Cell>,
     {
-        self.state.update(key, f)
+        panic!("Table::update is disabled — use insert_event instead")
     }
 
     fn clear(&mut self) -> io::Result<()> {
-        self.state.clear()?;
-        self.events.clear()?;
-        self.cache.clear();
-        self.novel_pending = 0;
-        Ok(())
+        panic!("Table::clear is disabled — tables cannot be cleared directly")
     }
 
     fn compact(&mut self) -> io::Result<()> {
@@ -1024,39 +1017,6 @@ mod tests {
         let start = PrimaryKey::String("a".into());
         let end = PrimaryKey::String("z".into());
         let _ = OrderedBackend::range(&table, &start, &end).count();
-    }
-
-    #[test]
-    fn direct_put_writes_to_state() {
-        let path = tmp_path("direct_put");
-        let mut table = Table::create(&path, manual_config()).unwrap();
-        let key = PrimaryKey::String("a".into());
-        Backend::put(&mut table, key.clone(), Cell::dummy(Some(Value::Int(42)))).unwrap();
-        assert_eq!(
-            Backend::get(&table, &key).unwrap().into_owned().value,
-            Some(Value::Int(42))
-        );
-    }
-
-    #[test]
-    fn clear_wipes_state_events_and_cache() {
-        let path = tmp_path("clear");
-        let mut table = Table::create(&path, manual_config()).unwrap();
-        table.insert_event(event("a", 1, hlc(100))).unwrap();
-        table.insert_event(event("b", 2, hlc(110))).unwrap();
-        table.materialize().unwrap();
-        table.insert_event(event("c", 3, hlc(120))).unwrap();
-
-        assert!(!Backend::is_empty(&table));
-        assert!(table.events.size() > 0);
-        assert!(!table.cache.is_empty());
-
-        Backend::clear(&mut table).unwrap();
-        assert!(Backend::is_empty(&table));
-        assert_eq!(Backend::size(&table), 0);
-        assert_eq!(table.events.size(), 0);
-        assert!(table.cache.is_empty());
-        assert_eq!(table.novel_pending, 0);
     }
 
     /// Build a table with state rows {a, c, e} and cache rows

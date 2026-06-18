@@ -85,8 +85,8 @@ use hashbrown::hash_map::Entry;
 use hashbrown::HashMap;
 use memmap2::MmapMut;
 
-use crate::core::backend::Backend;
-use crate::utils::serdes::{deserialize_from, read_u32_le, with_two_scratches};
+use crate::core::backend::{Backend, FileBackedBackend};
+use crate::utils::serdes::{deserialize_from, rd_u32, read_u32_le, with_two_scratches};
 
 const DEFAULT_INITIAL_CAPACITY: u64 = 1024 * 1024;
 const DEFAULT_COMPACTION_RATIO: f64 = 0.5;
@@ -264,7 +264,7 @@ pub struct KeyDir<K, V> {
 
 impl<K, V> KeyDir<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
 {
     // -----------------------------------------------------------------------
@@ -375,17 +375,11 @@ impl<K, V> fmt::Debug for KeyDir<K, V> {
 // directly rather than delegating to inherent methods.
 // ---------------------------------------------------------------------------
 
-impl<K, V> crate::core::backend::Backend<K, V> for KeyDir<K, V>
+impl<K, V> FileBackedBackend<K, V> for KeyDir<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
 {
-    type Stats<'a>
-        = &'a KeyDirStats
-    where
-        Self: 'a;
-    type Config = KeyDirConfig;
-
     fn create(path: &Path, config: Self::Config) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -417,7 +411,7 @@ where
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
-        let file_magic = u32::from_le_bytes(mmap[0..4].try_into().unwrap());
+        let file_magic = rd_u32(&mmap[0..4]);
         if file_magic != MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -437,6 +431,18 @@ where
         this.rebuild_index()?;
         Ok(this)
     }
+}
+
+impl<K, V> crate::core::backend::Backend<K, V> for KeyDir<K, V>
+where
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
+    V: Encode + Decode<()> + Clone,
+{
+    type Stats<'a>
+        = &'a KeyDirStats
+    where
+        Self: 'a;
+    type Config = KeyDirConfig;
 
     /// One HashMap lookup, then materialize the value by decoding the
     /// mmap slice the meta points at. Returns `Cow::Owned` since the
@@ -495,21 +501,15 @@ where
     /// `Entry`; the Vacant arm writes the record and fills the slot in
     /// the same lookup. The default trait impl does `contains` + `put`
     /// — two hashes — which is why we override.
-    fn put_if_absent(&mut self, key: K, value: V) -> io::Result<bool> {
-        let inserted = match self.index.entry(key) {
-            Entry::Occupied(_) => false,
-            Entry::Vacant(e) => {
-                // The entry holds K; pass it as &K to write_entry_into
-                // via VacantEntry::key().
-                let key_ref: &K = e.key();
-                let meta = write_entry_into(
-                    &mut self.mmap,
-                    &mut self.file,
-                    &mut self.stats,
-                    key_ref,
-                    &value,
-                )?;
-                e.insert(meta);
+    fn put_if_absent(&mut self, key: &K, value: V) -> io::Result<bool> {
+        use hashbrown::hash_map::RawEntryMut;
+
+        let inserted = match self.index.raw_entry_mut().from_key(key) {
+            RawEntryMut::Occupied(_) => false,
+            RawEntryMut::Vacant(e) => {
+                let meta =
+                    write_entry_into(&mut self.mmap, &mut self.file, &mut self.stats, key, &value)?;
+                e.insert(key.clone(), meta);
                 true
             }
         };
@@ -529,37 +529,32 @@ where
     /// The returned `Cow` is always `Owned`: KeyDir decodes the prior
     /// value out of the mmap and immediately overwrites the slot, so
     /// there's nothing borrowable left behind.
-    fn replace(&mut self, key: K, value: V) -> io::Result<Option<Cow<'_, V>>> {
-        let prev = match self.index.entry(key) {
-            Entry::Occupied(mut e) => {
+    fn replace(&mut self, key: &K, value: V) -> io::Result<Option<Cow<'_, V>>> {
+        use hashbrown::hash_map::RawEntryMut;
+
+        let prev = match self.index.raw_entry_mut().from_key(key) {
+            RawEntryMut::Occupied(mut e) => {
                 let (prev_val, old_size) = {
                     let old_meta = e.get();
                     let bytes = value_bytes_in(&self.mmap, old_meta);
                     let prev_val: V = deserialize_from(bytes)?;
                     (prev_val, old_meta.record_size as u64)
                 };
-                let key_ref: &K = e.key();
                 let meta = write_entry_into(
                     &mut self.mmap,
                     &mut self.file,
                     &mut self.stats,
-                    key_ref,
+                    e.key(),
                     &value,
                 )?;
                 self.stats.dead_bytes += old_size;
                 *e.get_mut() = meta;
                 Some(prev_val)
             }
-            Entry::Vacant(e) => {
-                let key_ref: &K = e.key();
-                let meta = write_entry_into(
-                    &mut self.mmap,
-                    &mut self.file,
-                    &mut self.stats,
-                    key_ref,
-                    &value,
-                )?;
-                e.insert(meta);
+            RawEntryMut::Vacant(e) => {
+                let meta =
+                    write_entry_into(&mut self.mmap, &mut self.file, &mut self.stats, key, &value)?;
+                e.insert(key.clone(), meta);
                 None
             }
         };
@@ -738,10 +733,6 @@ where
         self.index.len()
     }
 
-    fn is_empty(&self) -> bool {
-        self.index.is_empty()
-    }
-
     fn stats(&self) -> Self::Stats<'_> {
         &self.stats
     }
@@ -752,13 +743,13 @@ where
 
     /// Schedule mmap writeback asynchronously. Returns once the OS has
     /// accepted the request; use [`sync`](Self::sync) to wait for it.
-    fn flush(&self) -> io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         self.mmap.flush_async()
     }
 
     /// Block until pending mmap writes have been flushed by the OS.
     /// This does not provide crash recovery or log repair.
-    fn sync(&self) -> io::Result<()> {
+    fn sync(&mut self) -> io::Result<()> {
         self.mmap.flush()
     }
 }
@@ -780,7 +771,7 @@ mod tests {
     /// and immediately materialize to an owned value for easy compare.
     fn get<K, V>(kd: &KeyDir<K, V>, key: &K) -> Option<V>
     where
-        K: Encode + Decode<()> + Hash + Eq + Clone,
+        K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
         V: Encode + Decode<()> + Clone,
     {
         Backend::get(kd, key).map(Cow::into_owned)
@@ -1457,7 +1448,7 @@ mod tests {
     fn put_if_absent_inserts_when_missing() {
         let p = tmp_path("pia_insert");
         let mut kd = create(&p);
-        let inserted = Backend::put_if_absent(&mut kd, k("a"), v("first", 1)).unwrap();
+        let inserted = Backend::put_if_absent(&mut kd, &k("a"), v("first", 1)).unwrap();
         assert!(inserted);
         assert_eq!(get(&kd, &k("a")), Some(v("first", 1)));
     }
@@ -1467,7 +1458,7 @@ mod tests {
         let p = tmp_path("pia_noop");
         let mut kd = create(&p);
         kd.put(k("a"), v("first", 1)).unwrap();
-        let inserted = Backend::put_if_absent(&mut kd, k("a"), v("second", 2)).unwrap();
+        let inserted = Backend::put_if_absent(&mut kd, &k("a"), v("second", 2)).unwrap();
         assert!(!inserted);
         assert_eq!(get(&kd, &k("a")), Some(v("first", 1)));
     }
@@ -1477,7 +1468,7 @@ mod tests {
         let p = tmp_path("replace");
         let mut kd = create(&p);
         kd.put(k("a"), v("first", 1)).unwrap();
-        let prev = Backend::replace(&mut kd, k("a"), v("second", 2))
+        let prev = Backend::replace(&mut kd, &k("a"), v("second", 2))
             .unwrap()
             .map(Cow::into_owned);
         assert_eq!(prev, Some(v("first", 1)));
@@ -1488,7 +1479,7 @@ mod tests {
     fn replace_returns_none_when_absent() {
         let p = tmp_path("replace_absent");
         let mut kd = create(&p);
-        let prev = Backend::replace(&mut kd, k("a"), v("new", 99)).unwrap();
+        let prev = Backend::replace(&mut kd, &k("a"), v("new", 99)).unwrap();
         assert!(prev.is_none());
         assert_eq!(get(&kd, &k("a")), Some(v("new", 99)));
     }
@@ -1548,7 +1539,7 @@ mod tests {
     #[test]
     fn flush_returns_ok_on_empty_keydir() {
         let p = tmp_path("flush_empty");
-        let kd = create(&p);
+        let mut kd = create(&p);
         kd.flush().unwrap();
         kd.sync().unwrap();
     }
@@ -1563,7 +1554,7 @@ mod tests {
         let p = tmp_path("replace_absent_persist");
         {
             let mut kd = create(&p);
-            let prev = Backend::replace(&mut kd, k("fresh"), v("inserted", 7)).unwrap();
+            let prev = Backend::replace(&mut kd, &k("fresh"), v("inserted", 7)).unwrap();
             assert!(prev.is_none());
             kd.sync().unwrap();
         }
@@ -1585,7 +1576,7 @@ mod tests {
         );
         kd.put(k("a"), v("v1", 1)).unwrap();
         assert_eq!(kd.stats().dead_bytes, 0);
-        let prev = Backend::replace(&mut kd, k("a"), v("v2", 2))
+        let prev = Backend::replace(&mut kd, &k("a"), v("v2", 2))
             .unwrap()
             .map(Cow::into_owned);
         assert_eq!(prev, Some(v("v1", 1)));
@@ -1608,7 +1599,7 @@ mod tests {
         kd.put(k("a"), v("first", 1)).unwrap();
         let size_before = kd.stats().data_size;
         let dead_before = kd.stats().dead_bytes;
-        let inserted = Backend::put_if_absent(&mut kd, k("a"), v("second", 2)).unwrap();
+        let inserted = Backend::put_if_absent(&mut kd, &k("a"), v("second", 2)).unwrap();
         assert!(!inserted);
         assert_eq!(get(&kd, &k("a")), Some(v("first", 1)));
         // No write happened.
@@ -1654,8 +1645,8 @@ mod tests {
         let p = tmp_path("pia_persist");
         {
             let mut kd = create(&p);
-            assert!(Backend::put_if_absent(&mut kd, k("only"), v("once", 1)).unwrap());
-            assert!(!Backend::put_if_absent(&mut kd, k("only"), v("twice", 2)).unwrap());
+            assert!(Backend::put_if_absent(&mut kd, &k("only"), v("once", 1)).unwrap());
+            assert!(!Backend::put_if_absent(&mut kd, &k("only"), v("twice", 2)).unwrap());
             kd.sync().unwrap();
         }
         let kd = open(&p);

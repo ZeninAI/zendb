@@ -341,11 +341,7 @@ mod tests {
     }
 
     fn cell(value: Option<Value>, hlc: Hlc, sync: Option<bool>) -> Cell {
-        Cell {
-            value,
-            hlc,
-            sync,
-        }
+        Cell { value, hlc, sync }
     }
 
     fn apply(list: &mut List, op: ListOp, at: Hlc) -> bool {
@@ -713,27 +709,31 @@ mod tests {
     fn list_path_targets_stable_element_id() {
         let id = hlc(100, 1);
         let mut root = cell(Some(Value::List(List::default())), hlc(50, 1), None);
-        assert!(root.apply_event(
-            &event(
-                Path::new(),
-                Op::Type(TypeOp::List(ListOp::Insert {
-                    after: None,
-                    value: Value::Int(1),
-                })),
-                id,
-            ),
-            true
-        ));
-        assert!(root.apply_event(
-            &event(
-                vec![PathStep::new(TypeTag::List, Segment::List(id))],
-                Op::Replace {
-                    value: Value::Int(2),
-                },
-                hlc(200, 1),
-            ),
-            true
-        ));
+        assert!(root
+            .apply_event(
+                &event(
+                    Path::new(),
+                    Op::Type(TypeOp::List(ListOp::Insert {
+                        after: None,
+                        value: Value::Int(1),
+                    })),
+                    id,
+                ),
+                true
+            )
+            .unwrap());
+        assert!(root
+            .apply_event(
+                &event(
+                    vec![PathStep::new(TypeTag::List, Segment::List(id))],
+                    Op::Replace {
+                        value: Value::Int(2),
+                    },
+                    hlc(200, 1),
+                ),
+                true
+            )
+            .unwrap());
 
         let Some(Value::List(list)) = &root.value else {
             panic!("expected list");
@@ -781,55 +781,61 @@ mod tests {
     fn matching_elements_recursively_merge_nested_cells() {
         let id = hlc(100, 1);
         let mut base = cell(Some(Value::List(List::default())), hlc(50, 1), None);
-        assert!(base.apply_event(
-            &event(
-                Path::new(),
-                Op::Type(TypeOp::List(ListOp::Insert {
-                    after: None,
-                    value: Value::Record(Default::default()),
-                })),
-                id,
-            ),
-            true
-        ));
+        assert!(base
+            .apply_event(
+                &event(
+                    Path::new(),
+                    Op::Type(TypeOp::List(ListOp::Insert {
+                        after: None,
+                        value: Value::Record(Default::default()),
+                    })),
+                    id,
+                ),
+                true
+            )
+            .unwrap());
 
         let mut left = base.clone();
         let mut right = base;
         let element = vec![PathStep::new(TypeTag::List, Segment::List(id))];
-        assert!(left.apply_event(
-            &event(
-                [
-                    element.clone(),
-                    vec![PathStep::new(
-                        TypeTag::Record,
-                        Segment::Record("left".into()),
-                    )],
-                ]
-                .concat(),
-                Op::Replace {
-                    value: Value::Bool(true),
-                },
-                hlc(200, 1),
-            ),
-            true
-        ));
-        assert!(right.apply_event(
-            &event(
-                [
-                    element,
-                    vec![PathStep::new(
-                        TypeTag::Record,
-                        Segment::Record("right".into()),
-                    )],
-                ]
-                .concat(),
-                Op::Replace {
-                    value: Value::Bool(true),
-                },
-                hlc(200, 2),
-            ),
-            true
-        ));
+        assert!(left
+            .apply_event(
+                &event(
+                    [
+                        element.clone(),
+                        vec![PathStep::new(
+                            TypeTag::Record,
+                            Segment::Record("left".into()),
+                        )],
+                    ]
+                    .concat(),
+                    Op::Replace {
+                        value: Value::Bool(true),
+                    },
+                    hlc(200, 1),
+                ),
+                true
+            )
+            .unwrap());
+        assert!(right
+            .apply_event(
+                &event(
+                    [
+                        element,
+                        vec![PathStep::new(
+                            TypeTag::Record,
+                            Segment::Record("right".into()),
+                        )],
+                    ]
+                    .concat(),
+                    Op::Replace {
+                        value: Value::Bool(true),
+                    },
+                    hlc(200, 2),
+                ),
+                true
+            )
+            .unwrap());
 
         assert!(Type::merge(&mut left, &right, MergeClocks::ZERO).unwrap());
         let Some(Value::List(list)) = &left.value else {

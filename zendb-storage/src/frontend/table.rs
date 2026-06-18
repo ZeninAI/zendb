@@ -1,223 +1,229 @@
-//! Table abstraction over materialized state and an ordered event log.
+//! Table abstraction over materialized state, a resolved cache, and a change topic.
 
-use std::{borrow::Cow, cmp::Ordering, collections::BTreeMap, fs, io, path::Path};
+use std::{borrow::Cow, cmp::Ordering, fs, io, path::Path};
 
 use bincode::{Decode, Encode};
-use zendb_storage::core::{
+use zendb_types::{Cell, Event, PrimaryKey};
+
+use crate::core::{
     backend::{Backend, OrderedBackend},
-    orderlog::{OrderLog, OrderLogConfig, OrderLogStats},
+    skiplist::{SkipList, SkipListCapacity, SkipListConfig, SkipListStats},
+    topic::{Topic, TopicConfig, TopicConsumer, TopicOffset, TopicStats},
+    FileBackedBackend,
 };
-use zendb_types::{Cell, Event, Hlc, PrimaryKey};
+use crate::frontend::state::{State, StateConfig, StateStats};
 
-use zendb_storage::core::state::{State, StateConfig, StateStats};
+pub const DEFAULT_MAX_BUFFERED_RECORDS: usize = 1_000;
+const TABLE_RECOVERY_CONSUMER: &str = "__zendb_table_recovery";
 
-type EventLog = OrderLog<EventKey, Event>;
-
-pub const DEFAULT_MAX_EVENTS: usize = 1_000;
-
-/// Controls when in-flight events are materialized into table state.
 #[derive(Debug, Clone, Encode, Decode)]
-pub enum FlushConfig {
-    Manual,
-    EventCount { max_events: usize },
-}
-
-impl Default for FlushConfig {
-    fn default() -> Self {
-        Self::EventCount {
-            max_events: DEFAULT_MAX_EVENTS,
-        }
-    }
+pub struct Change {
+    pub event: Event,
+    pub previous: Option<Cell>,
+    pub current: Option<Cell>,
 }
 
 /// Complete configuration required to create or open a table.
-#[derive(Debug, Clone, Default, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct TableConfig {
     pub sync: bool,
-    pub flush: FlushConfig,
     pub state: StateConfig,
-    pub events: OrderLogConfig,
+    pub max_buffered_records: usize,
+    pub topic: TopicConfig,
+}
+
+impl Default for TableConfig {
+    fn default() -> Self {
+        Self {
+            sync: false,
+            state: StateConfig::default(),
+            max_buffered_records: DEFAULT_MAX_BUFFERED_RECORDS,
+            topic: TopicConfig::default(),
+        }
+    }
 }
 
 /// Current stats view over the delegated backends.
 #[derive(Debug)]
 pub struct TableStats<'a> {
-    pub state: StateStats<'a>,
-    pub events: &'a OrderLogStats,
+    pub state: StateStats,
+    pub cache: &'a SkipListStats,
+    pub topic: &'a TopicStats,
 }
 
-/// OrderLog key that groups events by row and orders each row by HLC.
-///
-/// HLC includes the originating device ID and acts as the event identity.
-/// The path stays in the event value because ordering by path could reorder
-/// parent and descendant operations within a row.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
-pub struct EventKey {
-    pub primary_key: PrimaryKey,
-    pub hlc: Hlc,
-}
-
-impl EventKey {
-    pub fn from_event(event: &Event) -> Self {
-        Self {
-            primary_key: event.primary_key.clone(),
-            hlc: event.hlc,
-        }
-    }
-}
-
-/// A table presents a resolved `PrimaryKey -> Cell` backend while owning the
-/// materialized backend and durable in-flight event log used to produce it.
-///
-/// The `cache` is an in-memory map from primary key to the **fully resolved**
-/// `Cell` (i.e. `state[pk] ⊔ fold(events-for-pk-in-events-log)`). It is a
-/// transparent read accelerator over the events log, not a parallel store of
-/// truth — on crash it is dropped and rebuilt from the events log on `open`.
-///
-/// Invariant: for every `pk ∈ cache`, `cache[pk].0` equals what the legacy
-/// "state.get + apply events.range" path would compute, and `cache[pk].1`
-/// (the `had_previous_in_state` bit) reflects whether the materialized state
-/// contained `pk` at the time the cache entry was first created.
-///
-/// `novel_pending` is the count of cache entries with `had_previous == false`,
-/// maintained incrementally so that `Backend::size()` is `state.size() +
-/// novel_pending` in O(1).
+/// A table presents the resolved union of materialized state and its in-memory
+/// skip-list cache. Cache entries shadow state, and successful changes are
+/// durably appended to the table topic.
 pub struct Table {
     config: TableConfig,
     state: State<PrimaryKey, Cell>,
-    events: EventLog,
-    cache: BTreeMap<PrimaryKey, (Cell, bool)>,
+    cache: SkipList<PrimaryKey, (Cell, bool)>,
     novel_pending: usize,
+    topic: Topic<Change>,
+    recovery: TopicConsumer<Change>,
+    pending_offset: Option<TopicOffset>,
+}
+
+fn cache_cell(entry: Cow<'_, (Cell, bool)>) -> Cow<'_, Cell> {
+    match entry {
+        Cow::Borrowed((cell, _)) => Cow::Borrowed(cell),
+        Cow::Owned((cell, _)) => Cow::Owned(cell),
+    }
+}
+
+fn cache_entry<'a>(
+    (key, entry): (Cow<'a, PrimaryKey>, Cow<'a, (Cell, bool)>),
+) -> (Cow<'a, PrimaryKey>, Cow<'a, Cell>) {
+    (key, cache_cell(entry))
 }
 
 impl Table {
-    /// Insert an event if it is not already present (by `EventKey`).
-    ///
-    /// Returns whether the event was inserted.
-    pub fn insert_event(&mut self, event: Event) -> io::Result<bool> {
-        let key = EventKey::from_event(&event);
-        if !self.events.put_if_absent(key, event.clone())? {
-            return Ok(false);
+    /// Apply an event, cache the resolved row, and publish real changes.
+    pub fn insert_event(&mut self, event: Event) -> io::Result<()> {
+        if self.cache.size() >= self.config.max_buffered_records
+            && !self.cache.contains(&event.primary_key)
+        {
+            self.drain_cache()?;
         }
 
-        // Update the resolved-Cell cache. Either fold the event into the
-        // existing cache entry, or create a fresh entry seeded from state.
-        // Skip fresh-entry creation if both the row was absent from state
-        // AND the event did not change anything (preserves "absent + only
-        // no-op events ⇒ row invisible" semantics).
-        if let Some((cell, _)) = self.cache.get_mut(&event.primary_key) {
-            cell.try_apply_event(&event, self.config.sync)
-                .map_err(io::Error::other)?;
-        } else {
-            let (mut cell, had_previous) = match self.state.get(&event.primary_key) {
-                Some(c) => (c.into_owned(), true),
-                None => (Cell::dummy(None), false),
-            };
-            let changed = cell
-                .try_apply_event(&event, self.config.sync)
-                .map_err(io::Error::other)?;
-            if had_previous || changed {
-                if !had_previous {
-                    self.novel_pending += 1;
-                }
-                self.cache
-                    .insert(event.primary_key.clone(), (cell, had_previous));
-            }
-        }
-
-        self.maybe_materialize()?;
-
-        Ok(true)
-    }
-
-    /// Insert events one-by-one in sorted order, returning the count that
-    /// were not duplicates.
-    ///
-    /// Note: we intentionally do **not** use [`OrderLog::bulk_put_sorted`]
-    /// here. That primitive has overwrite (last-write-wins) semantics for
-    /// duplicate keys, but `insert_event` is `put_if_absent` — an event whose
-    /// `EventKey` already exists in the journal must be a no-op, not a
-    /// silent overwrite, otherwise the cache would double-apply it. So we
-    /// route through `events.put_if_absent` per item.
-    pub fn bulk_insert_event(
-        &mut self,
-        events: impl IntoIterator<Item = Event>,
-    ) -> io::Result<usize> {
-        let mut pairs: Vec<(EventKey, Event)> = events
-            .into_iter()
-            .map(|event| (EventKey::from_event(&event), event))
-            .collect();
-
-        pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
-        pairs.dedup_by(|(a, _), (b, _)| a == b);
-
-        let mut inserted = 0;
-        for (key, event) in pairs {
-            if !self.events.put_if_absent(key, event.clone())? {
-                continue;
-            }
-
-            if let Some((cell, _)) = self.cache.get_mut(&event.primary_key) {
-                cell.try_apply_event(&event, self.config.sync)
-                    .map_err(io::Error::other)?;
-            } else {
-                let (mut cell, had_previous) = match self.state.get(&event.primary_key) {
-                    Some(c) => (c.into_owned(), true),
-                    None => (Cell::dummy(None), false),
-                };
-                let changed = cell
-                    .try_apply_event(&event, self.config.sync)
-                    .map_err(io::Error::other)?;
-                if had_previous || changed {
-                    if !had_previous {
-                        self.novel_pending += 1;
-                    }
-                    self.cache
-                        .insert(event.primary_key.clone(), (cell, had_previous));
-                }
-            }
-
-            inserted += 1;
-        }
-
-        if inserted > 0 {
-            self.maybe_materialize()?;
-        }
-        Ok(inserted)
-    }
-
-    pub fn materialize(&mut self) -> io::Result<()> {
-        // Iterate by reference and only clear at the end so that a
-        // mid-loop I/O failure leaves the in-memory cache intact —
-        // otherwise reads in this process would no longer see pending
-        // edits even though the events log still contains them.
-        //
-        // Durability uses `flush` (async writeback hint), not `sync`.
-        // Under app-only crash failure modes the kernel still owns the
-        // dirty pages and will finish writeback regardless of our
-        // process exiting; under OS crash / power loss we'd need
-        // ordered `sync`s to be safe, but that's out of scope.
-        for (pk, (cell, _)) in &self.cache {
-            self.state.put(pk.clone(), cell.clone())?;
-        }
-        self.state.flush()?;
-        self.events.clear()?;
-        self.events.flush()?;
-        self.cache.clear();
-        self.novel_pending = 0;
-
-        Ok(())
-    }
-
-    fn maybe_materialize(&mut self) -> io::Result<()> {
-        let should = match self.config.flush {
-            FlushConfig::Manual => false,
-            FlushConfig::EventCount { max_events } => self.events.size() >= max_events,
+        let Some((previous, current)) = self.apply_event_to_cache(&event)? else {
+            return Ok(());
         };
-        if should {
-            self.materialize()?;
+        let change = Change {
+            event,
+            previous,
+            current,
+        };
+        let offset = self.topic.append(&change)?;
+        self.pending_offset = Some(offset);
+        Ok(())
+    }
+
+    pub fn consumer(&self, consumer: &str) -> io::Result<TopicConsumer<Change>> {
+        self.topic.consumer(consumer)
+    }
+
+    fn apply_event_to_cache(
+        &mut self,
+        event: &Event,
+    ) -> io::Result<Option<(Option<Cell>, Option<Cell>)>> {
+        let state = &self.state;
+        let sync = self.config.sync;
+        let mut previous = None;
+        let mut current = None;
+        let mut changed = false;
+        let mut novel = false;
+
+        self.cache.update(&event.primary_key, |cached| {
+            let (mut cell, had_previous, visible) = match cached {
+                Some((cell, had_previous)) => (cell, had_previous, true),
+                None => match state.get(&event.primary_key) {
+                    Some(cell) => (cell.into_owned(), true, true),
+                    None => (Cell::dummy(None), false, false),
+                },
+            };
+
+            previous = visible.then(|| cell.clone());
+            match cell.apply_event(event, sync) {
+                Ok(true) => {
+                    current = Some(cell.clone());
+                    changed = true;
+                    novel = !visible;
+                    Some((cell, had_previous))
+                }
+                Ok(false) => visible.then_some((cell, had_previous)),
+                Err(error) => {
+                    log::warn!(
+                        "failed to apply event to table {:?}, key {:?}: {error}",
+                        event.table_id,
+                        event.primary_key
+                    );
+                    visible.then_some((cell, had_previous))
+                }
+            }
+        })?;
+
+        if changed {
+            if novel {
+                self.novel_pending += 1;
+            }
+            Ok(Some((previous, current)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn replay_recovery(&mut self) -> io::Result<()> {
+        while let Some(change) = self.recovery.next() {
+            let change = change?;
+            self.apply_event_to_cache(&change.event)?;
+            self.pending_offset = self.recovery.volatile_offset().checked_sub(1);
         }
         Ok(())
+    }
+
+    fn drain_cache(&mut self) -> io::Result<()> {
+        if self.cache.is_empty() {
+            return Ok(());
+        }
+        for (pk, entry) in self.cache.entries() {
+            self.state.put(pk.into_owned(), entry.into_owned().0)?;
+        }
+        self.cache.clear()?;
+        self.novel_pending = 0;
+        if let Some(offset) = self.pending_offset.take() {
+            self.recovery.commit_offset(offset)?;
+        }
+        Ok(())
+    }
+}
+
+impl FileBackedBackend<PrimaryKey, Cell> for Table {
+    fn create(path: &Path, config: TableConfig) -> io::Result<Self> {
+        fs::create_dir_all(path)?;
+
+        let state = State::create(&path.join("state"), config.state.clone())?;
+        let cache = SkipList::new(SkipListConfig {
+            capacity: SkipListCapacity::Bounded {
+                max_entries: config.max_buffered_records,
+            },
+        });
+        let topic = Topic::create(&path.join("topic"), config.topic.clone())?;
+        let recovery = topic.consumer(TABLE_RECOVERY_CONSUMER)?;
+
+        Ok(Self {
+            config,
+            state,
+            cache,
+            novel_pending: 0,
+            topic,
+            recovery,
+            pending_offset: None,
+        })
+    }
+
+    fn open(path: &Path, config: TableConfig) -> io::Result<Self> {
+        let state: State<PrimaryKey, Cell> =
+            State::open(&path.join("state"), config.state.clone())?;
+        let cache = SkipList::new(SkipListConfig {
+            capacity: SkipListCapacity::Bounded {
+                max_entries: config.max_buffered_records,
+            },
+        });
+        let topic = Topic::open(&path.join("topic"), config.topic.clone())?;
+        let recovery = topic.consumer(TABLE_RECOVERY_CONSUMER)?;
+
+        let mut table = Self {
+            config,
+            state,
+            cache,
+            novel_pending: 0,
+            topic,
+            recovery,
+            pending_offset: None,
+        };
+        table.replay_recovery()?;
+        Ok(table)
     }
 }
 
@@ -228,89 +234,17 @@ impl Backend<PrimaryKey, Cell> for Table {
         Self: 'a;
     type Config = TableConfig;
 
-    fn create(path: &Path, config: Self::Config) -> io::Result<Self> {
-        fs::create_dir_all(path)?;
-
-        let state = State::create(&path.join("state"), config.state.clone())?;
-        let events = OrderLog::create(&path.join("events"), config.events.clone())?;
-
-        Ok(Self {
-            config,
-            state,
-            events,
-            cache: BTreeMap::new(),
-            novel_pending: 0,
-        })
-    }
-
-    fn open(path: &Path, config: Self::Config) -> io::Result<Self> {
-        let state: State<PrimaryKey, Cell> =
-            State::open(&path.join("state"), config.state.clone())?;
-        let events: EventLog = OrderLog::open(&path.join("events"), config.events.clone())?;
-
-        // Replay the events log into the in-memory cache. `events.entries()`
-        // yields in `EventKey` order, which groups by primary_key and orders
-        // each row's events by HLC, so we walk one row at a time and commit
-        // it on the next-row transition.
-        let mut cache: BTreeMap<PrimaryKey, (Cell, bool)> = BTreeMap::new();
-        let mut novel_pending: usize = 0;
-        let mut group: Option<(PrimaryKey, Cell, bool, bool)> = None;
-        for (event_key, event) in events.entries() {
-            let same_row = group
-                .as_ref()
-                .is_some_and(|(pk, _, _, _)| pk == &event_key.primary_key);
-
-            if !same_row {
-                if let Some((pk, cell, had_previous, changed)) = group.take() {
-                    if had_previous || changed {
-                        if !had_previous {
-                            novel_pending += 1;
-                        }
-                        cache.insert(pk, (cell, had_previous));
-                    }
-                }
-                let pk = event_key.primary_key.clone();
-                let (cell, had_previous) = match state.get(&pk) {
-                    Some(c) => (c.into_owned(), true),
-                    None => (Cell::dummy(None), false),
-                };
-                group = Some((pk, cell, had_previous, false));
-            }
-
-            let g = group.as_mut().unwrap();
-            g.3 |=
-                g.1.try_apply_event(&event, config.sync)
-                    .map_err(io::Error::other)?;
-        }
-        if let Some((pk, cell, had_previous, changed)) = group {
-            if had_previous || changed {
-                if !had_previous {
-                    novel_pending += 1;
-                }
-                cache.insert(pk, (cell, had_previous));
-            }
-        }
-
-        Ok(Self {
-            config,
-            state,
-            events,
-            cache,
-            novel_pending,
-        })
-    }
-
     // ---- reads --------------------------------------------------------
 
     fn get(&self, key: &PrimaryKey) -> Option<Cow<'_, Cell>> {
-        if let Some((cell, _)) = self.cache.get(key) {
-            return Some(Cow::Borrowed(cell));
+        if let Some(entry) = self.cache.get(key) {
+            return Some(cache_cell(entry));
         }
         self.state.get(key)
     }
 
     fn contains(&self, key: &PrimaryKey) -> bool {
-        if self.cache.contains_key(key) {
+        if self.cache.contains(key) {
             return true;
         }
         self.state.contains(key)
@@ -319,18 +253,17 @@ impl Backend<PrimaryKey, Cell> for Table {
     // ---- writes (blocked) -------------------------------------------
     //
     // Direct backend writes are forbidden on Table. All mutations must
-    // go through `insert_event` (or `bulk_insert_event`) so the event
-    // log and the resolved-Cell cache stay consistent.
+    // go through `insert_event` so the cache and topic stay consistent.
 
     fn put(&mut self, _key: PrimaryKey, _value: Cell) -> io::Result<()> {
         panic!("Table::put is disabled — use insert_event instead")
     }
 
-    fn put_if_absent(&mut self, _key: PrimaryKey, _value: Cell) -> io::Result<bool> {
+    fn put_if_absent(&mut self, _key: &PrimaryKey, _value: Cell) -> io::Result<bool> {
         panic!("Table::put_if_absent is disabled — use insert_event instead")
     }
 
-    fn replace(&mut self, _key: PrimaryKey, _value: Cell) -> io::Result<Option<Cow<'_, Cell>>> {
+    fn replace(&mut self, _key: &PrimaryKey, _value: Cell) -> io::Result<Option<Cow<'_, Cell>>> {
         panic!("Table::replace is disabled — use insert_event instead")
     }
 
@@ -338,14 +271,14 @@ impl Backend<PrimaryKey, Cell> for Table {
     where
         I: IntoIterator<Item = (PrimaryKey, Cell)>,
     {
-        panic!("Table::bulk_put is disabled — use bulk_insert_event instead")
+        panic!("Table::bulk_put is disabled — use insert_event instead")
     }
 
     fn bulk_put_sorted<I>(&mut self, _sorted: I) -> io::Result<()>
     where
         I: IntoIterator<Item = (PrimaryKey, Cell)>,
     {
-        panic!("Table::bulk_put_sorted is disabled — use bulk_insert_event instead")
+        panic!("Table::bulk_put_sorted is disabled — use insert_event instead")
     }
 
     fn delete(&mut self, _key: &PrimaryKey) -> io::Result<bool> {
@@ -382,9 +315,7 @@ impl Backend<PrimaryKey, Cell> for Table {
     }
 
     fn compact(&mut self) -> io::Result<()> {
-        self.state.compact()?;
-        self.events.compact()?;
-        Ok(())
+        self.state.compact()
     }
 
     // ---- iteration (resolved over state ⊕ cache) ---------------------
@@ -411,10 +342,10 @@ impl Backend<PrimaryKey, Cell> for Table {
 
                     match order {
                         Ordering::Less => s_iter.next(),
-                        Ordering::Greater => c_iter.next().map(Cow::Borrowed),
+                        Ordering::Greater => c_iter.next(),
                         Ordering::Equal => {
                             s_iter.next();
-                            c_iter.next().map(Cow::Borrowed)
+                            c_iter.next()
                         }
                     }
                 });
@@ -425,8 +356,17 @@ impl Backend<PrimaryKey, Cell> for Table {
                 let cache_ref = &self.cache;
                 let state_only = state
                     .keys()
-                    .filter(move |k| !cache_ref.contains_key(k.as_ref()));
-                let cache_keys = self.cache.keys().map(Cow::Borrowed);
+                    .filter(move |k| !cache_ref.contains(k.as_ref()));
+                let cache_keys = self.cache.keys();
+                Box::new(state_only.chain(cache_keys))
+                    as Box<dyn Iterator<Item = Cow<'a, PrimaryKey>> + 'a>
+            }
+            State::InMemory { backend: state, .. } => {
+                let cache_ref = &self.cache;
+                let state_only = state
+                    .keys()
+                    .filter(move |k| !cache_ref.contains(k.as_ref()));
+                let cache_keys = self.cache.keys();
                 Box::new(state_only.chain(cache_keys))
                     as Box<dyn Iterator<Item = Cow<'a, PrimaryKey>> + 'a>
             }
@@ -444,7 +384,7 @@ impl Backend<PrimaryKey, Cell> for Table {
         match &self.state {
             State::Ordered { backend: state, .. } => {
                 let mut s_iter = state.entries().peekable();
-                let mut c_iter = self.cache.iter().peekable();
+                let mut c_iter = self.cache.entries().map(cache_entry).peekable();
 
                 let it = std::iter::from_fn(move || {
                     let order = match (s_iter.peek(), c_iter.peek()) {
@@ -457,13 +397,13 @@ impl Backend<PrimaryKey, Cell> for Table {
                     match order {
                         Ordering::Less => s_iter.next().map(|(_, v)| v),
                         Ordering::Greater => {
-                            let (_, (cell, _)) = c_iter.next().unwrap();
-                            Some(Cow::Borrowed(cell))
+                            let (_, cell) = c_iter.next().unwrap();
+                            Some(cell)
                         }
                         Ordering::Equal => {
                             s_iter.next();
-                            let (_, (cell, _)) = c_iter.next().unwrap();
-                            Some(Cow::Borrowed(cell))
+                            let (_, cell) = c_iter.next().unwrap();
+                            Some(cell)
                         }
                     }
                 });
@@ -474,8 +414,17 @@ impl Backend<PrimaryKey, Cell> for Table {
                 let cache_ref = &self.cache;
                 let state_only = state
                     .entries()
-                    .filter_map(move |(k, v)| (!cache_ref.contains_key(k.as_ref())).then_some(v));
-                let cache_vals = self.cache.values().map(|(v, _)| Cow::Borrowed(v));
+                    .filter_map(move |(k, v)| (!cache_ref.contains(k.as_ref())).then_some(v));
+                let cache_vals = self.cache.values().map(cache_cell);
+                Box::new(state_only.chain(cache_vals))
+                    as Box<dyn Iterator<Item = Cow<'a, Cell>> + 'a>
+            }
+            State::InMemory { backend: state, .. } => {
+                let cache_ref = &self.cache;
+                let state_only = state
+                    .entries()
+                    .filter_map(move |(k, v)| (!cache_ref.contains(k.as_ref())).then_some(v));
+                let cache_vals = self.cache.values().map(cache_cell);
                 Box::new(state_only.chain(cache_vals))
                     as Box<dyn Iterator<Item = Cow<'a, Cell>> + 'a>
             }
@@ -494,7 +443,7 @@ impl Backend<PrimaryKey, Cell> for Table {
         match &self.state {
             State::Ordered { backend: state, .. } => {
                 let mut s_iter = state.entries().peekable();
-                let mut c_iter = self.cache.iter().peekable();
+                let mut c_iter = self.cache.entries().map(cache_entry).peekable();
 
                 let it = std::iter::from_fn(move || {
                     let order = match (s_iter.peek(), c_iter.peek()) {
@@ -506,14 +455,10 @@ impl Backend<PrimaryKey, Cell> for Table {
 
                     match order {
                         Ordering::Less => s_iter.next(),
-                        Ordering::Greater => {
-                            let (pk, (cell, _)) = c_iter.next().unwrap();
-                            Some((Cow::Borrowed(pk), Cow::Borrowed(cell)))
-                        }
+                        Ordering::Greater => c_iter.next(),
                         Ordering::Equal => {
                             let _state_row = s_iter.next();
-                            let (pk, (cell, _)) = c_iter.next().unwrap();
-                            Some((Cow::Borrowed(pk), Cow::Borrowed(cell)))
+                            c_iter.next()
                         }
                     }
                 });
@@ -524,11 +469,17 @@ impl Backend<PrimaryKey, Cell> for Table {
                 let cache_ref = &self.cache;
                 let state_only = state
                     .entries()
-                    .filter(move |(k, _)| !cache_ref.contains_key(k.as_ref()));
-                let cache_iter = self
-                    .cache
-                    .iter()
-                    .map(|(k, (v, _))| (Cow::Borrowed(k), Cow::Borrowed(v)));
+                    .filter(move |(k, _)| !cache_ref.contains(k.as_ref()));
+                let cache_iter = self.cache.entries().map(cache_entry);
+                Box::new(state_only.chain(cache_iter))
+                    as Box<dyn Iterator<Item = (Cow<'a, PrimaryKey>, Cow<'a, Cell>)> + 'a>
+            }
+            State::InMemory { backend: state, .. } => {
+                let cache_ref = &self.cache;
+                let state_only = state
+                    .entries()
+                    .filter(move |(k, _)| !cache_ref.contains(k.as_ref()));
+                let cache_iter = self.cache.entries().map(cache_entry);
                 Box::new(state_only.chain(cache_iter))
                     as Box<dyn Iterator<Item = (Cow<'a, PrimaryKey>, Cow<'a, Cell>)> + 'a>
             }
@@ -540,18 +491,14 @@ impl Backend<PrimaryKey, Cell> for Table {
     }
 
     fn is_empty(&self) -> bool {
-        // A cache entry with `had_previous == true` requires a corresponding
-        // state row, so `state.is_empty()` implies every cache entry has
-        // `had_previous == false`, i.e. they all count toward `novel_pending`.
-        // Therefore `state.is_empty() && novel_pending == 0` is the exact
-        // emptiness predicate.
         self.state.is_empty() && self.novel_pending == 0
     }
 
     fn stats(&self) -> Self::Stats<'_> {
         TableStats {
             state: self.state.stats(),
-            events: self.events.stats(),
+            cache: self.cache.stats(),
+            topic: self.topic.stats(),
         }
     }
 
@@ -559,22 +506,24 @@ impl Backend<PrimaryKey, Cell> for Table {
         &self.config
     }
 
-    fn flush(&self) -> io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
+        self.drain_cache()?;
         self.state.flush()?;
-        self.events.flush()
+        self.topic.flush()
     }
 
-    fn sync(&self) -> io::Result<()> {
+    fn sync(&mut self) -> io::Result<()> {
+        self.drain_cache()?;
         self.state.sync()?;
-        self.events.sync()
+        self.topic.sync()
     }
 }
 
 impl OrderedBackend<PrimaryKey, Cell> for Table {
     fn range<'a>(
         &'a self,
-        start: &PrimaryKey,
-        end: &PrimaryKey,
+        start: &'a PrimaryKey,
+        end: &'a PrimaryKey,
     ) -> impl Iterator<Item = (Cow<'a, PrimaryKey>, Cow<'a, Cell>)> + 'a
     where
         PrimaryKey: 'a,
@@ -582,10 +531,8 @@ impl OrderedBackend<PrimaryKey, Cell> for Table {
     {
         let state = &self.state;
 
-        // BTreeMap::range uses an exclusive upper bound, matching the
-        // [start, end) contract of `OrderedBackend::range`.
         let mut s_iter = state.range(start, end).peekable();
-        let mut c_iter = self.cache.range(start.clone()..end.clone()).peekable();
+        let mut c_iter = self.cache.range(start, end).map(cache_entry).peekable();
 
         let it = std::iter::from_fn(move || {
             let order = match (s_iter.peek(), c_iter.peek()) {
@@ -597,14 +544,10 @@ impl OrderedBackend<PrimaryKey, Cell> for Table {
 
             match order {
                 Ordering::Less => s_iter.next(),
-                Ordering::Greater => {
-                    let (pk, (cell, _)) = c_iter.next().unwrap();
-                    Some((Cow::Borrowed(pk), Cow::Borrowed(cell)))
-                }
+                Ordering::Greater => c_iter.next(),
                 Ordering::Equal => {
                     let _state_row = s_iter.next();
-                    let (pk, (cell, _)) = c_iter.next().unwrap();
-                    Some((Cow::Borrowed(pk), Cow::Borrowed(cell)))
+                    c_iter.next()
                 }
             }
         });
@@ -620,19 +563,17 @@ impl OrderedBackend<PrimaryKey, Cell> for Table {
         let state = &self.state;
 
         let s_first = state.first();
-        let c_first = self.cache.iter().next();
+        let c_first = self.cache.first().map(cache_entry);
 
         match (s_first, c_first) {
             (None, None) => None,
             (Some(s), None) => Some(s),
-            (None, Some((pk, (cell, _)))) => Some((Cow::Borrowed(pk), Cow::Borrowed(cell))),
-            (Some(s), Some((c_pk, (c_cell, _)))) => match s.0.as_ref().cmp(c_pk) {
+            (None, Some(c)) => Some(c),
+            (Some(s), Some(c)) => match s.0.as_ref().cmp(c.0.as_ref()) {
                 Ordering::Less => Some(s),
                 // Greater → cache key is smaller, yield it.
                 // Equal   → cache always wins on collision.
-                Ordering::Greater | Ordering::Equal => {
-                    Some((Cow::Borrowed(c_pk), Cow::Borrowed(c_cell)))
-                }
+                Ordering::Greater | Ordering::Equal => Some(c),
             },
         }
     }
@@ -645,19 +586,17 @@ impl OrderedBackend<PrimaryKey, Cell> for Table {
         let state = &self.state;
 
         let s_last = state.last();
-        let c_last = self.cache.iter().next_back();
+        let c_last = self.cache.last().map(cache_entry);
 
         match (s_last, c_last) {
             (None, None) => None,
             (Some(s), None) => Some(s),
-            (None, Some((pk, (cell, _)))) => Some((Cow::Borrowed(pk), Cow::Borrowed(cell))),
-            (Some(s), Some((c_pk, (c_cell, _)))) => match s.0.as_ref().cmp(c_pk) {
+            (None, Some(c)) => Some(c),
+            (Some(s), Some(c)) => match s.0.as_ref().cmp(c.0.as_ref()) {
                 Ordering::Greater => Some(s),
                 // Less  → cache key is greater, yield it.
                 // Equal → cache always wins on collision.
-                Ordering::Less | Ordering::Equal => {
-                    Some((Cow::Borrowed(c_pk), Cow::Borrowed(c_cell)))
-                }
+                Ordering::Less | Ordering::Equal => Some(c),
             },
         }
     }
@@ -672,7 +611,7 @@ impl OrderedBackend<PrimaryKey, Cell> for Table {
         // Two-pointer streaming merge in reverse: pick the larger head
         // each step; cache wins on equality.
         let mut s_iter = state.entries_rev().peekable();
-        let mut c_iter = self.cache.iter().rev().peekable();
+        let mut c_iter = self.cache.entries_rev().map(cache_entry).peekable();
 
         let it = std::iter::from_fn(move || {
             let order = match (s_iter.peek(), c_iter.peek()) {
@@ -684,14 +623,10 @@ impl OrderedBackend<PrimaryKey, Cell> for Table {
 
             match order {
                 Ordering::Greater => s_iter.next(),
-                Ordering::Less => {
-                    let (pk, (cell, _)) = c_iter.next().unwrap();
-                    Some((Cow::Borrowed(pk), Cow::Borrowed(cell)))
-                }
+                Ordering::Less => c_iter.next(),
                 Ordering::Equal => {
                     s_iter.next();
-                    let (pk, (cell, _)) = c_iter.next().unwrap();
-                    Some((Cow::Borrowed(pk), Cow::Borrowed(cell)))
+                    c_iter.next()
                 }
             }
         });
@@ -701,8 +636,8 @@ impl OrderedBackend<PrimaryKey, Cell> for Table {
 
     fn range_rev<'a>(
         &'a self,
-        start: &PrimaryKey,
-        end: &PrimaryKey,
+        start: &'a PrimaryKey,
+        end: &'a PrimaryKey,
     ) -> impl Iterator<Item = (Cow<'a, PrimaryKey>, Cow<'a, Cell>)> + 'a
     where
         PrimaryKey: 'a,
@@ -710,15 +645,8 @@ impl OrderedBackend<PrimaryKey, Cell> for Table {
     {
         let state = &self.state;
 
-        // Same reverse two-pointer merge as `entries_rev`, bounded to
-        // `[start, end)`. `BTreeMap::range` is double-ended, so its
-        // `.rev()` walks the slice from high to low without buffering.
         let mut s_iter = state.range_rev(start, end).peekable();
-        let mut c_iter = self
-            .cache
-            .range(start.clone()..end.clone())
-            .rev()
-            .peekable();
+        let mut c_iter = self.cache.range_rev(start, end).map(cache_entry).peekable();
 
         let it = std::iter::from_fn(move || {
             let order = match (s_iter.peek(), c_iter.peek()) {
@@ -730,14 +658,10 @@ impl OrderedBackend<PrimaryKey, Cell> for Table {
 
             match order {
                 Ordering::Greater => s_iter.next(),
-                Ordering::Less => {
-                    let (pk, (cell, _)) = c_iter.next().unwrap();
-                    Some((Cow::Borrowed(pk), Cow::Borrowed(cell)))
-                }
+                Ordering::Less => c_iter.next(),
                 Ordering::Equal => {
                     s_iter.next();
-                    let (pk, (cell, _)) = c_iter.next().unwrap();
-                    Some((Cow::Borrowed(pk), Cow::Borrowed(cell)))
+                    c_iter.next()
                 }
             }
         });
@@ -749,12 +673,12 @@ impl OrderedBackend<PrimaryKey, Cell> for Table {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::keydir::KeyDirConfig;
     use std::{
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
-    use zendb_storage::core::keydir::KeyDirConfig;
-    use zendb_types::{device_id, init_device_id, Op, Path, Value};
+    use zendb_types::{device_id, init_device_id, Hlc, Op, Path, Value};
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 
@@ -765,7 +689,7 @@ mod tests {
 
     fn tmp_path(name: &str) -> PathBuf {
         let id = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("zendb_engine_{name}_{id}"))
+        std::env::temp_dir().join(format!("zendb_engine_{name}_{}_{id}", std::process::id()))
     }
 
     fn event(key: &str, value: i64, hlc: Hlc) -> Event {
@@ -782,14 +706,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn event_keys_group_rows_and_order_by_hlc() {
-        let early = EventKey::from_event(&event("a", 1, hlc(100)));
-        let late = EventKey::from_event(&event("a", 2, hlc(200)));
-        let next_row = EventKey::from_event(&event("b", 3, hlc(50)));
-
-        assert!(early < late);
-        assert!(late < next_row);
+    fn materialize(table: &mut Table) {
+        table.drain_cache().unwrap();
+        table.state.flush().unwrap();
     }
 
     #[test]
@@ -805,8 +724,8 @@ mod tests {
         .unwrap();
 
         let first_event = event("a", 1, hlc(100));
-        assert!(table.insert_event(first_event.clone()).unwrap());
-        assert!(!table.insert_event(first_event).unwrap());
+        table.insert_event(first_event.clone()).unwrap();
+        table.insert_event(first_event).unwrap();
         let key = PrimaryKey::String("a".into());
         assert_eq!(
             Backend::get(&table, &key).unwrap().into_owned().value,
@@ -814,17 +733,17 @@ mod tests {
         );
         let stats = Backend::stats(&table);
         assert!(matches!(&stats.state, StateStats::Unordered(_)));
-        assert!(stats.events.data_size > 0);
+        assert_eq!(stats.cache.entries, 1);
+        assert_eq!(stats.topic.records, 1);
     }
 
     #[test]
-    fn open_recovers_state_and_events() {
+    fn open_recovers_unflushed_topic_records() {
         let path = tmp_path("open");
         let config = TableConfig::default();
         {
             let mut table = Table::create(&path, config.clone()).unwrap();
             table.insert_event(event("a", 1, hlc(100))).unwrap();
-            Backend::sync(&table).unwrap();
         }
 
         let table = Table::open(&path, config).unwrap();
@@ -833,13 +752,13 @@ mod tests {
             Backend::get(&table, &key).unwrap().into_owned().value,
             Some(Value::Int(1))
         );
+        assert_eq!(table.cache.size(), 1);
+        assert_eq!(table.state.size(), 0);
+        assert_eq!(table.topic.stats().records, 1);
     }
 
     fn manual_config() -> TableConfig {
-        TableConfig {
-            flush: FlushConfig::Manual,
-            ..TableConfig::default()
-        }
+        TableConfig::default()
     }
 
     #[test]
@@ -854,7 +773,7 @@ mod tests {
         // Cache hit returns Cow::Borrowed (zero-clone).
         assert!(matches!(got, Cow::Borrowed(_)));
         assert_eq!(got.into_owned().value, Some(Value::Int(2)));
-        assert_eq!(table.novel_pending, 1);
+        assert_eq!(table.cache.size(), 1);
     }
 
     #[test]
@@ -869,6 +788,7 @@ mod tests {
 
         assert_eq!(Backend::size(&table), 3);
         assert_eq!(Backend::entries(&table).count(), 3);
+        assert_eq!(table.cache.size(), 3);
         assert_eq!(table.novel_pending, 3);
         assert!(!Backend::is_empty(&table));
     }
@@ -879,12 +799,13 @@ mod tests {
         let mut table = Table::create(&path, manual_config()).unwrap();
         // Seed state via materialize.
         table.insert_event(event("a", 1, hlc(100))).unwrap();
-        table.materialize().unwrap();
+        materialize(&mut table);
         assert!(table.cache.is_empty());
 
         // Now shadow "a" with a newer event and add a fresh "b".
         table.insert_event(event("a", 9, hlc(200))).unwrap();
         table.insert_event(event("b", 7, hlc(210))).unwrap();
+        assert_eq!(table.novel_pending, 1);
 
         let collected: Vec<(PrimaryKey, Cell)> = Backend::entries(&table)
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
@@ -902,9 +823,9 @@ mod tests {
         let path = tmp_path("dup");
         let mut table = Table::create(&path, manual_config()).unwrap();
         let d = event("a", 1, hlc(100));
-        assert!(table.insert_event(d.clone()).unwrap());
-        assert!(!table.insert_event(d.clone()).unwrap());
-        assert_eq!(table.novel_pending, 1);
+        table.insert_event(d.clone()).unwrap();
+        table.insert_event(d.clone()).unwrap();
+        assert_eq!(table.cache.size(), 1);
         assert_eq!(Backend::size(&table), 1);
         let key = PrimaryKey::String("a".into());
         assert_eq!(
@@ -919,12 +840,13 @@ mod tests {
         let mut table = Table::create(&path, manual_config()).unwrap();
         table.insert_event(event("a", 1, hlc(100))).unwrap();
         table.insert_event(event("b", 2, hlc(110))).unwrap();
-        assert_eq!(table.novel_pending, 2);
+        assert_eq!(table.cache.size(), 2);
 
-        table.materialize().unwrap();
+        materialize(&mut table);
         assert!(table.cache.is_empty());
+        assert_eq!(table.cache.size(), 0);
         assert_eq!(table.novel_pending, 0);
-        assert_eq!(table.events.size(), 0);
+        assert_eq!(table.topic.stats().records, 2);
 
         // Reads now come straight from state.
         assert_eq!(Backend::size(&table), 2);
@@ -936,7 +858,30 @@ mod tests {
     }
 
     #[test]
-    fn open_rebuilds_cache_from_events() {
+    fn bounded_cache_materializes_at_capacity_without_clearing_topic() {
+        let path = tmp_path("bounded_cache");
+        let config = TableConfig {
+            max_buffered_records: 2,
+            ..TableConfig::default()
+        };
+        let mut table = Table::create(&path, config).unwrap();
+
+        table.insert_event(event("a", 1, hlc(100))).unwrap();
+        table.insert_event(event("b", 2, hlc(110))).unwrap();
+
+        assert_eq!(table.cache.size(), 2);
+        assert_eq!(table.state.size(), 0);
+
+        table.insert_event(event("c", 3, hlc(120))).unwrap();
+
+        assert_eq!(table.cache.size(), 1);
+        assert_eq!(table.state.size(), 2);
+        assert_eq!(table.novel_pending, 1);
+        assert_eq!(table.topic.stats().records, 3);
+    }
+
+    #[test]
+    fn sync_materializes_pending_events_before_open() {
         let path = tmp_path("open_cache");
         let config = manual_config();
         {
@@ -944,13 +889,11 @@ mod tests {
             table.insert_event(event("a", 1, hlc(100))).unwrap();
             table.insert_event(event("a", 2, hlc(200))).unwrap();
             table.insert_event(event("b", 5, hlc(150))).unwrap();
-            Backend::sync(&table).unwrap();
-            // Intentionally do NOT materialize.
+            Backend::sync(&mut table).unwrap();
         }
 
         let table = Table::open(&path, config).unwrap();
-        assert_eq!(table.novel_pending, 2);
-        assert_eq!(table.cache.len(), 2);
+        assert_eq!(table.cache.size(), 0);
         assert_eq!(Backend::size(&table), 2);
         let key_a = PrimaryKey::String("a".into());
         let key_b = PrimaryKey::String("b".into());
@@ -972,7 +915,7 @@ mod tests {
         table.insert_event(event("a", 1, hlc(100))).unwrap();
         table.insert_event(event("c", 3, hlc(101))).unwrap();
         table.insert_event(event("e", 5, hlc(102))).unwrap();
-        table.materialize().unwrap();
+        materialize(&mut table);
 
         // Cache: shadow "c" + add "b" and "d".
         table.insert_event(event("c", 99, hlc(200))).unwrap();
@@ -1009,7 +952,6 @@ mod tests {
             &path,
             TableConfig {
                 state: StateConfig::Unordered(KeyDirConfig::default()),
-                flush: FlushConfig::Manual,
                 ..TableConfig::default()
             },
         )
@@ -1027,7 +969,7 @@ mod tests {
         table.insert_event(event("a", 1, hlc(100))).unwrap();
         table.insert_event(event("c", 3, hlc(101))).unwrap();
         table.insert_event(event("e", 5, hlc(102))).unwrap();
-        table.materialize().unwrap();
+        materialize(&mut table);
         table.insert_event(event("c", 99, hlc(200))).unwrap();
         table.insert_event(event("b", 2, hlc(201))).unwrap();
         table.insert_event(event("d", 4, hlc(202))).unwrap();
@@ -1061,7 +1003,7 @@ mod tests {
         let path = tmp_path("first_cache_smaller");
         let mut table = Table::create(&path, manual_config()).unwrap();
         table.insert_event(event("m", 1, hlc(100))).unwrap();
-        table.materialize().unwrap();
+        materialize(&mut table);
         // Cache key "a" < state key "m" → cache wins.
         table.insert_event(event("a", 9, hlc(200))).unwrap();
 
@@ -1074,7 +1016,7 @@ mod tests {
         let path = tmp_path("first_eq");
         let mut table = Table::create(&path, manual_config()).unwrap();
         table.insert_event(event("a", 1, hlc(100))).unwrap();
-        table.materialize().unwrap();
+        materialize(&mut table);
         table.insert_event(event("a", 99, hlc(200))).unwrap();
 
         let (k, v) = OrderedBackend::first(&table).unwrap();
@@ -1095,7 +1037,7 @@ mod tests {
         let path = tmp_path("last_cache_larger");
         let mut table = Table::create(&path, manual_config()).unwrap();
         table.insert_event(event("a", 1, hlc(100))).unwrap();
-        table.materialize().unwrap();
+        materialize(&mut table);
         // Cache key "z" > state key "a" → cache wins.
         table.insert_event(event("z", 9, hlc(200))).unwrap();
 
@@ -1108,7 +1050,7 @@ mod tests {
         let path = tmp_path("last_eq");
         let mut table = Table::create(&path, manual_config()).unwrap();
         table.insert_event(event("a", 1, hlc(100))).unwrap();
-        table.materialize().unwrap();
+        materialize(&mut table);
         table.insert_event(event("a", 99, hlc(200))).unwrap();
 
         let (k, v) = OrderedBackend::last(&table).unwrap();
@@ -1159,7 +1101,6 @@ mod tests {
             &path,
             TableConfig {
                 state: StateConfig::Unordered(KeyDirConfig::default()),
-                flush: FlushConfig::Manual,
                 ..TableConfig::default()
             },
         )

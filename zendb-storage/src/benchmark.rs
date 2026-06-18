@@ -1,4 +1,4 @@
-//! KeyDir, OrderLog, LMDB, and BPlusTree storage benchmarks.
+//! KeyDir, SkipList, Topic, LMDB, and BPlusTree storage benchmarks.
 //!
 //! The suite keeps the workload shape constant within each scenario and
 //! labels each backend by the write mode it actually implements:
@@ -16,14 +16,14 @@
 //!   ratio). This generates dead bytes and exercises `maybe_compact` in
 //!   write paths.
 //!
-//! OrderLog also has sorted bulk paths. Its unsorted bulk methods collect
+//! SkipList also has sorted bulk paths. Its unsorted bulk methods collect
 //! and sort before delegating to the sorted finger-walk implementation, so
 //! the bulk benchmarks include both direct sorted input and reversed input
 //! that pays the sort cost.
 //!
 //! LMDB sits next to the in-tree backends as a baseline:
 //!
-//! - KeyDir/OrderLog direct writes <-> LMDB one-txn-per-op.
+//! - KeyDir/SkipList direct writes <-> LMDB one-txn-per-op.
 //! - LMDB single batch transaction remains a reference point for commit
 //!   amortization outside the in-tree backends.
 //!
@@ -48,17 +48,18 @@ use tempfile::TempDir;
 
 use crate::{
     core::{
-        backend::Backend,
+        backend::{Backend, FileBackedBackend},
         btree::{BPlusTree, BPlusTreeConfig},
         keydir::{KeyDir, KeyDirConfig},
-        orderlog::{OrderLog, OrderLogConfig},
+        skiplist::{SkipList, SkipListCapacity, SkipListConfig},
+        topic::{Topic, TopicConfig},
     },
     utils::serdes::{deserialize_from, serialize_to_vec},
 };
 
 // ---------------------------------------------------------------------------
 // Workload knobs — kept identical across every scenario so the numbers
-// are directly comparable. KeyDir, OrderLog, and LMDB use `u64` keys.
+// are directly comparable. KeyDir, SkipList, and LMDB use `u64` keys.
 // BPlusTree uses fixed-width `[u8; 8]` big-endian keys so its serialized
 // key bytes preserve numeric order without adding Vec allocation or a
 // length prefix. Values are `u64` for every backend.
@@ -84,14 +85,24 @@ fn keydir_config() -> KeyDirConfig {
     KeyDirConfig::default()
 }
 
-fn orderlog_config() -> OrderLogConfig {
-    // Match KeyDir's defaults: 1 MiB initial capacity and 0.5 compaction
-    // ratio, so fresh/churn measurements line up across both backends.
-    OrderLogConfig::default()
+fn skiplist_config() -> SkipListConfig {
+    SkipListConfig::default()
+}
+
+fn bounded_skiplist_config() -> SkipListConfig {
+    SkipListConfig {
+        capacity: SkipListCapacity::Bounded {
+            max_entries: N as usize,
+        },
+    }
 }
 
 fn btree_config() -> BPlusTreeConfig {
     BPlusTreeConfig::default()
+}
+
+fn topic_config() -> TopicConfig {
+    TopicConfig::default()
 }
 
 // ---------------------------------------------------------------------------
@@ -268,15 +279,64 @@ fn keydir_reads() -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// OrderLog — fresh (no overwrites)
+// Topic - append and consumer reads
 // ---------------------------------------------------------------------------
 
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn orderlog_writes_fresh_direct() -> io::Result<()> {
+fn topic_writes_fresh_append() -> io::Result<()> {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().join("orderlog.bin");
-    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+    let path = dir.path().join("topic");
+    let mut topic = Topic::<u64>::create(&path, topic_config())?;
+    let keys = fresh_keys();
+
+    let elapsed = timed(|| {
+        for &k in &keys {
+            topic.append(&k.wrapping_mul(7))?;
+        }
+        topic.flush()
+    })?;
+
+    BenchResult::new("Topic fresh writes (append)", N, elapsed).print();
+    Ok(())
+}
+
+#[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
+fn topic_reads() -> io::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("topic");
+    let mut topic = Topic::<u64>::create(&path, topic_config())?;
+
+    // Register before seeding because a new consumer starts at the current tail.
+    drop(topic.consumer("bench-reader")?);
+
+    for k in 0..N {
+        topic.append(&k.wrapping_mul(7))?;
+    }
+    topic.flush()?;
+
+    let mut consumer = topic.consumer("bench-reader")?;
+    let elapsed = timed(|| {
+        for k in 0..N {
+            let value = consumer.next().expect("record must exist")?;
+            assert_eq!(value, k.wrapping_mul(7));
+        }
+        Ok(())
+    })?;
+
+    BenchResult::new("Topic reads", N, elapsed).print();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SkipList — fresh (no overwrites)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
+fn skiplist_writes_fresh_direct() -> io::Result<()> {
+    let mut ol = SkipList::<u64, u64>::new(skiplist_config());
     let keys = fresh_keys();
 
     let elapsed = timed(|| {
@@ -286,20 +346,35 @@ fn orderlog_writes_fresh_direct() -> io::Result<()> {
         ol.flush()
     })?;
 
-    BenchResult::new("OrderLog fresh writes (direct put)", N, elapsed).print();
+    BenchResult::new("SkipList fresh writes (direct put)", N, elapsed).print();
+    Ok(())
+}
+
+#[test]
+#[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
+fn skiplist_writes_fresh_bounded_direct() -> io::Result<()> {
+    let mut list = SkipList::<u64, u64>::new(bounded_skiplist_config());
+    let keys = fresh_keys();
+
+    let elapsed = timed(|| {
+        for &key in &keys {
+            list.put(key, key.wrapping_mul(7))?;
+        }
+        list.flush()
+    })?;
+
+    BenchResult::new("SkipList bounded fresh writes (direct put)", N, elapsed).print();
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// OrderLog — churn (4× overwrite ratio, exercises maybe_compact)
+// SkipList — churn (4× overwrite ratio, exercises maybe_compact)
 // ---------------------------------------------------------------------------
 
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn orderlog_writes_churn_direct() -> io::Result<()> {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("orderlog.bin");
-    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+fn skiplist_writes_churn_direct() -> io::Result<()> {
+    let mut ol = SkipList::<u64, u64>::new(skiplist_config());
     let keys = churn_keys();
 
     let elapsed = timed(|| {
@@ -309,20 +384,18 @@ fn orderlog_writes_churn_direct() -> io::Result<()> {
         ol.flush()
     })?;
 
-    BenchResult::new("OrderLog churn writes (direct put)", N, elapsed).print();
+    BenchResult::new("SkipList churn writes (direct put)", N, elapsed).print();
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// OrderLog — sorted bulk paths
+// SkipList — sorted bulk paths
 // ---------------------------------------------------------------------------
 
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn orderlog_bulk_put_sorted_fresh() -> io::Result<()> {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("orderlog.bin");
-    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+fn skiplist_bulk_put_sorted_fresh() -> io::Result<()> {
+    let mut ol = SkipList::<u64, u64>::new(skiplist_config());
     let items = kv_payload(&fresh_keys());
 
     let elapsed = timed(|| {
@@ -330,16 +403,14 @@ fn orderlog_bulk_put_sorted_fresh() -> io::Result<()> {
         ol.flush()
     })?;
 
-    BenchResult::new("OrderLog fresh bulk_put_sorted", N, elapsed).print();
+    BenchResult::new("SkipList fresh bulk_put_sorted", N, elapsed).print();
     Ok(())
 }
 
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn orderlog_bulk_put_unsorted_fresh() -> io::Result<()> {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("orderlog.bin");
-    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+fn skiplist_bulk_put_unsorted_fresh() -> io::Result<()> {
+    let mut ol = SkipList::<u64, u64>::new(skiplist_config());
     let items = reversed_kv_payload(&fresh_keys());
 
     let elapsed = timed(|| {
@@ -347,16 +418,14 @@ fn orderlog_bulk_put_unsorted_fresh() -> io::Result<()> {
         ol.flush()
     })?;
 
-    BenchResult::new("OrderLog fresh bulk_put (sort first)", N, elapsed).print();
+    BenchResult::new("SkipList fresh bulk_put (sort first)", N, elapsed).print();
     Ok(())
 }
 
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn orderlog_bulk_put_sorted_churn() -> io::Result<()> {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("orderlog.bin");
-    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+fn skiplist_bulk_put_sorted_churn() -> io::Result<()> {
+    let mut ol = SkipList::<u64, u64>::new(skiplist_config());
     let mut items = kv_payload(&churn_keys());
     items.sort_by(|(a, _), (b, _)| a.cmp(b));
 
@@ -365,16 +434,14 @@ fn orderlog_bulk_put_sorted_churn() -> io::Result<()> {
         ol.flush()
     })?;
 
-    BenchResult::new("OrderLog churn bulk_put_sorted", N, elapsed).print();
+    BenchResult::new("SkipList churn bulk_put_sorted", N, elapsed).print();
     Ok(())
 }
 
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn orderlog_bulk_put_unsorted_churn() -> io::Result<()> {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("orderlog.bin");
-    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+fn skiplist_bulk_put_unsorted_churn() -> io::Result<()> {
+    let mut ol = SkipList::<u64, u64>::new(skiplist_config());
     let items = reversed_kv_payload(&churn_keys());
 
     let elapsed = timed(|| {
@@ -382,20 +449,18 @@ fn orderlog_bulk_put_unsorted_churn() -> io::Result<()> {
         ol.flush()
     })?;
 
-    BenchResult::new("OrderLog churn bulk_put (sort first)", N, elapsed).print();
+    BenchResult::new("SkipList churn bulk_put (sort first)", N, elapsed).print();
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// OrderLog — reads
+// SkipList — reads
 // ---------------------------------------------------------------------------
 
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
-fn orderlog_reads() -> io::Result<()> {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("orderlog.bin");
-    let mut ol = OrderLog::<u64, u64>::create(&path, orderlog_config())?;
+fn skiplist_reads() -> io::Result<()> {
+    let mut ol = SkipList::<u64, u64>::new(skiplist_config());
 
     ol.bulk_put_sorted(kv_payload(&fresh_keys()))?;
     ol.flush()?;
@@ -408,7 +473,7 @@ fn orderlog_reads() -> io::Result<()> {
         Ok(())
     })?;
 
-    BenchResult::new("OrderLog reads", N, elapsed).print();
+    BenchResult::new("SkipList reads", N, elapsed).print();
     Ok(())
 }
 

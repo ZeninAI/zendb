@@ -4,11 +4,15 @@
 //!
 //! - **Generic** over `K` and `V`. Both are serialized through bincode
 //!   into the backend's byte storage (mmap'd files).
-//! - **Reads return owned values.** `get` produces an `Option<V>` by
-//!   deserializing from the backing bytes. Bincode is not a zero-copy
-//!   format — every read materializes.
-//! - **Writes consume.** `put` takes `K` and `V` by value, matching
-//!   `HashMap::insert`. The backend serializes and may drop both.
+//! - **Reads return `Cow`.** File-backed backends normally materialize
+//!   owned values from bytes; in-memory backends can borrow directly from
+//!   their resident nodes. Generic callers should treat the `Cow` variant
+//!   as backend-dependent.
+//! - **Writes consume values.** `put` takes `K` and `V` by value, matching
+//!   `HashMap::insert`. Conditional write APIs such as
+//!   [`put_if_absent`](Backend::put_if_absent) and
+//!   [`replace`](Backend::replace) borrow the key so hit paths can reuse
+//!   the backend's stored key and clone only when an insert is needed.
 //! - **Read-modify-write** has a first-class [`Backend::update`] combinator
 //!   that handles the deserialize → modify → serialize dance. The trait
 //!   provides a default implementation; backends with cheaper paths
@@ -16,8 +20,9 @@
 //! - **Bulk operations** ([`bulk_put`](Backend::bulk_put),
 //!   [`bulk_put_sorted`](Backend::bulk_put_sorted),
 //!   [`bulk_delete`](Backend::bulk_delete)) default to looping the
-//!   single-item variants; backends with optimized fast paths
-//!   (BPlusTree's future bottom-up bulk-load) override the relevant one.
+//!   single-item variants. The sorted variants are opportunistic fast-path
+//!   hooks: implementations may optimize them, but callers must not rely on
+//!   uniform complexity across backends.
 //! - **Writeback** is two-tier: [`flush`](Backend::flush) schedules OS
 //!   writeback (async); [`sync`](Backend::sync) waits for it. This layer
 //!   does not provide crash recovery, corruption repair, or multi-page
@@ -30,10 +35,10 @@
 //!
 //! | Form | Meaning |
 //! |------|---------|
-//! | `&K`            | probe — look this up, caller keeps it |
-//! | `K` (parameter) | transfer — store this, caller is done with it |
-//! | `K` (return)    | owned — backend hands you a fresh `K` |
-//! | `V` (return)    | owned — backend hands you a fresh `V` (deserialized) |
+//! | `&K`            | lookup key — may be cloned only if an insert needs ownership |
+//! | `K` (parameter) | transfer — store this key, caller is done with it |
+//! | `Cow<K>` return | borrowed or owned — backend-dependent |
+//! | `Cow<V>` return | borrowed or owned — backend-dependent |
 //! | `V` (parameter) | transfer — backend serializes and may drop it |
 //!
 //! ## Object safety
@@ -55,17 +60,15 @@ use bincode::{Decode, Encode};
 ///
 /// Generic over `K` and `V`. The bounds are the union of what every
 /// backend implementation needs: `Hash + Eq` (KeyDir's hash index),
-/// `Clone` on both K and V (in-memory backends like OrderLog hold owned
+/// `Ord` (the shared ordered-backend and runtime-state contract),
+/// `Clone` on both K and V (in-memory backends like SkipList hold owned
 /// `(K, V)` and need to hand cloned copies to callers; the `update`
 /// default impl also clones the key on the insert path), plus bincode's
 /// `Encode + Decode<()>` for both K and V.
 ///
-/// No `Ord` on `K` for the common backend surface. `Ord` only appears on
-/// [`OrderedBackend`], where each implementation documents what its
-/// "ascending key order" means.
 pub trait Backend<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
 {
     /// Cheap backend-specific metrics view. Implementations keep the
@@ -77,18 +80,6 @@ where
     /// Backend configuration values. Set once at construction, read
     /// through `config()`. Immutable after creation.
     type Config: Clone + Default + Encode + Decode<()>;
-
-    // ---- construction -------------------------------------------------
-
-    /// Create a fresh backend at `path`, replacing any existing backend file.
-    fn create(path: &Path, config: Self::Config) -> io::Result<Self>
-    where
-        Self: Sized;
-
-    /// Open an existing backend at `path`.
-    fn open(path: &Path, config: Self::Config) -> io::Result<Self>
-    where
-        Self: Sized;
 
     // ---- reads --------------------------------------------------------
 
@@ -111,29 +102,31 @@ where
 
     /// Insert iff `key` is currently absent. Returns `true` if the
     /// value was inserted, `false` if the key was already present (no
-    /// change made). Default impl: `contains` then `put`; backends with
-    /// a cheaper atomic primitive may override.
-    fn put_if_absent(&mut self, key: K, value: V) -> io::Result<bool> {
-        if self.contains(&key) {
+    /// change made). The key is borrowed so hit paths do not consume or
+    /// clone it; the default implementation clones only on insert.
+    fn put_if_absent(&mut self, key: &K, value: V) -> io::Result<bool> {
+        if self.contains(key) {
             Ok(false)
         } else {
-            self.put(key, value)?;
+            self.put(key.clone(), value)?;
             Ok(true)
         }
     }
 
-    /// Insert `(key, value)`, returning the previous value if the key
-    /// existed (matching `HashMap::insert` semantics). For
-    /// fire-and-forget overwrite use [`put`](Self::put); for
+    /// Insert or overwrite `key` with `value`, returning the previous
+    /// value if the key existed. For fire-and-forget overwrite use
+    /// [`put`](Self::put); for
     /// insert-only-if-absent use [`put_if_absent`](Self::put_if_absent).
+    /// The key is borrowed so hit paths can reuse the backend's stored key;
+    /// the default implementation clones only on insert/update.
     ///
     /// Wraps the prior value in `Cow` for consistency with the other
     /// retrieval methods. In practice every backend's `replace` returns
     /// `Cow::Owned`: the old value is unconditionally evicted from the
     /// backend, so there's nothing left to borrow against.
-    fn replace(&mut self, key: K, value: V) -> io::Result<Option<Cow<'_, V>>> {
-        let old = self.get(&key).map(|c| Cow::Owned(c.into_owned()));
-        self.put(key, value)?;
+    fn replace(&mut self, key: &K, value: V) -> io::Result<Option<Cow<'_, V>>> {
+        let old = self.get(key).map(|c| Cow::Owned(c.into_owned()));
+        self.put(key.clone(), value)?;
         Ok(old)
     }
 
@@ -152,10 +145,14 @@ where
     }
 
     /// Insert every item from a **key-sorted** iterator. Caller
-    /// guarantees ascending key order. Default loops [`put`](Self::put);
-    /// backends that can build a tree bottom-up (BPlusTree's future
-    /// bulk-load) override this for an O(n) construction instead of
-    /// N × O(log n).
+    /// guarantees ascending key order in the same key domain the backend
+    /// uses for ordered operations.
+    ///
+    /// This is an opportunistic fast-path hook. The default loops
+    /// [`put`](Self::put), and individual backends may still choose a
+    /// fallback path when the current state does not fit their fast path.
+    /// Generic code should depend on the semantics, not a particular
+    /// complexity guarantee.
     fn bulk_put_sorted<I>(&mut self, sorted: I) -> io::Result<()>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -185,11 +182,14 @@ where
     }
 
     /// Remove every key from a **key-sorted** iterator. Caller
-    /// guarantees ascending key order. Returns the number of keys that
-    /// were actually present (and removed). Default loops
-    /// [`delete`](Self::delete); ordered backends with bottom-up
-    /// bulk-delete fast paths (BPlusTree's range-trim) should override
-    /// for an O(n) sweep instead of N × O(log n).
+    /// guarantees ascending key order in the same key domain the backend
+    /// uses for ordered operations. Returns the number of keys that were
+    /// actually present and removed.
+    ///
+    /// This is an opportunistic fast-path hook. The default loops
+    /// [`delete`](Self::delete), and optimized implementations may still
+    /// fall back to per-key deletion when that is the appropriate path for
+    /// the current backend state.
     fn bulk_delete_sorted<'a, I>(&mut self, sorted: I) -> io::Result<usize>
     where
         I: IntoIterator<Item = &'a K>,
@@ -247,18 +247,20 @@ where
 
     // ---- iteration (unspecified order) -------------------------------
 
-    /// Iterate all keys. Order is backend-defined. Yields `Cow<K>` —
-    /// borrowed when the backend holds them, owned when materialized.
+    /// Iterate all keys. Order is backend-defined. Yields `Cow<K>`;
+    /// whether items are borrowed or owned is backend-dependent.
     fn keys<'a>(&'a self) -> impl Iterator<Item = Cow<'a, K>> + 'a
     where
         K: 'a;
 
-    /// Iterate all values. Order is backend-defined. Yields `Cow<V>`.
+    /// Iterate all values. Order is backend-defined. Yields `Cow<V>`;
+    /// whether items are borrowed or owned is backend-dependent.
     fn values<'a>(&'a self) -> impl Iterator<Item = Cow<'a, V>> + 'a
     where
         V: 'a;
 
-    /// Iterate all `(key, value)` pairs as `Cow` per side.
+    /// Iterate all `(key, value)` pairs as `Cow` per side. Either side may
+    /// be borrowed or owned depending on the backend.
     fn entries<'a>(&'a self) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
     where
         K: 'a,
@@ -284,12 +286,31 @@ where
     /// Schedule pending writes for OS writeback. May return before the
     /// writeback has completed. Backed by `MmapMut::flush_async` on the
     /// mmap'd backends.
-    fn flush(&self) -> io::Result<()>;
+    fn flush(&mut self) -> io::Result<()>;
 
     /// Block until pending mmap writes have been flushed by the OS.
     /// Slower than [`flush`](Self::flush). This is a writeback boundary,
     /// not a crash-recovery or corruption-repair mechanism.
-    fn sync(&self) -> io::Result<()>;
+    fn sync(&mut self) -> io::Result<()>;
+}
+
+/// Construction contract for backends whose contents live on disk.
+///
+/// In-memory backends implement [`Backend`] but do not implement this trait.
+pub trait FileBackedBackend<K, V>: Backend<K, V>
+where
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
+    V: Encode + Decode<()> + Clone,
+{
+    /// Create a fresh backend at `path`, replacing any existing backend file.
+    fn create(path: &Path, config: Self::Config) -> io::Result<Self>
+    where
+        Self: Sized;
+
+    /// Open an existing backend at `path`.
+    fn open(path: &Path, config: Self::Config) -> io::Result<Self>
+    where
+        Self: Sized;
 }
 
 // ---------------------------------------------------------------------------
@@ -297,17 +318,23 @@ where
 // ---------------------------------------------------------------------------
 
 /// Extension trait for backends whose iteration has a stable ascending key
-/// order (e.g. B+ trees, OrderLog). Generic code that needs ordering should
+/// order (e.g. B+ trees, SkipList). Generic code that needs ordering should
 /// constrain to `OrderedBackend` rather than `Backend`.
 ///
 /// The ordering is backend-defined:
 /// - [`crate::core::btree::BPlusTree`] orders by lexicographic bincode key
 ///   bytes because tree navigation stores serialized keys.
-/// - [`crate::core::orderlog::OrderLog`] orders by `K::Ord` because its
+/// - [`crate::core::skiplist::SkipList`] orders by `K::Ord` because its
 ///   in-memory skip list stores decoded keys.
 ///
-/// `Ord` lives **here**, not on [`Backend`]: only ordered backends
-/// need it. Unordered backends (KeyDir's hash index) work without it.
+/// Code that switches between ordered backends must use key types and
+/// encodings where `K::Ord` agrees with lexicographic serialized-byte order.
+/// The same rule applies to the sorted bulk hooks: the iterator must already
+/// be sorted in the order the chosen backend observes.
+///
+/// All backends share the `Ord` key bound so runtime-selected wrappers such as
+/// `State` have one uniform key contract. This trait adds ordered operations,
+/// not an additional key constraint.
 pub trait OrderedBackend<K, V>: Backend<K, V>
 where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
@@ -316,8 +343,8 @@ where
     /// Iterate entries with keys in `[start, end)`, ascending.
     fn range<'a>(
         &'a self,
-        start: &K,
-        end: &K,
+        start: &'a K,
+        end: &'a K,
     ) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
     where
         K: 'a,
@@ -370,8 +397,8 @@ where
     /// may override for true streaming reverse iteration.
     fn range_rev<'a>(
         &'a self,
-        start: &K,
-        end: &K,
+        start: &'a K,
+        end: &'a K,
     ) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
     where
         K: 'a,

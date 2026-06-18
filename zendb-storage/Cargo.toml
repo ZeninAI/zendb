@@ -3,12 +3,16 @@ name = "zendb-storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Storage subsystem for ZeninDB — KeyDir, B+Tree, OrderLog, compaction"
+description = "Storage subsystem for ZeninDB: KeyDir, B+Tree, SkipList, compaction"
 
 [dependencies]
 memmap2.workspace = true
 hashbrown.workspace = true
 bincode.workspace = true
+arc-swap.workspace = true
+parking_lot.workspace = true
+log.workspace = true
+zendb-types = { path = "../zendb-types" }
 
 [dev-dependencies]
 lmdb = "0.8"

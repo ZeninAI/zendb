@@ -15,7 +15,7 @@ The central abstraction is a table containing rows addressed by primary keys. Ea
 The current repository implements three major layers:
 
 1. **`zendb-types`** implements the recursive cell model, HLCs, events, paths, operations, generated type dispatch, scalar values, records, LWW sets, RGA-style lists, and RGA-style collaborative text.
-2. **`zendb-storage`** implements reusable persistent storage backends: an unordered Bitcask-style `KeyDir`, an ordered memory-mapped `BPlusTree`, and an in-memory ordered `OrderLog` with a durable write-ahead log.
+2. **`zendb-storage`** implements reusable storage backends: an unordered persistent Bitcask-style `KeyDir`, an ordered persistent memory-mapped `BPlusTree`, and an ordered in-memory `SkipList`.
 3. **`zendb-engine`** implements a `Table` that combines materialized row state with an in-flight event journal and an in-memory resolved-row cache. An in-progress `Database` implementation owns a persistent table catalog and lazily opened tables.
 
 The next major product capability is a **stateful streaming consumer runtime**. External owners of a database must be able to register computations that:
@@ -166,7 +166,7 @@ replication / consumers / application adapters
 | Storage | Generic backend contract | Implemented | CRUD, bulk operations, iteration, stats, flush, sync |
 | Storage | Unordered `KeyDir` | Implemented | Hash index plus append-only mmap data file |
 | Storage | Ordered `BPlusTree` | Implemented | mmap, page splits, extents, ranges, reverse iteration |
-| Storage | Ordered `OrderLog` | Implemented | In-memory skip list plus durable WAL |
+| Storage | Ordered `SkipList` | Implemented | Entirely in-memory skip list |
 | Storage | Database transactions | Missing | No atomic multi-backend transaction boundary |
 | Engine | Materialized table state | Implemented | Ordered or unordered backend |
 | Engine | In-flight table event journal | Implemented | Ordered by row then HLC |
@@ -669,22 +669,20 @@ Critical ordering rule:
 
 Callers must choose a serialization whose byte order matches the desired semantic order. This is particularly important for numeric keys and any future stream cursor encoding.
 
-### 11.5 OrderLog
+### 11.5 SkipList
 
 **Status: Implemented**
 
-`OrderLog` combines:
+`SkipList` provides:
 
-- an in-memory ordered skip-list index;
-- a memory-mapped append-only write-ahead log;
+- an entirely in-memory ordered skip-list;
 - key ordering based on Rust `K::Ord`;
-- overwrite and tombstone replay;
-- compaction;
+- overwrite and delete operations;
 - efficient ordered and reverse iteration.
 
-It is suitable for durable ordered working sets and journals where values should remain immediately available in memory after replay.
+It is suitable for ordered working sets and buffers where durability is handled separately.
 
-The current table uses `OrderLog<EventKey, Event>` as an in-flight event journal. That journal is not a durable consumer stream because materialization clears it.
+The current table uses `SkipList<EventKey, Event>` as an in-flight event buffer. It is cleared by materialization and is empty after reopening a table.
 
 ---
 
@@ -698,7 +696,7 @@ A `Table` owns:
 
 ```text
 state   = materialized PrimaryKey -> Cell backend
-events  = durable in-flight EventKey -> Event journal
+events  = in-memory EventKey -> Event buffer
 cache   = in-memory PrimaryKey -> fully resolved pending Cell
 ```
 
@@ -707,7 +705,7 @@ The state backend is configurable:
 - ordered `BPlusTree`;
 - unordered `KeyDir`.
 
-The event journal is an `OrderLog`.
+The event buffer is a `SkipList`.
 
 ### 12.2 EventKey
 

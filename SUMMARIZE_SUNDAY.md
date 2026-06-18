@@ -6,7 +6,7 @@
 - `State<K, V>` owns either an ordered `BPlusTree` or unordered `KeyDir` and implements `Backend<K, V>`.
 - `State` has no events, event log, replication, or reactive behavior.
 - Indexes and computations use arbitrary typed `State<K, V>` instances for persistent internal state.
-- `Table` is an event-capable layer over `State<PrimaryKey, Cell>` and an optional `OrderLog`.
+- `Table` is an event-capable layer over `State<PrimaryKey, Cell>` and an optional in-memory `SkipList`.
 - Tables without an event log use direct backend operations; event/event methods are unavailable or invalid.
 
 ## Change Model

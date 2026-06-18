@@ -59,12 +59,7 @@ impl Cell {
     /// The nearest explicit cell sync flag on the target path overrides it.
     /// Remote-device events cannot mutate local-only values, except that
     /// `SetSync` is always allowed to update the policy itself.
-    pub fn apply_event(&mut self, event: &crate::Event, sync: bool) -> bool {
-        self.try_apply_event(event, sync).unwrap_or(false)
-    }
-
-    /// Apply an event while preserving type and container errors.
-    pub fn try_apply_event(&mut self, event: &crate::Event, sync: bool) -> Result<bool, TypeError> {
+    pub fn apply_event(&mut self, event: &crate::Event, sync: bool) -> Result<bool, TypeError> {
         if !matches!(&event.op, Op::SetSync { .. })
             && !self.is_synced(sync, &event.path)
             && event.hlc.device_id() != crate::device_id()
@@ -285,32 +280,36 @@ mod tests {
     #[test]
     fn replace_scalar() {
         let mut cell = Cell::dummy(Some(Value::String(String::new())));
-        assert!(cell.apply_event(
-            &event(
-                Path::new(),
-                Op::Replace {
-                    value: Value::Int(42),
-                },
-                hlc(100),
-            ),
-            true
-        ));
+        assert!(cell
+            .apply_event(
+                &event(
+                    Path::new(),
+                    Op::Replace {
+                        value: Value::Int(42),
+                    },
+                    hlc(100),
+                ),
+                true
+            )
+            .unwrap());
         assert_eq!(cell.hlc, hlc(100));
     }
 
     #[test]
     fn apply_lww_older_no_change() {
         let mut cell = cell(Some(Value::Int(1)), hlc(200), None);
-        let changed = cell.apply_event(
-            &event(
-                Path::new(),
-                Op::Replace {
-                    value: Value::Int(2),
-                },
-                hlc(100),
-            ),
-            true,
-        );
+        let changed = cell
+            .apply_event(
+                &event(
+                    Path::new(),
+                    Op::Replace {
+                        value: Value::Int(2),
+                    },
+                    hlc(100),
+                ),
+                true,
+            )
+            .unwrap();
         assert!(!changed);
         assert_eq!(cell.hlc, hlc(200));
     }
@@ -318,7 +317,9 @@ mod tests {
     #[test]
     fn delete_tombstones_cell() {
         let mut cell = cell(Some(Value::Int(1)), hlc(100), None);
-        assert!(cell.apply_event(&event(Path::new(), Op::Delete, hlc(200)), true));
+        assert!(cell
+            .apply_event(&event(Path::new(), Op::Delete, hlc(200)), true)
+            .unwrap());
         assert!(cell.is_tombstone());
         assert_eq!(cell.hlc, hlc(200));
     }
@@ -326,16 +327,18 @@ mod tests {
     #[test]
     fn older_write_does_not_resurrect_tombstone() {
         let mut cell = cell(None, hlc(200), None);
-        let changed = cell.apply_event(
-            &event(
-                Path::new(),
-                Op::Replace {
-                    value: Value::Int(2),
-                },
-                hlc(100),
-            ),
-            true,
-        );
+        let changed = cell
+            .apply_event(
+                &event(
+                    Path::new(),
+                    Op::Replace {
+                        value: Value::Int(2),
+                    },
+                    hlc(100),
+                ),
+                true,
+            )
+            .unwrap();
         assert!(!changed);
         assert!(cell.is_tombstone());
     }
@@ -344,16 +347,18 @@ mod tests {
     fn apply_set_field() {
         let mut root = cell(Some(Value::Record(Record::default())), hlc(50), None);
         let path = vec![PathStep::new(TypeTag::Record, Segment::Record("x".into()))];
-        assert!(root.apply_event(
-            &event(
-                path,
-                Op::Replace {
-                    value: Value::String("hi".into()),
-                },
-                hlc(100),
-            ),
-            true
-        ));
+        assert!(root
+            .apply_event(
+                &event(
+                    path,
+                    Op::Replace {
+                        value: Value::String("hi".into()),
+                    },
+                    hlc(100),
+                ),
+                true
+            )
+            .unwrap());
     }
 
     #[test]
@@ -374,16 +379,18 @@ mod tests {
             PathStep::new(TypeTag::Record, Segment::Record("field".into())),
         ];
 
-        assert!(!root.apply_event(
-            &event(
-                path,
-                Op::Replace {
-                    value: Value::Int(2),
-                },
-                remote_hlc(200),
-            ),
-            true,
-        ));
+        assert!(!root
+            .apply_event(
+                &event(
+                    path,
+                    Op::Replace {
+                        value: Value::Int(2),
+                    },
+                    remote_hlc(200),
+                ),
+                true,
+            )
+            .unwrap());
 
         let Some(Value::Record(root_record)) = &root.value else {
             panic!("expected root record");
@@ -406,16 +413,18 @@ mod tests {
             Segment::Record("missing".into()),
         )];
 
-        assert!(!root.apply_event(
-            &event(
-                path,
-                Op::Replace {
-                    value: Value::Int(1),
-                },
-                remote_hlc(200),
-            ),
-            true,
-        ));
+        assert!(!root
+            .apply_event(
+                &event(
+                    path,
+                    Op::Replace {
+                        value: Value::Int(1),
+                    },
+                    remote_hlc(200),
+                ),
+                true,
+            )
+            .unwrap());
 
         let Some(Value::Record(record)) = &root.value else {
             panic!("expected record");
@@ -427,14 +436,16 @@ mod tests {
     fn remote_set_sync_is_allowed_on_local_only_target() {
         let mut root = cell(Some(Value::Int(1)), local_hlc(100), Some(false));
 
-        assert!(root.apply_event(
-            &event(
-                Path::new(),
-                Op::SetSync { sync: Some(true) },
-                remote_hlc(200),
-            ),
-            false,
-        ));
+        assert!(root
+            .apply_event(
+                &event(
+                    Path::new(),
+                    Op::SetSync { sync: Some(true) },
+                    remote_hlc(200),
+                ),
+                false,
+            )
+            .unwrap());
         assert_eq!(root.sync, Some(true));
     }
 
@@ -457,16 +468,18 @@ mod tests {
     fn nested_update_does_not_bump_existing_parent_hlc() {
         let mut root = cell(Some(Value::Record(Record::default())), hlc(50), None);
         let path = vec![PathStep::new(TypeTag::Record, Segment::Record("x".into()))];
-        assert!(root.apply_event(
-            &event(
-                path,
-                Op::Replace {
-                    value: Value::Int(1),
-                },
-                hlc(100),
-            ),
-            true
-        ));
+        assert!(root
+            .apply_event(
+                &event(
+                    path,
+                    Op::Replace {
+                        value: Value::Int(1),
+                    },
+                    hlc(100),
+                ),
+                true
+            )
+            .unwrap());
         assert_eq!(root.hlc, hlc(50));
     }
 
@@ -474,16 +487,18 @@ mod tests {
     fn recreated_parent_gets_event_hlc() {
         let mut root = cell(None, hlc(50), None);
         let path = vec![PathStep::new(TypeTag::Record, Segment::Record("x".into()))];
-        assert!(root.apply_event(
-            &event(
-                path,
-                Op::Replace {
-                    value: Value::Int(1),
-                },
-                hlc(100),
-            ),
-            true
-        ));
+        assert!(root
+            .apply_event(
+                &event(
+                    path,
+                    Op::Replace {
+                        value: Value::Int(1),
+                    },
+                    hlc(100),
+                ),
+                true
+            )
+            .unwrap());
         assert_eq!(root.hlc, hlc(100));
         assert_eq!(root.type_tag(), Some(TypeTag::Record));
     }
@@ -494,26 +509,30 @@ mod tests {
         let mut remote = cell(Some(Value::Record(Record::default())), hlc(50), None);
         let local_path = vec![PathStep::new(TypeTag::Record, Segment::Record("a".into()))];
         let remote_path = vec![PathStep::new(TypeTag::Record, Segment::Record("b".into()))];
-        local.apply_event(
-            &event(
-                local_path,
-                Op::Replace {
-                    value: Value::Int(1),
-                },
-                hlc(100),
-            ),
-            true,
-        );
-        remote.apply_event(
-            &event(
-                remote_path,
-                Op::Replace {
-                    value: Value::Int(2),
-                },
-                hlc(110),
-            ),
-            true,
-        );
+        local
+            .apply_event(
+                &event(
+                    local_path,
+                    Op::Replace {
+                        value: Value::Int(1),
+                    },
+                    hlc(100),
+                ),
+                true,
+            )
+            .unwrap();
+        remote
+            .apply_event(
+                &event(
+                    remote_path,
+                    Op::Replace {
+                        value: Value::Int(2),
+                    },
+                    hlc(110),
+                ),
+                true,
+            )
+            .unwrap();
         assert!(Type::merge(&mut local, &remote, MergeClocks::ZERO).unwrap());
         let Some(Value::Record(record)) = &local.value else {
             panic!("expected record");

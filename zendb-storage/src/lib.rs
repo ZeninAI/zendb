@@ -5,12 +5,15 @@
 //! Layer 1 — general-purpose data structures:
 //! - **KeyDir** — persistent KV store with in-memory hash index + mmap'd data file (Bitcask model)
 //! - **BPlusTree** — persistent ordered KV store (mmap, in-place mutation, bulk-merge)
-//! - **OrderLog** — in-memory ordered KV store with a write-ahead log for durability
+//! - **SkipList** — entirely in-memory ordered KV store
+//! - **Topic** — persistent segmented append-only log with consumer cursors
 //!
-//! Layer 2 — ZeninDB-aware storage (planned):
-//! - DeltaBuffer, Compactor, StateHash, Storage
+//! Frontend - ZeninDB-aware storage facades:
+//! - **State** - runtime-selected materialized-state backend
+//! - **Table** - resolved table cache over State plus Topic-backed changes
 
 pub mod core;
+pub mod frontend;
 pub mod utils;
 
 #[cfg(test)]

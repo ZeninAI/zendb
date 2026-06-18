@@ -11,3 +11,7 @@ zendb-storage = { path = "../zendb-storage" }
 bincode.workspace = true
 hashbrown.workspace = true
 parking_lot.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+futures = "0.3"

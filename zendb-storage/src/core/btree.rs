@@ -16,7 +16,7 @@
 //! Tree navigation compares serialized key bytes lexicographically, not
 //! `K::Ord`. Callers that need semantic ordering must choose key encodings
 //! whose bincode byte representation has that ordering, or use a backend such
-//! as `OrderLog` whose ordered surface is based on `K::Ord`.
+//! as `SkipList` whose ordered surface is based on `K::Ord`.
 //!
 //! # Page layout
 //!
@@ -82,7 +82,7 @@ use std::{
 use bincode::{Decode, Encode};
 use hashbrown::HashMap;
 
-use crate::core::backend::{Backend, OrderedBackend};
+use crate::core::backend::{Backend, FileBackedBackend, OrderedBackend};
 use crate::utils::reusables::PooledBuf;
 use crate::utils::serdes::{
     deserialize_from, rd_u16, rd_u32, rd_u64, serialize_to_vec, with_scratch, with_two_scratches,
@@ -313,6 +313,69 @@ struct RawBTreeEntries<'a, K, V> {
     count: usize,
 }
 
+struct RawBTreeKeys<'a, K, V> {
+    tree: &'a BPlusTree<K, V>,
+    page: u64,
+    slot: usize,
+    count: usize,
+}
+
+struct BottomUpBuilder<'a, K, V> {
+    tree: &'a mut BPlusTree<K, V>,
+    current_leaf: u64,
+    leaves: Vec<u64>,
+    leaf_first_keys: Vec<Vec<u8>>,
+    leaf_last_keys: Vec<Vec<u8>>,
+    current_first_key: Option<Vec<u8>>,
+    current_last_key: Option<Vec<u8>>,
+    entry_count: u64,
+}
+
+impl<'a, K, V> RawBTreeKeys<'a, K, V> {
+    fn new(tree: &'a BPlusTree<K, V>, first_leaf: u64) -> Self {
+        let count = if first_leaf == 0 {
+            0
+        } else {
+            rd_u16(&tree.page_bytes(first_leaf)[2..4]) as usize
+        };
+        Self {
+            tree,
+            page: first_leaf,
+            slot: 0,
+            count,
+        }
+    }
+}
+
+impl<'a, K, V> Iterator for RawBTreeKeys<'a, K, V> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.page != 0 {
+            if self.slot < self.count {
+                let leaf_off = page_offset(self.page);
+                let leaf = &self.tree.mmap[leaf_off..leaf_off + PAGE_SIZE];
+                let sp = LEAF_HEADER_SIZE + self.slot * SLOT_SIZE;
+                let eo = rd_u16(&leaf[sp..sp + 2]) as usize;
+                let kl = rd_u16(&leaf[eo..eo + 2]) as usize;
+                let key_bytes = &leaf[eo + 6..eo + 6 + kl];
+                self.slot += 1;
+                return Some(key_bytes);
+            }
+            let cur_off = page_offset(self.page);
+            self.page = rd_u64(&self.tree.mmap[cur_off + 8..cur_off + 16]);
+            self.slot = 0;
+            self.count = if self.page == 0 {
+                0
+            } else {
+                let next_off = page_offset(self.page);
+                rd_u16(&self.tree.mmap[next_off + 2..next_off + 4]) as usize
+            };
+        }
+        None
+    }
+}
+
 impl<'a, K, V> RawBTreeEntries<'a, K, V> {
     fn new(tree: &'a BPlusTree<K, V>, first_leaf: u64) -> Self {
         let count = if first_leaf == 0 {
@@ -378,6 +441,117 @@ impl<'a, K, V> Iterator for RawBTreeEntries<'a, K, V> {
 // trait impls further down.
 // ===========================================================================
 
+impl<'a, K, V> BottomUpBuilder<'a, K, V>
+where
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
+    V: Encode + Decode<()> + Clone,
+{
+    fn new(tree: &'a mut BPlusTree<K, V>) -> Self {
+        debug_assert!(
+            tree.stats.entries == 0,
+            "bottom_up_build requires empty tree"
+        );
+        let current_leaf = 1; // root after do_clear
+        Self {
+            tree,
+            current_leaf,
+            leaves: vec![current_leaf],
+            leaf_first_keys: Vec::new(),
+            leaf_last_keys: Vec::new(),
+            current_first_key: None,
+            current_last_key: None,
+            entry_count: 0,
+        }
+    }
+
+    fn push(&mut self, kb: &[u8], vb: &[u8]) -> io::Result<()> {
+        self.entry_count += 1;
+        let v_len = vb.len();
+        let ovfl = kb.len() + v_len + 6 > MAX_INLINE;
+        let leaf_es = if ovfl {
+            6 + kb.len() + 8
+        } else {
+            6 + kb.len() + v_len
+        };
+        let needed = leaf_es + SLOT_SIZE;
+
+        let (count, data_off) = {
+            let leaf = self.tree.page_bytes(self.current_leaf);
+            (rd_u16(&leaf[2..4]) as usize, rd_u32(&leaf[4..8]) as usize)
+        };
+        let free_start = LEAF_HEADER_SIZE + count * SLOT_SIZE;
+        if free_start + needed > data_off {
+            if let Some(fk) = self.current_first_key.take() {
+                self.leaf_first_keys.push(fk);
+            }
+            if let Some(lk) = self.current_last_key.take() {
+                self.leaf_last_keys.push(lk);
+            }
+            let new_leaf = self.tree.alloc_page()?;
+            self.tree.init_leaf(new_leaf, false);
+            {
+                let cur = self.tree.page_bytes_mut(self.current_leaf);
+                wr_u64(&mut cur[8..16], new_leaf);
+            }
+            {
+                let nl = self.tree.page_bytes_mut(new_leaf);
+                wr_u64(&mut nl[16..24], self.current_leaf);
+            }
+            self.leaves.push(new_leaf);
+            self.current_leaf = new_leaf;
+        }
+        if self.current_first_key.is_none() {
+            self.current_first_key = Some(kb.to_vec());
+        }
+
+        let (count, data_off) = {
+            let leaf = self.tree.page_bytes(self.current_leaf);
+            (rd_u16(&leaf[2..4]) as usize, rd_u32(&leaf[4..8]) as usize)
+        };
+        let nd = data_off - leaf_es;
+        self.tree
+            .write_leaf_entry_raw(self.current_leaf, nd, kb, vb, ovfl)?;
+        {
+            let leaf = self.tree.page_bytes_mut(self.current_leaf);
+            let ss = LEAF_HEADER_SIZE;
+            wr_u16(
+                &mut leaf[ss + count * SLOT_SIZE..ss + count * SLOT_SIZE + 2],
+                nd as u16,
+            );
+            wr_u16(&mut leaf[2..4], (count + 1) as u16);
+            wr_u32(&mut leaf[4..8], nd as u32);
+        }
+        let payload = if ovfl { 8 } else { v_len };
+        self.tree
+            .add_leaf_entry_bytes(leaf_entry_bytes(kb.len(), payload));
+        self.current_last_key = Some(kb.to_vec());
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        if let Some(fk) = self.current_first_key.take() {
+            self.leaf_first_keys.push(fk);
+        }
+        if let Some(lk) = self.current_last_key.take() {
+            self.leaf_last_keys.push(lk);
+        }
+        self.tree.set_rightmost_leaf(self.current_leaf);
+        self.tree.inc_entries(self.entry_count);
+
+        if self.leaves.len() > 1 {
+            self.tree.build_internal_levels(
+                self.leaves,
+                self.leaf_first_keys,
+                self.leaf_last_keys,
+            )?;
+        } else {
+            let r = self.tree.page_bytes_mut(1);
+            r[1] |= FLAG_ROOT;
+        }
+        Ok(())
+    }
+}
+
 impl<K, V> BPlusTree<K, V> {
     // ---- page-byte dispatch -----------------------------------------------
     //
@@ -431,7 +605,7 @@ impl<K, V> BPlusTree<K, V> {
 
 impl<K, V> BPlusTree<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
 {
     /// Current estimated reclaimable-page ratio. Public so callers can
@@ -1699,11 +1873,10 @@ where
     /// Build the tree bottom-up from raw `(key_bytes, value_bytes)` pairs
     /// in ascending key order. Tree must be empty on entry.
     ///
-    /// Items are wrapped in `io::Result` so a streaming encoder (used by
-    /// `bulk_put_sorted`) can surface bincode errors without materializing
-    /// the whole encoded dataset upfront. Infallible sources (the
+    /// Items are wrapped in `io::Result` so raw rebuild sources can surface
+    /// errors without materializing the whole encoded dataset upfront. The
     /// `do_compact` shadow-rebuild walks `RawBTreeEntries`, which yields
-    /// borrowed page slices) wrap each item with `Ok`.
+    /// borrowed page slices and wraps each item with `Ok`.
     fn bottom_up_build_raw<I, K2, V2>(&mut self, items: I) -> io::Result<()>
     where
         I: IntoIterator<Item = io::Result<(K2, V2)>>,
@@ -1821,6 +1994,40 @@ where
         Ok(())
     }
 
+    /// Build from typed, sorted `(K, V)` pairs while encoding each emitted
+    /// entry into pooled scratch buffers only for the duration of the page
+    /// write. Adjacent duplicate keys are coalesced before encoding and the
+    /// last value wins, matching repeated `put` semantics for sorted input.
+    /// Boundary keys are still copied once per leaf because internal-level
+    /// construction needs them after the scratch buffers are released.
+    fn bottom_up_build_encoded<I>(&mut self, items: I) -> io::Result<()>
+    where
+        I: IntoIterator<Item = (K, V)>,
+    {
+        let mut builder = BottomUpBuilder::new(self);
+        let mut pending: Option<(K, V)> = None;
+
+        for (k, v) in items {
+            if pending
+                .as_ref()
+                .is_some_and(|(pending_key, _)| pending_key == &k)
+            {
+                pending = Some((k, v));
+                continue;
+            }
+
+            if let Some((pending_key, pending_value)) = pending.replace((k, v)) {
+                with_two_scratches(&pending_key, &pending_value, |kb, vb| builder.push(kb, vb))?;
+            }
+        }
+
+        if let Some((k, v)) = pending {
+            with_two_scratches(&k, &v, |kb, vb| builder.push(kb, vb))?;
+        }
+
+        builder.finish()
+    }
+
     /// Construct internal levels from a sorted list of leaf (or internal)
     /// page numbers and the first/last keys reachable through each.
     ///
@@ -1854,7 +2061,7 @@ where
                     wr_u64(&mut buf[8..16], children[i]);
                 }
                 let group_start = i;
-                next_first_keys.push(first_keys[group_start].clone());
+                next_first_keys.push(std::mem::take(&mut first_keys[group_start]));
                 next_pages.push(current);
                 i += 1;
                 // Pack subsequent (separator, child) into the same page
@@ -1894,7 +2101,7 @@ where
                 // The last child packed into this internal page is at
                 // index `i - 1`; its last_key bounds the range of this
                 // internal page.
-                next_last_keys.push(last_keys[i - 1].clone());
+                next_last_keys.push(std::mem::take(&mut last_keys[i - 1]));
             }
             children = next_pages;
             first_keys = next_first_keys;
@@ -1920,17 +2127,11 @@ where
 // Backend impl — all public method bodies live here.
 // ===========================================================================
 
-impl<K, V> Backend<K, V> for BPlusTree<K, V>
+impl<K, V> FileBackedBackend<K, V> for BPlusTree<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
 {
-    type Stats<'a>
-        = &'a BPlusTreeStats
-    where
-        Self: 'a;
-    type Config = BPlusTreeConfig;
-
     fn create(path: &Path, config: Self::Config) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -1999,6 +2200,18 @@ where
         this.refresh_stats_from_meta();
         Ok(this)
     }
+}
+
+impl<K, V> Backend<K, V> for BPlusTree<K, V>
+where
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
+    V: Encode + Decode<()> + Clone,
+{
+    type Stats<'a>
+        = &'a BPlusTreeStats
+    where
+        Self: 'a;
+    type Config = BPlusTreeConfig;
 
     fn get(&self, key: &K) -> Option<Cow<'_, V>> {
         with_scratch(key, |kb| {
@@ -2025,8 +2238,8 @@ where
 
     /// One descent: probe via `descend_to_leaf`; if found, return false
     /// without writing. Otherwise pass the descent to `insert_bytes`.
-    fn put_if_absent(&mut self, key: K, value: V) -> io::Result<bool> {
-        let inserted = with_two_scratches(&key, &value, |kb, vb| {
+    fn put_if_absent(&mut self, key: &K, value: V) -> io::Result<bool> {
+        let inserted = with_two_scratches(key, &value, |kb, vb| {
             let hint = self.descend_to_leaf(kb);
             if hint.slot.is_ok() {
                 return Ok(false);
@@ -2044,8 +2257,8 @@ where
     /// pass the same descent to `insert_bytes`. Returned value is
     /// always `Cow::Owned` — decoded out of the page bytes before the
     /// slot gets overwritten.
-    fn replace(&mut self, key: K, value: V) -> io::Result<Option<Cow<'_, V>>> {
-        let prev: Option<V> = with_two_scratches(&key, &value, |kb, vb| {
+    fn replace(&mut self, key: &K, value: V) -> io::Result<Option<Cow<'_, V>>> {
+        let prev: Option<V> = with_two_scratches(key, &value, |kb, vb| {
             let hint = self.descend_to_leaf(kb);
             let prev = if let Ok(slot) = hint.slot {
                 let bytes = self.value_bytes_at(hint.leaf_page, slot);
@@ -2102,25 +2315,13 @@ where
         })
     }
 
-    /// Auto-tx wrapped loop of `put`. If the caller already has a tx
-    /// open, joins it; otherwise opens one and closes on return.
-    fn bulk_put<I>(&mut self, items: I) -> io::Result<()>
-    where
-        I: IntoIterator<Item = (K, V)>,
-    {
-        for (k, v) in items {
-            self.put(k, v)?;
-        }
-        Ok(())
-    }
-
     /// Bottom-up bulk-load when the tree is empty. Falls back to
     /// `bulk_put` when non-empty.
     ///
-    /// Streams: keys/values are encoded on the fly by the iterator passed
-    /// to `bottom_up_build_raw`, so peak memory is one `(Vec<u8>,
-    /// Vec<u8>)` pair rather than the whole encoded dataset. Encoding
-    /// errors short-circuit the build via the `Result`-bearing iterator.
+    /// Streams: keys/values are encoded into pooled scratch buffers at
+    /// the point each leaf entry is written, so the fast path avoids
+    /// per-entry encoded `Vec` allocations. Only per-leaf boundary keys
+    /// are copied for internal-level construction.
     fn bulk_put_sorted<I>(&mut self, sorted: I) -> io::Result<()>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -2128,24 +2329,7 @@ where
         if self.size() != 0 {
             return self.bulk_put(sorted);
         }
-        let encoded = sorted
-            .into_iter()
-            .map(|(k, v)| Ok((serialize_to_vec(&k)?, serialize_to_vec(&v)?)));
-        self.bottom_up_build_raw(encoded)
-    }
-
-    fn bulk_delete<'a, I>(&mut self, keys: I) -> io::Result<usize>
-    where
-        I: IntoIterator<Item = &'a K>,
-        K: 'a,
-    {
-        let mut n: usize = 0;
-        for k in keys {
-            if self.delete(k)? {
-                n += 1;
-            }
-        }
-        Ok(n)
+        self.bottom_up_build_encoded(sorted)
     }
 
     /// Sorted bulk-delete: single leaf-chain pass + rewrite per leaf,
@@ -2174,16 +2358,15 @@ where
             let mut count = rd_u16(&self.page_bytes(leaf_page)[2..4]) as usize;
             let mut i = 0usize;
             while i < count && target_idx < targets.len() {
-                let key_slice = self.key_bytes_at(leaf_page, i).to_vec();
-                // Advance target_idx past keys < current entry key.
-                while target_idx < targets.len()
-                    && targets[target_idx].as_slice() < key_slice.as_slice()
-                {
-                    target_idx += 1;
-                }
-                if target_idx < targets.len()
-                    && targets[target_idx].as_slice() == key_slice.as_slice()
-                {
+                let matched = {
+                    let key_slice = self.key_bytes_at(leaf_page, i);
+                    // Advance target_idx past keys < current entry key.
+                    while target_idx < targets.len() && targets[target_idx].as_slice() < key_slice {
+                        target_idx += 1;
+                    }
+                    target_idx < targets.len() && targets[target_idx].as_slice() == key_slice
+                };
+                if matched {
                     // Match: free extent if any, then remove.
                     let data_off = rd_u32(&self.page_bytes(leaf_page)[4..8]) as usize;
                     let (raw_vl, kl, ext) = {
@@ -2235,14 +2418,16 @@ where
     where
         K: 'a,
     {
-        self.entries().map(|(k, _)| k)
+        RawBTreeKeys::new(self, self.first_leaf())
+            .map(|k| Cow::Owned(deserialize_from(k).expect("valid encoded key")))
     }
 
     fn values<'a>(&'a self) -> impl Iterator<Item = Cow<'a, V>> + 'a
     where
         V: 'a,
     {
-        self.entries().map(|(_, v)| v)
+        RawBTreeEntries::new(self, self.first_leaf())
+            .map(|(_, v)| Cow::Owned(deserialize_from(v).expect("valid encoded value")))
     }
 
     fn entries<'a>(&'a self) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
@@ -2277,12 +2462,12 @@ where
     }
 
     /// Schedule mmap writeback asynchronously.
-    fn flush(&self) -> io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         self.mmap.flush_async()
     }
 
     /// Block until pending mmap writes have been flushed.
-    fn sync(&self) -> io::Result<()> {
+    fn sync(&mut self) -> io::Result<()> {
         self.mmap.flush()
     }
 }
@@ -2298,8 +2483,8 @@ where
 {
     fn range<'a>(
         &'a self,
-        start: &K,
-        end: &K,
+        start: &'a K,
+        end: &'a K,
     ) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
     where
         K: 'a,
@@ -2399,8 +2584,8 @@ where
     /// Streaming `[start, end)` in descending order.
     fn range_rev<'a>(
         &'a self,
-        start: &K,
-        end: &K,
+        start: &'a K,
+        end: &'a K,
     ) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
     where
         K: 'a,
@@ -2473,7 +2658,7 @@ where
 
 impl<K, V> BPlusTree<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
 {
     /// Walk the leaf chain, free every internal page, then rebuild the
@@ -2547,26 +2732,23 @@ where
                     continue;
                 }
                 seen.insert(p, ());
-                // Collect this internal page's internal children only.
-                let internal_children: Vec<u64> = {
+                // Push this internal page's internal children only.
+                {
                     let buf = self.page_bytes(p);
                     debug_assert_eq!(buf[0], PAGE_INTERNAL);
                     let count = rd_u16(&buf[2..4]) as usize;
                     let leftmost = rd_u64(&buf[8..16]);
-                    let mut all: Vec<u64> = Vec::with_capacity(count + 1);
-                    all.push(leftmost);
+                    if self.page_bytes(leftmost)[0] == PAGE_INTERNAL {
+                        stack.push(leftmost);
+                    }
                     for i in 0..count {
                         let sp = HEADER_SIZE + i * SLOT_SIZE;
                         let eo = rd_u16(&buf[sp..sp + 2]) as usize;
-                        all.push(rd_u64(&buf[eo + 2..eo + 10]));
+                        let child = rd_u64(&buf[eo + 2..eo + 10]);
+                        if self.page_bytes(child)[0] == PAGE_INTERNAL {
+                            stack.push(child);
+                        }
                     }
-                    // Keep only children that are themselves internal.
-                    all.into_iter()
-                        .filter(|&c| self.page_bytes(c)[0] == PAGE_INTERNAL)
-                        .collect()
-                };
-                for c in internal_children {
-                    stack.push(c);
                 }
                 self.free_page(p);
             }
@@ -3066,7 +3248,7 @@ mod tests {
     fn put_if_absent_inserts_when_missing() {
         let p = tmp("pia_insert");
         let mut t = create(&p);
-        assert!(Backend::put_if_absent(&mut t, k("a"), vbytes("first")).unwrap());
+        assert!(Backend::put_if_absent(&mut t, &k("a"), vbytes("first")).unwrap());
         assert_eq!(vget(&t, &k("a")), Some(vbytes("first")));
     }
 
@@ -3075,7 +3257,7 @@ mod tests {
         let p = tmp("pia_noop");
         let mut t = create(&p);
         t.put(k("a"), vbytes("first")).unwrap();
-        assert!(!Backend::put_if_absent(&mut t, k("a"), vbytes("second")).unwrap());
+        assert!(!Backend::put_if_absent(&mut t, &k("a"), vbytes("second")).unwrap());
         assert_eq!(vget(&t, &k("a")), Some(vbytes("first")));
     }
 
@@ -3084,7 +3266,7 @@ mod tests {
         let p = tmp("replace");
         let mut t = create(&p);
         t.put(k("a"), vbytes("first")).unwrap();
-        let prev = Backend::replace(&mut t, k("a"), vbytes("second"))
+        let prev = Backend::replace(&mut t, &k("a"), vbytes("second"))
             .unwrap()
             .map(Cow::into_owned);
         assert_eq!(prev, Some(vbytes("first")));
@@ -3095,7 +3277,7 @@ mod tests {
     fn replace_returns_none_when_absent() {
         let p = tmp("replace_absent");
         let mut t = create(&p);
-        let prev = Backend::replace(&mut t, k("a"), vbytes("new")).unwrap();
+        let prev = Backend::replace(&mut t, &k("a"), vbytes("new")).unwrap();
         assert!(prev.is_none());
         assert_eq!(vget(&t, &k("a")), Some(vbytes("new")));
     }
@@ -3144,6 +3326,32 @@ mod tests {
         Backend::bulk_put_sorted(&mut t, vec![(k("only"), vbytes("v"))]).unwrap();
         assert_eq!(t.size(), 1);
         assert_eq!(vget(&t, &k("only")), Some(vbytes("v")));
+    }
+
+    #[test]
+    fn bulk_put_sorted_empty_tree_duplicate_keys_keep_last_value() {
+        let p = tmp("bulk_put_sorted_dupes");
+        let mut t = create(&p);
+
+        Backend::bulk_put_sorted(
+            &mut t,
+            vec![
+                (k("a"), vbytes("old")),
+                (k("a"), vbytes("new")),
+                (k("b"), vbytes("b")),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(t.size(), 2);
+        assert_eq!(vget(&t, &k("a")), Some(vbytes("new")));
+        assert_eq!(vget(&t, &k("b")), Some(vbytes("b")));
+        assert_eq!(
+            t.entries()
+                .map(|(key, _)| key.into_owned())
+                .collect::<Vec<_>>(),
+            vec![k("a"), k("b")]
+        );
     }
 
     #[test]

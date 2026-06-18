@@ -31,3 +31,5 @@ blake3 = "1"
 
 # concurrency
 parking_lot = "0.12"
+log = "0.4"
+arc-swap = "1"

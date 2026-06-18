@@ -6,9 +6,9 @@ use bincode::{Decode, Encode};
 use zendb_types::{Cell, Event, PrimaryKey};
 
 use crate::core::{
-    traits::{Backend, DurableStorage, OrderedBackend, Storage},
     skiplist::{SkipList, SkipListCapacity, SkipListConfig, SkipListStats},
     topic::{Topic, TopicConfig, TopicConsumer, TopicOffset, TopicStats},
+    traits::{Backend, DurableStorage, OrderedBackend, Storage},
 };
 use crate::frontend::state::{State, StateConfig, StateStats};
 
@@ -155,9 +155,13 @@ impl Table {
     fn replay_recovery(&mut self) -> io::Result<()> {
         while let Some(change) = self.recovery.next() {
             let change = change?;
-            self.apply_event_to_cache(&change.event)?;
-            self.pending_offset = self.recovery.volatile_offset().checked_sub(1);
+            if let Some(cell) = change.current {
+                self.state.put(change.event.primary_key, cell)?;
+            } else {
+                self.state.delete(&change.event.primary_key)?;
+            }
         }
+        self.recovery.commit()?;
         Ok(())
     }
 
@@ -243,7 +247,8 @@ impl DurableStorage for Table {
     }
 
     fn compact(&mut self) -> io::Result<()> {
-        self.state.compact()
+        self.state.compact()?;
+        self.topic.compact()
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -750,8 +755,8 @@ mod tests {
             Backend::get(&table, &key).unwrap().into_owned().value,
             Some(Value::Int(1))
         );
-        assert_eq!(table.cache.size(), 1);
-        assert_eq!(table.state.size(), 0);
+        assert_eq!(table.cache.size(), 0);
+        assert_eq!(table.state.size(), 1);
         assert_eq!(table.topic.stats().records, 1);
     }
 

@@ -22,8 +22,8 @@ use hashbrown::HashMap;
 use parking_lot::Mutex;
 
 use crate::core::{
-    traits::{Backend, DurableStorage, Storage},
     keydir::{KeyDir, KeyDirConfig},
+    traits::{Backend, DurableStorage, Storage},
 };
 use crate::utils::serdes::{deserialize_from, with_scratch};
 
@@ -117,7 +117,115 @@ impl<T> Topic<T>
 where
     T: Encode + Decode<()>,
 {
-    pub fn create(path: &Path, config: TopicConfig) -> io::Result<Self> {
+    /// Create a named consumer, registering it at the current tail when first
+    /// seen. A consumer name may have only one active handle.
+    pub fn consumer(&self, consumer: &str) -> io::Result<TopicConsumer<T>> {
+        let mut consumers = self.shared.consumers.lock();
+        let state = match consumers.get(consumer) {
+            Some(state) => Arc::clone(state),
+            None => {
+                let offset = self.shared.next_offset.load(Ordering::Acquire);
+                self.shared
+                    .offsets
+                    .lock()
+                    .put(consumer.to_owned(), offset)?;
+                let state = Arc::new(ConsumerState {
+                    committed: AtomicU64::new(offset),
+                    volatile: AtomicU64::new(offset),
+                    reader_active: AtomicBool::new(false),
+                });
+                consumers.insert(consumer.to_owned(), Arc::clone(&state));
+                state
+            }
+        };
+        if state.reader_active.swap(true, Ordering::AcqRel) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("consumer {consumer:?} already has an active reader"),
+            ));
+        }
+        drop(consumers);
+
+        Ok(TopicConsumer {
+            topic: Arc::clone(&self.shared),
+            name: consumer.to_owned(),
+            consumer: state,
+            current: None,
+        })
+    }
+
+    fn active_segment(&self) -> &Arc<Segment> {
+        self.segments.last().unwrap()
+    }
+
+    fn rotate_segment(&mut self) -> io::Result<()> {
+        self.active.flush()?;
+
+        let segment = create_segment(&self.path, self.stats.next_offset)?;
+        self.active = open_segment_writer(&segment.path)?;
+        self.stats.retained_bytes += HEADER_SIZE;
+        self.segments.push(segment);
+        self.publish_segments();
+        self.compact()?;
+        Ok(())
+    }
+
+    fn publish_segments(&self) {
+        self.shared.segments.store(Arc::new(self.segments.clone()));
+    }
+    pub fn append(&mut self, value: &T) -> io::Result<TopicOffset> {
+        with_scratch(value, |encoded| {
+            let record_size = 4 + encoded.len() as u64;
+            if self.active_segment().record_count() != 0
+                && self.active_segment().byte_len.load(Ordering::Acquire) + record_size
+                    > self.config.max_segment_bytes
+            {
+                self.rotate_segment()?;
+            }
+
+            let offset = self.stats.next_offset;
+            self.active
+                .write_all(&(encoded.len() as u32).to_le_bytes())?;
+            self.active.write_all(encoded)?;
+
+            let segment = self.active_segment();
+            segment.byte_len.store(
+                segment.byte_len.load(Ordering::Relaxed) + record_size,
+                Ordering::Release,
+            );
+            segment.end_offset.store(offset + 1, Ordering::Release);
+            self.stats.next_offset = offset + 1;
+            self.stats.records += 1;
+            self.stats.retained_bytes += record_size;
+            self.shared
+                .next_offset
+                .store(self.stats.next_offset, Ordering::Release);
+            Ok(offset)
+        })
+    }
+}
+
+impl<T> Storage for Topic<T>
+where
+    T: Encode + Decode<()>,
+{
+    type Stats = TopicStats;
+    type Config = TopicConfig;
+
+    fn stats(&self) -> Self::Stats {
+        self.stats.clone()
+    }
+
+    fn config(&self) -> Self::Config {
+        self.config.clone()
+    }
+}
+
+impl<T> DurableStorage for Topic<T>
+where
+    T: Encode + Decode<()>,
+{
+    fn create(path: &Path, config: Self::Config) -> io::Result<Self> {
         fs::create_dir_all(path)?;
 
         let offsets = KeyDir::create(&path.join(OFFSETS_FILE), config.offsets.clone())?;
@@ -147,7 +255,7 @@ where
         })
     }
 
-    pub fn open(path: &Path, config: TopicConfig) -> io::Result<Self> {
+    fn open(path: &Path, config: Self::Config) -> io::Result<Self> {
         let offsets: KeyDir<String, TopicOffset> =
             KeyDir::open(&path.join(OFFSETS_FILE), config.offsets.clone())?;
         let segment_files = list_segments(path)?;
@@ -223,65 +331,8 @@ where
             },
         })
     }
-    /// Create a named consumer, registering it at the current tail when first
-    /// seen. A consumer name may have only one active handle.
-    pub fn consumer(&self, consumer: &str) -> io::Result<TopicConsumer<T>> {
-        let mut consumers = self.shared.consumers.lock();
-        let state = match consumers.get(consumer) {
-            Some(state) => Arc::clone(state),
-            None => {
-                let offset = self.shared.next_offset.load(Ordering::Acquire);
-                self.shared
-                    .offsets
-                    .lock()
-                    .put(consumer.to_owned(), offset)?;
-                let state = Arc::new(ConsumerState {
-                    committed: AtomicU64::new(offset),
-                    volatile: AtomicU64::new(offset),
-                    reader_active: AtomicBool::new(false),
-                });
-                consumers.insert(consumer.to_owned(), Arc::clone(&state));
-                state
-            }
-        };
-        if state.reader_active.swap(true, Ordering::AcqRel) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("consumer {consumer:?} already has an active reader"),
-            ));
-        }
-        drop(consumers);
 
-        Ok(TopicConsumer {
-            topic: Arc::clone(&self.shared),
-            name: consumer.to_owned(),
-            consumer: state,
-            current: None,
-        })
-    }
-
-    pub fn stats(&self) -> TopicStats {
-        self.stats.clone()
-    }
-
-    pub fn config(&self) -> TopicConfig {
-        self.config.clone()
-    }
-
-    pub fn flush(&mut self) -> io::Result<()> {
-        self.active.flush()?;
-        self.shared.offsets.lock().flush()
-    }
-
-    pub fn sync(&mut self) -> io::Result<()> {
-        self.active.sync_all()?;
-        self.shared.offsets.lock().sync()
-    }
-    fn active_segment(&self) -> &Arc<Segment> {
-        self.segments.last().unwrap()
-    }
-
-    pub fn compact(&mut self) -> io::Result<()> {
+    fn compact(&mut self) -> io::Result<()> {
         let through = {
             let consumers = self.shared.consumers.lock();
             let Some(through) = consumers
@@ -321,91 +372,14 @@ where
         Ok(())
     }
 
-    fn rotate_segment(&mut self) -> io::Result<()> {
-        self.active.flush()?;
-
-        let segment = create_segment(&self.path, self.stats.next_offset)?;
-        self.active = open_segment_writer(&segment.path)?;
-        self.stats.retained_bytes += HEADER_SIZE;
-        self.segments.push(segment);
-        self.publish_segments();
-        self.compact()?;
-        Ok(())
-    }
-
-    fn publish_segments(&self) {
-        self.shared.segments.store(Arc::new(self.segments.clone()));
-    }
-    pub fn append(&mut self, value: &T) -> io::Result<TopicOffset> {
-        with_scratch(value, |encoded| {
-            let record_size = 4 + encoded.len() as u64;
-            if self.active_segment().record_count() != 0
-                && self.active_segment().byte_len.load(Ordering::Acquire) + record_size
-                    > self.config.max_segment_bytes
-            {
-                self.rotate_segment()?;
-            }
-
-            let offset = self.stats.next_offset;
-            self.active
-                .write_all(&(encoded.len() as u32).to_le_bytes())?;
-            self.active.write_all(encoded)?;
-
-            let segment = self.active_segment();
-            segment.byte_len.store(
-                segment.byte_len.load(Ordering::Relaxed) + record_size,
-                Ordering::Release,
-            );
-            segment.end_offset.store(offset + 1, Ordering::Release);
-            self.stats.next_offset = offset + 1;
-            self.stats.records += 1;
-            self.stats.retained_bytes += record_size;
-            self.shared
-                .next_offset
-                .store(self.stats.next_offset, Ordering::Release);
-            Ok(offset)
-        })
-    }
-}
-
-impl<T> Storage for Topic<T>
-where
-    T: Encode + Decode<()>,
-{
-    type Stats = TopicStats;
-    type Config = TopicConfig;
-
-    fn stats(&self) -> Self::Stats {
-        self.stats.clone()
-    }
-
-    fn config(&self) -> Self::Config {
-        self.config.clone()
-    }
-}
-
-impl<T> DurableStorage for Topic<T>
-where
-    T: Encode + Decode<()>,
-{
-    fn create(path: &Path, config: Self::Config) -> io::Result<Self> {
-        Topic::create(path, config)
-    }
-
-    fn open(path: &Path, config: Self::Config) -> io::Result<Self> {
-        Topic::open(path, config)
-    }
-
-    fn compact(&mut self) -> io::Result<()> {
-        Topic::compact(self)
-    }
-
     fn flush(&mut self) -> io::Result<()> {
-        Topic::flush(self)
+        self.active.flush()?;
+        self.shared.offsets.lock().flush()
     }
 
     fn sync(&mut self) -> io::Result<()> {
-        Topic::sync(self)
+        self.active.sync_all()?;
+        self.shared.offsets.lock().sync()
     }
 }
 
@@ -440,11 +414,6 @@ impl<T> TopicConsumer<T> {
         self.consumer.volatile.store(next, Ordering::Release);
         self.current = None;
         self.commit()
-    }
-
-    /// Return the next offset this consumer will read.
-    pub fn volatile_offset(&self) -> TopicOffset {
-        self.consumer.volatile.load(Ordering::Acquire)
     }
 
     /// Rewind this consumer to its last committed cursor.

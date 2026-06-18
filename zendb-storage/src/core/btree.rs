@@ -451,7 +451,7 @@ where
             tree.stats.entries == 0,
             "bottom_up_build requires empty tree"
         );
-        let current_leaf = 1; // root after do_clear
+        let current_leaf = 1; // root after clear
         Self {
             tree,
             current_leaf,
@@ -1036,7 +1036,7 @@ where
             return Ok(());
         }
         if self.fragmentation_ratio() >= threshold {
-            self.do_compact()?;
+            self.compact()?;
         }
         Ok(())
     }
@@ -1798,76 +1798,6 @@ where
         }))
     }
 
-    // ---- compact (streaming shadow rebuild) -------------------------------
-
-    fn do_compact(&mut self) -> io::Result<()> {
-        let tmp_path = compact_temp_path();
-        let result = (|| -> io::Result<()> {
-            let mut shadow = BPlusTree::<K, V>::create(
-                &tmp_path,
-                BPlusTreeConfig {
-                    initial_capacity_pages: 2,
-                    compaction_ratio: 1.0,
-                },
-            )?;
-            shadow.bottom_up_build_raw(RawBTreeEntries::new(self, self.first_leaf()).map(Ok))?;
-            let used = (shadow.pages_counter() as usize) * PAGE_SIZE;
-            self.mmap[..used].copy_from_slice(&shadow.mmap[..used]);
-            self.stats = shadow.stats.clone();
-
-            // Shrink the backing file to the compacted size, but never below
-            // the initial-capacity floor so the next writes don't immediately
-            // re-grow the file.
-            let new_pages = shadow
-                .pages_counter()
-                .max(self.config.initial_capacity_pages);
-            let new_size = (new_pages as usize) * PAGE_SIZE;
-            self.mmap = MmapMut::map_anon(1)?;
-            self.file.set_len(new_size as u64)?;
-            self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
-
-            Ok(())
-        })();
-        let _ = fs::remove_file(&tmp_path);
-        result?;
-        Ok(())
-    }
-
-    /// Reset tree to post-`create` state without going through the public
-    /// `clear` (which has a tx debug_assert).
-    fn do_clear(&mut self) -> io::Result<()> {
-        {
-            let meta = self.page_bytes_mut(META_PAGE);
-            wr_u64(&mut meta[META_ROOT..META_ROOT + 8], 1);
-            wr_u64(&mut meta[META_FREE_HEAD..META_FREE_HEAD + 8], 0);
-            wr_u64(&mut meta[META_PAGES..META_PAGES + 8], 2);
-            wr_u64(&mut meta[META_ENTRIES..META_ENTRIES + 8], 0);
-            wr_u64(&mut meta[META_RIGHTMOST_LEAF..META_RIGHTMOST_LEAF + 8], 1);
-            wr_u64(&mut meta[META_LEAF_PAGES..META_LEAF_PAGES + 8], 1);
-            wr_u64(
-                &mut meta[META_LEAF_ENTRY_BYTES..META_LEAF_ENTRY_BYTES + 8],
-                0,
-            );
-            wr_u64(&mut meta[META_FREE_PAGES..META_FREE_PAGES + 8], 0);
-        }
-        self.stats = BPlusTreeStats {
-            entries: 0,
-            pages: 2,
-            free_pages: 0,
-            leaf_pages: 1,
-            leaf_entry_bytes: 0,
-        };
-        // Re-initialize page 1 as the root leaf.
-        let r = self.page_bytes_mut(1);
-        r[0] = PAGE_LEAF;
-        r[1] = FLAG_ROOT;
-        wr_u16(&mut r[2..4], 0);
-        wr_u32(&mut r[4..8], PAGE_SIZE as u32);
-        wr_u64(&mut r[8..16], 0);
-        wr_u64(&mut r[16..24], 0);
-        Ok(())
-    }
-
     // ---- bottom-up bulk build --------------------------------------------
 
     /// Build the tree bottom-up from raw `(key_bytes, value_bytes)` pairs
@@ -1875,7 +1805,7 @@ where
     ///
     /// Items are wrapped in `io::Result` so raw rebuild sources can surface
     /// errors without materializing the whole encoded dataset upfront. The
-    /// `do_compact` shadow-rebuild walks `RawBTreeEntries`, which yields
+    /// `compact` shadow-rebuild walks `RawBTreeEntries`, which yields
     /// borrowed page slices and wraps each item with `Ok`.
     fn bottom_up_build_raw<I, K2, V2>(&mut self, items: I) -> io::Result<()>
     where
@@ -1883,10 +1813,10 @@ where
         K2: AsRef<[u8]>,
         V2: AsRef<[u8]>,
     {
-        // Tree must be empty: `do_clear()` produces this state.
+        // Tree must be empty: `clear()` produces this state.
         debug_assert!(self.size() == 0, "bottom_up_build requires empty tree");
 
-        let mut current_leaf: u64 = 1; // root after do_clear
+        let mut current_leaf: u64 = 1; // root after clear
         let mut leaves: Vec<u64> = vec![current_leaf];
         // First key of each leaf: used as the smallest key reachable
         // through each internal-level child pointer. Pushed when a leaf
@@ -1986,7 +1916,7 @@ where
         if leaves.len() > 1 {
             self.build_internal_levels(leaves, leaf_first_keys, leaf_last_keys)?;
         } else {
-            // Single leaf is the root — root remains page 1 (set by do_clear).
+            // Single leaf is the root — root remains page 1 (set by clear).
             // Ensure FLAG_ROOT is set.
             let r = self.page_bytes_mut(1);
             r[1] |= FLAG_ROOT;
@@ -2225,7 +2155,36 @@ where
     }
 
     fn compact(&mut self) -> io::Result<()> {
-        self.do_compact()
+        let tmp_path = compact_temp_path();
+        let result = (|| -> io::Result<()> {
+            let mut shadow = BPlusTree::<K, V>::create(
+                &tmp_path,
+                BPlusTreeConfig {
+                    initial_capacity_pages: 2,
+                    compaction_ratio: 1.0,
+                },
+            )?;
+            shadow.bottom_up_build_raw(RawBTreeEntries::new(self, self.first_leaf()).map(Ok))?;
+            let used = (shadow.pages_counter() as usize) * PAGE_SIZE;
+            self.mmap[..used].copy_from_slice(&shadow.mmap[..used]);
+            self.stats = shadow.stats.clone();
+
+            // Shrink the backing file to the compacted size, but never below
+            // the initial-capacity floor so the next writes don't immediately
+            // re-grow the file.
+            let new_pages = shadow
+                .pages_counter()
+                .max(self.config.initial_capacity_pages);
+            let new_size = (new_pages as usize) * PAGE_SIZE;
+            self.mmap = MmapMut::map_anon(1)?;
+            self.file.set_len(new_size as u64)?;
+            self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
+
+            Ok(())
+        })();
+        let _ = fs::remove_file(&tmp_path);
+        result?;
+        Ok(())
     }
 
     /// Schedule mmap writeback asynchronously.
@@ -2438,7 +2397,36 @@ where
     }
 
     fn clear(&mut self) -> io::Result<()> {
-        self.do_clear()
+        {
+            let meta = self.page_bytes_mut(META_PAGE);
+            wr_u64(&mut meta[META_ROOT..META_ROOT + 8], 1);
+            wr_u64(&mut meta[META_FREE_HEAD..META_FREE_HEAD + 8], 0);
+            wr_u64(&mut meta[META_PAGES..META_PAGES + 8], 2);
+            wr_u64(&mut meta[META_ENTRIES..META_ENTRIES + 8], 0);
+            wr_u64(&mut meta[META_RIGHTMOST_LEAF..META_RIGHTMOST_LEAF + 8], 1);
+            wr_u64(&mut meta[META_LEAF_PAGES..META_LEAF_PAGES + 8], 1);
+            wr_u64(
+                &mut meta[META_LEAF_ENTRY_BYTES..META_LEAF_ENTRY_BYTES + 8],
+                0,
+            );
+            wr_u64(&mut meta[META_FREE_PAGES..META_FREE_PAGES + 8], 0);
+        }
+        self.stats = BPlusTreeStats {
+            entries: 0,
+            pages: 2,
+            free_pages: 0,
+            leaf_pages: 1,
+            leaf_entry_bytes: 0,
+        };
+        // Re-initialize page 1 as the root leaf.
+        let r = self.page_bytes_mut(1);
+        r[0] = PAGE_LEAF;
+        r[1] = FLAG_ROOT;
+        wr_u16(&mut r[2..4], 0);
+        wr_u32(&mut r[4..8], PAGE_SIZE as u32);
+        wr_u64(&mut r[8..16], 0);
+        wr_u64(&mut r[16..24], 0);
+        Ok(())
     }
 
     fn keys<'a>(&'a self) -> impl Iterator<Item = Cow<'a, K>> + 'a
@@ -2708,7 +2696,7 @@ where
             leaf_page = next;
         }
         // If no leaves survived, leave one empty root leaf in place
-        // (matches do_clear's state).
+        // (matches clear's state).
         if leaves.is_empty() {
             // Allocate a fresh empty leaf as the root.
             let p = self.alloc_page()?;

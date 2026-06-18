@@ -14,8 +14,8 @@ use bincode::{Decode, Encode};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 use zendb_storage::core::{
-    backend::{Backend, FileBackedBackend},
     keydir::KeyDirConfig,
+    traits::{Backend, DurableStorage},
 };
 use zendb_storage::frontend::table::{Table as RawTable, TableConfig};
 

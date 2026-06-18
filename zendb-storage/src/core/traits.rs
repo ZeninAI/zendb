@@ -48,7 +48,7 @@
 //! needs runtime dispatch over multiple backend kinds wraps them in a
 //! concrete enum that itself implements `Backend`.
 
-use std::{borrow::Cow, hash::Hash, io, path::Path};
+use std::{borrow::Cow, fmt::Debug, hash::Hash, io, path::Path};
 
 use bincode::{Decode, Encode};
 
@@ -56,31 +56,37 @@ use bincode::{Decode, Encode};
 // Backend — semantically common subset across every backend kind.
 // ---------------------------------------------------------------------------
 
-/// The common contract every storage backend satisfies.
-///
-/// Generic over `K` and `V`. The bounds are the union of what every
-/// backend implementation needs: `Hash + Eq` (KeyDir's hash index),
-/// `Ord` (the shared ordered-backend and runtime-state contract),
-/// `Clone` on both K and V (in-memory backends like SkipList hold owned
-/// `(K, V)` and need to hand cloned copies to callers; the `update`
-/// default impl also clones the key on the insert path), plus bincode's
-/// `Encode + Decode<()>` for both K and V.
-///
-pub trait Backend<K, V>
+pub trait Storage {
+    type Stats: Clone + Encode + Decode<()> + Debug;
+    type Config: Clone + Default + Encode + Decode<()> + Debug;
+
+    fn stats(&self) -> Self::Stats;
+    fn config(&self) -> Self::Config;
+}
+
+pub trait DurableStorage: Storage {
+    fn create(path: &Path, config: Self::Config) -> io::Result<Self>
+    where
+        Self: Sized;
+
+    fn open(path: &Path, config: Self::Config) -> io::Result<Self>
+    where
+        Self: Sized;
+
+    fn compact(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()>;
+    fn sync(&mut self) -> io::Result<()>;
+}
+
+/// The common key/value contract every KV backend satisfies.
+pub trait Backend<K, V>: Storage
 where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
 {
-    /// Cheap backend-specific metrics view. Implementations keep the
-    /// underlying stats in the backend object and update them as state changes.
-    type Stats<'a>
-    where
-        Self: 'a;
-
-    /// Backend configuration values. Set once at construction, read
-    /// through `config()`. Immutable after creation.
-    type Config: Clone + Default + Encode + Decode<()>;
-
     // ---- reads --------------------------------------------------------
 
     /// Look up `key`. Returns the value (borrowed when the backend holds
@@ -238,13 +244,6 @@ where
     /// logical state is reset.
     fn clear(&mut self) -> io::Result<()>;
 
-    /// Reclaim backend-specific storage waste while preserving live
-    /// entries. Backends that do not accumulate reclaimable space can
-    /// keep the default no-op implementation.
-    fn compact(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-
     // ---- iteration (unspecified order) -------------------------------
 
     /// Iterate all keys. Order is backend-defined. Yields `Cow<K>`;
@@ -274,43 +273,6 @@ where
     fn is_empty(&self) -> bool {
         self.size() == 0
     }
-
-    /// Return the backend's current in-memory stats view.
-    fn stats(&self) -> Self::Stats<'_>;
-
-    /// Return the backend's configuration.
-    fn config(&self) -> &Self::Config;
-
-    // ---- durability ---------------------------------------------------
-
-    /// Schedule pending writes for OS writeback. May return before the
-    /// writeback has completed. Backed by `MmapMut::flush_async` on the
-    /// mmap'd backends.
-    fn flush(&mut self) -> io::Result<()>;
-
-    /// Block until pending mmap writes have been flushed by the OS.
-    /// Slower than [`flush`](Self::flush). This is a writeback boundary,
-    /// not a crash-recovery or corruption-repair mechanism.
-    fn sync(&mut self) -> io::Result<()>;
-}
-
-/// Construction contract for backends whose contents live on disk.
-///
-/// In-memory backends implement [`Backend`] but do not implement this trait.
-pub trait FileBackedBackend<K, V>: Backend<K, V>
-where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
-{
-    /// Create a fresh backend at `path`, replacing any existing backend file.
-    fn create(path: &Path, config: Self::Config) -> io::Result<Self>
-    where
-        Self: Sized;
-
-    /// Open an existing backend at `path`.
-    fn open(path: &Path, config: Self::Config) -> io::Result<Self>
-    where
-        Self: Sized;
 }
 
 // ---------------------------------------------------------------------------

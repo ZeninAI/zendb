@@ -9,9 +9,9 @@
 //! # Public surface
 //!
 //! Aside from the constructors [`KeyDir::create`] and [`KeyDir::open`],
-//! every callable is exposed through the [`Backend`](crate::core::backend::Backend)
+//! every callable is exposed through the [`Backend`](crate::core::traits::Backend)
 //! trait — there are no inherent `pub` accessors that duplicate it.
-//! Callers should `use crate::core::backend::Backend;` and reach the
+//! Callers should `use crate::core::traits::Backend;` and reach the
 //! operations through that trait.
 //!
 //! # Writing
@@ -85,7 +85,7 @@ use hashbrown::hash_map::Entry;
 use hashbrown::HashMap;
 use memmap2::MmapMut;
 
-use crate::core::backend::{Backend, FileBackedBackend};
+use crate::core::traits::{DurableStorage, Storage};
 use crate::utils::serdes::{deserialize_from, rd_u32, read_u32_le, with_two_scratches};
 
 const DEFAULT_INITIAL_CAPACITY: u64 = 1024 * 1024;
@@ -122,7 +122,7 @@ impl Default for KeyDirConfig {
 /// Append-log accounting. The live entry count is **not** tracked here —
 /// it comes straight from `index.len()` via `Backend::size`, so there's
 /// no separate counter to keep in sync on every mutation.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct KeyDirStats {
     pub data_size: u64,
     pub dead_bytes: u64,
@@ -375,7 +375,24 @@ impl<K, V> fmt::Debug for KeyDir<K, V> {
 // directly rather than delegating to inherent methods.
 // ---------------------------------------------------------------------------
 
-impl<K, V> FileBackedBackend<K, V> for KeyDir<K, V>
+impl<K, V> Storage for KeyDir<K, V>
+where
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
+    V: Encode + Decode<()> + Clone,
+{
+    type Stats = KeyDirStats;
+    type Config = KeyDirConfig;
+
+    fn stats(&self) -> Self::Stats {
+        self.stats.clone()
+    }
+
+    fn config(&self) -> Self::Config {
+        self.config.clone()
+    }
+}
+
+impl<K, V> DurableStorage for KeyDir<K, V>
 where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
@@ -424,26 +441,64 @@ where
             mmap,
             file,
             config,
-            stats: KeyDirStats::default(),
+            stats: KeyDirStats {
+                data_size: 0,
+                dead_bytes: 0,
+            },
             _phantom: PhantomData,
         };
 
         this.rebuild_index()?;
         Ok(this)
     }
+
+    fn compact(&mut self) -> io::Result<()> {
+        // Collect mutable references to every entry so we can update
+        // offsets in-place - no drain/reinsert, no key clones.
+        let mut snapshot: Vec<&mut EntryMeta> = self.index.values_mut().collect();
+        snapshot.sort_unstable_by_key(|m| m.offset);
+
+        let mut cursor: usize = HEADER_SIZE;
+        for meta in snapshot.iter_mut() {
+            let src = meta.offset as usize;
+            let len = meta.record_size as usize;
+            if src != cursor {
+                self.mmap.copy_within(src..src + len, cursor);
+            }
+            meta.offset = cursor as u64;
+            cursor += len;
+        }
+
+        self.mmap[cursor..cursor + 4].copy_from_slice(&SENTINEL.to_le_bytes());
+
+        self.stats.data_size = cursor as u64;
+        self.stats.dead_bytes = 0;
+
+        let new_capacity = ((cursor + 4) as u64).max(self.config.initial_capacity);
+        self.mmap = MmapMut::map_anon(1)?;
+        self.file.set_len(new_capacity)?;
+        self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
+        Ok(())
+    }
+
+    /// Schedule mmap writeback asynchronously. Returns once the OS has
+    /// accepted the request; use [`sync`](Self::sync) to wait for it.
+    fn flush(&mut self) -> io::Result<()> {
+        self.mmap.flush_async()
+    }
+
+    /// Block until pending mmap writes have been flushed by the OS.
+    /// This does not provide crash recovery or log repair.
+    fn sync(&mut self) -> io::Result<()> {
+        self.mmap.flush()
+    }
 }
 
-impl<K, V> crate::core::backend::Backend<K, V> for KeyDir<K, V>
+impl<K, V> crate::core::traits::Backend<K, V> for KeyDir<K, V>
 where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
 {
-    type Stats<'a>
-        = &'a KeyDirStats
-    where
-        Self: 'a;
-    type Config = KeyDirConfig;
-
     /// One HashMap lookup, then materialize the value by decoding the
     /// mmap slice the meta points at. Returns `Cow::Owned` since the
     /// value is freshly decoded each call.
@@ -648,55 +703,6 @@ where
         Ok(())
     }
 
-    /// In-place compaction. Sweeps the mmap forward in offset order,
-    /// `copy_within`-ing each live record into its packed position. No
-    /// tmp file, no `fs::rename`, one optional `set_len` + remap at the
-    /// end to release the physical slack.
-    ///
-    /// Correctness: entries are sorted by ascending current offset, and
-    /// the write cursor (`dst`) is always ≤ `src` at each step, so the
-    /// forward shift never destructively overlaps a record we haven't
-    /// moved yet (`copy_within` itself uses memmove semantics).
-    fn compact(&mut self) -> io::Result<()> {
-        // Collect mutable references to every entry so we can update
-        // offsets in-place — no drain/reinsert, no key clones. We only
-        // need `&mut EntryMeta`; the K borrow would just bloat the
-        // ref-tuple (2 pointers → 1) without being used by the sort or
-        // the relocation loop.
-        let mut snapshot: Vec<&mut EntryMeta> = self.index.values_mut().collect();
-        snapshot.sort_unstable_by_key(|m| m.offset);
-
-        let mut cursor: usize = HEADER_SIZE;
-        for meta in snapshot.iter_mut() {
-            let src = meta.offset as usize;
-            let len = meta.record_size as usize;
-            if src != cursor {
-                self.mmap.copy_within(src..src + len, cursor);
-            }
-            meta.offset = cursor as u64;
-            cursor += len;
-        }
-
-        self.mmap[cursor..cursor + 4].copy_from_slice(&SENTINEL.to_le_bytes());
-
-        self.stats.data_size = cursor as u64;
-        self.stats.dead_bytes = 0;
-
-        // Release the physical slack past the new tail. Keep at least
-        // `initial_capacity` so the next writes don't immediately
-        // re-grow the file.
-        //
-        // Windows note: `set_len` refuses to shrink a file while a
-        // mapped section is open. Swap in a small anonymous mmap as a
-        // placeholder so the file's mapped section is dropped before
-        // the truncation, then remap onto the resized file.
-        let new_capacity = ((cursor + 4) as u64).max(self.config.initial_capacity);
-        self.mmap = MmapMut::map_anon(1)?;
-        self.file.set_len(new_capacity)?;
-        self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
-        Ok(())
-    }
-
     fn keys<'a>(&'a self) -> impl Iterator<Item = Cow<'a, K>> + 'a
     where
         K: 'a,
@@ -732,26 +738,6 @@ where
     fn size(&self) -> usize {
         self.index.len()
     }
-
-    fn stats(&self) -> Self::Stats<'_> {
-        &self.stats
-    }
-
-    fn config(&self) -> &Self::Config {
-        &self.config
-    }
-
-    /// Schedule mmap writeback asynchronously. Returns once the OS has
-    /// accepted the request; use [`sync`](Self::sync) to wait for it.
-    fn flush(&mut self) -> io::Result<()> {
-        self.mmap.flush_async()
-    }
-
-    /// Block until pending mmap writes have been flushed by the OS.
-    /// This does not provide crash recovery or log repair.
-    fn sync(&mut self) -> io::Result<()> {
-        self.mmap.flush()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -761,7 +747,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::backend::Backend;
+    use crate::core::traits::Backend;
     use std::borrow::Cow;
     use std::fs;
     use std::path::PathBuf;
@@ -1379,7 +1365,7 @@ mod tests {
             },
         );
         assert_eq!(
-            *kd.stats(),
+            kd.stats(),
             KeyDirStats {
                 data_size: HEADER_SIZE as u64,
                 dead_bytes: 0,

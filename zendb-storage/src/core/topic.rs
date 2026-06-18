@@ -22,7 +22,7 @@ use hashbrown::HashMap;
 use parking_lot::Mutex;
 
 use crate::core::{
-    backend::{Backend, FileBackedBackend},
+    traits::{Backend, DurableStorage, Storage},
     keydir::{KeyDir, KeyDirConfig},
 };
 use crate::utils::serdes::{deserialize_from, with_scratch};
@@ -50,7 +50,7 @@ impl Default for TopicConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct TopicStats {
     pub earliest_offset: TopicOffset,
     pub next_offset: TopicOffset,
@@ -139,8 +139,10 @@ where
             active,
             shared,
             stats: TopicStats {
+                earliest_offset: 0,
+                next_offset: 0,
+                records: 0,
                 retained_bytes: HEADER_SIZE,
-                ..TopicStats::default()
             },
         })
     }
@@ -258,12 +260,12 @@ where
         })
     }
 
-    pub fn stats(&self) -> &TopicStats {
-        &self.stats
+    pub fn stats(&self) -> TopicStats {
+        self.stats.clone()
     }
 
-    pub fn config(&self) -> &TopicConfig {
-        &self.config
+    pub fn config(&self) -> TopicConfig {
+        self.config.clone()
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
@@ -363,6 +365,47 @@ where
                 .store(self.stats.next_offset, Ordering::Release);
             Ok(offset)
         })
+    }
+}
+
+impl<T> Storage for Topic<T>
+where
+    T: Encode + Decode<()>,
+{
+    type Stats = TopicStats;
+    type Config = TopicConfig;
+
+    fn stats(&self) -> Self::Stats {
+        self.stats.clone()
+    }
+
+    fn config(&self) -> Self::Config {
+        self.config.clone()
+    }
+}
+
+impl<T> DurableStorage for Topic<T>
+where
+    T: Encode + Decode<()>,
+{
+    fn create(path: &Path, config: Self::Config) -> io::Result<Self> {
+        Topic::create(path, config)
+    }
+
+    fn open(path: &Path, config: Self::Config) -> io::Result<Self> {
+        Topic::open(path, config)
+    }
+
+    fn compact(&mut self) -> io::Result<()> {
+        Topic::compact(self)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Topic::flush(self)
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        Topic::sync(self)
     }
 }
 

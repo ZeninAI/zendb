@@ -2,7 +2,7 @@
 
 use std::{fs, io};
 
-use zendb_storage::core::backend::Backend;
+use zendb_storage::core::traits::Backend;
 
 use super::{
     already_exists, not_found, CatalogEntry, DatabaseInner, COMPUTATIONS_DIR, SHARED_STATES_DIR,

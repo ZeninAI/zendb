@@ -6,10 +6,9 @@ use bincode::{Decode, Encode};
 use zendb_types::{Cell, Event, PrimaryKey};
 
 use crate::core::{
-    backend::{Backend, OrderedBackend},
+    traits::{Backend, DurableStorage, OrderedBackend, Storage},
     skiplist::{SkipList, SkipListCapacity, SkipListConfig, SkipListStats},
     topic::{Topic, TopicConfig, TopicConsumer, TopicOffset, TopicStats},
-    FileBackedBackend,
 };
 use crate::frontend::state::{State, StateConfig, StateStats};
 
@@ -44,11 +43,11 @@ impl Default for TableConfig {
 }
 
 /// Current stats view over the delegated backends.
-#[derive(Debug)]
-pub struct TableStats<'a> {
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct TableStats {
     pub state: StateStats,
-    pub cache: &'a SkipListStats,
-    pub topic: &'a TopicStats,
+    pub cache: SkipListStats,
+    pub topic: TopicStats,
 }
 
 /// A table presents the resolved union of materialized state and its in-memory
@@ -178,7 +177,24 @@ impl Table {
     }
 }
 
-impl FileBackedBackend<PrimaryKey, Cell> for Table {
+impl Storage for Table {
+    type Stats = TableStats;
+    type Config = TableConfig;
+
+    fn stats(&self) -> Self::Stats {
+        TableStats {
+            state: self.state.stats(),
+            cache: self.cache.stats(),
+            topic: self.topic.stats(),
+        }
+    }
+
+    fn config(&self) -> Self::Config {
+        self.config.clone()
+    }
+}
+
+impl DurableStorage for Table {
     fn create(path: &Path, config: TableConfig) -> io::Result<Self> {
         fs::create_dir_all(path)?;
 
@@ -225,15 +241,25 @@ impl FileBackedBackend<PrimaryKey, Cell> for Table {
         table.replay_recovery()?;
         Ok(table)
     }
+
+    fn compact(&mut self) -> io::Result<()> {
+        self.state.compact()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.drain_cache()?;
+        self.state.flush()?;
+        self.topic.flush()
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        self.drain_cache()?;
+        self.state.sync()?;
+        self.topic.sync()
+    }
 }
 
 impl Backend<PrimaryKey, Cell> for Table {
-    type Stats<'a>
-        = TableStats<'a>
-    where
-        Self: 'a;
-    type Config = TableConfig;
-
     // ---- reads --------------------------------------------------------
 
     fn get(&self, key: &PrimaryKey) -> Option<Cow<'_, Cell>> {
@@ -312,10 +338,6 @@ impl Backend<PrimaryKey, Cell> for Table {
 
     fn clear(&mut self) -> io::Result<()> {
         panic!("Table::clear is disabled — tables cannot be cleared directly")
-    }
-
-    fn compact(&mut self) -> io::Result<()> {
-        self.state.compact()
     }
 
     // ---- iteration (resolved over state ⊕ cache) ---------------------
@@ -492,30 +514,6 @@ impl Backend<PrimaryKey, Cell> for Table {
 
     fn is_empty(&self) -> bool {
         self.state.is_empty() && self.novel_pending == 0
-    }
-
-    fn stats(&self) -> Self::Stats<'_> {
-        TableStats {
-            state: self.state.stats(),
-            cache: self.cache.stats(),
-            topic: self.topic.stats(),
-        }
-    }
-
-    fn config(&self) -> &Self::Config {
-        &self.config
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.drain_cache()?;
-        self.state.flush()?;
-        self.topic.flush()
-    }
-
-    fn sync(&mut self) -> io::Result<()> {
-        self.drain_cache()?;
-        self.state.sync()?;
-        self.topic.sync()
     }
 }
 
@@ -731,7 +729,7 @@ mod tests {
             Backend::get(&table, &key).unwrap().into_owned().value,
             Some(Value::Int(1))
         );
-        let stats = Backend::stats(&table);
+        let stats = Storage::stats(&table);
         assert!(matches!(&stats.state, StateStats::Unordered(_)));
         assert_eq!(stats.cache.entries, 1);
         assert_eq!(stats.topic.records, 1);
@@ -889,7 +887,7 @@ mod tests {
             table.insert_event(event("a", 1, hlc(100))).unwrap();
             table.insert_event(event("a", 2, hlc(200))).unwrap();
             table.insert_event(event("b", 5, hlc(150))).unwrap();
-            Backend::sync(&mut table).unwrap();
+            DurableStorage::sync(&mut table).unwrap();
         }
 
         let table = Table::open(&path, config).unwrap();

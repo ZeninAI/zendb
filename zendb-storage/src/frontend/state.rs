@@ -5,10 +5,10 @@ use std::{borrow::Cow, hash::Hash, io, path::Path};
 use bincode::{Decode, Encode};
 
 use crate::core::{
-    backend::{Backend, FileBackedBackend, OrderedBackend},
     btree::{BPlusTree, BPlusTreeConfig, BPlusTreeStats},
     keydir::{KeyDir, KeyDirConfig, KeyDirStats},
     skiplist::{SkipList, SkipListConfig, SkipListStats},
+    traits::{Backend, DurableStorage, OrderedBackend, Storage},
 };
 
 /// Configures the materialized-state backend.
@@ -26,7 +26,7 @@ impl Default for StateConfig {
 }
 
 /// Stats from the selected materialized-state backend.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum StateStats {
     Ordered(BPlusTreeStats),
     Unordered(KeyDirStats),
@@ -50,7 +50,32 @@ pub enum State<K: Ord, V> {
     },
 }
 
-impl<K, V> FileBackedBackend<K, V> for State<K, V>
+impl<K, V> Storage for State<K, V>
+where
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
+    V: Encode + Decode<()> + Clone,
+{
+    type Stats = StateStats;
+    type Config = StateConfig;
+
+    fn stats(&self) -> Self::Stats {
+        match self {
+            Self::Ordered { backend, .. } => StateStats::Ordered(backend.stats()),
+            Self::Unordered { backend, .. } => StateStats::Unordered(backend.stats()),
+            Self::InMemory { backend, .. } => StateStats::InMemory(backend.stats()),
+        }
+    }
+
+    fn config(&self) -> Self::Config {
+        match self {
+            Self::Ordered { config, .. }
+            | Self::Unordered { config, .. }
+            | Self::InMemory { config, .. } => config.clone(),
+        }
+    }
+}
+
+impl<K, V> DurableStorage for State<K, V>
 where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
@@ -88,6 +113,30 @@ where
             }),
         }
     }
+
+    fn compact(&mut self) -> io::Result<()> {
+        match self {
+            Self::Ordered { backend, .. } => backend.compact(),
+            Self::Unordered { backend, .. } => backend.compact(),
+            Self::InMemory { .. } => Ok(()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Ordered { backend, .. } => backend.flush(),
+            Self::Unordered { backend, .. } => backend.flush(),
+            Self::InMemory { .. } => Ok(()),
+        }
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        match self {
+            Self::Ordered { backend, .. } => backend.sync(),
+            Self::Unordered { backend, .. } => backend.sync(),
+            Self::InMemory { .. } => Ok(()),
+        }
+    }
 }
 
 impl<K, V> Backend<K, V> for State<K, V>
@@ -95,12 +144,6 @@ where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
 {
-    type Stats<'a>
-        = StateStats
-    where
-        Self: 'a;
-    type Config = StateConfig;
-
     fn get(&self, key: &K) -> Option<Cow<'_, V>> {
         match self {
             Self::Ordered { backend, .. } => backend.get(key),
@@ -214,14 +257,6 @@ where
         }
     }
 
-    fn compact(&mut self) -> io::Result<()> {
-        match self {
-            Self::Ordered { backend, .. } => backend.compact(),
-            Self::Unordered { backend, .. } => backend.compact(),
-            Self::InMemory { backend, .. } => backend.compact(),
-        }
-    }
-
     fn keys<'a>(&'a self) -> impl Iterator<Item = Cow<'a, K>> + 'a
     where
         K: 'a,
@@ -275,38 +310,6 @@ where
             Self::Ordered { backend, .. } => backend.is_empty(),
             Self::Unordered { backend, .. } => backend.is_empty(),
             Self::InMemory { backend, .. } => backend.is_empty(),
-        }
-    }
-
-    fn stats(&self) -> Self::Stats<'_> {
-        match self {
-            Self::Ordered { backend, .. } => StateStats::Ordered(backend.stats().clone()),
-            Self::Unordered { backend, .. } => StateStats::Unordered(backend.stats().clone()),
-            Self::InMemory { backend, .. } => StateStats::InMemory(backend.stats().clone()),
-        }
-    }
-
-    fn config(&self) -> &Self::Config {
-        match self {
-            Self::Ordered { config, .. }
-            | Self::Unordered { config, .. }
-            | Self::InMemory { config, .. } => config,
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Ordered { backend, .. } => backend.flush(),
-            Self::Unordered { backend, .. } => backend.flush(),
-            Self::InMemory { backend, .. } => backend.flush(),
-        }
-    }
-
-    fn sync(&mut self) -> io::Result<()> {
-        match self {
-            Self::Ordered { backend, .. } => backend.sync(),
-            Self::Unordered { backend, .. } => backend.sync(),
-            Self::InMemory { backend, .. } => backend.sync(),
         }
     }
 }

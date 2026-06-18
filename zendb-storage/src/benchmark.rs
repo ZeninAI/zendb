@@ -48,11 +48,11 @@ use tempfile::TempDir;
 
 use crate::{
     core::{
-        backend::{Backend, FileBackedBackend},
         btree::{BPlusTree, BPlusTreeConfig},
         keydir::{KeyDir, KeyDirConfig},
         skiplist::{SkipList, SkipListCapacity, SkipListConfig},
         topic::{Topic, TopicConfig},
+        traits::{Backend, DurableStorage},
     },
     utils::serdes::{deserialize_from, serialize_to_vec},
 };
@@ -343,7 +343,7 @@ fn skiplist_writes_fresh_direct() -> io::Result<()> {
         for &k in &keys {
             ol.put(k, k.wrapping_mul(7))?;
         }
-        ol.flush()
+        Ok(())
     })?;
 
     BenchResult::new("SkipList fresh writes (direct put)", N, elapsed).print();
@@ -360,7 +360,7 @@ fn skiplist_writes_fresh_bounded_direct() -> io::Result<()> {
         for &key in &keys {
             list.put(key, key.wrapping_mul(7))?;
         }
-        list.flush()
+        Ok(())
     })?;
 
     BenchResult::new("SkipList bounded fresh writes (direct put)", N, elapsed).print();
@@ -381,7 +381,7 @@ fn skiplist_writes_churn_direct() -> io::Result<()> {
         for &k in &keys {
             ol.put(k, k.wrapping_mul(7))?;
         }
-        ol.flush()
+        Ok(())
     })?;
 
     BenchResult::new("SkipList churn writes (direct put)", N, elapsed).print();
@@ -400,7 +400,7 @@ fn skiplist_bulk_put_sorted_fresh() -> io::Result<()> {
 
     let elapsed = timed(|| {
         ol.bulk_put_sorted(items)?;
-        ol.flush()
+        Ok(())
     })?;
 
     BenchResult::new("SkipList fresh bulk_put_sorted", N, elapsed).print();
@@ -415,7 +415,7 @@ fn skiplist_bulk_put_unsorted_fresh() -> io::Result<()> {
 
     let elapsed = timed(|| {
         ol.bulk_put(items)?;
-        ol.flush()
+        Ok(())
     })?;
 
     BenchResult::new("SkipList fresh bulk_put (sort first)", N, elapsed).print();
@@ -431,7 +431,7 @@ fn skiplist_bulk_put_sorted_churn() -> io::Result<()> {
 
     let elapsed = timed(|| {
         ol.bulk_put_sorted(items)?;
-        ol.flush()
+        Ok(())
     })?;
 
     BenchResult::new("SkipList churn bulk_put_sorted", N, elapsed).print();
@@ -446,7 +446,7 @@ fn skiplist_bulk_put_unsorted_churn() -> io::Result<()> {
 
     let elapsed = timed(|| {
         ol.bulk_put(items)?;
-        ol.flush()
+        Ok(())
     })?;
 
     BenchResult::new("SkipList churn bulk_put (sort first)", N, elapsed).print();
@@ -463,7 +463,6 @@ fn skiplist_reads() -> io::Result<()> {
     let mut ol = SkipList::<u64, u64>::new(skiplist_config());
 
     ol.bulk_put_sorted(kv_payload(&fresh_keys()))?;
-    ol.flush()?;
 
     let elapsed = timed(|| {
         for k in 0..N {
@@ -698,7 +697,7 @@ fn btree_reads() -> io::Result<()> {
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn btree_range_scan() -> io::Result<()> {
-    use crate::core::backend::OrderedBackend;
+    use crate::core::traits::OrderedBackend;
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
     let mut t = BPlusTree::<[u8; 8], u64>::create(&path, btree_config())?;
@@ -723,7 +722,7 @@ fn btree_range_scan() -> io::Result<()> {
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn btree_range_rev_scan() -> io::Result<()> {
-    use crate::core::backend::OrderedBackend;
+    use crate::core::traits::OrderedBackend;
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
     let mut t = BPlusTree::<[u8; 8], u64>::create(&path, btree_config())?;

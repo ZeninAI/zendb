@@ -82,7 +82,7 @@ use std::{
 use bincode::{Decode, Encode};
 use hashbrown::HashMap;
 
-use crate::core::backend::{Backend, FileBackedBackend, OrderedBackend};
+use crate::core::traits::{Backend, DurableStorage, OrderedBackend, Storage};
 use crate::utils::reusables::PooledBuf;
 use crate::utils::serdes::{
     deserialize_from, rd_u16, rd_u32, rd_u64, serialize_to_vec, with_scratch, with_two_scratches,
@@ -282,7 +282,7 @@ impl Default for BPlusTreeConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct BPlusTreeStats {
     pub entries: usize,
     pub pages: u64,
@@ -2127,7 +2127,24 @@ where
 // Backend impl — all public method bodies live here.
 // ===========================================================================
 
-impl<K, V> FileBackedBackend<K, V> for BPlusTree<K, V>
+impl<K, V> Storage for BPlusTree<K, V>
+where
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
+    V: Encode + Decode<()> + Clone,
+{
+    type Stats = BPlusTreeStats;
+    type Config = BPlusTreeConfig;
+
+    fn stats(&self) -> Self::Stats {
+        self.stats.clone()
+    }
+
+    fn config(&self) -> Self::Config {
+        self.config.clone()
+    }
+}
+
+impl<K, V> DurableStorage for BPlusTree<K, V>
 where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
@@ -2194,11 +2211,31 @@ where
             mmap,
             file,
             config,
-            stats: BPlusTreeStats::default(),
+            stats: BPlusTreeStats {
+                entries: 0,
+                pages: 0,
+                free_pages: 0,
+                leaf_pages: 0,
+                leaf_entry_bytes: 0,
+            },
             _phantom: PhantomData,
         };
         this.refresh_stats_from_meta();
         Ok(this)
+    }
+
+    fn compact(&mut self) -> io::Result<()> {
+        self.do_compact()
+    }
+
+    /// Schedule mmap writeback asynchronously.
+    fn flush(&mut self) -> io::Result<()> {
+        self.mmap.flush_async()
+    }
+
+    /// Block until pending mmap writes have been flushed.
+    fn sync(&mut self) -> io::Result<()> {
+        self.mmap.flush()
     }
 }
 
@@ -2207,12 +2244,6 @@ where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
 {
-    type Stats<'a>
-        = &'a BPlusTreeStats
-    where
-        Self: 'a;
-    type Config = BPlusTreeConfig;
-
     fn get(&self, key: &K) -> Option<Cow<'_, V>> {
         with_scratch(key, |kb| {
             Ok(self
@@ -2410,10 +2441,6 @@ where
         self.do_clear()
     }
 
-    fn compact(&mut self) -> io::Result<()> {
-        self.do_compact()
-    }
-
     fn keys<'a>(&'a self) -> impl Iterator<Item = Cow<'a, K>> + 'a
     where
         K: 'a,
@@ -2451,24 +2478,6 @@ where
 
     fn size(&self) -> usize {
         self.stats.entries
-    }
-
-    fn stats(&self) -> Self::Stats<'_> {
-        &self.stats
-    }
-
-    fn config(&self) -> &Self::Config {
-        &self.config
-    }
-
-    /// Schedule mmap writeback asynchronously.
-    fn flush(&mut self) -> io::Result<()> {
-        self.mmap.flush_async()
-    }
-
-    /// Block until pending mmap writes have been flushed.
-    fn sync(&mut self) -> io::Result<()> {
-        self.mmap.flush()
     }
 }
 
@@ -3181,10 +3190,10 @@ mod tests {
                 assert!(t.delete(&format!("k{:04}", i).into_bytes()).unwrap());
             }
             t.flush().unwrap();
-            t.stats().clone()
+            t.stats()
         };
         let t: BPlusTree<TestKey, TestVal> = open(&p);
-        assert_eq!(t.stats(), &stats_before);
+        assert_eq!(t.stats(), stats_before);
     }
 
     #[test]

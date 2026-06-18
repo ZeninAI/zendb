@@ -4,7 +4,7 @@ use std::{borrow::Cow, hash::Hash, io};
 
 use bincode::{Decode, Encode};
 
-use super::backend::{Backend, OrderedBackend};
+use super::traits::{Backend, OrderedBackend, Storage};
 use crate::utils::fast_rand;
 
 const MAX_LEVEL: usize = 16;
@@ -24,7 +24,7 @@ pub struct SkipListConfig {
     pub capacity: SkipListCapacity,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct SkipListStats {
     pub entries: usize,
 }
@@ -64,7 +64,7 @@ impl<K: Ord, V> SkipList<K, V> {
             tail: None,
             height: 0,
             config,
-            stats: SkipListStats::default(),
+            stats: SkipListStats { entries: 0 },
         }
     }
 
@@ -193,17 +193,28 @@ impl<K: Ord, V> SkipList<K, V> {
     }
 }
 
+impl<K, V> Storage for SkipList<K, V>
+where
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
+    V: Encode + Decode<()> + Clone,
+{
+    type Stats = SkipListStats;
+    type Config = SkipListConfig;
+
+    fn stats(&self) -> Self::Stats {
+        self.stats.clone()
+    }
+
+    fn config(&self) -> Self::Config {
+        self.config.clone()
+    }
+}
+
 impl<K, V> Backend<K, V> for SkipList<K, V>
 where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
     V: Encode + Decode<()> + Clone,
 {
-    type Stats<'a>
-        = &'a SkipListStats
-    where
-        Self: 'a;
-    type Config = SkipListConfig;
-
     fn get(&self, key: &K) -> Option<Cow<'_, V>> {
         self.search(key).1.map(|index| {
             Cow::Borrowed(
@@ -368,18 +379,6 @@ where
     }
     fn size(&self) -> usize {
         self.stats.entries
-    }
-    fn stats(&self) -> Self::Stats<'_> {
-        &self.stats
-    }
-    fn config(&self) -> &Self::Config {
-        &self.config
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-    fn sync(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }
 
@@ -713,14 +712,12 @@ mod tests {
     }
 
     #[test]
-    fn flush_and_sync_are_no_ops() {
+    fn stats_and_config_are_owned_views() {
         let mut list = list();
         list.put(1, 10).unwrap();
 
-        list.flush().unwrap();
-        list.sync().unwrap();
-
-        assert_eq!(*list.get(&1).unwrap(), 10);
+        assert_eq!(list.stats().entries, 1);
+        assert_eq!(list.config().capacity, SkipListCapacity::Unbounded);
     }
 
     #[test]

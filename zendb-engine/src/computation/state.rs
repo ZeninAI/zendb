@@ -14,7 +14,7 @@ use std::{
 
 use bincode::{Decode, Encode};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use zendb_storage::core::backend::{Backend, FileBackedBackend};
+use zendb_storage::core::traits::{Backend, DurableStorage};
 use zendb_storage::frontend::state::{State, StateConfig};
 
 pub trait StateKey: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static {}

@@ -7,7 +7,7 @@ use zendb_types::{Cell, Event, PrimaryKey};
 
 use crate::core::{
     skiplist::{SkipList, SkipListCapacity, SkipListConfig, SkipListStats},
-    topic::{Topic, TopicConfig, TopicConsumer, TopicOffset, TopicStats},
+    topic::{Topic, TopicConfig, TopicConsumer, TopicStats},
     traits::{Backend, DurableStorage, OrderedBackend, Storage},
 };
 use crate::frontend::state::{State, StateConfig, StateStats};
@@ -60,7 +60,6 @@ pub struct Table {
     novel_pending: usize,
     topic: Topic<Change>,
     recovery: TopicConsumer<Change>,
-    pending_offset: Option<TopicOffset>,
 }
 
 fn cache_cell(entry: Cow<'_, (Cell, bool)>) -> Cow<'_, Cell> {
@@ -94,7 +93,7 @@ impl Table {
             current,
         };
         let offset = self.topic.append(&change)?;
-        self.pending_offset = Some(offset);
+        self.recovery.seek(offset + 1);
         Ok(())
     }
 
@@ -174,9 +173,7 @@ impl Table {
         }
         self.cache.clear()?;
         self.novel_pending = 0;
-        if let Some(offset) = self.pending_offset.take() {
-            self.recovery.commit_offset(offset)?;
-        }
+        self.recovery.commit()?;
         Ok(())
     }
 }
@@ -218,7 +215,6 @@ impl DurableStorage for Table {
             novel_pending: 0,
             topic,
             recovery,
-            pending_offset: None,
         })
     }
 
@@ -240,7 +236,6 @@ impl DurableStorage for Table {
             novel_pending: 0,
             topic,
             recovery,
-            pending_offset: None,
         };
         table.replay_recovery()?;
         Ok(table)

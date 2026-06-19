@@ -406,14 +406,11 @@ impl<T> TopicConsumer<T> {
         Ok(())
     }
 
-    /// Mark records through `offset` as consumed and persist that cursor.
-    pub fn commit_offset(&mut self, offset: TopicOffset) -> io::Result<()> {
-        let next = offset
-            .checked_add(1)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "topic offset overflow"))?;
-        self.consumer.volatile.store(next, Ordering::Release);
+    /// Move the volatile cursor to `offset`. The next read will start at
+    /// that offset. Call [`commit`](Self::commit) to persist.
+    pub fn seek(&mut self, offset: TopicOffset) {
+        self.consumer.volatile.store(offset, Ordering::Release);
         self.current = None;
-        self.commit()
     }
 
     /// Rewind this consumer to its last committed cursor.
@@ -772,14 +769,15 @@ mod tests {
     }
 
     #[test]
-    fn commit_offset_marks_records_through_offset_consumed() {
-        let path = tmp("commit_offset");
+    fn seek_marks_records_through_offset_consumed() {
+        let path = tmp("seek");
         let mut topic = Topic::<u64>::create(&path, TopicConfig::default()).unwrap();
         let first = topic.append(&1).unwrap();
         topic.append(&2).unwrap();
 
         let mut consumer = topic.consumer("c").unwrap();
-        consumer.commit_offset(first).unwrap();
+        consumer.seek(first + 1);
+        consumer.commit().unwrap();
         drop(consumer);
 
         let mut consumer = topic.consumer("c").unwrap();

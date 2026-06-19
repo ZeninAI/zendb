@@ -271,7 +271,7 @@ pub struct BPlusTreeConfig {
     pub compaction_ratio: f64,
 }
 
-const DEFAULT_INITIAL_CAPACITY_PAGES: u64 = 64;
+const DEFAULT_INITIAL_CAPACITY_PAGES: u64 = 4096;
 
 impl Default for BPlusTreeConfig {
     fn default() -> Self {

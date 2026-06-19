@@ -88,7 +88,7 @@ use memmap2::MmapMut;
 use crate::core::traits::{DurableStorage, Storage};
 use crate::utils::serdes::{deserialize_from, rd_u32, read_u32_le, with_two_scratches};
 
-const DEFAULT_INITIAL_CAPACITY: u64 = 1024 * 1024;
+const DEFAULT_INITIAL_CAPACITY: u64 = 16 * 1024 * 1024;
 const DEFAULT_COMPACTION_RATIO: f64 = 0.5;
 /// Magic number identifying a KeyDir file. Stored at offset 0 as `u32` LE.
 /// ASCII: `"KIRD"`.

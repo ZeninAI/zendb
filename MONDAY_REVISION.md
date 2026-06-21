@@ -1,5 +1,17 @@
 # Monday Revision
 
+Note: the current engine API uses `operator` terminology, not `computation`.
+Operators receive `Weak<Database>` in `open/process/finish`, and database
+resources use fluent get-or-create calls:
+
+- `database.table(name, Option<TableConfig>)`
+- `database.state::<K, V>(name, Option<StateConfig>)`
+- `database.register_operator(name, config)`
+
+State ownership is no longer tracked by the database catalog. An operator that
+creates temporary states is responsible for dropping them explicitly in
+`finish()`.
+
 This document describes the current ZendDB engine model after the table/topic,
 computation runtime, and typed computation-state changes.
 
@@ -74,14 +86,19 @@ The database is the lifecycle owner of:
 
 - Catalog
 - Tables
-- Shared computation states
-- Local computation states
+- States
 - Computation workers
 
 Public table handles are direct concurrent handles:
 
 ```rust
 pub type Table = Arc<RwLock<RawTable>>;
+```
+
+State handles follow the same shape:
+
+```rust
+pub type State<K, V> = Arc<RwLock<RawState<K, V>>>;
 ```
 
 The database does not wrap table operations in a proxy API. Application code
@@ -101,14 +118,14 @@ The catalog stores durable resource metadata:
 
 - `Table(TableConfig)`
 - `Computation(ComputationConfig)`
-- `SharedState { owner, implementation, config }`
+- `State { owner: Option<String>, config: StateConfig }`
 
-Tables and shared states are reopened from the catalog when the database opens.
-Computations in the catalog are also restarted on database open.
+Tables are reopened from the catalog when the database opens. State catalog
+entries store backend configuration plus optional computation ownership; the
+typed state handle is opened lazily when application or computation code asks
+for it. Computations in the catalog are also restarted on database open.
 
-Local computation states are not catalog entries by themselves. They are owned
-through the computation configuration and opened from the computation state
-directory when the computation is opened.
+The database stores tables under `tables/` and states under `states/`.
 
 ## Computation Model
 
@@ -127,6 +144,8 @@ When a computation is created or reopened:
 2. The computation instance is created from the registry.
 3. A topic reader is created for every subscribed table.
 4. A `ComputationWorker` is spawned on the application-provided executor.
+5. The worker calls `Computation::open` with a context so the computation can
+   obtain tables and create/open states.
 
 The worker loop is poll based:
 
@@ -135,7 +154,11 @@ The worker loop is poll based:
 3. Pass the batch to `Computation::process`.
 4. If processing succeeds with `Continue`, commit topic offsets.
 5. If processing fails, reset readers to committed offsets.
-6. If processing returns `Finish`, drop the computation and its owned states.
+6. If processing returns `Finish`, call `Computation::finish`, then drop the
+   computation registration and topic consumers.
+7. If the database externally drops a computation, the worker is signaled to
+   stop, runs `finish`, cleans up its consumers and owned states, and only then
+   does `drop_computation` return.
 
 The database does not require Tokio. The application supplies the executor:
 
@@ -148,72 +171,73 @@ pub trait Executor: Send + Sync + 'static {
 
 This keeps runtime selection application-specific.
 
-## Computation State Model
+## State Model
 
-Computation states are now typed. They are not forced through
+States are typed. They are not forced through
 `State<Vec<u8>, Vec<u8>>`.
 
-The storage layer still provides:
+The storage layer still provides the raw backend:
 
 ```rust
-State<K, V>
+RawState<K, V>
 ```
 
-The engine stores heterogeneous typed states internally using erased state
-handles, and computations recover the real type by requesting:
+The engine exposes guarded state handles, matching the table handle pattern:
 
 ```rust
-context.local_state::<K, V>("name")?;
-context.shared_state::<K, V>("name")?;
+pub type State<K, V> = Arc<RwLock<RawState<K, V>>>;
 ```
 
-The state type is selected by a stable state implementation name registered in
-`ComputationRegistry`:
+State types and state names are no longer registered in
+`ComputationRegistry`, and `ComputationConfig` no longer declares states.
+Instead, computations create/open resources in `open()` and store the returned
+guarded handles:
 
 ```rust
-registry.register_state::<String, u64>("string-u64");
-```
+struct Totals {
+    totals: Option<State<String, u64>>,
+    output: Option<Table>,
+}
 
-The computation configuration refers to that implementation:
+impl Computation for Totals {
+    fn open<'a>(&'a mut self, context: ComputationContext) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            self.totals = Some(context.state("totals", StateConfig::default())?);
+            self.output = Some(context.table("summary")?);
+            Ok(())
+        })
+    }
 
-```rust
-StateDefinition {
-    name: "totals".into(),
-    visibility: StateVisibility::Shared,
-    implementation: "string-u64".into(),
-    config: StateConfig::default(),
+    fn process<'a>(
+        &'a mut self,
+        changes: Vec<Change>,
+        context: ComputationContext,
+    ) -> BoxFuture<'a, io::Result<ComputationStatus>> {
+        Box::pin(async move {
+            let totals = self.totals.as_ref().unwrap();
+            totals.write().put("users".into(), changes.len() as u64)?;
+            let output = self.output.as_ref().unwrap();
+            let _guard = output.write();
+            Ok(ComputationStatus::Continue)
+        })
+    }
 }
 ```
 
-At runtime, the state is accessed as:
+The same `ComputationContext` API shape is available to `open`, `process`, and
+`finish`, so a computation can either reuse stored handles or perform late
+lookups when that is appropriate.
 
-```rust
-let totals = context.shared_state::<String, u64>("totals")?;
-totals.put("users".into(), 42)?;
-```
-
-`StateRef<K, V>` exposes:
-
-- `read()` for direct read-guard access to `State<K, V>`
-- `write()` for direct write-guard access to `State<K, V>`
-- `get`
-- `put`
-- `delete`
+When a computation creates a state through the context, the catalog records
+that computation as the state owner. `drop_computation` removes the computation
+registration synchronously and drops any states owned by that computation.
 
 Wrong typed lookup fails with a type mismatch error instead of returning an
-incorrect state.
-
-## State Visibility
-
-There are two computation-state visibility modes:
-
-- **Local**: owned by one computation and stored under that computation.
-- **Shared**: cataloged database resource, owned by the creating computation,
-  and accessible by name.
-
-When a computation is dropped or finishes, its declared local and shared states
-are removed from the database registries and marked inactive. Physical deletion
-is delayed until outstanding state handles are dropped.
+incorrect state when a state is already open in the current process as another
+`K, V`. After a database restart, there is no persisted Rust type identity or
+schema registry; the first typed lookup opens the durable bytes as the caller's
+requested `K, V`, so application code is responsible for using a compatible
+type for existing data.
 
 ## Concurrency Model
 
@@ -221,7 +245,7 @@ The current concurrency model is deliberately explicit:
 
 - Storage backends are single-threaded values.
 - Tables are shared through `Arc<RwLock<RawTable>>`.
-- Computation states are shared through typed state refs backed by `RwLock`.
+- States are shared through `Arc<RwLock<RawState<K, V>>>`.
 - Topic writing is single-writer.
 - Topic reading supports multiple readers.
 - The computation worker owns its topic readers.
@@ -270,6 +294,6 @@ infinite computation loops.
 
 ## Compatibility Note
 
-The catalog now stores state implementation names for shared states. Databases
-created with the older computation-state catalog shape are not compatible
-without a migration.
+The catalog now stores `State { owner, config }` entries and tables live under
+the `tables/` directory. Databases created with previous table/state catalog or
+path shapes are not compatible without a migration.

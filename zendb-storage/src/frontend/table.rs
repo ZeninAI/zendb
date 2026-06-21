@@ -205,7 +205,7 @@ impl DurableStorage for Table {
                 max_entries: config.max_buffered_records,
             },
         });
-        let topic = Topic::create(&path.join("topic"), config.topic.clone())?;
+        let topic = Topic::create(path, config.topic.clone())?;
         let recovery = topic.consumer(TABLE_RECOVERY_CONSUMER)?;
 
         Ok(Self {
@@ -226,7 +226,7 @@ impl DurableStorage for Table {
                 max_entries: config.max_buffered_records,
             },
         });
-        let topic = Topic::open(&path.join("topic"), config.topic.clone())?;
+        let topic = Topic::open(path, config.topic.clone())?;
         let recovery = topic.consumer(TABLE_RECOVERY_CONSUMER)?;
 
         let mut table = Self {

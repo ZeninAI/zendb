@@ -58,7 +58,7 @@ use bincode::{Decode, Encode};
 
 pub trait Storage {
     type Stats: Clone + Encode + Decode<()> + Debug;
-    type Config: Clone + Default + Encode + Decode<()> + Debug;
+    type Config: Clone + Default + Encode + Decode<()> + Debug + PartialEq;
 
     fn stats(&self) -> Self::Stats;
     fn config(&self) -> Self::Config;
@@ -84,8 +84,8 @@ pub trait DurableStorage: Storage {
 /// The common key/value contract every KV backend satisfies.
 pub trait Backend<K, V>: Storage
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     // ---- reads --------------------------------------------------------
 
@@ -299,8 +299,8 @@ where
 /// not an additional key constraint.
 pub trait OrderedBackend<K, V>: Backend<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     /// Iterate entries with keys in `[start, end)`, ascending.
     fn range<'a>(

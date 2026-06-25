@@ -166,4 +166,3 @@ pub(super) async fn run_scheduler(
         let _ = notify.1.wait_for(&mut guard, sleep_for);
     }
 }
-

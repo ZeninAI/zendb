@@ -19,7 +19,7 @@ pub enum SkipListCapacity {
     Bounded { max_entries: usize },
 }
 
-#[derive(Debug, Clone, Default, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
 pub struct SkipListConfig {
     pub capacity: SkipListCapacity,
 }
@@ -195,8 +195,8 @@ impl<K: Ord, V> SkipList<K, V> {
 
 impl<K, V> Storage for SkipList<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     type Stats = SkipListStats;
     type Config = SkipListConfig;
@@ -212,8 +212,8 @@ where
 
 impl<K, V> Backend<K, V> for SkipList<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     fn get(&self, key: &K) -> Option<Cow<'_, V>> {
         self.search(key).1.map(|index| {
@@ -384,8 +384,8 @@ where
 
 impl<K, V> OrderedBackend<K, V> for SkipList<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     fn range<'a>(
         &'a self,

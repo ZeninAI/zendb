@@ -102,7 +102,7 @@ const TOMBSTONE: u32 = u32::MAX;
 /// representation is 0 bytes (e.g. the unit type) round-trips correctly.
 const SENTINEL: u32 = u32::MAX - 1;
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct KeyDirConfig {
     pub initial_capacity: u64,
     /// Auto-compaction threshold. Callers must pass a value in `[0.0, 1.0]`:
@@ -264,8 +264,8 @@ pub struct KeyDir<K, V> {
 
 impl<K, V> KeyDir<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     // -----------------------------------------------------------------------
     // Private helpers — everything below this point is implementation
@@ -377,8 +377,8 @@ impl<K, V> fmt::Debug for KeyDir<K, V> {
 
 impl<K, V> Storage for KeyDir<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     type Stats = KeyDirStats;
     type Config = KeyDirConfig;
@@ -394,8 +394,8 @@ where
 
 impl<K, V> DurableStorage for KeyDir<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     fn create(path: &Path, config: Self::Config) -> io::Result<Self> {
         let file = OpenOptions::new()
@@ -496,8 +496,8 @@ where
 
 impl<K, V> crate::core::traits::Backend<K, V> for KeyDir<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     /// One HashMap lookup, then materialize the value by decoding the
     /// mmap slice the meta points at. Returns `Cow::Owned` since the
@@ -757,8 +757,8 @@ mod tests {
     /// and immediately materialize to an owned value for easy compare.
     fn get<K, V>(kd: &KeyDir<K, V>, key: &K) -> Option<V>
     where
-        K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-        V: Encode + Decode<()> + Clone,
+        K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+        V: Encode + Decode<()> + Clone + Send + Sync + 'static,
     {
         Backend::get(kd, key).map(Cow::into_owned)
     }

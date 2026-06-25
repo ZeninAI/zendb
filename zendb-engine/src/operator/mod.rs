@@ -11,7 +11,7 @@ use bincode::{Decode, Encode};
 
 pub use context::OperatorContext;
 pub use registry::OperatorRegistry;
-pub use state::{State, StateKey, StateValue};
+pub use state::State;
 pub use zendb_types::Change;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

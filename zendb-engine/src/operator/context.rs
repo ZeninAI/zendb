@@ -4,7 +4,7 @@ use std::{io, sync::Arc, sync::Weak};
 
 use bincode::{Decode, Encode};
 
-use crate::{StateHandle, StateKey, StateValue, TableHandle, OperatorConfig};
+use crate::{StateHandle, TableHandle, OperatorConfig};
 use zendb_storage::frontend::{state::StateConfig, table::TableConfig};
 
 /// Context passed to every [`super::Operator`] lifecycle method.
@@ -46,11 +46,15 @@ impl OperatorContext {
     }
 
     /// Get or create a typed state handle.
-    pub fn state<K: StateKey, V: StateValue>(
+    pub fn state<K, V>(
         &self,
         name: &str,
         config: Option<StateConfig>,
-    ) -> io::Result<StateHandle<K, V>> {
+    ) -> io::Result<StateHandle<K, V>>
+    where
+        K: Encode + Decode<()> + std::hash::Hash + Eq + Clone + Ord + Send + Sync + 'static,
+        V: Encode + Decode<()> + Clone + Send + Sync + 'static,
+    {
         self.require_db()?.state(name, config)
     }
 

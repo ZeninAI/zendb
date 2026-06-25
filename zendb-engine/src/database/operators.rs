@@ -12,30 +12,62 @@ use crate::operator::{
 use super::{already_exists, not_found, CatalogEntry, Database};
 
 impl Database {
-    /// Register a new operator: check catalog uniqueness, build the worker, persist
-    /// to catalog (rolling back worker inputs on failure), then spawn the run loop.
+    /// Register a new operator: persist to catalog, build the worker, and spawn
+    /// the run loop.
     pub fn register_operator(
         self: &Arc<Self>,
         name: &str,
         config: OperatorConfig,
     ) -> io::Result<()> {
-        let _lifecycle = self.lifecycle.lock();
-        if self.catalog.lock().contains(&name.to_owned()) {
-            return Err(already_exists("catalog resource", name));
-        }
+        let worker = {
+            let _lifecycle = self.lifecycle.lock();
+            if self.catalog.lock().contains(&name.to_owned()) {
+                return Err(already_exists("catalog resource", name));
+            }
 
-        let worker = self.build_worker(name.to_owned(), config.clone())?;
-        if let Err(error) = self
-            .catalog
-            .lock()
-            .put(name.to_owned(), CatalogEntry::Operator(config))
-        {
-            worker.delete_inputs();
-            return Err(error);
-        }
-        self.operators
-            .write()
-            .insert(name.to_owned(), Arc::clone(&worker));
+            let worker = self.build_worker(name.to_owned(), config.clone())?;
+            if let Err(error) = self
+                .catalog
+                .lock()
+                .put(name.to_owned(), CatalogEntry::Operator(config))
+            {
+                worker.delete_inputs();
+                return Err(error);
+            }
+            self.operators
+                .write()
+                .insert(name.to_owned(), Arc::clone(&worker));
+            worker
+        };
+        OperatorWorker::spawn(self, worker);
+        Ok(())
+    }
+
+    /// Start an operator that exists in the catalog but is not currently running.
+    /// Only creates consumers for tables that are already open; remaining tables
+    /// will attach when they are opened later.
+    pub fn open_operator(self: &Arc<Self>, name: &str) -> io::Result<()> {
+        let worker = {
+            let _lifecycle = self.lifecycle.lock();
+            if self.operators.read().contains_key(name) {
+                return Err(already_exists("operator", name));
+            }
+            let config = {
+                let catalog = self.catalog.lock();
+                match catalog.get(&name.to_owned()) {
+                    Some(entry) => match entry.as_ref() {
+                        CatalogEntry::Operator(config) => config.clone(),
+                        _ => return Err(already_exists("catalog resource", name)),
+                    },
+                    None => return Err(not_found("operator", name)),
+                }
+            };
+            let worker = self.build_worker(name.to_owned(), config)?;
+            self.operators
+                .write()
+                .insert(name.to_owned(), Arc::clone(&worker));
+            worker
+        };
         OperatorWorker::spawn(self, worker);
         Ok(())
     }
@@ -52,19 +84,14 @@ impl Database {
         Ok(())
     }
 
-    /// Validate subscriptions, instantiate the operator via the registry, and
-    /// acquire one topic consumer per matched table. Rolls back consumers on error.
+    /// Instantiate the operator via the registry and acquire one topic consumer
+    /// per currently-open table that matches the subscription. Does NOT validate
+    /// that all subscribed tables exist — in the lazy model, tables may open later.
     pub(super) fn build_worker(
         self: &Arc<Self>,
         name: String,
         config: OperatorConfig,
     ) -> io::Result<Arc<OperatorWorker>> {
-        for subscription in &config.subscriptions {
-            if !subscription.is_wildcard() && !self.tables.read().contains_key(&subscription.0) {
-                return Err(not_found("subscribed table", &subscription.0));
-            }
-        }
-
         let instance = self
             .registry
             .create_operator(&config.implementation, &config.configuration)?;
@@ -116,5 +143,28 @@ impl Database {
         }
 
         Ok(worker)
+    }
+
+    /// Remove an operator from the in-memory map and mark it evicted, preserving
+    /// its catalog entry. Caller must hold the lifecycle lock.
+    pub(crate) fn evict_operator_locked(&self, name: &str) -> Option<Arc<OperatorWorker>> {
+        let worker = self.operators.write().remove(name)?;
+        worker.mark_evicted();
+        worker.stop();
+        worker.delete_inputs();
+        self.sweep_operator_timers(name);
+        Some(worker)
+    }
+
+    /// Evict the operator from memory while keeping its catalog entry intact.
+    /// Blocks until the run loop exits.
+    pub fn close_operator(self: &Arc<Self>, name: &str) -> io::Result<()> {
+        let worker = {
+            let _lifecycle = self.lifecycle.lock();
+            self.evict_operator_locked(name)
+                .ok_or_else(|| not_found("operator", name))?
+        };
+        worker.wait_finished();
+        Ok(())
     }
 }

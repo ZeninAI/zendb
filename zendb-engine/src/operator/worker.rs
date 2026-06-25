@@ -28,6 +28,7 @@ pub(crate) struct OperatorWorker {
     operator: Mutex<Option<Box<dyn ErasedOperator>>>,
     pub(crate) timer_inbox: Mutex<VecDeque<Vec<u8>>>,
     stopped: AtomicBool,
+    evicted: AtomicBool,
     finished: Mutex<bool>,
     finished_signal: Condvar,
 }
@@ -46,6 +47,7 @@ impl OperatorWorker {
             operator: Mutex::new(Some(operator)),
             timer_inbox: Mutex::new(VecDeque::new()),
             stopped: AtomicBool::new(false),
+            evicted: AtomicBool::new(false),
             finished: Mutex::new(false),
             finished_signal: Condvar::new(),
         })
@@ -53,6 +55,16 @@ impl OperatorWorker {
 
     pub(crate) fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
+    }
+
+    /// Mark this worker as evicted from the in-memory operator map.
+    /// When set, `retire()` becomes a no-op so the catalog entry is preserved.
+    pub(crate) fn mark_evicted(&self) {
+        self.evicted.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_evicted(&self) -> bool {
+        self.evicted.load(Ordering::Acquire)
     }
 
     /// Delete all subscribed topic consumers and clear the inputs list on retirement.
@@ -82,11 +94,15 @@ impl OperatorWorker {
 
     /// Deregister this operator from the database under the lifecycle lock.
     /// Called by the run loop when the operator finishes or exhausts retries.
-    fn retire(database: &Weak<Database>, name: &str) {
+    /// No-op if the worker was already evicted via `close_operator`.
+    fn retire(database: &Weak<Database>, worker: &Arc<Self>) {
+        if worker.is_evicted() {
+            return;
+        }
         if let Some(database) = database.upgrade() {
             let _lifecycle = database.lifecycle.lock();
-            if let Err(error) = database.deregister_operator(name) {
-                log::error!("failed to retire operator {name:?}: {error}");
+            if let Err(error) = database.deregister_operator(&worker.name) {
+                log::error!("failed to retire operator {:?}: {error}", worker.name);
             }
         }
     }
@@ -117,7 +133,7 @@ impl OperatorWorker {
 
         if let Err(error) = operator.open(make_ctx()).await {
             log::error!("failed opening operator {:?}: {error}", worker.name);
-            Self::retire(&database, &worker.name);
+            Self::retire(&database, &worker);
             worker.mark_finished();
             return;
         }
@@ -163,7 +179,7 @@ impl OperatorWorker {
                     if let Err(error) = operator.finish(make_ctx()).await {
                         log::error!("failed finishing operator {:?}: {error}", worker.name);
                     }
-                    Self::retire(&database, &worker.name);
+                    Self::retire(&database, &worker);
                     worker.mark_finished();
                     return;
                 }
@@ -186,7 +202,7 @@ impl OperatorWorker {
                                 worker.name
                             );
                         }
-                        Self::retire(&database, &worker.name);
+                        Self::retire(&database, &worker);
                         worker.mark_finished();
                         return;
                     }
@@ -204,7 +220,7 @@ impl OperatorWorker {
         if let Err(error) = operator.finish(make_ctx()).await {
             log::error!("failed finishing operator {:?}: {error}", worker.name);
         }
-        Self::retire(&database, &worker.name);
+        Self::retire(&database, &worker);
         worker.mark_finished();
     }
 

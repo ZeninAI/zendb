@@ -12,7 +12,7 @@ use crate::core::{
 };
 
 /// Configures the materialized-state backend.
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum StateConfig {
     Ordered(BPlusTreeConfig),
     Unordered(KeyDirConfig),
@@ -52,8 +52,8 @@ pub enum State<K: Ord, V> {
 
 impl<K, V> Storage for State<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     type Stats = StateStats;
     type Config = StateConfig;
@@ -77,8 +77,8 @@ where
 
 impl<K, V> DurableStorage for State<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     fn create(path: &Path, config: Self::Config) -> io::Result<Self> {
         match config {
@@ -141,8 +141,8 @@ where
 
 impl<K, V> Backend<K, V> for State<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     fn get(&self, key: &K) -> Option<Cow<'_, V>> {
         match self {
@@ -316,8 +316,8 @@ where
 
 impl<K, V> OrderedBackend<K, V> for State<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     fn range<'a>(
         &'a self,

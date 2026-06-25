@@ -261,7 +261,7 @@ fn compact_temp_path() -> PathBuf {
 // Public configuration / stats / state types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct BPlusTreeConfig {
     /// Pre-allocated page count. File never shrinks below this after
     /// creation or compaction (minimum 2: meta page + root leaf).
@@ -443,8 +443,8 @@ impl<'a, K, V> Iterator for RawBTreeEntries<'a, K, V> {
 
 impl<'a, K, V> BottomUpBuilder<'a, K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     fn new(tree: &'a mut BPlusTree<K, V>) -> Self {
         debug_assert!(
@@ -605,8 +605,8 @@ impl<K, V> BPlusTree<K, V> {
 
 impl<K, V> BPlusTree<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     /// Current estimated reclaimable-page ratio. Public so callers can
     /// observe fragmentation without grabbing internal counters.
@@ -2059,8 +2059,8 @@ where
 
 impl<K, V> Storage for BPlusTree<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     type Stats = BPlusTreeStats;
     type Config = BPlusTreeConfig;
@@ -2076,8 +2076,8 @@ where
 
 impl<K, V> DurableStorage for BPlusTree<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     fn create(path: &Path, config: Self::Config) -> io::Result<Self> {
         let file = OpenOptions::new()
@@ -2200,8 +2200,8 @@ where
 
 impl<K, V> Backend<K, V> for BPlusTree<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     fn get(&self, key: &K) -> Option<Cow<'_, V>> {
         with_scratch(key, |kb| {
@@ -2475,8 +2475,8 @@ where
 
 impl<K, V> OrderedBackend<K, V> for BPlusTree<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     fn range<'a>(
         &'a self,
@@ -2655,8 +2655,8 @@ where
 
 impl<K, V> BPlusTree<K, V>
 where
-    K: Encode + Decode<()> + Hash + Eq + Clone + Ord,
-    V: Encode + Decode<()> + Clone,
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
     /// Walk the leaf chain, free every internal page, then rebuild the
     /// internal levels from the surviving leaves. Used by

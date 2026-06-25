@@ -16,7 +16,7 @@ use hashbrown::HashMap;
 use parking_lot::{Condvar, Mutex, RwLock};
 use zendb_storage::core::{
     keydir::{KeyDir, KeyDirConfig},
-    traits::{Backend, DurableStorage},
+    traits::DurableStorage,
 };
 use zendb_storage::frontend::{
     state::{State, StateConfig},
@@ -24,7 +24,7 @@ use zendb_storage::frontend::{
 };
 
 use crate::{
-    operator::{worker::OperatorWorker, OperatorRegistry, StateKey, StateValue},
+    operator::{worker::OperatorWorker, OperatorRegistry},
     runtime::Executor,
     OperatorConfig, TableConfig,
 };
@@ -94,21 +94,21 @@ impl TableHandle {
 /// A durable, weak reference to a typed database state, mirroring
 /// [`TableHandle`]. The database owns the state; the handle never keeps it (or
 /// the database) alive.
-pub struct StateHandle<K: StateKey, V: StateValue> {
+#[derive(Clone)]
+pub struct StateHandle<K, V>
+where
+    K: Encode + Decode<()> + std::hash::Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
+{
     name: Arc<str>,
     inner: Weak<RwLock<State<K, V>>>,
 }
 
-impl<K: StateKey, V: StateValue> Clone for StateHandle<K, V> {
-    fn clone(&self) -> Self {
-        Self {
-            name: Arc::clone(&self.name),
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl<K: StateKey, V: StateValue> StateHandle<K, V> {
+impl<K, V> StateHandle<K, V>
+where
+    K: Encode + Decode<()> + std::hash::Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
+{
     pub(crate) fn new(name: &str, state: &ConcurrentState<K, V>) -> Self {
         Self {
             name: Arc::from(name),
@@ -134,6 +134,7 @@ impl<K: StateKey, V: StateValue> StateHandle<K, V> {
 /// is torn down deterministically when the last `Arc<Database>` is dropped.
 pub struct Database {
     path: PathBuf,
+    #[allow(dead_code)]
     pub(crate) config: DatabaseConfig,
     pub(crate) executor: Arc<dyn Executor>,
     registry: OperatorRegistry,
@@ -168,13 +169,10 @@ impl Database {
     ) -> io::Result<Arc<Self>> {
         let catalog = Catalog::open(&path.join(META_FILE), KeyDirConfig::default())?;
         let timers = TimerStore::open(&path.join(TIMERS_FILE), StateConfig::default())?;
-        let database = Self::from_parts(path, catalog, timers, executor, registry, config)?;
-        database.open_catalog()?;
-        Ok(database)
+        Self::from_parts(path, catalog, timers, executor, registry, config)
     }
 
-    /// Assemble a `Database` from its constituent parts, clamp config values,
-    /// and spawn the background timer scheduler.
+    /// Assemble a `Database` from its constituent parts and spawn the background timer scheduler.
     fn from_parts(
         path: &Path,
         catalog: Catalog,
@@ -204,35 +202,6 @@ impl Database {
             .spawn(Box::pin(run_scheduler(db_weak, executor, timer_notify)));
         Ok(database)
     }
-
-    /// Replay the durable catalog on open: tables are opened eagerly, states are
-    /// skipped (opened lazily on first typed access), operators are deferred until
-    /// all tables are wired so their subscription inputs can be resolved.
-    fn open_catalog(self: &Arc<Self>) -> io::Result<()> {
-        let mut operator_entries = Vec::new();
-        for (name, entry) in self.catalog.lock().entries() {
-            match entry.as_ref() {
-                CatalogEntry::Table(config) => {
-                    let table = Arc::new(RwLock::new(Table::open(
-                        &self.path.join(TABLES_DIR).join(name.as_ref()),
-                        config.clone(),
-                    )?));
-                    self.tables.write().insert(name.into_owned(), table);
-                }
-                CatalogEntry::State(_) => {} // opened lazily on first typed access
-                CatalogEntry::Operator(config) => {
-                    operator_entries.push((name.into_owned(), config.clone()));
-                }
-            }
-        }
-        for (name, config) in operator_entries {
-            let worker = self.build_worker(name.clone(), config)?;
-            self.operators.write().insert(name, Arc::clone(&worker));
-            OperatorWorker::spawn(self, worker);
-        }
-        Ok(())
-    }
-
 }
 
 fn already_exists(kind: &str, name: &str) -> io::Error {
@@ -262,6 +231,7 @@ mod tests {
     };
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+    use zendb_storage::core::traits::Backend;
     use zendb_types::{
         device_id, init_device_id, Event, Hlc, Op, Path as ValuePath, PrimaryKey, Value,
     };
@@ -301,10 +271,7 @@ mod tests {
     impl Operator for CountingOperator {
         type Config = ();
         type Timer = ();
-        fn open<'a>(
-            &'a mut self,
-            ctx: OperatorContext,
-        ) -> crate::BoxFuture<'a, io::Result<()>> {
+        fn open<'a>(&'a mut self, ctx: OperatorContext) -> crate::BoxFuture<'a, io::Result<()>> {
             Box::pin(async move {
                 self.buffer = Some(ctx.state("counter/buffer", Some(StateConfig::default()))?);
                 self.index = Some(ctx.state("index", Some(StateConfig::default()))?);
@@ -342,10 +309,7 @@ mod tests {
             })
         }
 
-        fn finish<'a>(
-            &'a mut self,
-            ctx: OperatorContext,
-        ) -> crate::BoxFuture<'a, io::Result<()>> {
+        fn finish<'a>(&'a mut self, ctx: OperatorContext) -> crate::BoxFuture<'a, io::Result<()>> {
             Box::pin(async move {
                 self.buffer = None;
                 self.index = None;
@@ -409,10 +373,7 @@ mod tests {
         type Config = ();
         type Timer = ();
 
-        fn open<'a>(
-            &'a mut self,
-            ctx: OperatorContext,
-        ) -> crate::BoxFuture<'a, io::Result<()>> {
+        fn open<'a>(&'a mut self, ctx: OperatorContext) -> crate::BoxFuture<'a, io::Result<()>> {
             Box::pin(async move {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -525,28 +486,28 @@ mod tests {
     }
 
     #[test]
-    fn open_eagerly_opens_tables_and_starts_operators() {
+    fn lazy_open_tables_and_operators() {
         let path = tmp("reopen");
-        {
-            let db = Database::create(
-                &path,
-                Arc::new(ThreadExecutor),
-                registry(Arc::new(AtomicUsize::new(0)), false),
-                DatabaseConfig::default(),
-            )
-            .unwrap();
-            db.table("users", Some(TableConfig::default())).unwrap();
-            db.register_operator("counter", config()).unwrap();
-        }
-
         let count = Arc::new(AtomicUsize::new(0));
-        let db = Database::open(
+        let db = Database::create(
             &path,
             Arc::new(ThreadExecutor),
             registry(Arc::clone(&count), false),
             DatabaseConfig::default(),
         )
         .unwrap();
+        db.table("users", Some(TableConfig::default())).unwrap();
+        db.register_operator("counter", config()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        // Close operator and table so we can re-open lazily in same DB
+        db.close_operator("counter").unwrap();
+        db.close_table("users").unwrap();
+        // Nothing in memory now
+        assert!(!db.tables.read().contains_key("users"));
+        assert!(!db.operators.read().contains_key("counter"));
+        // Opening the table automatically starts the matching catalog operator
+        db.table("users", None).unwrap();
+        assert!(db.operators.read().contains_key("counter"));
         db.table("users", None)
             .unwrap()
             .get()

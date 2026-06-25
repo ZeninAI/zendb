@@ -7,47 +7,138 @@ use zendb_storage::core::traits::{Backend, DurableStorage};
 use zendb_storage::frontend::table::{Table, TableConfig};
 
 use crate::operator::worker::{OperatorInput, OperatorWorker};
+use crate::OperatorConfig;
 
-use super::{not_found, CatalogEntry, ConcurrentTable, Database, TableHandle, TABLES_DIR};
+use super::{
+    already_exists, not_found, CatalogEntry, ConcurrentTable, Database, TableHandle, TABLES_DIR,
+};
 
 impl Database {
-    /// Open an existing table or create it with `config`. The lifecycle lock is
-    /// taken only on the creation path; reads against an already-open table are
-    /// lock-free because the tables map is exhaustive after `open()`.
+    /// Return an open table, opening it lazily from the catalog or creating it
+    /// with `config`. If the table is in the catalog and a different `config` is
+    /// supplied, the catalog is updated before opening. Automatically starts
+    /// catalog operators that subscribe to this table.
     pub fn table(
         self: &Arc<Self>,
         name: &str,
         config: Option<TableConfig>,
     ) -> io::Result<TableHandle> {
-        let _lifecycle = config.is_some().then(|| self.lifecycle.lock());
-
+        // Fast path: already open
         if let Some(table) = self.tables.read().get(name).cloned() {
             return Ok(TableHandle::new(name, &table));
         }
 
-        // The tables map is exhaustive: `open()` eagerly loads every catalog
-        // table, so a name missing here means the table does not exist yet.
-        let Some(config) = config else {
-            return Err(not_found("table", name));
+        // Slow path: open/create under lifecycle lock, then spawn operators outside it.
+        let (table, workers_to_spawn) = {
+            let _lifecycle = self.lifecycle.lock();
+            // Double-check under lifecycle lock
+            if let Some(table) = self.tables.read().get(name).cloned() {
+                return Ok(TableHandle::new(name, &table));
+            }
+
+            let mut catalog = self.catalog.lock();
+            let (table, matching_operators) = match catalog.get(&name.to_owned()) {
+                Some(entry) => match entry.as_ref() {
+                    CatalogEntry::Table(saved_config) => {
+                        let effective_config = match &config {
+                            Some(new_config) if new_config != saved_config => {
+                                catalog.put(
+                                    name.to_owned(),
+                                    CatalogEntry::Table(new_config.clone()),
+                                )?;
+                                new_config.clone()
+                            }
+                            _ => saved_config.clone(),
+                        };
+                        let path = self.path.join(TABLES_DIR).join(name);
+                        let table = Arc::new(RwLock::new(Table::open(&path, effective_config)?));
+                        let ops = Self::collect_matching_operators(&catalog, name);
+                        (table, ops)
+                    }
+                    _ => return Err(already_exists("catalog resource", name)),
+                },
+                None => {
+                    let Some(config) = config else {
+                        return Err(not_found("table", name));
+                    };
+                    let path = self.path.join(TABLES_DIR).join(name);
+                    let raw = Table::create(&path, config.clone())?;
+                    catalog.put(name.to_owned(), CatalogEntry::Table(config))?;
+                    let table = Arc::new(RwLock::new(raw));
+                    let ops = Self::collect_matching_operators(&catalog, name);
+                    (table, ops)
+                }
+            };
+            drop(catalog);
+
+            // Insert table BEFORE building workers so build_worker can find it.
+            self.tables
+                .write()
+                .insert(name.to_owned(), Arc::clone(&table));
+            let workers = self.activate_table_subscribers(name, &table, matching_operators)?;
+            (table, workers)
         };
-        let mut catalog = self.catalog.lock();
-        let path = self.path.join(TABLES_DIR).join(name);
-        let raw = Table::create(&path, config.clone())?;
-        let table = Arc::new(RwLock::new(raw));
-        catalog.put(name.to_owned(), CatalogEntry::Table(config))?;
-        self.attach_table_to_all_subscribers(name, &table)?;
-        self.tables
-            .write()
-            .insert(name.to_owned(), Arc::clone(&table));
+        // lifecycle lock released — safe to spawn (workers may call retire() immediately)
+
+        for worker in workers_to_spawn {
+            OperatorWorker::spawn(self, worker);
+        }
         Ok(TableHandle::new(name, &table))
     }
 
-    /// Detach the table from all workers and collect orphaned operators (those
-    /// whose only inputs were on this table). Split from `finish_drop_table` so
-    /// callers can wait for orphan workers to stop outside the lifecycle lock.
+    /// Scan the catalog for operator entries whose subscriptions match `table_name`.
+    fn collect_matching_operators(
+        catalog: &super::Catalog,
+        table_name: &str,
+    ) -> Vec<(String, OperatorConfig)> {
+        let mut result = Vec::new();
+        for (op_name, entry) in catalog.entries() {
+            if let CatalogEntry::Operator(config) = entry.as_ref() {
+                if config.subscriptions.iter().any(|s| s.matches(table_name)) {
+                    result.push((op_name.into_owned(), config.clone()));
+                }
+            }
+        }
+        result
+    }
+
+    /// Wire a newly opened table into matching operators. For operators already
+    /// running, creates a consumer and attaches. For catalog-only operators,
+    /// builds them (but does NOT spawn — caller spawns after releasing the
+    /// lifecycle lock to avoid deadlock with `retire()`).
+    fn activate_table_subscribers(
+        self: &Arc<Self>,
+        name: &str,
+        table: &ConcurrentTable,
+        matching_operators: Vec<(String, OperatorConfig)>,
+    ) -> io::Result<Vec<Arc<OperatorWorker>>> {
+        let mut to_spawn = Vec::new();
+        for (op_name, op_config) in matching_operators {
+            let existing = self.operators.read().get(&op_name).cloned();
+            if let Some(worker) = existing {
+                // Already running — just attach this table
+                let reader = table.read().consumer(&worker.name)?;
+                worker.inputs.lock().push(OperatorInput {
+                    table_name: name.to_owned(),
+                    reader,
+                });
+            } else {
+                // Not running — build and register, defer spawn
+                let worker = self.build_worker(op_name.clone(), op_config)?;
+                self.operators.write().insert(op_name, Arc::clone(&worker));
+                to_spawn.push(worker);
+            }
+        }
+        Ok(to_spawn)
+    }
+
     fn prepare_drop_table(&self, name: &str) -> io::Result<Vec<Arc<OperatorWorker>>> {
         if !self.tables.read().contains_key(name) {
-            return Err(not_found("table", name));
+            // Table exists in catalog but has never been opened; no operators to detach
+            if !self.catalog.lock().contains(&name.to_owned()) {
+                return Err(not_found("table", name));
+            }
+            return Ok(Vec::new());
         }
 
         let workers: Vec<_> = self.operators.read().values().cloned().collect();
@@ -71,6 +162,72 @@ impl Database {
     /// from the in-memory map, catalog, and disk.
     fn finish_drop_table(&self, name: &str) -> io::Result<()> {
         let mut tables = self.tables.write();
+        if let Some(table) = tables.get(name) {
+            if Arc::strong_count(table) != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("table {name:?} still has active handles"),
+                ));
+            }
+            tables.remove(name);
+        }
+        drop(tables);
+
+        self.catalog.lock().delete(&name.to_owned())?;
+        let _ = fs::remove_dir_all(self.path.join(TABLES_DIR).join(name));
+        Ok(())
+    }
+
+    /// Two-phase drop: collect orphaned workers under the lifecycle lock, wait
+    /// for them to finish outside it, then physically remove the table.
+    pub fn drop_table(self: &Arc<Self>, name: &str) -> io::Result<()> {
+        let orphaned = {
+            let _lifecycle = self.lifecycle.lock();
+            self.prepare_drop_table(name)?
+        };
+        for worker in orphaned {
+            worker.wait_finished();
+        }
+
+        let _lifecycle = self.lifecycle.lock();
+        self.finish_drop_table(name)
+    }
+
+    /// Evict a table from memory without removing it from the catalog or disk.
+    /// Orphaned operators (those that lose all inputs) are evicted with their
+    /// catalog entries intact so they can be re-opened later. Blocks until all
+    /// evicted workers finish.
+    pub fn close_table(self: &Arc<Self>, name: &str) -> io::Result<()> {
+        let orphaned = {
+            let _lifecycle = self.lifecycle.lock();
+            if !self.tables.read().contains_key(name) {
+                if !self.catalog.lock().contains(&name.to_owned()) {
+                    return Err(not_found("table", name));
+                }
+                return Ok(()); // Table not open; nothing to evict
+            }
+
+            let workers: Vec<_> = self.operators.read().values().cloned().collect();
+            let mut evicted = Vec::new();
+            for worker in &workers {
+                let removed = self.detach_table_from_worker(name, worker);
+                if removed
+                    && !worker.config.subscriptions.iter().any(|s| s.is_wildcard())
+                    && worker.inputs.lock().is_empty()
+                {
+                    if let Some(w) = self.evict_operator_locked(&worker.name) {
+                        evicted.push(w);
+                    }
+                }
+            }
+            evicted
+        };
+        for worker in orphaned {
+            worker.wait_finished();
+        }
+
+        let _lifecycle = self.lifecycle.lock();
+        let mut tables = self.tables.write();
         let table = tables.get(name).ok_or_else(|| not_found("table", name))?;
         if Arc::strong_count(table) != 1 {
             return Err(io::Error::new(
@@ -78,36 +235,7 @@ impl Database {
                 format!("table {name:?} still has active handles"),
             ));
         }
-        let table = tables.remove(name).unwrap();
-        drop(tables);
-
-        self.catalog.lock().delete(&name.to_owned())?;
-        drop(table);
-        fs::remove_dir_all(self.path.join(TABLES_DIR).join(name))?;
-        Ok(())
-    }
-
-    /// Wire a newly created table into every operator whose subscription pattern
-    /// matches its name, creating a dedicated topic consumer for each.
-    fn attach_table_to_all_subscribers(
-        &self,
-        name: &str,
-        table: &ConcurrentTable,
-    ) -> io::Result<()> {
-        for worker in self.operators.read().values() {
-            if worker
-                .config
-                .subscriptions
-                .iter()
-                .any(|s| s.matches(name))
-            {
-                let reader = table.read().consumer(&worker.name)?;
-                worker.inputs.lock().push(OperatorInput {
-                    table_name: name.to_owned(),
-                    reader,
-                });
-            }
-        }
+        tables.remove(name);
         Ok(())
     }
 
@@ -131,20 +259,5 @@ impl Database {
         } else {
             false
         }
-    }
-
-    /// Two-phase drop: collect orphaned workers under the lifecycle lock, wait
-    /// for them to finish outside it, then physically remove the table.
-    pub fn drop_table(self: &Arc<Self>, name: &str) -> io::Result<()> {
-        let orphaned = {
-            let _lifecycle = self.lifecycle.lock();
-            self.prepare_drop_table(name)?
-        };
-        for worker in orphaned {
-            worker.wait_finished();
-        }
-
-        let _lifecycle = self.lifecycle.lock();
-        self.finish_drop_table(name)
     }
 }

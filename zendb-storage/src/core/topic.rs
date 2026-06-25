@@ -35,7 +35,7 @@ const MAGIC: u32 = 0x4349_5054;
 const HEADER_SIZE: u64 = 4;
 const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct TopicConfig {
     pub max_segment_bytes: u64,
     pub offsets: KeyDirConfig,

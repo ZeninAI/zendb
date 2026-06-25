@@ -18,7 +18,7 @@ const TABLE_RECOVERY_CONSUMER: &str = "__zendb_table_recovery";
 pub use zendb_types::Change;
 
 /// Complete configuration required to create or open a table.
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct TableConfig {
     pub sync: bool,
     pub state: StateConfig,

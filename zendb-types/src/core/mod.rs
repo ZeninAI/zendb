@@ -1,4 +1,5 @@
 pub mod cell;
+pub mod change;
 pub mod event;
 pub mod hlc;
 pub mod op;

@@ -4,10 +4,10 @@ pub mod database;
 pub mod operator;
 pub mod runtime;
 
-pub use database::{ConcurrentTable, Database, DatabaseConfig};
+pub use database::{ConcurrentState, ConcurrentTable, Database, DatabaseConfig, StateHandle, TableHandle};
 pub use operator::{
-    BoxFuture, Change, ConcurrentState, Operator, OperatorConfig, OperatorRegistry, OperatorStatus,
-    State, StateKey, StateValue, Subscription,
+    BoxFuture, Change, Operator, OperatorConfig, OperatorContext, OperatorRegistry,
+    OperatorStatus, RetryConfig, State, StateKey, StateValue, Subscription,
 };
 pub use runtime::{Executor, RuntimeFuture};
 pub use zendb_storage::frontend::{

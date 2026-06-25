@@ -1,72 +1,150 @@
 //! Eager database lifecycle and resource ownership.
 
-mod catalog;
+mod operators;
 mod states;
 mod tables;
+mod timers;
 
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use bincode::{Decode, Encode};
 use hashbrown::HashMap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use zendb_storage::core::{
-    keydir::KeyDirConfig,
+    keydir::{KeyDir, KeyDirConfig},
     traits::{Backend, DurableStorage},
 };
 use zendb_storage::frontend::{
-    state::StateConfig,
-    table::{Table, TableConfig},
+    state::{State, StateConfig},
+    table::Table,
 };
 
 use crate::{
-    operator::{
-        worker::{OperatorInput, OperatorWorker},
-        ConcurrentState, Operator, OperatorConfig, OperatorRegistry, StateKey, StateValue,
-        Subscription,
-    },
+    operator::{worker::OperatorWorker, OperatorRegistry, StateKey, StateValue},
     runtime::Executor,
+    OperatorConfig, TableConfig,
 };
 
-use catalog::{Catalog, CatalogEntry};
 use states::ErasedStateHandle;
+use timers::{run_scheduler, TimerStore};
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub(super) enum CatalogEntry {
+    Table(TableConfig),
+    Operator(OperatorConfig),
+    State(StateConfig),
+}
+
+pub(super) type Catalog = KeyDir<String, CatalogEntry>;
 
 const META_FILE: &str = "_meta";
 pub(crate) const TABLES_DIR: &str = "tables";
 pub(crate) const STATES_DIR: &str = "states";
+const TIMERS_FILE: &str = "timers";
 
 #[derive(Debug, Clone, Encode, Decode)]
-pub struct DatabaseConfig {
-    pub operator_poll_size: usize,
-}
+pub struct DatabaseConfig {}
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
-        Self {
-            operator_poll_size: 128,
-        }
+        Self {}
     }
 }
 
 pub type ConcurrentTable = Arc<RwLock<Table>>;
+pub type ConcurrentState<K, V> = Arc<RwLock<State<K, V>>>;
 
-pub(crate) struct DatabaseInner {
+/// A durable, weak reference to a database table.
+///
+/// The database is the single owner of every table, so handles never keep a
+/// table (or the database) alive. Call [`TableHandle::get`] to obtain a strong
+/// guard for an operation; once the owning database is dropped, `get` fails
+/// instead of resurrecting a detached table.
+#[derive(Clone)]
+pub struct TableHandle {
+    name: Arc<str>,
+    inner: Weak<RwLock<Table>>,
+}
+
+impl TableHandle {
+    pub(crate) fn new(name: &str, table: &ConcurrentTable) -> Self {
+        Self {
+            name: Arc::from(name),
+            inner: Arc::downgrade(table),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Upgrade to a strong handle for a single operation, or fail if the owning
+    /// database has been dropped.
+    pub fn get(&self) -> io::Result<ConcurrentTable> {
+        self.inner
+            .upgrade()
+            .ok_or_else(|| resource_closed("table", &self.name))
+    }
+}
+
+/// A durable, weak reference to a typed database state, mirroring
+/// [`TableHandle`]. The database owns the state; the handle never keeps it (or
+/// the database) alive.
+pub struct StateHandle<K: StateKey, V: StateValue> {
+    name: Arc<str>,
+    inner: Weak<RwLock<State<K, V>>>,
+}
+
+impl<K: StateKey, V: StateValue> Clone for StateHandle<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            name: Arc::clone(&self.name),
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<K: StateKey, V: StateValue> StateHandle<K, V> {
+    pub(crate) fn new(name: &str, state: &ConcurrentState<K, V>) -> Self {
+        Self {
+            name: Arc::from(name),
+            inner: Arc::downgrade(state),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Upgrade to a strong handle for a single operation, or fail if the owning
+    /// database has been dropped.
+    pub fn get(&self) -> io::Result<ConcurrentState<K, V>> {
+        self.inner
+            .upgrade()
+            .ok_or_else(|| resource_closed("state", &self.name))
+    }
+}
+
+/// The database is the single lifecycle root. It holds the only strong
+/// references to its tables, states, and operator workers; everything it owns
+/// is torn down deterministically when the last `Arc<Database>` is dropped.
+pub struct Database {
     path: PathBuf,
     pub(crate) config: DatabaseConfig,
     pub(crate) executor: Arc<dyn Executor>,
     registry: OperatorRegistry,
     pub(crate) lifecycle: Mutex<()>,
     catalog: Mutex<Catalog>,
-    tables: RwLock<HashMap<String, ConcurrentTable>>,
+    pub(crate) tables: RwLock<HashMap<String, ConcurrentTable>>,
     states: RwLock<HashMap<String, ErasedStateHandle>>,
-    operators: RwLock<HashMap<String, Arc<OperatorWorker>>>,
-}
-
-pub struct Database {
-    pub(crate) inner: Arc<DatabaseInner>,
+    pub(crate) operators: RwLock<HashMap<String, Arc<OperatorWorker>>>,
+    timers: Arc<RwLock<TimerStore>>,
+    /// Notified by `register_timer` to wake the scheduler early.
+    pub(crate) timer_notify: Arc<(Mutex<()>, Condvar)>,
 }
 
 impl Database {
@@ -78,7 +156,8 @@ impl Database {
     ) -> io::Result<Arc<Self>> {
         fs::create_dir_all(path)?;
         let catalog = Catalog::create(&path.join(META_FILE), KeyDirConfig::default())?;
-        Ok(Self::from_parts(path, catalog, executor, registry, config))
+        let timers = TimerStore::create(&path.join(TIMERS_FILE), StateConfig::default())?;
+        Self::from_parts(path, catalog, timers, executor, registry, config)
     }
 
     pub fn open(
@@ -88,232 +167,72 @@ impl Database {
         config: DatabaseConfig,
     ) -> io::Result<Arc<Self>> {
         let catalog = Catalog::open(&path.join(META_FILE), KeyDirConfig::default())?;
-        let database = Self::from_parts(path, catalog, executor, registry, config);
+        let timers = TimerStore::open(&path.join(TIMERS_FILE), StateConfig::default())?;
+        let database = Self::from_parts(path, catalog, timers, executor, registry, config)?;
         database.open_catalog()?;
         Ok(database)
     }
 
+    /// Assemble a `Database` from its constituent parts, clamp config values,
+    /// and spawn the background timer scheduler.
     fn from_parts(
         path: &Path,
         catalog: Catalog,
+        timers: TimerStore,
         executor: Arc<dyn Executor>,
         registry: OperatorRegistry,
-        mut config: DatabaseConfig,
-    ) -> Arc<Self> {
-        config.operator_poll_size = config.operator_poll_size.max(1);
-        Arc::new(Self {
-            inner: Arc::new(DatabaseInner {
-                path: path.to_path_buf(),
-                config,
-                executor,
-                registry,
-                lifecycle: Mutex::new(()),
-                catalog: Mutex::new(catalog),
-                tables: RwLock::new(HashMap::new()),
-                states: RwLock::new(HashMap::new()),
-                operators: RwLock::new(HashMap::new()),
-            }),
-        })
+        config: DatabaseConfig,
+    ) -> io::Result<Arc<Self>> {
+        let timer_notify = Arc::new((Mutex::new(()), Condvar::new()));
+        let database = Arc::new(Self {
+            path: path.to_path_buf(),
+            config,
+            executor,
+            registry,
+            lifecycle: Mutex::new(()),
+            catalog: Mutex::new(catalog),
+            tables: RwLock::new(HashMap::new()),
+            states: RwLock::new(HashMap::new()),
+            operators: RwLock::new(HashMap::new()),
+            timers: Arc::new(RwLock::new(timers)),
+            timer_notify: Arc::clone(&timer_notify),
+        });
+        let db_weak = Arc::downgrade(&database);
+        let executor = Arc::clone(&database.executor);
+        database
+            .executor
+            .spawn(Box::pin(run_scheduler(db_weak, executor, timer_notify)));
+        Ok(database)
     }
 
+    /// Replay the durable catalog on open: tables are opened eagerly, states are
+    /// skipped (opened lazily on first typed access), operators are deferred until
+    /// all tables are wired so their subscription inputs can be resolved.
     fn open_catalog(self: &Arc<Self>) -> io::Result<()> {
-        let entries: Vec<_> = self
-            .inner
-            .catalog
-            .lock()
-            .entries()
-            .map(|(name, entry)| (name.into_owned(), entry.into_owned()))
-            .collect();
-
-        for (name, entry) in &entries {
-            if let CatalogEntry::Table(config) = entry {
-                let table = Arc::new(RwLock::new(Table::open(
-                    &self.inner.path.join(TABLES_DIR).join(name),
-                    config.clone(),
-                )?));
-                self.inner.tables.write().insert(name.clone(), table);
-            }
-        }
-        for (name, entry) in entries {
-            if let CatalogEntry::Operator(config) = entry {
-                let (worker, operator) = self.inner.build_worker(name.clone(), config)?;
-                self.inner
-                    .operators
-                    .write()
-                    .insert(name, Arc::clone(&worker));
-                self.spawn(worker, operator);
-            }
-        }
-        Ok(())
-    }
-
-    pub fn table(
-        self: &Arc<Self>,
-        name: &str,
-        config: Option<TableConfig>,
-    ) -> io::Result<ConcurrentTable> {
-        if config.is_some() {
-            let _lifecycle = self.inner.lifecycle.lock();
-            return self.inner.table(name, config);
-        }
-        self.inner.table(name, None)
-    }
-
-    pub fn drop_table(self: &Arc<Self>, name: &str) -> io::Result<()> {
-        let orphaned = {
-            let _lifecycle = self.inner.lifecycle.lock();
-            self.inner.prepare_drop_table(name)?
-        };
-        for worker in orphaned {
-            worker.wait_finished();
-        }
-
-        let _lifecycle = self.inner.lifecycle.lock();
-        self.inner.finish_drop_table(name)
-    }
-
-    pub fn state<K: StateKey, V: StateValue>(
-        self: &Arc<Self>,
-        name: &str,
-        config: Option<StateConfig>,
-    ) -> io::Result<ConcurrentState<K, V>> {
-        if config.is_some() {
-            let _lifecycle = self.inner.lifecycle.lock();
-            return self.inner.state(name, config);
-        }
-        self.inner.state(name, None)
-    }
-
-    pub fn drop_state(self: &Arc<Self>, name: &str) -> io::Result<()> {
-        let _lifecycle = self.inner.lifecycle.lock();
-        self.inner.drop_state(name)
-    }
-
-    pub fn register_operator(
-        self: &Arc<Self>,
-        name: &str,
-        config: OperatorConfig,
-    ) -> io::Result<()> {
-        let _lifecycle = self.inner.lifecycle.lock();
-        if self.inner.catalog.lock().contains(&name.to_owned()) {
-            return Err(already_exists("catalog resource", name));
-        }
-
-        let (worker, operator) = self.inner.build_worker(name.to_owned(), config.clone())?;
-        if let Err(error) = self
-            .inner
-            .catalog
-            .lock()
-            .put(name.to_owned(), CatalogEntry::Operator(config.clone()))
-        {
-            self.inner.remove_worker_consumers(&worker);
-            return Err(error);
-        }
-        self.inner
-            .operators
-            .write()
-            .insert(name.to_owned(), Arc::clone(&worker));
-        self.spawn(worker, operator);
-        Ok(())
-    }
-
-    pub fn drop_operator(self: &Arc<Self>, name: &str) -> io::Result<()> {
-        let worker = {
-            let _lifecycle = self.inner.lifecycle.lock();
-            self.inner
-                .retire_operator_locked(name)?
-                .ok_or_else(|| not_found("operator", name))?
-        };
-        worker.wait_finished();
-        Ok(())
-    }
-
-    fn spawn(self: &Arc<Self>, worker: Arc<OperatorWorker>, operator: Box<dyn Operator>) {
-        OperatorWorker::spawn(self, worker, operator);
-    }
-}
-
-impl DatabaseInner {
-    fn build_worker(
-        self: &Arc<Self>,
-        name: String,
-        config: OperatorConfig,
-    ) -> io::Result<(Arc<OperatorWorker>, Box<dyn Operator>)> {
-        for subscription in &config.subscriptions {
-            if let Subscription::Table(table) = subscription {
-                if self.table(table, None).is_err() {
-                    return Err(not_found("subscribed table", table));
+        let mut operator_entries = Vec::new();
+        for (name, entry) in self.catalog.lock().entries() {
+            match entry.as_ref() {
+                CatalogEntry::Table(config) => {
+                    let table = Arc::new(RwLock::new(Table::open(
+                        &self.path.join(TABLES_DIR).join(name.as_ref()),
+                        config.clone(),
+                    )?));
+                    self.tables.write().insert(name.into_owned(), table);
+                }
+                CatalogEntry::State(_) => {} // opened lazily on first typed access
+                CatalogEntry::Operator(config) => {
+                    operator_entries.push((name.into_owned(), config.clone()));
                 }
             }
         }
-
-        let instance = self
-            .registry
-            .create_operator(&config.implementation, &config.configuration)?;
-        let mut inputs = Vec::new();
-        for (table_name, table) in self.tables.read().iter() {
-            if config
-                .subscriptions
-                .iter()
-                .any(|subscription| subscription.matches(table_name))
-            {
-                let reader = match table.read().consumer(&name) {
-                    Ok(reader) => reader,
-                    Err(error) => {
-                        Self::delete_consumers(inputs, &name);
-                        return Err(error);
-                    }
-                };
-                inputs.push(OperatorInput {
-                    table_name: table_name.clone(),
-                    reader,
-                });
-            }
+        for (name, config) in operator_entries {
+            let worker = self.build_worker(name.clone(), config)?;
+            self.operators.write().insert(name, Arc::clone(&worker));
+            OperatorWorker::spawn(self, worker);
         }
-        Ok((OperatorWorker::new(name, config, inputs), instance))
+        Ok(())
     }
 
-    pub(crate) fn finish_operator_locked(&self, name: &str) -> io::Result<()> {
-        self.retire_operator_locked(name).map(|_| ())
-    }
-
-    pub(crate) fn retire_operator_locked(
-        &self,
-        name: &str,
-    ) -> io::Result<Option<Arc<OperatorWorker>>> {
-        let worker = self.operators.write().remove(name);
-        if let Some(worker) = &worker {
-            worker.stop();
-            self.remove_worker_consumers(worker);
-        }
-
-        let mut catalog = self.catalog.lock();
-        match catalog.get(&name.to_owned()) {
-            Some(entry) if matches!(entry.as_ref(), CatalogEntry::Operator(_)) => {
-                catalog.delete(&name.to_owned())?;
-            }
-            Some(_) => return Err(already_exists("catalog resource", name)),
-            None => {}
-        }
-
-        Ok(worker)
-    }
-
-    fn remove_worker_consumers(&self, worker: &OperatorWorker) {
-        let inputs = std::mem::take(&mut *worker.inputs.lock());
-        Self::delete_consumers(inputs, &worker.name);
-    }
-
-    fn delete_consumers(inputs: Vec<OperatorInput>, operator: &str) {
-        for input in inputs {
-            if let Err(error) = input.reader.delete() {
-                log::error!(
-                    "failed deleting consumer {operator:?} from table {:?}: {error}",
-                    input.table_name
-                );
-            }
-        }
-    }
 }
 
 fn already_exists(kind: &str, name: &str) -> io::Error {
@@ -327,12 +246,21 @@ fn not_found(kind: &str, name: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("no {kind} {name:?}"))
 }
 
+fn resource_closed(kind: &str, name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotConnected,
+        format!("{kind} {name:?} is unavailable because its database was dropped"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Change, ConcurrentState, Operator, OperatorRegistry, OperatorStatus};
+    use crate::{
+        Change, Operator, OperatorConfig, OperatorContext, OperatorRegistry, OperatorStatus,
+        Subscription, TableConfig,
+    };
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use std::sync::Weak;
     use std::time::{Duration, Instant};
     use zendb_types::{
         device_id, init_device_id, Event, Hlc, Op, Path as ValuePath, PrimaryKey, Value,
@@ -348,6 +276,10 @@ mod tests {
         fn idle(&self) -> crate::RuntimeFuture {
             Box::pin(async { std::thread::sleep(Duration::from_millis(1)) })
         }
+
+        fn sleep(&self, duration: Duration) -> crate::RuntimeFuture {
+            Box::pin(async move { std::thread::sleep(duration) })
+        }
     }
 
     fn wait_until(condition: impl Fn() -> bool) {
@@ -361,23 +293,22 @@ mod tests {
     struct CountingOperator {
         count: Arc<AtomicUsize>,
         finish: bool,
-        buffer: Option<ConcurrentState<String, u64>>,
-        index: Option<ConcurrentState<Vec<u8>, Vec<u8>>>,
-        output: Option<ConcurrentTable>,
+        buffer: Option<StateHandle<String, u64>>,
+        index: Option<StateHandle<Vec<u8>, Vec<u8>>>,
+        output: Option<TableHandle>,
     }
 
     impl Operator for CountingOperator {
+        type Config = ();
+        type Timer = ();
         fn open<'a>(
             &'a mut self,
-            database: Weak<Database>,
+            ctx: OperatorContext,
         ) -> crate::BoxFuture<'a, io::Result<()>> {
             Box::pin(async move {
-                let database = database.upgrade().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotConnected, "database is closed")
-                })?;
-                self.buffer = Some(database.state("counter/buffer", Some(StateConfig::default()))?);
-                self.index = Some(database.state("index", Some(StateConfig::default()))?);
-                self.output = Some(database.table("users", None)?);
+                self.buffer = Some(ctx.state("counter/buffer", Some(StateConfig::default()))?);
+                self.index = Some(ctx.state("index", Some(StateConfig::default()))?);
+                self.output = Some(ctx.table("users", None)?);
                 Ok(())
             })
         }
@@ -385,18 +316,19 @@ mod tests {
         fn process<'a>(
             &'a mut self,
             changes: Vec<Change>,
-            _database: Weak<Database>,
+            _ctx: OperatorContext,
         ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>> {
             Box::pin(async move {
                 self.count.fetch_add(changes.len(), Ordering::Relaxed);
                 if let Some(state) = &self.index {
-                    state.write().put(
+                    state.get()?.write().put(
                         b"count".to_vec(),
                         self.count.load(Ordering::Relaxed).to_le_bytes().to_vec(),
                     )?;
                 }
                 if let Some(state) = &self.buffer {
                     let key = "count".to_owned();
+                    let state = state.get()?;
                     let mut state = state.write();
                     let count = state.get(&key).map(|value| value.into_owned()).unwrap_or(0)
                         + changes.len() as u64;
@@ -412,13 +344,13 @@ mod tests {
 
         fn finish<'a>(
             &'a mut self,
-            database: Weak<Database>,
+            ctx: OperatorContext,
         ) -> crate::BoxFuture<'a, io::Result<()>> {
             Box::pin(async move {
                 self.buffer = None;
                 self.index = None;
                 self.output = None;
-                if let Some(database) = database.upgrade() {
+                if let Some(database) = ctx.database() {
                     database.drop_state("counter/buffer")?;
                     database.drop_state("index")?;
                 }
@@ -433,10 +365,12 @@ mod tests {
     }
 
     impl Operator for FailingOnceOperator {
+        type Config = ();
+        type Timer = ();
         fn process<'a>(
             &'a mut self,
             changes: Vec<Change>,
-            _database: Weak<Database>,
+            _ctx: OperatorContext,
         ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>> {
             Box::pin(async move {
                 if self.attempts.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -453,10 +387,12 @@ mod tests {
     }
 
     impl Operator for MultiTableOperator {
+        type Config = ();
+        type Timer = ();
         fn process<'a>(
             &'a mut self,
             changes: Vec<Change>,
-            _database: Weak<Database>,
+            _ctx: OperatorContext,
         ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>> {
             Box::pin(async move {
                 self.processed.fetch_add(changes.len(), Ordering::Relaxed);
@@ -465,16 +401,58 @@ mod tests {
         }
     }
 
+    struct TimerOperator {
+        fired: Arc<AtomicUsize>,
+    }
+
+    impl Operator for TimerOperator {
+        type Config = ();
+        type Timer = ();
+
+        fn open<'a>(
+            &'a mut self,
+            ctx: OperatorContext,
+        ) -> crate::BoxFuture<'a, io::Result<()>> {
+            Box::pin(async move {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                ctx.register_timer_typed(now, &())?;
+                Ok(())
+            })
+        }
+
+        fn process<'a>(
+            &'a mut self,
+            _changes: Vec<Change>,
+            _ctx: OperatorContext,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>> {
+            Box::pin(async { Ok(OperatorStatus::Continue) })
+        }
+
+        fn handle_timer<'a>(
+            &'a mut self,
+            _payload: (),
+            _ctx: OperatorContext,
+        ) -> crate::BoxFuture<'a, io::Result<()>> {
+            Box::pin(async move {
+                self.fired.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+        }
+    }
+
     fn registry(count: Arc<AtomicUsize>, finish: bool) -> OperatorRegistry {
         let mut registry = OperatorRegistry::new();
-        registry.register("count", move |_| {
-            Ok(Box::new(CountingOperator {
+        registry.register_operator::<CountingOperator>("count", move |_: ()| {
+            Ok(CountingOperator {
                 count: Arc::clone(&count),
                 finish,
                 buffer: None,
                 index: None,
                 output: None,
-            }))
+            })
         });
         registry
     }
@@ -483,7 +461,9 @@ mod tests {
         OperatorConfig {
             implementation: "count".into(),
             configuration: Vec::new(),
-            subscriptions: vec![Subscription::Table("users".into())],
+            subscriptions: vec![Subscription::pattern("users")],
+            retry: Default::default(),
+            poll_size: 128,
         }
     }
 
@@ -525,10 +505,17 @@ mod tests {
         let table = db.table("users", Some(TableConfig::default())).unwrap();
         db.register_operator("counter", config()).unwrap();
 
-        table.write().insert_event(event("users", 1, 100)).unwrap();
+        table
+            .get()
+            .unwrap()
+            .write()
+            .insert_event(event("users", 1, 100))
+            .unwrap();
         wait_until(|| count.load(Ordering::Relaxed) == 1);
         assert_eq!(
             table
+                .get()
+                .unwrap()
                 .read()
                 .get(&PrimaryKey::String("u1".into()))
                 .unwrap()
@@ -562,6 +549,8 @@ mod tests {
         .unwrap();
         db.table("users", None)
             .unwrap()
+            .get()
+            .unwrap()
             .write()
             .insert_event(event("users", 1, 100))
             .unwrap();
@@ -582,9 +571,14 @@ mod tests {
         let table = db.table("users", Some(TableConfig::default())).unwrap();
         db.register_operator("counter", config()).unwrap();
 
-        table.write().insert_event(event("users", 1, 100)).unwrap();
+        table
+            .get()
+            .unwrap()
+            .write()
+            .insert_event(event("users", 1, 100))
+            .unwrap();
         wait_until(|| count.load(Ordering::Relaxed) == 1);
-        wait_until(|| !db.inner.operators.read().contains_key("counter"));
+        wait_until(|| !db.operators.read().contains_key("counter"));
         assert!(matches!(
             db.state::<Vec<u8>, Vec<u8>>("index", None),
             Err(error) if error.kind() == io::ErrorKind::NotFound
@@ -593,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_table_requires_releasing_handles() {
+    fn drop_table_invalidates_outstanding_handles() {
         let path = tmp("drop_table");
         let db = Database::create(
             &path,
@@ -602,13 +596,39 @@ mod tests {
             DatabaseConfig::default(),
         )
         .unwrap();
+        // A table handle is a weak reference: holding it does not keep the
+        // table alive, so the database can drop it as the single owner.
         let table = db.table("users", Some(TableConfig::default())).unwrap();
+        assert!(path.join(TABLES_DIR).join("users").exists());
+        db.drop_table("users").unwrap();
+        assert!(!path.join(TABLES_DIR).join("users").exists());
+        // The outstanding handle now fails to upgrade instead of resurrecting a
+        // detached table.
+        assert_eq!(
+            table.get().err().unwrap().kind(),
+            io::ErrorKind::NotConnected
+        );
+    }
+
+    #[test]
+    fn drop_table_blocks_while_handle_is_upgraded() {
+        let path = tmp("drop_table_inflight");
+        let db = Database::create(
+            &path,
+            Arc::new(ThreadExecutor),
+            OperatorRegistry::new(),
+            DatabaseConfig::default(),
+        )
+        .unwrap();
+        let table = db.table("users", Some(TableConfig::default())).unwrap();
+        // An in-flight upgrade holds a strong reference for the duration of an
+        // operation and blocks teardown until released.
+        let strong = table.get().unwrap();
         assert_eq!(
             db.drop_table("users").unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
-        assert!(path.join(TABLES_DIR).join("users").exists());
-        drop(table);
+        drop(strong);
         db.drop_table("users").unwrap();
         assert!(!path.join(TABLES_DIR).join("users").exists());
     }
@@ -627,13 +647,18 @@ mod tests {
         let table = db.table("users", Some(TableConfig::default())).unwrap();
         db.register_operator("counter", config()).unwrap();
 
-        table.write().insert_event(event("users", 1, 100)).unwrap();
+        table
+            .get()
+            .unwrap()
+            .write()
+            .insert_event(event("users", 1, 100))
+            .unwrap();
         wait_until(|| count.load(Ordering::Relaxed) == 1);
         drop(table);
 
         db.drop_table("users").unwrap();
 
-        assert!(!db.inner.operators.read().contains_key("counter"));
+        assert!(!db.operators.read().contains_key("counter"));
         assert!(!path.join(TABLES_DIR).join("users").exists());
         assert!(matches!(
             db.table("users", None),
@@ -647,10 +672,10 @@ mod tests {
         let processed = Arc::new(AtomicUsize::new(0));
         let mut registry = OperatorRegistry::new();
         let factory_processed = Arc::clone(&processed);
-        registry.register("multi", move |_| {
-            Ok(Box::new(MultiTableOperator {
+        registry.register_operator::<MultiTableOperator>("multi", move |_: ()| {
+            Ok(MultiTableOperator {
                 processed: Arc::clone(&factory_processed),
-            }))
+            })
         });
         let db = Database::create(
             &path,
@@ -667,9 +692,11 @@ mod tests {
                 implementation: "multi".into(),
                 configuration: Vec::new(),
                 subscriptions: vec![
-                    Subscription::Table("users".into()),
-                    Subscription::Table("posts".into()),
+                    Subscription::pattern("users"),
+                    Subscription::pattern("posts"),
                 ],
+                retry: Default::default(),
+                poll_size: 128,
             },
         )
         .unwrap();
@@ -677,13 +704,18 @@ mod tests {
         drop(users);
         db.drop_table("users").unwrap();
 
-        assert!(db.inner.operators.read().contains_key("multi"));
-        posts.write().insert_event(event("posts", 1, 100)).unwrap();
+        assert!(db.operators.read().contains_key("multi"));
+        posts
+            .get()
+            .unwrap()
+            .write()
+            .insert_event(event("posts", 1, 100))
+            .unwrap();
         wait_until(|| processed.load(Ordering::Relaxed) == 1);
     }
 
     #[test]
-    fn drop_state_requires_releasing_handles() {
+    fn drop_state_invalidates_outstanding_handles() {
         let path = tmp("drop_state");
         let db = Database::create(
             &path,
@@ -695,12 +727,19 @@ mod tests {
         let state = db
             .state::<String, u64>("counter/buffer", Some(StateConfig::default()))
             .unwrap();
+        // Holding the weak handle does not block teardown; an in-flight upgrade
+        // does.
+        let strong = state.get().unwrap();
         assert_eq!(
             db.drop_state("counter/buffer").unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
-        drop(state);
+        drop(strong);
         db.drop_state("counter/buffer").unwrap();
+        assert_eq!(
+            state.get().err().unwrap().kind(),
+            io::ErrorKind::NotConnected
+        );
         assert!(!path
             .join(STATES_DIR)
             .join("counter")
@@ -716,11 +755,11 @@ mod tests {
         let mut registry = OperatorRegistry::new();
         let factory_attempts = Arc::clone(&attempts);
         let factory_processed = Arc::clone(&processed);
-        registry.register("retry", move |_| {
-            Ok(Box::new(FailingOnceOperator {
+        registry.register_operator::<FailingOnceOperator>("retry", move |_: ()| {
+            Ok(FailingOnceOperator {
                 attempts: Arc::clone(&factory_attempts),
                 processed: Arc::clone(&factory_processed),
-            }))
+            })
         });
         let db = Database::create(
             &path,
@@ -735,13 +774,25 @@ mod tests {
             OperatorConfig {
                 implementation: "retry".into(),
                 configuration: Vec::new(),
-                subscriptions: vec![Subscription::Table("users".into())],
+                subscriptions: vec![Subscription::pattern("users")],
+                retry: Default::default(),
+                poll_size: 128,
             },
         )
         .unwrap();
 
-        table.write().insert_event(event("users", 1, 100)).unwrap();
-        table.write().insert_event(event("users", 2, 110)).unwrap();
+        table
+            .get()
+            .unwrap()
+            .write()
+            .insert_event(event("users", 1, 100))
+            .unwrap();
+        table
+            .get()
+            .unwrap()
+            .write()
+            .insert_event(event("users", 2, 110))
+            .unwrap();
 
         wait_until(|| attempts.load(Ordering::Relaxed) >= 2);
         wait_until(|| processed.load(Ordering::Relaxed) == 2);
@@ -763,11 +814,15 @@ mod tests {
         wait_until(|| db.state::<Vec<u8>, Vec<u8>>("index", None).is_ok());
         let index = db.state::<Vec<u8>, Vec<u8>>("index", None).unwrap();
         index
+            .get()
+            .unwrap()
             .write()
             .put(b"users".to_vec(), 42_u64.to_le_bytes().to_vec())
             .unwrap();
         assert_eq!(
             index
+                .get()
+                .unwrap()
                 .read()
                 .get(&b"users".to_vec())
                 .map(|value| value.into_owned()),
@@ -792,6 +847,8 @@ mod tests {
             wait_until(|| db.state::<Vec<u8>, Vec<u8>>("index", None).is_ok());
             db.state::<Vec<u8>, Vec<u8>>("index", None)
                 .unwrap()
+                .get()
+                .unwrap()
                 .write()
                 .put(b"users".to_vec(), 42_u64.to_le_bytes().to_vec())
                 .unwrap();
@@ -807,10 +864,66 @@ mod tests {
         assert_eq!(
             db.state::<Vec<u8>, Vec<u8>>("index", None)
                 .unwrap()
+                .get()
+                .unwrap()
                 .read()
                 .get(&b"users".to_vec())
                 .map(|value| value.into_owned()),
             Some(42_u64.to_le_bytes().to_vec())
         );
+    }
+
+    #[test]
+    fn processing_time_timers_fire_and_survive_restart() {
+        let path = tmp("timers");
+        let fired = Arc::new(AtomicUsize::new(0));
+        let mut registry = OperatorRegistry::new();
+        let factory_fired = Arc::clone(&fired);
+        registry.register_operator::<TimerOperator>("timer", move |_: ()| {
+            Ok(TimerOperator {
+                fired: Arc::clone(&factory_fired),
+            })
+        });
+        let db = Database::create(
+            &path,
+            Arc::new(ThreadExecutor),
+            registry,
+            DatabaseConfig::default(),
+        )
+        .unwrap();
+        db.table("users", Some(TableConfig::default())).unwrap();
+        db.register_operator(
+            "ticker",
+            OperatorConfig {
+                implementation: "timer".into(),
+                configuration: Vec::new(),
+                subscriptions: vec![Subscription::pattern("users")],
+                retry: Default::default(),
+                poll_size: 128,
+            },
+        )
+        .unwrap();
+
+        wait_until(|| fired.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[test]
+    fn far_future_timer_is_persistent_and_swept_on_drop() {
+        let path = tmp("timers_persist");
+        let db = Database::create(
+            &path,
+            Arc::new(ThreadExecutor),
+            OperatorRegistry::new(),
+            DatabaseConfig::default(),
+        )
+        .unwrap();
+        let far_future = u64::MAX;
+        db.register_timer("ghost", far_future, b"never".to_vec())
+            .unwrap();
+        assert_eq!(db.timers.read().size(), 1);
+
+        // Sweeping a (never registered) operator removes only its timers.
+        db.sweep_operator_timers("ghost");
+        assert_eq!(db.timers.read().size(), 0);
     }
 }

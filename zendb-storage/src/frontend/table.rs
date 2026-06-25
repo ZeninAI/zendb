@@ -15,12 +15,7 @@ use crate::frontend::state::{State, StateConfig, StateStats};
 pub const DEFAULT_MAX_BUFFERED_RECORDS: usize = 1_000;
 const TABLE_RECOVERY_CONSUMER: &str = "__zendb_table_recovery";
 
-#[derive(Debug, Clone, Encode, Decode)]
-pub struct Change {
-    pub event: Event,
-    pub previous: Option<Cell>,
-    pub current: Option<Cell>,
-}
+pub use zendb_types::Change;
 
 /// Complete configuration required to create or open a table.
 #[derive(Debug, Clone, Encode, Decode)]

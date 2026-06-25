@@ -295,6 +295,7 @@ register_types! {
 
 // --- re-exports ---
 pub use core::cell::Cell;
+pub use core::change::Change;
 pub use core::event::{Event, Signature, TableId};
 pub use core::hlc::{device_id, init_device_id, DeviceId, Hlc};
 pub use core::op::Op;

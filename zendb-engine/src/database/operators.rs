@@ -9,98 +9,117 @@ use crate::operator::{
     OperatorConfig, OperatorPhase,
 };
 
-use super::{already_exists, not_found, CatalogEntry, Database};
+use super::{Database, OperatorEntry};
 
 impl Database {
-    /// Register a new operator: persist to catalog, build the worker, and spawn
-    /// the run loop.
-    pub fn register_operator(
+    /// Return the phase and effective config of an operator, ensuring it is
+    /// running unless it is in a terminal state or no matching tables are open.
+    ///
+    /// - If already running in memory, returns `(Active, config)` immediately.
+    /// - If in the catalog as `Active`, re-opens using the stored config (a new
+    ///   `config` replaces the stored one). If no matching tables are open yet,
+    ///   the operator stays in the catalog without spawning — it will be started
+    ///   automatically when a matching table opens.
+    /// - If in a terminal state (`Finished` / `Failed`), returns the phase and
+    ///   stored config without starting anything.
+    /// - If not in the catalog, creates it with `config` (required for new
+    ///   operators; returns an error if `config` is `None`). If no matching
+    ///   tables are open yet, the operator is persisted to the catalog only and
+    ///   will be started when a matching table opens.
+    pub fn operator(
         self: &Arc<Self>,
         name: &str,
-        config: OperatorConfig,
-    ) -> io::Result<()> {
-        let worker = {
-            let _lifecycle = self.lifecycle.lock();
-            if self.catalog.lock().contains(&name.to_owned()) {
-                return Err(already_exists("catalog resource", name));
+        config: Option<OperatorConfig>,
+    ) -> io::Result<(OperatorPhase, OperatorConfig)> {
+        // Fast path: already running — return its config.
+        if let Some(worker) = self.operators.read().get(name).cloned() {
+            return Ok((OperatorPhase::Active, (*worker.config).clone()));
+        }
+
+        let (phase, effective, worker_opt) = {
+            let mut catalog = self.operator_catalog.lock();
+            // Double-check under catalog lock
+            if let Some(worker) = self.operators.read().get(name).cloned() {
+                return Ok((OperatorPhase::Active, (*worker.config).clone()));
             }
 
-            let worker = self.build_worker(name.to_owned(), config.clone())?;
-            if let Err(error) = self.catalog.lock().put(
-                name.to_owned(),
-                CatalogEntry::Operator { config, phase: OperatorPhase::Running },
-            ) {
-                worker.delete_inputs();
-                return Err(error);
-            }
-            self.operators
-                .write()
-                .insert(name.to_owned(), Arc::clone(&worker));
-            worker
-        };
-        OperatorWorker::spawn(self, worker);
-        Ok(())
-    }
-
-    /// Start an operator that exists in the catalog but is not currently running.
-    /// Only operators in `Running` or `Stopped` phase can be opened — terminal
-    /// states (`Finished`, `Failed`) are rejected. Only creates consumers for
-    /// tables that are already open; remaining tables will attach when opened.
-    pub fn open_operator(self: &Arc<Self>, name: &str) -> io::Result<()> {
-        let worker = {
-            let _lifecycle = self.lifecycle.lock();
-            if self.operators.read().contains_key(name) {
-                return Err(already_exists("operator", name));
-            }
-            let config = {
-                let mut catalog = self.catalog.lock();
-                match catalog.get(&name.to_owned()) {
-                    Some(entry) => match entry.as_ref() {
-                        CatalogEntry::Operator { config, phase } => {
-                            if matches!(phase, OperatorPhase::Finished | OperatorPhase::Failed { .. }) {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    format!("operator {name:?} is in a terminal state ({phase:?}) and cannot be opened"),
-                                ));
-                            }
-                            let config = config.clone();
+            match catalog.get(&name.to_owned()) {
+                Some(entry) if entry.phase == OperatorPhase::Active => {
+                    let stored = &entry.as_ref().config;
+                    let effective = match &config {
+                        Some(new_config) if new_config != stored => {
                             catalog.put(
                                 name.to_owned(),
-                                CatalogEntry::Operator { config: config.clone(), phase: OperatorPhase::Running },
+                                OperatorEntry {
+                                    config: new_config.clone(),
+                                    phase: OperatorPhase::Active,
+                                },
                             )?;
-                            config
+                            new_config.clone()
                         }
-                        _ => return Err(already_exists("catalog resource", name)),
-                    },
-                    None => return Err(not_found("operator", name)),
+                        _ => stored.clone(),
+                    };
+                    let worker = self.build_worker(name.to_owned(), effective.clone())?;
+                    if worker.inputs.lock().is_empty() {
+                        // No matching tables open yet. Catalog entry is already
+                        // Active — activate_table_subscribers will spawn when one opens.
+                        return Ok((OperatorPhase::Active, effective));
+                    }
+                    self.operators
+                        .write()
+                        .insert(name.to_owned(), Arc::clone(&worker));
+                    (OperatorPhase::Active, effective, Some(worker))
                 }
-            };
-            let worker = self.build_worker(name.to_owned(), config)?;
-            self.operators
-                .write()
-                .insert(name.to_owned(), Arc::clone(&worker));
-            worker
+                Some(entry) => {
+                    let e = entry.as_ref();
+                    (e.phase.clone(), e.config.clone(), None)
+                }
+                None => {
+                    let config = config.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("operator {name:?} does not exist and no config was provided"),
+                        )
+                    })?;
+                    let worker = self.build_worker(name.to_owned(), config.clone())?;
+                    if worker.inputs.lock().is_empty() {
+                        // No matching tables open yet — persist to catalog only.
+                        catalog.put(
+                            name.to_owned(),
+                            OperatorEntry {
+                                config: config.clone(),
+                                phase: OperatorPhase::Active,
+                            },
+                        )?;
+                        return Ok((OperatorPhase::Active, config));
+                    }
+                    if let Err(error) = catalog.put(
+                        name.to_owned(),
+                        OperatorEntry {
+                            config: config.clone(),
+                            phase: OperatorPhase::Active,
+                        },
+                    ) {
+                        worker.delete_inputs();
+                        return Err(error);
+                    }
+                    self.operators
+                        .write()
+                        .insert(name.to_owned(), Arc::clone(&worker));
+                    (OperatorPhase::Active, config, Some(worker))
+                }
+            }
         };
-        OperatorWorker::spawn(self, worker);
-        Ok(())
-    }
 
-    /// Permanently delete an operator: stop it, remove from memory, catalog, and
-    /// sweep its timers. Blocks until the run loop exits.
-    pub fn delete_operator(self: &Arc<Self>, name: &str) -> io::Result<()> {
-        let worker = {
-            let _lifecycle = self.lifecycle.lock();
-            self.deregister_operator(name)?
-        };
-        if let Some(worker) = worker {
-            worker.wait_finished();
+        if let Some(worker) = worker_opt {
+            worker.spawn(self);
         }
-        Ok(())
+        Ok((phase, effective))
     }
 
     /// Instantiate the operator via the registry and acquire one topic consumer
     /// per currently-open table that matches the subscription. Does NOT validate
-    /// that all subscribed tables exist — in the lazy model, tables may open later.
+    /// that all subscribed tables exist - in the lazy model, tables may open later.
     pub(super) fn build_worker(
         self: &Arc<Self>,
         name: String,
@@ -111,11 +130,7 @@ impl Database {
             .create_operator(&config.implementation, &config.configuration)?;
         let mut inputs: Vec<OperatorInput> = Vec::new();
         for (table_name, table) in self.tables.read().iter() {
-            if config
-                .subscriptions
-                .iter()
-                .any(|s| s.matches(table_name))
-            {
+            if config.subscriptions.iter().any(|s| s.matches(table_name)) {
                 let reader = match table.read().consumer(&name) {
                     Ok(reader) => reader,
                     Err(error) => {
@@ -134,82 +149,16 @@ impl Database {
         Ok(OperatorWorker::new(name, config, inputs, instance))
     }
 
-    /// Stop the operator, delete inputs, sweep timers, and remove from both
-    /// memory and catalog. Caller must hold the lifecycle lock.
-    fn deregister_operator(
-        &self,
-        name: &str,
-    ) -> io::Result<Option<Arc<OperatorWorker>>> {
-        let worker = self.operators.write().remove(name);
-        if let Some(worker) = &worker {
-            worker.stop();
-            worker.delete_inputs();
-        }
-        self.sweep_operator_timers(name);
-
-        let mut catalog = self.catalog.lock();
-        match catalog.get(&name.to_owned()) {
-            Some(entry) if matches!(entry.as_ref(), CatalogEntry::Operator { .. }) => {
-                catalog.delete(&name.to_owned())?;
-            }
-            Some(_) => return Err(already_exists("catalog resource", name)),
-            None => {}
-        }
-
-        Ok(worker)
-    }
-
     /// Transition catalog phase to `Finished` or `Failed` and remove from memory.
-    /// Called by the run loop on natural exit. Caller must hold the lifecycle lock.
+    /// Called by the run loop on natural exit.
     pub(crate) fn retire_operator(&self, name: &str, phase: OperatorPhase) {
         self.operators.write().remove(name);
-        let mut catalog = self.catalog.lock();
+        let mut catalog = self.operator_catalog.lock();
         if let Some(entry) = catalog.get(&name.to_owned()) {
-            if let CatalogEntry::Operator { config, .. } = entry.as_ref() {
-                let config = config.clone();
-                if let Err(error) = catalog.put(
-                    name.to_owned(),
-                    CatalogEntry::Operator { config, phase },
-                ) {
-                    log::error!("failed updating catalog phase for operator {name:?}: {error}");
-                }
+            let config = entry.as_ref().config.clone();
+            if let Err(error) = catalog.put(name.to_owned(), OperatorEntry { config, phase }) {
+                log::error!("failed updating catalog phase for operator {name:?}: {error}");
             }
         }
-    }
-
-    /// Remove operator from the in-memory map and set catalog phase to `Stopped`.
-    /// Does NOT sweep timers (they are durable). Caller must hold the lifecycle lock.
-    pub(crate) fn evict_operator_locked(&self, name: &str) -> Option<Arc<OperatorWorker>> {
-        let worker = self.operators.write().remove(name)?;
-        worker.mark_evicted();
-        worker.stop();
-        worker.delete_inputs();
-
-        let mut catalog = self.catalog.lock();
-        if let Some(entry) = catalog.get(&name.to_owned()) {
-            if let CatalogEntry::Operator { config, .. } = entry.as_ref() {
-                let config = config.clone();
-                if let Err(error) = catalog.put(
-                    name.to_owned(),
-                    CatalogEntry::Operator { config, phase: OperatorPhase::Stopped },
-                ) {
-                    log::error!("failed setting Stopped phase for operator {name:?}: {error}");
-                }
-            }
-        }
-
-        Some(worker)
-    }
-
-    /// Evict the operator from memory while keeping its catalog entry intact.
-    /// Blocks until the run loop exits.
-    pub fn close_operator(self: &Arc<Self>, name: &str) -> io::Result<()> {
-        let worker = {
-            let _lifecycle = self.lifecycle.lock();
-            self.evict_operator_locked(name)
-                .ok_or_else(|| not_found("operator", name))?
-        };
-        worker.wait_finished();
-        Ok(())
     }
 }

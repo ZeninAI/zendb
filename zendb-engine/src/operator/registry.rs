@@ -2,8 +2,6 @@
 
 use std::{collections::HashMap, io, sync::Arc};
 
-use bincode::Decode;
-
 use super::{ErasedOperator, Operator};
 
 type OperatorFactory = dyn Fn(&[u8]) -> io::Result<Box<dyn ErasedOperator>> + Send + Sync + 'static;
@@ -26,30 +24,15 @@ impl OperatorRegistry {
         implementation: impl Into<String>,
         factory: impl Fn(O::Config) -> io::Result<O> + Send + Sync + 'static,
     ) {
-        self.register_typed::<O::Config, _>(implementation, move |config| {
-            factory(config).map(|op| Box::new(op) as Box<dyn ErasedOperator>)
-        });
-    }
-
-    fn register_typed<C, F>(&mut self, implementation: impl Into<String>, factory: F)
-    where
-        C: Decode<()> + 'static,
-        F: Fn(C) -> io::Result<Box<dyn ErasedOperator>> + Send + Sync + 'static,
-    {
-        self.register(implementation, move |bytes| {
-            let (config, _) =
-                bincode::decode_from_slice::<C, _>(bytes, bincode::config::standard())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            factory(config)
-        });
-    }
-
-    fn register<F>(&mut self, implementation: impl Into<String>, factory: F)
-    where
-        F: Fn(&[u8]) -> io::Result<Box<dyn ErasedOperator>> + Send + Sync + 'static,
-    {
-        self.operators
-            .insert(implementation.into(), Arc::new(factory));
+        self.operators.insert(
+            implementation.into(),
+            Arc::new(move |bytes| {
+                let (config, _) =
+                    bincode::decode_from_slice::<O::Config, _>(bytes, bincode::config::standard())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                factory(config).map(|op| Box::new(op) as Box<dyn ErasedOperator>)
+            }),
+        );
     }
 
     /// Look up the registered factory by name and invoke it with the raw config bytes.
@@ -66,4 +49,3 @@ impl OperatorRegistry {
         })?(configuration)
     }
 }
-

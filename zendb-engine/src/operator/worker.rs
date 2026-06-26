@@ -3,10 +3,7 @@
 use std::{
     collections::VecDeque,
     io,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Weak,
-    },
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -22,49 +19,31 @@ pub(crate) struct OperatorInput {
 }
 
 pub(crate) struct OperatorWorker {
-    pub(crate) name: Arc<str>,
+    pub(crate) name: String,
     pub(crate) config: Arc<OperatorConfig>,
     pub(crate) inputs: Mutex<Vec<OperatorInput>>,
     operator: Mutex<Option<Box<dyn ErasedOperator>>>,
     pub(crate) timer_inbox: Mutex<VecDeque<Vec<u8>>>,
-    stopped: AtomicBool,
-    evicted: AtomicBool,
     finished: Mutex<bool>,
     finished_signal: Condvar,
 }
 
 impl OperatorWorker {
     pub(crate) fn new(
-        name: impl Into<Arc<str>>,
+        name: String,
         config: OperatorConfig,
         inputs: Vec<OperatorInput>,
         operator: Box<dyn ErasedOperator>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            name: name.into(),
+            name,
             config: Arc::new(config),
             inputs: Mutex::new(inputs),
             operator: Mutex::new(Some(operator)),
             timer_inbox: Mutex::new(VecDeque::new()),
-            stopped: AtomicBool::new(false),
-            evicted: AtomicBool::new(false),
             finished: Mutex::new(false),
             finished_signal: Condvar::new(),
         })
-    }
-
-    pub(crate) fn stop(&self) {
-        self.stopped.store(true, Ordering::Release);
-    }
-
-    /// Mark this worker as evicted from the in-memory operator map.
-    /// When set, `retire()` becomes a no-op so the catalog entry is preserved.
-    pub(crate) fn mark_evicted(&self) {
-        self.evicted.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn is_evicted(&self) -> bool {
-        self.evicted.load(Ordering::Acquire)
     }
 
     /// Delete all subscribed topic consumers and clear the inputs list on retirement.
@@ -80,13 +59,6 @@ impl OperatorWorker {
         }
     }
 
-    pub(crate) fn wait_finished(&self) {
-        let mut done = self.finished.lock();
-        while !*done {
-            self.finished_signal.wait(&mut done);
-        }
-    }
-
     fn mark_finished(&self) {
         *self.finished.lock() = true;
         self.finished_signal.notify_all();
@@ -94,56 +66,60 @@ impl OperatorWorker {
 
     /// Transition the operator to its terminal phase in the catalog.
     /// Called by the run loop when the operator finishes or exhausts retries.
-    /// No-op if the worker was already evicted via `close_operator`.
-    fn retire(database: &Weak<Database>, worker: &Arc<Self>, phase: super::OperatorPhase) {
-        if worker.is_evicted() {
-            return;
-        }
+    fn retire(&self, database: &Weak<Database>, phase: super::OperatorPhase) {
         if let Some(database) = database.upgrade() {
-            let _lifecycle = database.lifecycle.lock();
-            database.retire_operator(&worker.name, phase);
+            database.retire_operator(&self.name, phase);
         }
     }
 
     /// Extract the operator from its holding mutex and start the async run loop.
-    pub(crate) fn spawn(database: &Arc<Database>, worker: Arc<Self>) {
+    pub(crate) fn spawn(self: &Arc<Self>, database: &Arc<Database>) {
         let executor = Arc::clone(&database.executor);
         let database = Arc::downgrade(database);
-        let operator = worker
+        let operator = self
             .operator
             .lock()
             .take()
             .expect("operator already taken from worker");
         executor
             .clone()
-            .spawn(Box::pin(Self::run(database, executor, worker, operator)));
+            .spawn(Box::pin(Arc::clone(self).run(database, executor, operator)));
     }
 
     /// Main event loop: drain timer inbox, poll changes, commit on success,
     /// apply exponential backoff on error, retire on `Finish` or exhausted retries.
     async fn run(
+        self: Arc<Self>,
         database: Weak<Database>,
         executor: Arc<dyn Executor>,
-        worker: Arc<Self>,
         mut operator: Box<dyn ErasedOperator>,
     ) {
-        let make_ctx = || OperatorContext::new(database.clone(), Arc::clone(&worker.name), Arc::clone(&worker.config));
+        let make_ctx = || {
+            OperatorContext::new(
+                database.clone(),
+                self.name.clone(),
+                Arc::clone(&self.config),
+            )
+        };
 
         if let Err(error) = operator.open(make_ctx()).await {
-            log::error!("failed opening operator {:?}: {error}", worker.name);
-            Self::retire(&database, &worker, super::OperatorPhase::Failed {
-                error: error.to_string(),
-            });
-            worker.mark_finished();
+            log::error!("failed opening operator {:?}: {error}", self.name);
+            self.retire(
+                &database,
+                super::OperatorPhase::Failed {
+                    error: error.to_string(),
+                },
+            );
+            self.mark_finished();
             return;
         }
 
-        let retry = worker.config.retry.clone();
+        let retry = self.config.retry.clone();
         let mut attempt: usize = 0;
 
-        while !worker.stopped.load(Ordering::Acquire) {
-            let changes = worker.poll(worker.config.poll_size.max(1));
-            let timers: Vec<Vec<u8>> = worker.timer_inbox.lock().drain(..).collect();
+        loop {
+            let changes = self.poll(self.config.poll_size.max(1));
+            let timers: Vec<Vec<u8>> = self.timer_inbox.lock().drain(..).collect();
 
             if changes.is_empty() && timers.is_empty() {
                 executor.idle().await;
@@ -152,7 +128,7 @@ impl OperatorWorker {
 
             for payload in timers {
                 if let Err(error) = operator.on_timer(payload, make_ctx()).await {
-                    log::error!("operator {:?} on_timer failed: {error}", worker.name);
+                    log::error!("operator {:?} on_timer failed: {error}", self.name);
                 }
             }
 
@@ -163,24 +139,20 @@ impl OperatorWorker {
             match operator.process(changes, make_ctx()).await {
                 Ok(OperatorStatus::Continue) => {
                     attempt = 0;
-                    if let Err(error) = worker.commit() {
-                        log::error!("failed to commit operator {:?}: {error}", worker.name);
-                        if let Err(reset_error) = worker.reset() {
-                            log::error!(
-                                "failed to reset operator {:?}: {reset_error}",
-                                worker.name
-                            );
+                    if let Err(error) = self.commit() {
+                        log::error!("failed to commit operator {:?}: {error}", self.name);
+                        if let Err(reset_error) = self.reset() {
+                            log::error!("failed to reset operator {:?}: {reset_error}", self.name);
                         }
                         executor.idle().await;
                     }
                 }
                 Ok(OperatorStatus::Finish) => {
-                    worker.stop();
                     if let Err(error) = operator.finish(make_ctx()).await {
-                        log::error!("failed finishing operator {:?}: {error}", worker.name);
+                        log::error!("failed finishing operator {:?}: {error}", self.name);
                     }
-                    Self::retire(&database, &worker, super::OperatorPhase::Finished);
-                    worker.mark_finished();
+                    self.retire(&database, super::OperatorPhase::Finished);
+                    self.mark_finished();
                     return;
                 }
                 Err(error) => {
@@ -188,30 +160,25 @@ impl OperatorWorker {
                     let error_msg = error.to_string();
                     log::error!(
                         "operator {:?} failed (attempt {attempt}): {error_msg}",
-                        worker.name
+                        self.name
                     );
 
                     if retry.max_attempts > 0 && attempt >= retry.max_attempts {
                         log::error!(
                             "operator {:?} exceeded max_attempts ({}) — retiring",
-                            worker.name,
+                            self.name,
                             retry.max_attempts
                         );
                         if let Err(finish_err) = operator.finish(make_ctx()).await {
-                            log::error!(
-                                "failed finishing operator {:?}: {finish_err}",
-                                worker.name
-                            );
+                            log::error!("failed finishing operator {:?}: {finish_err}", self.name);
                         }
-                        Self::retire(&database, &worker, super::OperatorPhase::Failed {
-                            error: error_msg,
-                        });
-                        worker.mark_finished();
+                        self.retire(&database, super::OperatorPhase::Failed { error: error_msg });
+                        self.mark_finished();
                         return;
                     }
 
-                    if let Err(reset_error) = worker.reset() {
-                        log::error!("failed to reset operator {:?}: {reset_error}", worker.name);
+                    if let Err(reset_error) = self.reset() {
+                        log::error!("failed to reset operator {:?}: {reset_error}", self.name);
                     }
 
                     let delay = backoff_delay(&retry, attempt);
@@ -219,13 +186,6 @@ impl OperatorWorker {
                 }
             }
         }
-
-        // Stopped externally (via close_operator / evict). Run finish callback
-        // but don't update catalog — that's the caller's responsibility.
-        if let Err(error) = operator.finish(make_ctx()).await {
-            log::error!("failed finishing operator {:?}: {error}", worker.name);
-        }
-        worker.mark_finished();
     }
 
     /// Round-robin across all table inputs, collecting up to `limit` changes.
@@ -289,10 +249,11 @@ fn backoff_delay(retry: &super::RetryConfig, attempt: usize) -> Duration {
         .min(retry.max_delay_ms);
 
     // Minimal LCG — good enough for jitter; state is per-call.
-    let seed = base_ms.wrapping_add(attempt as u64).wrapping_mul(6364136223846793005);
+    let seed = base_ms
+        .wrapping_add(attempt as u64)
+        .wrapping_mul(6364136223846793005);
     let rand_fraction = (seed >> 33) as f64 / (u32::MAX as f64);
     let jitter_ms = (base_ms as f64 * retry.jitter_factor * rand_fraction) as u64;
 
     Duration::from_millis(base_ms.saturating_add(jitter_ms))
 }
-

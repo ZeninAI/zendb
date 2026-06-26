@@ -46,12 +46,6 @@ impl Subscription {
     pub(crate) fn matches(&self, table: &str) -> bool {
         glob_matches(&self.0, table)
     }
-
-    /// Returns `true` if the pattern contains at least one `*`, meaning it
-    /// may match tables that do not yet exist.
-    pub(crate) fn is_wildcard(&self) -> bool {
-        self.0.contains('*')
-    }
 }
 
 /// Match `value` against a simple `*`-only glob `pattern`.
@@ -85,7 +79,7 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 // ── RetryConfig ───────────────────────────────────────────────────────────────
 
 /// Retry policy for a failing operator `process` call.
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct RetryConfig {
     /// Maximum consecutive failures before the operator is permanently retired.
     /// `0` means unlimited retries.
@@ -115,10 +109,9 @@ impl Default for RetryConfig {
 /// Persisted lifecycle phase of an operator in the catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum OperatorPhase {
-    /// The operator is actively running (or will be started on next table open).
-    Running,
-    /// Explicitly stopped (e.g. via `close_operator`). Restarts on next activation.
-    Stopped,
+    /// The operator is eligible to run. If absent from the in-memory operator map,
+    /// it can be started by [`Database::operator`] or by a matching table activation.
+    Active,
     /// The operator returned [`OperatorStatus::Finish`] and exited cleanly.
     Finished,
     /// The operator exhausted its retry budget and was permanently retired.
@@ -127,7 +120,7 @@ pub enum OperatorPhase {
 
 // ── OperatorConfig ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct OperatorConfig {
     pub implementation: String,
     /// Raw (bincode-serialised) operator configuration bytes. Internal only —
@@ -152,8 +145,16 @@ pub enum OperatorStatus {
 
 pub(crate) trait ErasedOperator: Send + 'static {
     fn open<'a>(&'a mut self, ctx: OperatorContext) -> BoxFuture<'a, io::Result<()>>;
-    fn process<'a>(&'a mut self, changes: Vec<Change>, ctx: OperatorContext) -> BoxFuture<'a, io::Result<OperatorStatus>>;
-    fn on_timer<'a>(&'a mut self, payload: Vec<u8>, ctx: OperatorContext) -> BoxFuture<'a, io::Result<()>>;
+    fn process<'a>(
+        &'a mut self,
+        changes: Vec<Change>,
+        ctx: OperatorContext,
+    ) -> BoxFuture<'a, io::Result<OperatorStatus>>;
+    fn on_timer<'a>(
+        &'a mut self,
+        payload: Vec<u8>,
+        ctx: OperatorContext,
+    ) -> BoxFuture<'a, io::Result<()>>;
     fn finish<'a>(&'a mut self, ctx: OperatorContext) -> BoxFuture<'a, io::Result<()>>;
 }
 
@@ -282,4 +283,3 @@ mod tests {
         assert!(!glob_matches("user-*-data", "user-john-other"));
     }
 }
-

@@ -4,7 +4,7 @@ use std::{io, sync::Arc, sync::Weak};
 
 use bincode::{Decode, Encode};
 
-use crate::{StateHandle, TableHandle, OperatorConfig};
+use crate::{OperatorConfig, StateHandle, TableHandle};
 use zendb_storage::frontend::{state::StateConfig, table::TableConfig};
 
 /// Context passed to every [`super::Operator`] lifecycle method.
@@ -15,12 +15,16 @@ use zendb_storage::frontend::{state::StateConfig, table::TableConfig};
 #[derive(Clone)]
 pub struct OperatorContext {
     pub(crate) db: Weak<crate::Database>,
-    pub(crate) name: Arc<str>,
+    pub(crate) name: String,
     config: Arc<OperatorConfig>,
 }
 
 impl OperatorContext {
-    pub(crate) fn new(db: Weak<crate::Database>, name: Arc<str>, config: Arc<OperatorConfig>) -> Self {
+    pub(crate) fn new(
+        db: Weak<crate::Database>,
+        name: String,
+        config: Arc<OperatorConfig>,
+    ) -> Self {
         Self { db, name, config }
     }
 
@@ -61,11 +65,7 @@ impl OperatorContext {
     ///
     /// If a timer already exists for this operator at `fire_at_ms` it is
     /// replaced (last-write-wins — no FIFO guarantee for equal times).
-    pub fn register_timer<T: Encode>(
-        &self,
-        fire_at_ms: u64,
-        payload: &T,
-    ) -> io::Result<()> {
+    pub fn register_timer<T: Encode>(&self, fire_at_ms: u64, payload: &T) -> io::Result<()> {
         let bytes = bincode::encode_to_vec(payload, bincode::config::standard())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         self.require_db()?

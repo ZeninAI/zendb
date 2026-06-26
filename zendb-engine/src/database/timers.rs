@@ -80,22 +80,6 @@ impl Database {
         self.timers.write().delete(&key).map(|_| ())
     }
 
-    /// Remove every pending timer owned by `operator`. Only called on permanent
-    /// deletion (not on stop/evict — timers are durable across restarts).
-    pub(crate) fn sweep_operator_timers(&self, operator: &str) {
-        let mut timers = self.timers.write();
-        let stale: Vec<TimerKey> = timers
-            .entries()
-            .filter(|(key, _)| key.operator == operator)
-            .map(|(key, _)| key.into_owned())
-            .collect();
-        for key in stale {
-            if let Err(error) = timers.delete(&key) {
-                log::error!("failed sweeping timer for operator {operator:?}: {error}");
-            }
-        }
-    }
-
     /// Pop due timers only for operators that are currently loaded in memory.
     /// Timers for unloaded operators are left in the store untouched.
     fn take_due_timers(&self, now: u64) -> Vec<(String, Vec<u8>)> {
@@ -138,11 +122,7 @@ impl Database {
     }
 }
 
-pub(super) async fn run_scheduler(
-    database: Weak<Database>,
-    _executor: Arc<dyn crate::runtime::Executor>,
-    notify: Arc<(Mutex<()>, Condvar)>,
-) {
+pub(super) async fn run_scheduler(database: Weak<Database>, notify: Arc<(Mutex<()>, Condvar)>) {
     let cap = Duration::from_secs(60);
     loop {
         let Some(db) = database.upgrade() else {

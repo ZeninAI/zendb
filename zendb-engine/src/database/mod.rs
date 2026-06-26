@@ -26,7 +26,7 @@ use zendb_storage::frontend::{
 use crate::{
     operator::{worker::OperatorWorker, OperatorRegistry},
     runtime::Executor,
-    OperatorConfig, TableConfig,
+    OperatorConfig, OperatorPhase, TableConfig,
 };
 
 use states::ErasedStateHandle;
@@ -35,7 +35,7 @@ use timers::{run_scheduler, TimerStore};
 #[derive(Debug, Clone, Encode, Decode)]
 pub(super) enum CatalogEntry {
     Table(TableConfig),
-    Operator(OperatorConfig),
+    Operator { config: OperatorConfig, phase: OperatorPhase },
     State(StateConfig),
 }
 
@@ -379,7 +379,7 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as u64;
-                ctx.register_timer_typed(now, &())?;
+                ctx.register_timer(now, &())?;
                 Ok(())
             })
         }
@@ -539,12 +539,15 @@ mod tests {
             .insert_event(event("users", 1, 100))
             .unwrap();
         wait_until(|| count.load(Ordering::Relaxed) == 1);
+        // Operator returned Finish — removed from memory, catalog phase set to Finished.
         wait_until(|| !db.operators.read().contains_key("counter"));
         assert!(matches!(
             db.state::<Vec<u8>, Vec<u8>>("index", None),
             Err(error) if error.kind() == io::ErrorKind::NotFound
         ));
-        wait_until(|| db.register_operator("counter", config()).is_ok());
+        // Must explicitly delete before re-registering (catalog entry persists as historical log).
+        db.delete_operator("counter").unwrap();
+        db.register_operator("counter", config()).unwrap();
     }
 
     #[test]

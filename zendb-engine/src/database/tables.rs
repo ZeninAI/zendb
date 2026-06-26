@@ -86,15 +86,20 @@ impl Database {
         Ok(TableHandle::new(name, &table))
     }
 
-    /// Scan the catalog for operator entries whose subscriptions match `table_name`.
+    /// Scan the catalog for operator entries whose subscriptions match `table_name`
+    /// and whose phase indicates they should be running.
     fn collect_matching_operators(
         catalog: &super::Catalog,
         table_name: &str,
     ) -> Vec<(String, OperatorConfig)> {
+        use crate::OperatorPhase;
         let mut result = Vec::new();
         for (op_name, entry) in catalog.entries() {
-            if let CatalogEntry::Operator(config) = entry.as_ref() {
-                if config.subscriptions.iter().any(|s| s.matches(table_name)) {
+            if let CatalogEntry::Operator { config, phase } = entry.as_ref() {
+                // Only activate operators that are Running or Stopped (i.e. awaiting restart).
+                // Finished/Failed operators remain dormant until explicitly re-opened.
+                let activatable = matches!(phase, OperatorPhase::Running | OperatorPhase::Stopped);
+                if activatable && config.subscriptions.iter().any(|s| s.matches(table_name)) {
                     result.push((op_name.into_owned(), config.clone()));
                 }
             }
@@ -103,9 +108,9 @@ impl Database {
     }
 
     /// Wire a newly opened table into matching operators. For operators already
-    /// running, creates a consumer and attaches. For catalog-only operators,
-    /// builds them (but does NOT spawn — caller spawns after releasing the
-    /// lifecycle lock to avoid deadlock with `retire()`).
+    /// running, creates a consumer and attaches. For catalog-only operators
+    /// (phase Running or Stopped), transitions them to Running, builds them, and
+    /// returns them for spawning after the lifecycle lock is released.
     fn activate_table_subscribers(
         self: &Arc<Self>,
         name: &str,
@@ -123,7 +128,14 @@ impl Database {
                     reader,
                 });
             } else {
-                // Not running — build and register, defer spawn
+                // Not running — transition catalog phase to Running, build, defer spawn
+                self.catalog.lock().put(
+                    op_name.clone(),
+                    CatalogEntry::Operator {
+                        config: op_config.clone(),
+                        phase: crate::OperatorPhase::Running,
+                    },
+                )?;
                 let worker = self.build_worker(op_name.clone(), op_config)?;
                 self.operators.write().insert(op_name, Arc::clone(&worker));
                 to_spawn.push(worker);
@@ -151,7 +163,17 @@ impl Database {
                 && !worker.config.subscriptions.iter().any(|s| s.is_wildcard())
                 && worker.inputs.lock().is_empty()
             {
+                // Table is being permanently dropped — fully deregister this operator
+                // (remove from catalog + sweep timers) since no tables can ever match again.
+                self.operators.write().remove(&*worker.name);
                 worker.stop();
+                self.sweep_operator_timers(&worker.name);
+                let mut catalog = self.catalog.lock();
+                if let Some(entry) = catalog.get(&worker.name.to_string()) {
+                    if matches!(entry.as_ref(), CatalogEntry::Operator { .. }) {
+                        let _ = catalog.delete(&worker.name.to_string());
+                    }
+                }
                 orphaned.push(Arc::clone(worker));
             }
         }

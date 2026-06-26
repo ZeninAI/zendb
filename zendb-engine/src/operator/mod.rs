@@ -110,13 +110,30 @@ impl Default for RetryConfig {
     }
 }
 
+// ── OperatorPhase ─────────────────────────────────────────────────────────────
+
+/// Persisted lifecycle phase of an operator in the catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub enum OperatorPhase {
+    /// The operator is actively running (or will be started on next table open).
+    Running,
+    /// Explicitly stopped (e.g. via `close_operator`). Restarts on next activation.
+    Stopped,
+    /// The operator returned [`OperatorStatus::Finish`] and exited cleanly.
+    Finished,
+    /// The operator exhausted its retry budget and was permanently retired.
+    Failed { error: String },
+}
+
 // ── OperatorConfig ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct OperatorConfig {
     pub implementation: String,
-    /// Raw (application-serialised) configuration bytes.
-    pub configuration: Vec<u8>,
+    /// Raw (bincode-serialised) operator configuration bytes. Internal only —
+    /// users construct configs via [`OperatorConfig::for_operator`] and never
+    /// touch the bytes directly.
+    pub(crate) configuration: Vec<u8>,
     pub subscriptions: Vec<Subscription>,
     pub retry: RetryConfig,
     /// Maximum number of changes consumed from subscribed tables per poll cycle.
@@ -197,7 +214,7 @@ impl<T: Operator> ErasedOperator for T {
         ctx: OperatorContext,
     ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
-            let timer = ctx.decode_timer::<T::Timer>(&payload)?;
+            let timer: T::Timer = ctx.decode(&payload)?;
             Operator::handle_timer(self, timer, ctx).await
         })
     }

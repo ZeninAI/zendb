@@ -92,18 +92,16 @@ impl OperatorWorker {
         self.finished_signal.notify_all();
     }
 
-    /// Deregister this operator from the database under the lifecycle lock.
+    /// Transition the operator to its terminal phase in the catalog.
     /// Called by the run loop when the operator finishes or exhausts retries.
     /// No-op if the worker was already evicted via `close_operator`.
-    fn retire(database: &Weak<Database>, worker: &Arc<Self>) {
+    fn retire(database: &Weak<Database>, worker: &Arc<Self>, phase: super::OperatorPhase) {
         if worker.is_evicted() {
             return;
         }
         if let Some(database) = database.upgrade() {
             let _lifecycle = database.lifecycle.lock();
-            if let Err(error) = database.deregister_operator(&worker.name) {
-                log::error!("failed to retire operator {:?}: {error}", worker.name);
-            }
+            database.retire_operator(&worker.name, phase);
         }
     }
 
@@ -133,7 +131,9 @@ impl OperatorWorker {
 
         if let Err(error) = operator.open(make_ctx()).await {
             log::error!("failed opening operator {:?}: {error}", worker.name);
-            Self::retire(&database, &worker);
+            Self::retire(&database, &worker, super::OperatorPhase::Failed {
+                error: error.to_string(),
+            });
             worker.mark_finished();
             return;
         }
@@ -179,14 +179,15 @@ impl OperatorWorker {
                     if let Err(error) = operator.finish(make_ctx()).await {
                         log::error!("failed finishing operator {:?}: {error}", worker.name);
                     }
-                    Self::retire(&database, &worker);
+                    Self::retire(&database, &worker, super::OperatorPhase::Finished);
                     worker.mark_finished();
                     return;
                 }
                 Err(error) => {
                     attempt += 1;
+                    let error_msg = error.to_string();
                     log::error!(
-                        "operator {:?} failed (attempt {attempt}): {error}",
+                        "operator {:?} failed (attempt {attempt}): {error_msg}",
                         worker.name
                     );
 
@@ -202,7 +203,9 @@ impl OperatorWorker {
                                 worker.name
                             );
                         }
-                        Self::retire(&database, &worker);
+                        Self::retire(&database, &worker, super::OperatorPhase::Failed {
+                            error: error_msg,
+                        });
                         worker.mark_finished();
                         return;
                     }
@@ -217,10 +220,11 @@ impl OperatorWorker {
             }
         }
 
+        // Stopped externally (via close_operator / evict). Run finish callback
+        // but don't update catalog — that's the caller's responsibility.
         if let Err(error) = operator.finish(make_ctx()).await {
             log::error!("failed finishing operator {:?}: {error}", worker.name);
         }
-        Self::retire(&database, &worker);
         worker.mark_finished();
     }
 

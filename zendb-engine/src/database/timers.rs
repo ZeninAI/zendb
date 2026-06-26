@@ -8,7 +8,9 @@
 //! operator and time as an existing entry overwrites it (last-write-wins).
 //!
 //! The scheduler loop uses a condvar to sleep until the next timer is due,
-//! waking early whenever a nearer timer is registered.
+//! waking early whenever a nearer timer is registered. Timers for operators
+//! that are not currently loaded are skipped (left in the store) and fire
+//! once the operator is activated again.
 
 use std::{
     io,
@@ -78,8 +80,8 @@ impl Database {
         self.timers.write().delete(&key).map(|_| ())
     }
 
-    /// Remove every pending timer owned by `operator` (called on operator
-    /// retirement so stale timers do not fire against a missing worker).
+    /// Remove every pending timer owned by `operator`. Only called on permanent
+    /// deletion (not on stop/evict — timers are durable across restarts).
     pub(crate) fn sweep_operator_timers(&self, operator: &str) {
         let mut timers = self.timers.write();
         let stale: Vec<TimerKey> = timers
@@ -94,13 +96,16 @@ impl Database {
         }
     }
 
-    /// Pop all timers whose fire time is ≤ `now`, in key order, removing them.
-    /// Returns `(operator, payload)` pairs.
+    /// Pop due timers only for operators that are currently loaded in memory.
+    /// Timers for unloaded operators are left in the store untouched.
     fn take_due_timers(&self, now: u64) -> Vec<(String, Vec<u8>)> {
+        let operators = self.operators.read();
         let mut timers = self.timers.write();
+
         let due: Vec<(TimerKey, TimerEntry)> = timers
             .entries()
             .take_while(|(key, _)| key.fire_at_ms <= now)
+            .filter(|(key, _)| operators.contains_key(&key.operator))
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
 
@@ -115,19 +120,20 @@ impl Database {
         fired
     }
 
-    /// Peek at the `fire_at_ms` of the earliest pending timer (without removing it).
-    fn next_timer_ms(&self) -> Option<u64> {
+    /// Peek at the earliest pending timer that has a loaded operator, so the
+    /// scheduler only wakes when there is something deliverable.
+    fn next_deliverable_timer_ms(&self) -> Option<u64> {
+        let operators = self.operators.read();
         self.timers
             .read()
             .entries()
-            .next()
+            .find(|(key, _)| operators.contains_key(&key.operator))
             .map(|(key, _)| key.fire_at_ms)
     }
 
     fn deliver_timer(&self, operator: &str, payload: Vec<u8>) {
-        match self.operators.read().get(operator) {
-            Some(worker) => worker.timer_inbox.lock().push_back(payload),
-            None => log::debug!("dropping timer for unknown operator {operator:?}"),
+        if let Some(worker) = self.operators.read().get(operator).cloned() {
+            worker.timer_inbox.lock().push_back(payload);
         }
     }
 }
@@ -147,12 +153,11 @@ pub(super) async fn run_scheduler(
             db.deliver_timer(&operator, payload);
         }
 
-        let sleep_for = match db.next_timer_ms() {
+        let sleep_for = match db.next_deliverable_timer_ms() {
             None => cap,
             Some(next) => {
                 if next <= now {
-                    // Another timer is due immediately (edge case: new entry
-                    // arrived between take_due_timers and next_timer_ms).
+                    // Deliverable timer is due immediately — loop without sleeping.
                     drop(db);
                     continue;
                 }

@@ -29,8 +29,7 @@ impl OperatorContext {
         &self.name
     }
 
-    /// The full registration config for this operator, including subscriptions,
-    /// retry policy, and the raw encoded typed config.
+    /// The full registration config for this operator (subscriptions, retry, etc.).
     pub fn config(&self) -> &OperatorConfig {
         &self.config
     }
@@ -58,27 +57,19 @@ impl OperatorContext {
         self.require_db()?.state(name, config)
     }
 
-    /// Register a processing-time timer with raw bytes as the payload.
+    /// Register a processing-time timer, serialising `payload` with bincode.
     ///
     /// If a timer already exists for this operator at `fire_at_ms` it is
     /// replaced (last-write-wins — no FIFO guarantee for equal times).
-    pub fn register_timer(&self, fire_at_ms: u64, payload: Vec<u8>) -> io::Result<()> {
-        self.require_db()?
-            .register_timer(&self.name, fire_at_ms, payload)
-    }
-
-    /// Register a processing-time timer, serialising `payload` with bincode.
-    ///
-    /// Use [`decode_timer`](Self::decode_timer) in `on_timer` to recover the
-    /// value without writing any serialisation code directly.
-    pub fn register_timer_typed<T: Encode>(
+    pub fn register_timer<T: Encode>(
         &self,
         fire_at_ms: u64,
         payload: &T,
     ) -> io::Result<()> {
         let bytes = bincode::encode_to_vec(payload, bincode::config::standard())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        self.register_timer(fire_at_ms, bytes)
+        self.require_db()?
+            .register_timer(&self.name, fire_at_ms, bytes)
     }
 
     /// Cancel a pending timer at `fire_at_ms` registered by this operator.
@@ -86,8 +77,8 @@ impl OperatorContext {
         self.require_db()?.cancel_timer(&self.name, fire_at_ms)
     }
 
-    /// Decode a timer payload previously written by [`register_timer_typed`](Self::register_timer_typed).
-    pub fn decode_timer<T: Decode<()>>(&self, payload: &[u8]) -> io::Result<T> {
+    /// Decode a bincode-encoded payload. Used internally by the erased dispatch.
+    pub(crate) fn decode<T: Decode<()>>(&self, payload: &[u8]) -> io::Result<T> {
         bincode::decode_from_slice(payload, bincode::config::standard())
             .map(|(v, _)| v)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))

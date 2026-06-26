@@ -6,7 +6,7 @@ use zendb_storage::core::traits::Backend;
 
 use crate::operator::{
     worker::{OperatorInput, OperatorWorker},
-    OperatorConfig,
+    OperatorConfig, OperatorPhase,
 };
 
 use super::{already_exists, not_found, CatalogEntry, Database};
@@ -26,11 +26,10 @@ impl Database {
             }
 
             let worker = self.build_worker(name.to_owned(), config.clone())?;
-            if let Err(error) = self
-                .catalog
-                .lock()
-                .put(name.to_owned(), CatalogEntry::Operator(config))
-            {
+            if let Err(error) = self.catalog.lock().put(
+                name.to_owned(),
+                CatalogEntry::Operator { config, phase: OperatorPhase::Running },
+            ) {
                 worker.delete_inputs();
                 return Err(error);
             }
@@ -44,8 +43,9 @@ impl Database {
     }
 
     /// Start an operator that exists in the catalog but is not currently running.
-    /// Only creates consumers for tables that are already open; remaining tables
-    /// will attach when they are opened later.
+    /// Only operators in `Running` or `Stopped` phase can be opened — terminal
+    /// states (`Finished`, `Failed`) are rejected. Only creates consumers for
+    /// tables that are already open; remaining tables will attach when opened.
     pub fn open_operator(self: &Arc<Self>, name: &str) -> io::Result<()> {
         let worker = {
             let _lifecycle = self.lifecycle.lock();
@@ -53,10 +53,23 @@ impl Database {
                 return Err(already_exists("operator", name));
             }
             let config = {
-                let catalog = self.catalog.lock();
+                let mut catalog = self.catalog.lock();
                 match catalog.get(&name.to_owned()) {
                     Some(entry) => match entry.as_ref() {
-                        CatalogEntry::Operator(config) => config.clone(),
+                        CatalogEntry::Operator { config, phase } => {
+                            if matches!(phase, OperatorPhase::Finished | OperatorPhase::Failed { .. }) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("operator {name:?} is in a terminal state ({phase:?}) and cannot be opened"),
+                                ));
+                            }
+                            let config = config.clone();
+                            catalog.put(
+                                name.to_owned(),
+                                CatalogEntry::Operator { config: config.clone(), phase: OperatorPhase::Running },
+                            )?;
+                            config
+                        }
                         _ => return Err(already_exists("catalog resource", name)),
                     },
                     None => return Err(not_found("operator", name)),
@@ -72,15 +85,16 @@ impl Database {
         Ok(())
     }
 
-    /// Retire the operator under the lifecycle lock, then block until its
-    /// run loop has stopped.
-    pub fn drop_operator(self: &Arc<Self>, name: &str) -> io::Result<()> {
+    /// Permanently delete an operator: stop it, remove from memory, catalog, and
+    /// sweep its timers. Blocks until the run loop exits.
+    pub fn delete_operator(self: &Arc<Self>, name: &str) -> io::Result<()> {
         let worker = {
             let _lifecycle = self.lifecycle.lock();
             self.deregister_operator(name)?
-                .ok_or_else(|| not_found("operator", name))?
         };
-        worker.wait_finished();
+        if let Some(worker) = worker {
+            worker.wait_finished();
+        }
         Ok(())
     }
 
@@ -120,9 +134,9 @@ impl Database {
         Ok(OperatorWorker::new(name, config, inputs, instance))
     }
 
-    /// Signal stop, delete inputs, sweep pending timers, and remove the operator
-    /// from the in-memory map and catalog. Caller must hold the lifecycle lock.
-    pub(crate) fn deregister_operator(
+    /// Stop the operator, delete inputs, sweep timers, and remove from both
+    /// memory and catalog. Caller must hold the lifecycle lock.
+    fn deregister_operator(
         &self,
         name: &str,
     ) -> io::Result<Option<Arc<OperatorWorker>>> {
@@ -130,12 +144,12 @@ impl Database {
         if let Some(worker) = &worker {
             worker.stop();
             worker.delete_inputs();
-            self.sweep_operator_timers(name);
         }
+        self.sweep_operator_timers(name);
 
         let mut catalog = self.catalog.lock();
         match catalog.get(&name.to_owned()) {
-            Some(entry) if matches!(entry.as_ref(), CatalogEntry::Operator(_)) => {
+            Some(entry) if matches!(entry.as_ref(), CatalogEntry::Operator { .. }) => {
                 catalog.delete(&name.to_owned())?;
             }
             Some(_) => return Err(already_exists("catalog resource", name)),
@@ -145,14 +159,45 @@ impl Database {
         Ok(worker)
     }
 
-    /// Remove an operator from the in-memory map and mark it evicted, preserving
-    /// its catalog entry. Caller must hold the lifecycle lock.
+    /// Transition catalog phase to `Finished` or `Failed` and remove from memory.
+    /// Called by the run loop on natural exit. Caller must hold the lifecycle lock.
+    pub(crate) fn retire_operator(&self, name: &str, phase: OperatorPhase) {
+        self.operators.write().remove(name);
+        let mut catalog = self.catalog.lock();
+        if let Some(entry) = catalog.get(&name.to_owned()) {
+            if let CatalogEntry::Operator { config, .. } = entry.as_ref() {
+                let config = config.clone();
+                if let Err(error) = catalog.put(
+                    name.to_owned(),
+                    CatalogEntry::Operator { config, phase },
+                ) {
+                    log::error!("failed updating catalog phase for operator {name:?}: {error}");
+                }
+            }
+        }
+    }
+
+    /// Remove operator from the in-memory map and set catalog phase to `Stopped`.
+    /// Does NOT sweep timers (they are durable). Caller must hold the lifecycle lock.
     pub(crate) fn evict_operator_locked(&self, name: &str) -> Option<Arc<OperatorWorker>> {
         let worker = self.operators.write().remove(name)?;
         worker.mark_evicted();
         worker.stop();
         worker.delete_inputs();
-        self.sweep_operator_timers(name);
+
+        let mut catalog = self.catalog.lock();
+        if let Some(entry) = catalog.get(&name.to_owned()) {
+            if let CatalogEntry::Operator { config, .. } = entry.as_ref() {
+                let config = config.clone();
+                if let Err(error) = catalog.put(
+                    name.to_owned(),
+                    CatalogEntry::Operator { config, phase: OperatorPhase::Stopped },
+                ) {
+                    log::error!("failed setting Stopped phase for operator {name:?}: {error}");
+                }
+            }
+        }
+
         Some(worker)
     }
 

@@ -6,6 +6,7 @@ mod tables;
 mod timers;
 
 use std::{
+    any::Any,
     fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Weak},
@@ -24,23 +25,20 @@ use zendb_storage::frontend::{
 };
 
 use crate::{
-    operator::{worker::OperatorWorker, OperatorRegistry},
-    runtime::Executor,
-    OperatorConfig, OperatorPhase, TableConfig,
+    operator::worker::OperatorWorker, runtime::Executor, GlobalOperator, OperatorPhase, TableConfig,
 };
 
-use states::ErasedStateHandle;
 use timers::{run_scheduler, TimerStore};
 
 #[derive(Debug, Clone, Encode, Decode)]
-pub(super) struct OperatorEntry {
-    pub(super) config: OperatorConfig,
+pub(super) struct OperatorEntry<Config> {
+    pub(super) config: Config,
     pub(super) phase: OperatorPhase,
 }
 
 pub(super) type TableCatalog = KeyDir<String, TableConfig>;
 pub(super) type StateCatalog = KeyDir<String, StateConfig>;
-pub(super) type OperatorCatalog = KeyDir<String, OperatorEntry>;
+pub(super) type OperatorCatalog<Config> = KeyDir<String, OperatorEntry<Config>>;
 
 const TABLE_CATALOG_FILE: &str = "_tables";
 const STATE_CATALOG_FILE: &str = "_states";
@@ -60,6 +58,7 @@ impl Default for DatabaseConfig {
 
 pub type ConcurrentTable = Arc<RwLock<Table>>;
 pub type ConcurrentState<K, V> = Arc<RwLock<State<K, V>>>;
+pub(super) type ErasedStateHandle = Arc<dyn Any + Send + Sync>;
 
 /// A durable, weak reference to a database table.
 ///
@@ -135,28 +134,32 @@ where
 /// The database is the single lifecycle root. It holds the only strong
 /// references to its tables, states, and operator workers; everything it owns
 /// is torn down deterministically when the last `Arc<Database>` is dropped.
-pub struct Database {
+pub struct Database<Ops>
+where
+    Ops: GlobalOperator,
+{
     path: PathBuf,
     #[allow(dead_code)]
     pub(crate) config: DatabaseConfig,
     pub(crate) executor: Arc<dyn Executor>,
-    registry: OperatorRegistry,
     table_catalog: Mutex<TableCatalog>,
     state_catalog: Mutex<StateCatalog>,
-    operator_catalog: Mutex<OperatorCatalog>,
+    operator_catalog: Mutex<OperatorCatalog<Ops::Config>>,
     pub(crate) tables: RwLock<HashMap<String, ConcurrentTable>>,
     states: RwLock<HashMap<String, ErasedStateHandle>>,
-    pub(crate) operators: RwLock<HashMap<String, Arc<OperatorWorker>>>,
+    pub(crate) operators: RwLock<HashMap<String, Arc<OperatorWorker<Ops>>>>,
     timers: Arc<RwLock<TimerStore>>,
     /// Notified by `register_timer` to wake the scheduler early.
     pub(crate) timer_notify: Arc<(Mutex<()>, Condvar)>,
 }
 
-impl Database {
+impl<Ops> Database<Ops>
+where
+    Ops: GlobalOperator,
+{
     pub fn create(
         path: &Path,
         executor: Arc<dyn Executor>,
-        registry: OperatorRegistry,
         config: DatabaseConfig,
     ) -> io::Result<Arc<Self>> {
         fs::create_dir_all(path)?;
@@ -164,8 +167,10 @@ impl Database {
             TableCatalog::create(&path.join(TABLE_CATALOG_FILE), KeyDirConfig::default())?;
         let state_catalog =
             StateCatalog::create(&path.join(STATE_CATALOG_FILE), KeyDirConfig::default())?;
-        let operator_catalog =
-            OperatorCatalog::create(&path.join(OPERATOR_CATALOG_FILE), KeyDirConfig::default())?;
+        let operator_catalog = OperatorCatalog::<Ops::Config>::create(
+            &path.join(OPERATOR_CATALOG_FILE),
+            KeyDirConfig::default(),
+        )?;
         let timers = TimerStore::create(&path.join(TIMERS_FILE), StateConfig::default())?;
         Self::from_parts(
             path,
@@ -174,7 +179,6 @@ impl Database {
             operator_catalog,
             timers,
             executor,
-            registry,
             config,
         )
     }
@@ -182,15 +186,16 @@ impl Database {
     pub fn open(
         path: &Path,
         executor: Arc<dyn Executor>,
-        registry: OperatorRegistry,
         config: DatabaseConfig,
     ) -> io::Result<Arc<Self>> {
         let table_catalog =
             TableCatalog::open(&path.join(TABLE_CATALOG_FILE), KeyDirConfig::default())?;
         let state_catalog =
             StateCatalog::open(&path.join(STATE_CATALOG_FILE), KeyDirConfig::default())?;
-        let operator_catalog =
-            OperatorCatalog::open(&path.join(OPERATOR_CATALOG_FILE), KeyDirConfig::default())?;
+        let operator_catalog = OperatorCatalog::<Ops::Config>::open(
+            &path.join(OPERATOR_CATALOG_FILE),
+            KeyDirConfig::default(),
+        )?;
         let timers = TimerStore::open(&path.join(TIMERS_FILE), StateConfig::default())?;
         Self::from_parts(
             path,
@@ -199,7 +204,6 @@ impl Database {
             operator_catalog,
             timers,
             executor,
-            registry,
             config,
         )
     }
@@ -209,10 +213,9 @@ impl Database {
         path: &Path,
         table_catalog: TableCatalog,
         state_catalog: StateCatalog,
-        operator_catalog: OperatorCatalog,
+        operator_catalog: OperatorCatalog<Ops::Config>,
         timers: TimerStore,
         executor: Arc<dyn Executor>,
-        registry: OperatorRegistry,
         config: DatabaseConfig,
     ) -> io::Result<Arc<Self>> {
         let timer_notify = Arc::new((Mutex::new(()), Condvar::new()));
@@ -220,7 +223,6 @@ impl Database {
             path: path.to_path_buf(),
             config,
             executor,
-            registry,
             table_catalog: Mutex::new(table_catalog),
             state_catalog: Mutex::new(state_catalog),
             operator_catalog: Mutex::new(operator_catalog),
@@ -249,10 +251,14 @@ fn resource_closed(kind: &str, name: &str) -> io::Error {
 mod tests {
     use super::*;
     use crate::{
-        Change, Operator, OperatorConfig, OperatorContext, OperatorRegistry, OperatorStatus,
-        Subscription, TableConfig,
+        Change, GlobalOperatorConfig, Operator, OperatorContext, OperatorRuntimeConfig,
+        OperatorStatus, Subscription, TableConfig,
     };
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use parking_lot::Mutex;
+    use std::sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        OnceLock,
+    };
     use std::time::{Duration, Instant};
     use zendb_storage::core::traits::Backend;
     use zendb_types::{
@@ -283,6 +289,12 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Encode, Decode)]
+    struct CountingConfig {
+        tracker: String,
+        finish: bool,
+    }
+
     struct CountingOperator {
         count: Arc<AtomicUsize>,
         finish: bool,
@@ -292,22 +304,42 @@ mod tests {
     }
 
     impl Operator for CountingOperator {
-        type Config = ();
+        type Config = CountingConfig;
         type Timer = ();
-        fn open<'a>(&'a mut self, ctx: OperatorContext) -> crate::BoxFuture<'a, io::Result<()>> {
+
+        fn new(config: &Self::Config) -> io::Result<Self> {
+            Ok(Self {
+                count: lookup_counter(&config.tracker)?,
+                finish: config.finish,
+                buffer: None,
+                index: None,
+                output: None,
+            })
+        }
+
+        fn open<'a, Ops>(
+            &'a mut self,
+            ctx: OperatorContext<Ops>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>>
+        where
+            Ops: crate::GlobalOperator,
+        {
             Box::pin(async move {
                 self.buffer = Some(ctx.state("counter/buffer", Some(StateConfig::default()))?);
                 self.index = Some(ctx.state("index", Some(StateConfig::default()))?);
                 self.output = Some(ctx.table("users", None)?);
-                Ok(())
+                Ok(OperatorStatus::Continue)
             })
         }
 
-        fn process<'a>(
+        fn process<'a, Ops>(
             &'a mut self,
             changes: Vec<Change>,
-            _ctx: OperatorContext,
-        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>> {
+            _ctx: OperatorContext<Ops>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>>
+        where
+            Ops: crate::GlobalOperator,
+        {
             Box::pin(async move {
                 self.count.fetch_add(changes.len(), Ordering::Relaxed);
                 if let Some(state) = &self.index {
@@ -332,7 +364,13 @@ mod tests {
             })
         }
 
-        fn finish<'a>(&'a mut self, _ctx: OperatorContext) -> crate::BoxFuture<'a, io::Result<()>> {
+        fn finish<'a, Ops>(
+            &'a mut self,
+            _ctx: OperatorContext<Ops>,
+        ) -> crate::BoxFuture<'a, io::Result<()>>
+        where
+            Ops: crate::GlobalOperator,
+        {
             Box::pin(async move {
                 self.buffer = None;
                 self.index = None;
@@ -342,19 +380,36 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Encode, Decode)]
+    struct RetryOperatorConfig {
+        attempts_tracker: String,
+        processed_tracker: String,
+    }
+
     struct FailingOnceOperator {
         attempts: Arc<AtomicUsize>,
         processed: Arc<AtomicUsize>,
     }
 
     impl Operator for FailingOnceOperator {
-        type Config = ();
+        type Config = RetryOperatorConfig;
         type Timer = ();
-        fn process<'a>(
+
+        fn new(config: &Self::Config) -> io::Result<Self> {
+            Ok(Self {
+                attempts: lookup_counter(&config.attempts_tracker)?,
+                processed: lookup_counter(&config.processed_tracker)?,
+            })
+        }
+
+        fn process<'a, Ops>(
             &'a mut self,
             changes: Vec<Change>,
-            _ctx: OperatorContext,
-        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>> {
+            _ctx: OperatorContext<Ops>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>>
+        where
+            Ops: crate::GlobalOperator,
+        {
             Box::pin(async move {
                 if self.attempts.fetch_add(1, Ordering::Relaxed) == 0 {
                     return Err(io::Error::other("expected failure"));
@@ -365,67 +420,154 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Encode, Decode)]
+    struct TimerOperatorConfig {
+        tracker: String,
+    }
+
     struct TimerOperator {
         fired: Arc<AtomicUsize>,
     }
 
     impl Operator for TimerOperator {
-        type Config = ();
+        type Config = TimerOperatorConfig;
         type Timer = ();
 
-        fn open<'a>(&'a mut self, ctx: OperatorContext) -> crate::BoxFuture<'a, io::Result<()>> {
+        fn new(config: &Self::Config) -> io::Result<Self> {
+            Ok(Self {
+                fired: lookup_counter(&config.tracker)?,
+            })
+        }
+
+        fn open<'a, Ops>(
+            &'a mut self,
+            ctx: OperatorContext<Ops>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>>
+        where
+            Ops: crate::GlobalOperator,
+        {
             Box::pin(async move {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as u64;
                 ctx.register_timer(now, &())?;
-                Ok(())
+                Ok(OperatorStatus::Continue)
             })
         }
 
-        fn process<'a>(
+        fn process<'a, Ops>(
             &'a mut self,
             _changes: Vec<Change>,
-            _ctx: OperatorContext,
-        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>> {
+            _ctx: OperatorContext<Ops>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>>
+        where
+            Ops: crate::GlobalOperator,
+        {
             Box::pin(async { Ok(OperatorStatus::Continue) })
         }
 
-        fn handle_timer<'a>(
+        fn handle_timer<'a, Ops>(
             &'a mut self,
             _payload: (),
-            _ctx: OperatorContext,
-        ) -> crate::BoxFuture<'a, io::Result<()>> {
+            _ctx: OperatorContext<Ops>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>>
+        where
+            Ops: crate::GlobalOperator,
+        {
             Box::pin(async move {
                 self.fired.fetch_add(1, Ordering::Relaxed);
-                Ok(())
+                Ok(OperatorStatus::Finish)
             })
         }
     }
 
-    fn registry(count: Arc<AtomicUsize>, finish: bool) -> OperatorRegistry {
-        let mut registry = OperatorRegistry::new();
-        registry.register_operator::<CountingOperator>("count", move |_: ()| {
-            Ok(CountingOperator {
-                count: Arc::clone(&count),
-                finish,
-                buffer: None,
-                index: None,
-                output: None,
-            })
-        });
-        registry
+    crate::define_operator_set! {
+        mod test_operators {
+            Count(CountingOperator),
+            Retry(FailingOnceOperator),
+            Timer(TimerOperator),
+        }
     }
 
-    fn config() -> OperatorConfig {
-        OperatorConfig {
-            implementation: "count".into(),
-            configuration: Vec::new(),
-            subscriptions: vec![Subscription::pattern("users")],
-            retry: Default::default(),
-            poll_size: 128,
-        }
+    type TestDatabase = Database<test_operators::Instance>;
+    type TestOperatorConfig = test_operators::Config;
+    type TestOperatorInstanceConfig = test_operators::OperatorInstanceConfig;
+
+    fn counter_trackers() -> &'static Mutex<HashMap<String, Arc<AtomicUsize>>> {
+        static TRACKERS: OnceLock<Mutex<HashMap<String, Arc<AtomicUsize>>>> = OnceLock::new();
+        TRACKERS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn new_tracker(prefix: &str) -> (String, Arc<AtomicUsize>) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let key = format!(
+            "{prefix}_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let counter = Arc::new(AtomicUsize::new(0));
+        counter_trackers()
+            .lock()
+            .insert(key.clone(), Arc::clone(&counter));
+        (key, counter)
+    }
+
+    fn lookup_counter(key: &str) -> io::Result<Arc<AtomicUsize>> {
+        counter_trackers().lock().get(key).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("missing test counter tracker {key:?}"),
+            )
+        })
+    }
+
+    fn counting_config(tracker: String, finish: bool) -> TestOperatorConfig {
+        let config = TestOperatorConfig {
+            operator: TestOperatorInstanceConfig::Count(CountingConfig { tracker, finish }),
+            runtime: OperatorRuntimeConfig {
+                subscriptions: vec![Subscription::pattern("users")],
+                retry: Default::default(),
+                poll_size: 128,
+            },
+        };
+        assert_eq!(config.kind(), test_operators::Kind::Count);
+        let _ = config.operator();
+        let _ = config.runtime_config();
+        config
+    }
+
+    fn retry_config(attempts_tracker: String, processed_tracker: String) -> TestOperatorConfig {
+        let config = TestOperatorConfig {
+            operator: TestOperatorInstanceConfig::Retry(RetryOperatorConfig {
+                attempts_tracker,
+                processed_tracker,
+            }),
+            runtime: OperatorRuntimeConfig {
+                subscriptions: vec![Subscription::pattern("users")],
+                retry: Default::default(),
+                poll_size: 128,
+            },
+        };
+        assert_eq!(config.kind(), test_operators::Kind::Retry);
+        let _ = config.operator();
+        let _ = config.runtime_config();
+        config
+    }
+
+    fn timer_config(tracker: String) -> TestOperatorConfig {
+        let config = TestOperatorConfig {
+            operator: TestOperatorInstanceConfig::Timer(TimerOperatorConfig { tracker }),
+            runtime: OperatorRuntimeConfig {
+                subscriptions: vec![Subscription::pattern("users")],
+                retry: Default::default(),
+                poll_size: 128,
+            },
+        };
+        assert_eq!(config.kind(), test_operators::Kind::Timer);
+        let _ = config.operator();
+        let _ = config.runtime_config();
+        config
     }
 
     fn event(table: &str, value: i64, ms: u64) -> Event {
@@ -455,16 +597,12 @@ mod tests {
     #[test]
     fn direct_table_writes_drive_operators() {
         let path = tmp("direct");
-        let count = Arc::new(AtomicUsize::new(0));
-        let db = Database::create(
-            &path,
-            Arc::new(ThreadExecutor),
-            registry(Arc::clone(&count), false),
-            DatabaseConfig::default(),
-        )
-        .unwrap();
+        let (tracker, count) = new_tracker("direct");
+        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
+            .unwrap();
         let table = db.table("users", Some(TableConfig::default())).unwrap();
-        db.operator("counter", Some(config())).unwrap();
+        db.operator("counter", Some(counting_config(tracker, false)))
+            .unwrap();
 
         table
             .get()
@@ -488,36 +626,13 @@ mod tests {
     #[test]
     fn failed_process_resets_readers_to_committed_offsets() {
         let path = tmp("retry");
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let processed = Arc::new(AtomicUsize::new(0));
-        let mut registry = OperatorRegistry::new();
-        let factory_attempts = Arc::clone(&attempts);
-        let factory_processed = Arc::clone(&processed);
-        registry.register_operator::<FailingOnceOperator>("retry", move |_: ()| {
-            Ok(FailingOnceOperator {
-                attempts: Arc::clone(&factory_attempts),
-                processed: Arc::clone(&factory_processed),
-            })
-        });
-        let db = Database::create(
-            &path,
-            Arc::new(ThreadExecutor),
-            registry,
-            DatabaseConfig::default(),
-        )
-        .unwrap();
+        let (attempts_key, attempts) = new_tracker("retry_attempts");
+        let (processed_key, processed) = new_tracker("retry_processed");
+        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
+            .unwrap();
         let table = db.table("users", Some(TableConfig::default())).unwrap();
-        db.operator(
-            "retry",
-            Some(OperatorConfig {
-                implementation: "retry".into(),
-                configuration: Vec::new(),
-                subscriptions: vec![Subscription::pattern("users")],
-                retry: Default::default(),
-                poll_size: 128,
-            }),
-        )
-        .unwrap();
+        db.operator("retry", Some(retry_config(attempts_key, processed_key)))
+            .unwrap();
 
         table
             .get()
@@ -539,15 +654,12 @@ mod tests {
     #[test]
     fn states_preserve_first_opened_key_and_value_types() {
         let path = tmp("typed_state");
-        let db = Database::create(
-            &path,
-            Arc::new(ThreadExecutor),
-            registry(Arc::new(AtomicUsize::new(0)), false),
-            DatabaseConfig::default(),
-        )
-        .unwrap();
+        let (tracker, _) = new_tracker("typed_state");
+        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
+            .unwrap();
         db.table("users", Some(TableConfig::default())).unwrap();
-        db.operator("counter", Some(config())).unwrap();
+        db.operator("counter", Some(counting_config(tracker, false)))
+            .unwrap();
 
         wait_until(|| db.state::<Vec<u8>, Vec<u8>>("index", None).is_ok());
         let index = db.state::<Vec<u8>, Vec<u8>>("index", None).unwrap();
@@ -572,16 +684,14 @@ mod tests {
     #[test]
     fn typed_states_reopen_from_catalog() {
         let path = tmp("typed_state_reopen");
+        let (tracker, _) = new_tracker("typed_state_reopen");
         {
-            let db = Database::create(
-                &path,
-                Arc::new(ThreadExecutor),
-                registry(Arc::new(AtomicUsize::new(0)), false),
-                DatabaseConfig::default(),
-            )
-            .unwrap();
+            let db =
+                TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
+                    .unwrap();
             db.table("users", Some(TableConfig::default())).unwrap();
-            db.operator("counter", Some(config())).unwrap();
+            db.operator("counter", Some(counting_config(tracker.clone(), false)))
+                .unwrap();
             wait_until(|| db.state::<Vec<u8>, Vec<u8>>("index", None).is_ok());
             db.state::<Vec<u8>, Vec<u8>>("index", None)
                 .unwrap()
@@ -592,13 +702,8 @@ mod tests {
                 .unwrap();
         }
 
-        let db = Database::open(
-            &path,
-            Arc::new(ThreadExecutor),
-            registry(Arc::new(AtomicUsize::new(0)), false),
-            DatabaseConfig::default(),
-        )
-        .unwrap();
+        let db =
+            TestDatabase::open(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
         assert_eq!(
             db.state::<Vec<u8>, Vec<u8>>("index", None)
                 .unwrap()
@@ -614,33 +719,11 @@ mod tests {
     #[test]
     fn processing_time_timers_fire_and_survive_restart() {
         let path = tmp("timers");
-        let fired = Arc::new(AtomicUsize::new(0));
-        let mut registry = OperatorRegistry::new();
-        let factory_fired = Arc::clone(&fired);
-        registry.register_operator::<TimerOperator>("timer", move |_: ()| {
-            Ok(TimerOperator {
-                fired: Arc::clone(&factory_fired),
-            })
-        });
-        let db = Database::create(
-            &path,
-            Arc::new(ThreadExecutor),
-            registry,
-            DatabaseConfig::default(),
-        )
-        .unwrap();
+        let (tracker, fired) = new_tracker("timers");
+        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
+            .unwrap();
         db.table("users", Some(TableConfig::default())).unwrap();
-        db.operator(
-            "ticker",
-            Some(OperatorConfig {
-                implementation: "timer".into(),
-                configuration: Vec::new(),
-                subscriptions: vec![Subscription::pattern("users")],
-                retry: Default::default(),
-                poll_size: 128,
-            }),
-        )
-        .unwrap();
+        db.operator("ticker", Some(timer_config(tracker))).unwrap();
 
         wait_until(|| fired.load(Ordering::Relaxed) >= 1);
     }

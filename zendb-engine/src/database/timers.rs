@@ -24,6 +24,7 @@ use zendb_storage::core::traits::Backend;
 use zendb_storage::frontend::state::State;
 
 use super::Database;
+use crate::GlobalOperator;
 
 /// Ordering key: earliest `fire_at_ms` first; within the same millisecond,
 /// lexicographic by operator name.
@@ -48,7 +49,10 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-impl Database {
+impl<Ops> Database<Ops>
+where
+    Ops: GlobalOperator,
+{
     /// Register a processing-time timer for `operator`.
     ///
     /// If a timer already exists for the same `(operator, fire_at_ms)` pair it
@@ -122,7 +126,12 @@ impl Database {
     }
 }
 
-pub(super) async fn run_scheduler(database: Weak<Database>, notify: Arc<(Mutex<()>, Condvar)>) {
+pub(super) async fn run_scheduler<Ops>(
+    database: Weak<Database<Ops>>,
+    notify: Arc<(Mutex<()>, Condvar)>,
+) where
+    Ops: GlobalOperator,
+{
     let cap = Duration::from_secs(60);
     loop {
         let Some(db) = database.upgrade() else {

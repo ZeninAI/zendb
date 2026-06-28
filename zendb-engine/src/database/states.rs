@@ -1,6 +1,6 @@
 //! Guarded database state lifecycle.
 
-use std::{any::Any, fs, io, sync::Arc};
+use std::{fs, io, sync::Arc};
 
 use bincode::{Decode, Encode};
 use parking_lot::RwLock;
@@ -9,11 +9,14 @@ use zendb_storage::{
     frontend::state::{State, StateConfig},
 };
 
-use super::{ConcurrentState, Database, StateHandle, STATES_DIR};
+use crate::GlobalOperator;
 
-pub(super) type ErasedStateHandle = Arc<dyn Any + Send + Sync>;
+use super::{ConcurrentState, Database, ErasedStateHandle, StateHandle, STATES_DIR};
 
-impl Database {
+impl<Ops> Database<Ops>
+where
+    Ops: GlobalOperator,
+{
     /// Return an open state, opening it lazily from the catalog or creating it
     /// with `config`. If the state is in the catalog and a different `config` is
     /// supplied, the catalog is updated before opening.

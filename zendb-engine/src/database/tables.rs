@@ -7,11 +7,14 @@ use zendb_storage::core::traits::{Backend, DurableStorage};
 use zendb_storage::frontend::table::{Table, TableConfig};
 
 use crate::operator::worker::{OperatorInput, OperatorWorker};
-use crate::{OperatorConfig, OperatorPhase};
+use crate::{GlobalOperator, GlobalOperatorConfig, OperatorPhase};
 
 use super::{ConcurrentTable, Database, OperatorCatalog, TableHandle, TABLES_DIR};
 
-impl Database {
+impl<Ops> Database<Ops>
+where
+    Ops: GlobalOperator,
+{
     /// Return an open table, opening it lazily from the catalog or creating it
     /// with `config`. If the table is in the catalog and a different `config` is
     /// supplied, the catalog is updated before opening. Automatically starts
@@ -81,14 +84,19 @@ impl Database {
         self: &Arc<Self>,
         name: &str,
         table: &ConcurrentTable,
-        operator_catalog: &mut OperatorCatalog,
-    ) -> io::Result<Vec<Arc<OperatorWorker>>> {
-        let matching_operators: Vec<(String, OperatorConfig)> = operator_catalog
+        operator_catalog: &mut OperatorCatalog<Ops::Config>,
+    ) -> io::Result<Vec<Arc<OperatorWorker<Ops>>>> {
+        let matching_operators: Vec<(String, Ops::Config)> = operator_catalog
             .entries()
             .filter_map(|(op_name, entry)| {
                 let entry = entry.as_ref();
                 if entry.phase == OperatorPhase::Active
-                    && entry.config.subscriptions.iter().any(|s| s.matches(name))
+                    && entry
+                        .config
+                        .runtime_config()
+                        .subscriptions
+                        .iter()
+                        .any(|s| s.matches(name))
                 {
                     Some((op_name.into_owned(), entry.config.clone()))
                 } else {

@@ -6,12 +6,15 @@ use zendb_storage::core::traits::Backend;
 
 use crate::operator::{
     worker::{OperatorInput, OperatorWorker},
-    OperatorConfig, OperatorPhase,
+    GlobalOperator, GlobalOperatorConfig, OperatorPhase,
 };
 
 use super::{Database, OperatorEntry};
 
-impl Database {
+impl<Ops> Database<Ops>
+where
+    Ops: GlobalOperator,
+{
     /// Return the phase and effective config of an operator, ensuring it is
     /// running unless it is in a terminal state or no matching tables are open.
     ///
@@ -29,18 +32,18 @@ impl Database {
     pub fn operator(
         self: &Arc<Self>,
         name: &str,
-        config: Option<OperatorConfig>,
-    ) -> io::Result<(OperatorPhase, OperatorConfig)> {
+        config: Option<Ops::Config>,
+    ) -> io::Result<(OperatorPhase, Ops::Config)> {
         // Fast path: already running — return its config.
         if let Some(worker) = self.operators.read().get(name).cloned() {
-            return Ok((OperatorPhase::Active, (*worker.config).clone()));
+            return Ok((OperatorPhase::Active, worker.config.clone()));
         }
 
         let (phase, effective, worker_opt) = {
             let mut catalog = self.operator_catalog.lock();
             // Double-check under catalog lock
             if let Some(worker) = self.operators.read().get(name).cloned() {
-                return Ok((OperatorPhase::Active, (*worker.config).clone()));
+                return Ok((OperatorPhase::Active, worker.config.clone()));
             }
 
             match catalog.get(&name.to_owned()) {
@@ -117,20 +120,24 @@ impl Database {
         Ok((phase, effective))
     }
 
-    /// Instantiate the operator via the registry and acquire one topic consumer
-    /// per currently-open table that matches the subscription. Does NOT validate
-    /// that all subscribed tables exist - in the lazy model, tables may open later.
+    /// Instantiate the operator from its typed config and acquire one topic
+    /// consumer per currently-open table that matches the subscription. Does
+    /// NOT validate that all subscribed tables exist - in the lazy model,
+    /// tables may open later.
     pub(super) fn build_worker(
         self: &Arc<Self>,
         name: String,
-        config: OperatorConfig,
-    ) -> io::Result<Arc<OperatorWorker>> {
-        let instance = self
-            .registry
-            .create_operator(&config.implementation, &config.configuration)?;
+        config: Ops::Config,
+    ) -> io::Result<Arc<OperatorWorker<Ops>>> {
+        let instance = Ops::new(&config)?;
         let mut inputs: Vec<OperatorInput> = Vec::new();
         for (table_name, table) in self.tables.read().iter() {
-            if config.subscriptions.iter().any(|s| s.matches(table_name)) {
+            if config
+                .runtime_config()
+                .subscriptions
+                .iter()
+                .any(|s| s.matches(table_name))
+            {
                 let reader = match table.read().consumer(&name) {
                     Ok(reader) => reader,
                     Err(error) => {

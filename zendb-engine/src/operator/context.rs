@@ -4,27 +4,29 @@ use std::{io, sync::Arc, sync::Weak};
 
 use bincode::{Decode, Encode};
 
-use crate::{OperatorConfig, StateHandle, TableHandle};
+use crate::{GlobalOperator, StateHandle, TableHandle};
 use zendb_storage::frontend::{state::StateConfig, table::TableConfig};
 
 /// Context passed to every [`super::Operator`] lifecycle method.
 ///
 /// Provides scoped access to the database (tables, states, timers) without
-/// exposing the raw `Weak<Database>` or requiring operators to know their
+/// exposing the raw `Weak<Database<Ops>>` or requiring operators to know their
 /// own registration name.
 #[derive(Clone)]
-pub struct OperatorContext {
-    pub(crate) db: Weak<crate::Database>,
+pub struct OperatorContext<Ops>
+where
+    Ops: GlobalOperator,
+{
+    pub(crate) db: Weak<crate::Database<Ops>>,
     pub(crate) name: String,
-    config: Arc<OperatorConfig>,
+    config: Ops::Config,
 }
 
-impl OperatorContext {
-    pub(crate) fn new(
-        db: Weak<crate::Database>,
-        name: String,
-        config: Arc<OperatorConfig>,
-    ) -> Self {
+impl<Ops> OperatorContext<Ops>
+where
+    Ops: GlobalOperator,
+{
+    pub(crate) fn new(db: Weak<crate::Database<Ops>>, name: String, config: Ops::Config) -> Self {
         Self { db, name, config }
     }
 
@@ -33,13 +35,13 @@ impl OperatorContext {
         &self.name
     }
 
-    /// The full registration config for this operator (subscriptions, retry, etc.).
-    pub fn config(&self) -> &OperatorConfig {
+    /// The full persisted config for this operator.
+    pub fn config(&self) -> &Ops::Config {
         &self.config
     }
 
     /// Upgrade to a strong database reference, or `None` if closed.
-    pub fn database(&self) -> Option<Arc<crate::Database>> {
+    pub fn database(&self) -> Option<Arc<crate::Database<Ops>>> {
         self.db.upgrade()
     }
 
@@ -77,14 +79,7 @@ impl OperatorContext {
         self.require_db()?.cancel_timer(&self.name, fire_at_ms)
     }
 
-    /// Decode a bincode-encoded payload. Used internally by the erased dispatch.
-    pub(crate) fn decode<T: Decode<()>>(&self, payload: &[u8]) -> io::Result<T> {
-        bincode::decode_from_slice(payload, bincode::config::standard())
-            .map(|(v, _)| v)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
-    }
-
-    fn require_db(&self) -> io::Result<Arc<crate::Database>> {
+    fn require_db(&self) -> io::Result<Arc<crate::Database<Ops>>> {
         self.db
             .upgrade()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "database is closed"))

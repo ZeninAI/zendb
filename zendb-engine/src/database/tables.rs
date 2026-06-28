@@ -15,6 +15,38 @@ impl<D> Database<D>
 where
     D: DispatchOperator,
 {
+    /// Return `true` if a table exists in the durable table catalog.
+    pub fn contains_table(&self, name: &str) -> bool {
+        self.table_catalog.lock().contains(&name.to_owned())
+    }
+
+    /// Return `true` if a table is currently loaded in memory.
+    pub fn is_table_open(&self, name: &str) -> bool {
+        self.tables.read().contains_key(name)
+    }
+
+    /// List every table known to the durable table catalog.
+    pub fn list_tables(&self) -> Vec<String> {
+        self.table_catalog
+            .lock()
+            .keys()
+            .map(|name| name.into_owned())
+            .collect()
+    }
+
+    /// List every table currently loaded in memory.
+    pub fn list_open_tables(&self) -> Vec<String> {
+        self.tables.read().keys().cloned().collect()
+    }
+
+    /// Return the persisted config for a table, if the catalog contains one.
+    pub fn table_config(&self, name: &str) -> Option<TableConfig> {
+        self.table_catalog
+            .lock()
+            .get(&name.to_owned())
+            .map(|config| config.into_owned())
+    }
+
     /// Return an open table, opening it lazily from the catalog or creating it
     /// with `config`. If the table is in the catalog and a different `config` is
     /// supplied, the catalog is updated before opening. Automatically starts

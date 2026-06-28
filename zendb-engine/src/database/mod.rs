@@ -320,7 +320,7 @@ mod tests {
 
         fn open<'a, D>(
             &'a mut self,
-            ctx: OperatorContext<'a, Self, D>,
+            ctx: &'a OperatorContext<Self, D>,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -336,7 +336,7 @@ mod tests {
         fn process<'a, D>(
             &'a mut self,
             changes: Vec<Change>,
-            _ctx: OperatorContext<'a, Self, D>,
+            _ctx: &'a OperatorContext<Self, D>,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -367,7 +367,7 @@ mod tests {
 
         fn finish<'a, D>(
             &'a mut self,
-            _ctx: OperatorContext<'a, Self, D>,
+            _ctx: &'a OperatorContext<Self, D>,
         ) -> crate::BoxFuture<'a, io::Result<()>>
         where
             D: crate::DispatchOperator,
@@ -406,7 +406,7 @@ mod tests {
         fn process<'a, D>(
             &'a mut self,
             changes: Vec<Change>,
-            _ctx: OperatorContext<'a, Self, D>,
+            _ctx: &'a OperatorContext<Self, D>,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -442,7 +442,7 @@ mod tests {
 
         fn open<'a, D>(
             &'a mut self,
-            ctx: OperatorContext<'a, Self, D>,
+            ctx: &'a OperatorContext<Self, D>,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -460,7 +460,7 @@ mod tests {
         fn process<'a, D>(
             &'a mut self,
             _changes: Vec<Change>,
-            _ctx: OperatorContext<'a, Self, D>,
+            _ctx: &'a OperatorContext<Self, D>,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -471,7 +471,7 @@ mod tests {
         fn handle_timer<'a, D>(
             &'a mut self,
             _payload: (),
-            _ctx: OperatorContext<'a, Self, D>,
+            _ctx: &'a OperatorContext<Self, D>,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,

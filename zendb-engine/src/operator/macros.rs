@@ -37,7 +37,12 @@ macro_rules! define_operator_set {
             }
 
             pub enum OperatorInstance {
-                $( $variant($operator), )+
+                $(
+                    $variant(
+                        $operator,
+                        Option<$crate::OperatorContext<$operator, OperatorInstance>>,
+                    ),
+                )+
             }
 
             impl OperatorConfig {
@@ -58,85 +63,80 @@ macro_rules! define_operator_set {
                 }
             }
 
-            impl $crate::Operator for OperatorInstance {
-                type Config = OperatorConfig;
-                type Timer = Vec<u8>;
+            impl $crate::DispatchOperator for OperatorInstance {
+                type DispatchConfig = OperatorConfig;
 
-                fn new(config: &Self::Config) -> ::std::io::Result<Self> {
+                fn new(config: &Self::DispatchConfig) -> ::std::io::Result<Self> {
                     match &config.operator {
                         $(
                             OperatorConfigVariant::$variant(inner) => {
                                 <$operator as $crate::Operator>::new(inner)
-                                    .map(OperatorInstance::$variant)
+                                    .map(|operator| OperatorInstance::$variant(operator, None))
                             }
                         )+
                     }
                 }
 
-                fn open<'a, D>(
+                fn open<'a>(
                     &'a mut self,
-                    ctx: $crate::OperatorContext<'a, Self, D>,
-                ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>>
-                where
-                    D: $crate::DispatchOperator,
-                {
+                    db: ::std::sync::Weak<$crate::Database<Self>>,
+                    name: &'a str,
+                    config: &'a Self::DispatchConfig,
+                ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
                     match self {
                         $(
-                            OperatorInstance::$variant(inner) => {
-                                let typed_config = match &ctx.config().operator {
-                                    OperatorConfigVariant::$variant(c) => c.clone(),
-                                    _ => ::std::unreachable!(),
-                                };
-                                let typed_ctx = $crate::OperatorContext {
-                                    db: ctx.db.clone(),
-                                    name: ctx.name,
-                                    config: typed_config,
-                                    _phantom: ::std::marker::PhantomData,
-                                };
+                            OperatorInstance::$variant(inner, cached_ctx) => {
+                                if cached_ctx.is_none() {
+                                    let typed_config = match &config.operator {
+                                        OperatorConfigVariant::$variant(c) => c.clone(),
+                                        _ => ::std::unreachable!(),
+                                    };
+                                    *cached_ctx = Some($crate::OperatorContext {
+                                        db: db.clone(),
+                                        name: name.to_owned(),
+                                        config: typed_config,
+                                        _phantom: ::std::marker::PhantomData,
+                                    });
+                                }
+                                let typed_ctx = cached_ctx.as_ref().expect("operator context is cached");
                                 <$operator as $crate::Operator>::open(inner, typed_ctx)
                             }
                         )+
                     }
                 }
 
-                fn process<'a, D>(
+                fn process<'a>(
                     &'a mut self,
                     changes: Vec<$crate::Change>,
-                    ctx: $crate::OperatorContext<'a, Self, D>,
-                ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>>
-                where
-                    D: $crate::DispatchOperator,
-                {
+                    _db: ::std::sync::Weak<$crate::Database<Self>>,
+                    _name: &'a str,
+                    _config: &'a Self::DispatchConfig,
+                ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
                     match self {
                         $(
-                            OperatorInstance::$variant(inner) => {
-                                let typed_config = match &ctx.config().operator {
-                                    OperatorConfigVariant::$variant(c) => c.clone(),
-                                    _ => ::std::unreachable!(),
-                                };
-                                let typed_ctx = $crate::OperatorContext {
-                                    db: ctx.db.clone(),
-                                    name: ctx.name,
-                                    config: typed_config,
-                                    _phantom: ::std::marker::PhantomData,
-                                };
+                            OperatorInstance::$variant(inner, cached_ctx) => {
+                                let typed_ctx = cached_ctx
+                                    .as_ref()
+                                    .expect("operator context must be initialized by open");
                                 <$operator as $crate::Operator>::process(inner, changes, typed_ctx)
                             }
                         )+
                     }
                 }
 
-                fn handle_timer<'a, D>(
+                fn handle_timer<'a>(
                     &'a mut self,
                     payload: Vec<u8>,
-                    ctx: $crate::OperatorContext<'a, Self, D>,
-                ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>>
-                where
-                    D: $crate::DispatchOperator,
-                {
+                    _db: ::std::sync::Weak<$crate::Database<Self>>,
+                    _name: &'a str,
+                    _config: &'a Self::DispatchConfig,
+                ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
                     match self {
                         $(
-                            OperatorInstance::$variant(inner) => {
+                            OperatorInstance::$variant(inner, cached_ctx) => {
+                                let typed_ctx = cached_ctx
+                                    .as_ref()
+                                    .expect("operator context must be initialized by open");
                                 Box::pin(async move {
                                     let timer: <$operator as $crate::Operator>::Timer =
                                         ::bincode::decode_from_slice(
@@ -150,16 +150,6 @@ macro_rules! define_operator_set {
                                                 error.to_string(),
                                             )
                                         })?;
-                                    let typed_config = match &ctx.config().operator {
-                                        OperatorConfigVariant::$variant(c) => c.clone(),
-                                        _ => ::std::unreachable!(),
-                                    };
-                                    let typed_ctx = $crate::OperatorContext {
-                                        db: ctx.db.clone(),
-                                        name: ctx.name,
-                                        config: typed_config,
-                                        _phantom: ::std::marker::PhantomData,
-                                    };
                                     <$operator as $crate::Operator>::handle_timer(
                                         inner, timer, typed_ctx,
                                     )
@@ -170,35 +160,23 @@ macro_rules! define_operator_set {
                     }
                 }
 
-                fn finish<'a, D>(
+                fn finish<'a>(
                     &'a mut self,
-                    ctx: $crate::OperatorContext<'a, Self, D>,
-                ) -> $crate::BoxFuture<'a, ::std::io::Result<()>>
-                where
-                    D: $crate::DispatchOperator,
-                {
+                    _db: ::std::sync::Weak<$crate::Database<Self>>,
+                    _name: &'a str,
+                    _config: &'a Self::DispatchConfig,
+                ) -> $crate::BoxFuture<'a, ::std::io::Result<()>> {
                     match self {
                         $(
-                            OperatorInstance::$variant(inner) => {
-                                let typed_config = match &ctx.config().operator {
-                                    OperatorConfigVariant::$variant(c) => c.clone(),
-                                    _ => ::std::unreachable!(),
-                                };
-                                let typed_ctx = $crate::OperatorContext {
-                                    db: ctx.db.clone(),
-                                    name: ctx.name,
-                                    config: typed_config,
-                                    _phantom: ::std::marker::PhantomData,
-                                };
+                            OperatorInstance::$variant(inner, cached_ctx) => {
+                                let typed_ctx = cached_ctx
+                                    .as_ref()
+                                    .expect("operator context must be initialized by open");
                                 <$operator as $crate::Operator>::finish(inner, typed_ctx)
                             }
                         )+
                     }
                 }
-            }
-
-            impl $crate::DispatchOperator for OperatorInstance {
-                type DispatchConfig = OperatorConfig;
             }
         }
     };

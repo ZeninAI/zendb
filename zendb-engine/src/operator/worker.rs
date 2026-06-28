@@ -10,10 +10,7 @@ use std::{
 use parking_lot::Mutex;
 use zendb_storage::core::topic::TopicConsumer;
 
-use super::{
-    Change, DispatchOperator, DispatchOperatorConfig, OperatorContext, OperatorDirective,
-    OperatorPhase,
-};
+use super::{Change, DispatchOperator, DispatchOperatorConfig, OperatorDirective, OperatorPhase};
 use crate::{runtime::Executor, Database};
 
 pub(crate) struct OperatorInput {
@@ -94,14 +91,10 @@ where
         executor: Arc<dyn Executor>,
         mut operator: D,
     ) {
-        let make_ctx = || OperatorContext {
-            db: database.clone(),
-            name: &self.name,
-            config: self.config.clone(),
-            _phantom: std::marker::PhantomData,
-        };
-
-        match operator.open(make_ctx()).await {
+        match operator
+            .open(database.clone(), &self.name, &self.config)
+            .await
+        {
             Ok(OperatorDirective::Continue) => {}
             Ok(OperatorDirective::Finish) => {
                 self.finish_and_retire(&database, &mut operator).await;
@@ -132,7 +125,10 @@ where
             }
 
             for payload in timers {
-                match operator.handle_timer(payload, make_ctx()).await {
+                match operator
+                    .handle_timer(payload, database.clone(), &self.name, &self.config)
+                    .await
+                {
                     Ok(OperatorDirective::Continue) => {}
                     Ok(OperatorDirective::Finish) => {
                         self.finish_and_retire(&database, &mut operator).await;
@@ -148,7 +144,10 @@ where
                 continue;
             }
 
-            match operator.process(changes, make_ctx()).await {
+            match operator
+                .process(changes, database.clone(), &self.name, &self.config)
+                .await
+            {
                 Ok(OperatorDirective::Continue) => {
                     attempt = 0;
                     if let Err(error) = self.commit() {
@@ -177,7 +176,10 @@ where
                             self.name,
                             runtime.retry.max_attempts
                         );
-                        if let Err(finish_err) = operator.finish(make_ctx()).await {
+                        if let Err(finish_err) = operator
+                            .finish(database.clone(), &self.name, &self.config)
+                            .await
+                        {
                             log::error!("failed finishing operator {:?}: {finish_err}", self.name);
                         }
                         self.retire(&database, OperatorPhase::Failed { error: error_msg });
@@ -196,13 +198,10 @@ where
     }
 
     async fn finish_and_retire(&self, database: &Weak<Database<D>>, operator: &mut D) {
-        let ctx = OperatorContext {
-            db: database.clone(),
-            name: &self.name,
-            config: self.config.clone(),
-            _phantom: std::marker::PhantomData,
-        };
-        if let Err(error) = operator.finish(ctx).await {
+        if let Err(error) = operator
+            .finish(database.clone(), &self.name, &self.config)
+            .await
+        {
             log::error!("failed finishing operator {:?}: {error}", self.name);
         }
         self.retire(database, OperatorPhase::Finished);

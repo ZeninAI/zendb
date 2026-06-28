@@ -14,25 +14,25 @@ use zendb_storage::frontend::{state::StateConfig, table::TableConfig};
 ///
 /// * `O` - the concrete operator type (e.g. `CountingOperator`).
 /// * `D` - the dispatch operator type (the generated `OperatorInstance` enum).
-pub struct OperatorContext<'a, O, D>
+pub struct OperatorContext<O, D>
 where
     O: Operator + ?Sized,
     D: DispatchOperator,
 {
     pub(crate) db: Weak<Database<D>>,
-    pub(crate) name: &'a str,
+    pub(crate) name: String,
     pub(crate) config: O::Config,
     pub(crate) _phantom: PhantomData<fn(&O, &D)>,
 }
 
-impl<'a, O, D> OperatorContext<'a, O, D>
+impl<O, D> OperatorContext<O, D>
 where
     O: Operator + ?Sized,
     D: DispatchOperator,
 {
     /// The registration name of this operator.
     pub fn name(&self) -> &str {
-        self.name
+        &self.name
     }
 
     /// The operator's own typed config, not the union enum.
@@ -75,12 +75,12 @@ where
         let bytes = bincode::encode_to_vec(payload, bincode::config::standard())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         self.require_db()?
-            .register_timer(self.name, fire_at_ms, bytes)
+            .register_timer(&self.name, fire_at_ms, bytes)
     }
 
     /// Cancel a pending timer at `fire_at_ms` registered by this operator.
     pub fn cancel_timer(&self, fire_at_ms: u64) -> io::Result<()> {
-        self.require_db()?.cancel_timer(self.name, fire_at_ms)
+        self.require_db()?.cancel_timer(&self.name, fire_at_ms)
     }
 
     fn require_db(&self) -> io::Result<Arc<Database<D>>> {

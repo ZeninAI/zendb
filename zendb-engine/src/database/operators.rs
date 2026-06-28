@@ -15,6 +15,46 @@ impl<D> Database<D>
 where
     D: DispatchOperator,
 {
+    /// Return `true` if an operator exists in the durable operator catalog.
+    pub fn contains_operator(&self, name: &str) -> bool {
+        self.operator_catalog.lock().contains(&name.to_owned())
+    }
+
+    /// Return `true` if an operator is currently loaded in memory.
+    pub fn is_operator_open(&self, name: &str) -> bool {
+        self.operators.read().contains_key(name)
+    }
+
+    /// List every operator known to the durable operator catalog.
+    pub fn list_operators(&self) -> Vec<String> {
+        self.operator_catalog
+            .lock()
+            .keys()
+            .map(|name| name.into_owned())
+            .collect()
+    }
+
+    /// List every operator currently loaded in memory.
+    pub fn list_open_operators(&self) -> Vec<String> {
+        self.operators.read().keys().cloned().collect()
+    }
+
+    /// Return the persisted phase for an operator, if the catalog contains one.
+    pub fn operator_phase(&self, name: &str) -> Option<OperatorPhase> {
+        self.operator_catalog
+            .lock()
+            .get(&name.to_owned())
+            .map(|entry| entry.as_ref().phase.clone())
+    }
+
+    /// Return the persisted config for an operator, if the catalog contains one.
+    pub fn operator_config(&self, name: &str) -> Option<D::DispatchConfig> {
+        self.operator_catalog
+            .lock()
+            .get(&name.to_owned())
+            .map(|entry| entry.as_ref().config.clone())
+    }
+
     /// Return the phase and effective config of an operator, ensuring it is
     /// running unless it is in a terminal state or no matching tables are open.
     ///

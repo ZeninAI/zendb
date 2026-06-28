@@ -10,6 +10,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Weak},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use bincode::{Decode, Encode};
@@ -29,7 +30,30 @@ use crate::{
     TableConfig,
 };
 
-use timers::{run_scheduler, TimerStore};
+use timers::run_scheduler;
+
+/// Ordering key: earliest `fire_at_ms` first; within the same millisecond,
+/// lexicographic by operator name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub(crate) struct TimerKey {
+    pub(crate) fire_at_ms: u64,
+    pub(crate) operator: String,
+}
+
+/// Opaque payload stored with each timer.
+#[derive(Debug, Clone, Encode, Decode)]
+pub(crate) struct TimerEntry {
+    pub(crate) payload: Vec<u8>,
+}
+
+pub(crate) type TimerStore = State<TimerKey, TimerEntry>;
+
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub(super) struct OperatorEntry<Config> {
@@ -471,6 +495,7 @@ mod tests {
         fn handle_timer<'a, D>(
             &'a mut self,
             _payload: (),
+            _fire_at_ms: u64,
             _ctx: &'a OperatorContext<Self, D>,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
@@ -594,13 +619,29 @@ mod tests {
         }
     }
 
-    fn tmp(name: &str) -> PathBuf {
+    /// RAII guard that removes the test directory when dropped.
+    struct TmpDir(PathBuf);
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for TmpDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    fn tmp(name: &str) -> TmpDir {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
+        TmpDir(std::env::temp_dir().join(format!(
             "zendb_database_{name}_{}_{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
+        )))
     }
 
     #[test]

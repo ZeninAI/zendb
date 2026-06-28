@@ -616,7 +616,23 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    fn tmp(label: &str) -> PathBuf {
+    /// RAII guard that removes the test directory when dropped.
+    struct TmpDir(PathBuf);
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for TmpDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    fn tmp(label: &str) -> TmpDir {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join("zendb_topic_tests").join(format!(
@@ -624,8 +640,8 @@ mod tests {
             std::process::id(),
             n
         ));
-        let _ = fs::remove_dir_all(&path);
-        path
+        let _ = std::fs::remove_dir_all(&path);
+        TmpDir(path)
     }
 
     fn config(max_segment_bytes: u64) -> TopicConfig {

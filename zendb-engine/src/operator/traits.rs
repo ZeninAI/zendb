@@ -42,6 +42,7 @@ pub trait Operator: Send + 'static {
     fn handle_timer<'a, D>(
         &'a mut self,
         _payload: Self::Timer,
+        _fire_at_ms: u64,
         _ctx: &'a OperatorContext<Self, D>,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
     where
@@ -107,6 +108,7 @@ pub trait DispatchOperator: Send + 'static {
     fn handle_timer<'a>(
         &'a mut self,
         payload: Vec<u8>,
+        fire_at_ms: u64,
         db: Weak<Database<Self>>,
         name: &'a str,
         config: &'a Self::DispatchConfig,

@@ -205,6 +205,7 @@ where
             worker.delete_inputs();
         }
         self.delete_operator_consumers(name);
+        self.cancel_operator_timers(name);
 
         if let Err(error) = self
             .operator_catalog

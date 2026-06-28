@@ -784,8 +784,26 @@ mod tests {
         }
     }
 
+    /// RAII guard that removes the backing files (.kd, .compact, .bak) when dropped.
+    struct TmpFile(PathBuf);
+
+    impl Drop for TmpFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+            let _ = fs::remove_file(self.0.with_extension("compact"));
+            let _ = fs::remove_file(self.0.with_extension("bak"));
+        }
+    }
+
+    impl std::ops::Deref for TmpFile {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
     /// Each test gets a fresh, isolated path.
-    fn tmp_path(label: &str) -> PathBuf {
+    fn tmp_path(label: &str) -> TmpFile {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join("zendb_keydir_tests");
@@ -794,7 +812,7 @@ mod tests {
         let _ = fs::remove_file(&p);
         let _ = fs::remove_file(p.with_extension("compact"));
         let _ = fs::remove_file(p.with_extension("bak"));
-        p
+        TmpFile(p)
     }
 
     fn create(path: &Path) -> KeyDir<TestKey, TestVal> {

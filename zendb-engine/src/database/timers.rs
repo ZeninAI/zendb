@@ -11,43 +11,22 @@
 //! waking early whenever a nearer timer is registered. Timers for operators
 //! that are not currently loaded are skipped (left in the store) and fire
 //! once the operator is activated again.
+//!
+//! Timer eviction is owned by the worker: `cancel_timer` is called after
+//! successful `handle_timer`. On operator retirement, `cancel_operator_timers`
+//! sweeps any remaining timers for that operator.
 
 use std::{
     io,
     sync::{Arc, Weak},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
-use bincode::{Decode, Encode};
 use parking_lot::{Condvar, Mutex};
 use zendb_storage::core::traits::Backend;
-use zendb_storage::frontend::state::State;
 
-use super::Database;
+use super::{now_ms, Database, TimerEntry, TimerKey};
 use crate::DispatchOperator;
-
-/// Ordering key: earliest `fire_at_ms` first; within the same millisecond,
-/// lexicographic by operator name.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
-pub(crate) struct TimerKey {
-    fire_at_ms: u64,
-    operator: String,
-}
-
-/// Opaque payload stored with each timer.
-#[derive(Debug, Clone, Encode, Decode)]
-pub(crate) struct TimerEntry {
-    payload: Vec<u8>,
-}
-
-pub(crate) type TimerStore = State<TimerKey, TimerEntry>;
-
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 impl<D> Database<D>
 where
@@ -84,46 +63,63 @@ where
         self.timers.write().delete(&key).map(|_| ())
     }
 
-    /// Pop due timers only for operators that are currently loaded in memory.
-    /// Timers for unloaded operators are left in the store untouched.
-    fn take_due_timers(&self, now: u64) -> Vec<(String, Vec<u8>)> {
+    /// Pop due timers for loaded operators and return the next deliverable
+    /// timestamp (if any) so the scheduler can sleep until then.
+    ///
+    /// Timers are NOT deleted here — eviction is owned by the worker after
+    /// successful `handle_timer`.
+    ///
+    /// Returns `(fired_timers, next_deliverable_ms)`.
+    fn take_due_timers(&self, now: u64) -> (Vec<(String, u64, Vec<u8>)>, Option<u64>) {
         let operators = self.operators.read();
-        let mut timers = self.timers.write();
+        let timers = self.timers.read();
 
-        let due: Vec<(TimerKey, TimerEntry)> = timers
-            .entries()
-            .take_while(|(key, _)| key.fire_at_ms <= now)
-            .filter(|(key, _)| operators.contains_key(&key.operator))
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
+        let mut fired = Vec::new();
+        let mut next_ms: Option<u64> = None;
+        let mut found_next = false;
 
-        drop(operators);
+        for item in timers.entries() {
+            let key_ref = item.0;
+            let loaded = operators.contains_key(&key_ref.operator);
 
-        let mut fired = Vec::with_capacity(due.len());
-        for (key, entry) in due {
-            if let Err(error) = timers.delete(&key) {
-                log::error!("failed removing fired timer: {error}");
-                continue;
+            if key_ref.fire_at_ms <= now {
+                if loaded {
+                    let key = key_ref.into_owned();
+                    let payload = item.1.into_owned().payload;
+                    fired.push((key.operator, key.fire_at_ms, payload));
+                }
+            } else {
+                if !found_next && loaded {
+                    next_ms = Some(key_ref.fire_at_ms);
+                    found_next = true;
+                }
+                if found_next {
+                    break;
+                }
             }
-            fired.push((key.operator, entry.payload));
         }
-        fired
+
+        (fired, next_ms)
     }
 
-    /// Peek at the earliest pending timer that has a loaded operator, so the
-    /// scheduler only wakes when there is something deliverable.
-    fn next_deliverable_timer_ms(&self) -> Option<u64> {
-        let operators = self.operators.read();
-        self.timers
-            .read()
+    /// Delete every timer belonging to `operator` from the store.
+    /// Called on operator retirement to prevent stale timers from
+    /// accumulating.
+    pub(crate) fn cancel_operator_timers(&self, operator: &str) {
+        let mut timers = self.timers.write();
+        let keys: Vec<TimerKey> = timers
             .entries()
-            .find(|(key, _)| operators.contains_key(&key.operator))
-            .map(|(key, _)| key.fire_at_ms)
+            .filter(|(key, _)| key.operator == operator)
+            .map(|(k, _)| k.into_owned())
+            .collect();
+        for key in keys {
+            let _ = timers.delete(&key);
+        }
     }
 
-    fn deliver_timer(&self, operator: &str, payload: Vec<u8>) {
+    fn deliver_timer(&self, operator: &str, fire_at_ms: u64, payload: Vec<u8>) {
         if let Some(worker) = self.operators.read().get(operator).cloned() {
-            worker.timer_inbox.lock().push_back(payload);
+            worker.timer_inbox.lock().push_back((fire_at_ms, payload));
         }
     }
 }
@@ -138,20 +134,19 @@ where
             return;
         };
         let now = now_ms();
-        for (operator, payload) in db.take_due_timers(now) {
-            db.deliver_timer(&operator, payload);
+        let (fired, next_ms) = db.take_due_timers(now);
+        for (operator, fire_at_ms, payload) in fired {
+            db.deliver_timer(&operator, fire_at_ms, payload);
         }
 
-        let sleep_for = match db.next_deliverable_timer_ms() {
+        let sleep_for = match next_ms {
             None => cap,
-            Some(next) => {
-                if next <= now {
-                    // Deliverable timer is due immediately - loop without sleeping.
-                    drop(db);
-                    continue;
-                }
-                Duration::from_millis(next - now).min(cap)
+            Some(next) if next <= now => {
+                // A deliverable timer appeared during processing — loop immediately.
+                drop(db);
+                continue;
             }
+            Some(next) => Duration::from_millis(next - now).min(cap),
         };
         drop(db);
 

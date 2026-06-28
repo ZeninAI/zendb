@@ -675,14 +675,32 @@ mod tests {
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 
+    /// RAII guard that removes the test directory when dropped.
+    struct TmpDir(PathBuf);
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for TmpDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
     fn hlc(ms: u64) -> Hlc {
         init_device_id();
         Hlc::with_device_id(ms, 0, device_id()).unwrap()
     }
 
-    fn tmp_path(name: &str) -> PathBuf {
+    fn tmp_path(name: &str) -> TmpDir {
         let id = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("zendb_engine_{name}_{}_{id}", std::process::id()))
+        TmpDir(
+            std::env::temp_dir().join(format!("zendb_engine_{name}_{}_{id}", std::process::id())),
+        )
     }
 
     fn event(key: &str, value: i64, hlc: Hlc) -> Event {

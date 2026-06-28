@@ -127,6 +127,7 @@ macro_rules! define_operator_set {
                 fn handle_timer<'a>(
                     &'a mut self,
                     payload: Vec<u8>,
+                    fire_at_ms: u64,
                     _db: ::std::sync::Weak<$crate::Database<Self>>,
                     _name: &'a str,
                     _config: &'a Self::DispatchConfig,
@@ -151,7 +152,7 @@ macro_rules! define_operator_set {
                                             )
                                         })?;
                                     <$operator as $crate::Operator>::handle_timer(
-                                        inner, timer, typed_ctx,
+                                        inner, timer, fire_at_ms, typed_ctx,
                                     )
                                     .await
                                 })

@@ -2,7 +2,6 @@
 
 use std::{
     collections::VecDeque,
-    io,
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -26,7 +25,7 @@ where
     pub(crate) config: D::DispatchConfig,
     pub(crate) inputs: Mutex<Vec<OperatorInput>>,
     operator: Mutex<Option<D>>,
-    pub(crate) timer_inbox: Mutex<VecDeque<Vec<u8>>>,
+    pub(crate) timer_inbox: Mutex<VecDeque<(u64, Vec<u8>)>>,
 }
 
 impl<D> OperatorWorker<D>
@@ -61,14 +60,6 @@ where
         }
     }
 
-    /// Transition the operator to its terminal phase in the catalog.
-    /// Called by the run loop when the operator finishes or exhausts retries.
-    fn retire(&self, database: &Weak<Database<D>>, phase: OperatorPhase) {
-        if let Some(database) = database.upgrade() {
-            database.retire_operator(&self.name, phase);
-        }
-    }
-
     /// Extract the operator from its holding mutex and start the async run loop.
     pub(crate) fn spawn(self: &Arc<Self>, database: &Arc<Database<D>>) {
         let executor = Arc::clone(&database.executor);
@@ -97,45 +88,79 @@ where
         {
             Ok(OperatorDirective::Continue) => {}
             Ok(OperatorDirective::Finish) => {
-                self.finish_and_retire(&database, &mut operator).await;
+                self.retire(&database, &mut operator, OperatorPhase::Finished)
+                    .await;
                 return;
             }
             Err(error) => {
                 log::error!("failed opening operator {:?}: {error}", self.name);
                 self.retire(
                     &database,
+                    &mut operator,
                     OperatorPhase::Failed {
                         error: error.to_string(),
                     },
-                );
+                )
+                .await;
                 return;
             }
         }
 
         let mut attempt: usize = 0;
 
-        loop {
-            let runtime = self.config.runtime_config();
-            let changes = self.poll(runtime.poll_size.max(1));
-            let timers: Vec<Vec<u8>> = self.timer_inbox.lock().drain(..).collect();
+        'outer: loop {
+            let runtime = self.config.runtime_config().clone();
+            let changes = self.poll(runtime.poll_size);
+            let timers: Vec<(u64, Vec<u8>)> = self.timer_inbox.lock().drain(..).collect();
 
             if changes.is_empty() && timers.is_empty() {
                 executor.idle().await;
                 continue;
             }
 
-            for payload in timers {
+            // --- handle timers ---
+            for (fire_at_ms, payload) in timers {
                 match operator
-                    .handle_timer(payload, database.clone(), &self.name, &self.config)
+                    .handle_timer(
+                        payload,
+                        fire_at_ms,
+                        database.clone(),
+                        &self.name,
+                        &self.config,
+                    )
                     .await
                 {
-                    Ok(OperatorDirective::Continue) => {}
+                    Ok(OperatorDirective::Continue) => {
+                        // Evict the processed timer from the store.
+                        if let Some(db) = database.upgrade() {
+                            let _ = db.cancel_timer(&self.name, fire_at_ms);
+                        }
+                    }
                     Ok(OperatorDirective::Finish) => {
-                        self.finish_and_retire(&database, &mut operator).await;
+                        self.retire(&database, &mut operator, OperatorPhase::Finished)
+                            .await;
                         return;
                     }
                     Err(error) => {
-                        log::error!("operator {:?} on_timer failed: {error}", self.name);
+                        let error_msg = error.to_string();
+                        log::error!("operator {:?} on_timer failed: {error_msg}", self.name);
+                        attempt += 1;
+
+                        if runtime.retry.max_attempts > 0 && attempt >= runtime.retry.max_attempts {
+                            self.retire(
+                                &database,
+                                &mut operator,
+                                OperatorPhase::Failed { error: error_msg },
+                            )
+                            .await;
+                            return;
+                        }
+
+                        self.reset();
+
+                        let delay = backoff_delay(&runtime.retry, attempt);
+                        executor.sleep(delay).await;
+                        continue 'outer;
                     }
                 }
             }
@@ -144,22 +169,18 @@ where
                 continue;
             }
 
+            // --- process changes ---
             match operator
                 .process(changes, database.clone(), &self.name, &self.config)
                 .await
             {
                 Ok(OperatorDirective::Continue) => {
+                    self.commit();
                     attempt = 0;
-                    if let Err(error) = self.commit() {
-                        log::error!("failed to commit operator {:?}: {error}", self.name);
-                        if let Err(reset_error) = self.reset() {
-                            log::error!("failed to reset operator {:?}: {reset_error}", self.name);
-                        }
-                        executor.idle().await;
-                    }
                 }
                 Ok(OperatorDirective::Finish) => {
-                    self.finish_and_retire(&database, &mut operator).await;
+                    self.retire(&database, &mut operator, OperatorPhase::Finished)
+                        .await;
                     return;
                 }
                 Err(error) => {
@@ -171,40 +192,22 @@ where
                     );
 
                     if runtime.retry.max_attempts > 0 && attempt >= runtime.retry.max_attempts {
-                        log::error!(
-                            "operator {:?} exceeded max_attempts ({}) - retiring",
-                            self.name,
-                            runtime.retry.max_attempts
-                        );
-                        if let Err(finish_err) = operator
-                            .finish(database.clone(), &self.name, &self.config)
-                            .await
-                        {
-                            log::error!("failed finishing operator {:?}: {finish_err}", self.name);
-                        }
-                        self.retire(&database, OperatorPhase::Failed { error: error_msg });
+                        self.retire(
+                            &database,
+                            &mut operator,
+                            OperatorPhase::Failed { error: error_msg },
+                        )
+                        .await;
                         return;
                     }
 
-                    if let Err(reset_error) = self.reset() {
-                        log::error!("failed to reset operator {:?}: {reset_error}", self.name);
-                    }
+                    self.reset();
 
                     let delay = backoff_delay(&runtime.retry, attempt);
                     executor.sleep(delay).await;
                 }
             }
         }
-    }
-
-    async fn finish_and_retire(&self, database: &Weak<Database<D>>, operator: &mut D) {
-        if let Err(error) = operator
-            .finish(database.clone(), &self.name, &self.config)
-            .await
-        {
-            log::error!("failed finishing operator {:?}: {error}", self.name);
-        }
-        self.retire(database, OperatorPhase::Finished);
     }
 
     /// Round-robin across all table inputs, collecting up to `limit` changes.
@@ -242,19 +245,30 @@ where
     }
 
     /// Advance all consumer read offsets after a successful `process` call.
-    fn commit(&self) -> io::Result<()> {
+    fn commit(&self) {
         for input in self.inputs.lock().iter_mut() {
-            input.reader.commit()?;
+            input.reader.commit().expect("commit must succeed");
         }
-        Ok(())
     }
 
     /// Roll back all consumer read offsets so the same changes are re-delivered.
-    fn reset(&self) -> io::Result<()> {
+    fn reset(&self) {
         for input in self.inputs.lock().iter_mut() {
-            input.reader.reset()?;
+            input.reader.reset().expect("reset must succeed");
         }
-        Ok(())
+    }
+
+    /// Call `operator.finish()` then transition to a terminal phase in the catalog.
+    async fn retire(&self, database: &Weak<Database<D>>, operator: &mut D, phase: OperatorPhase) {
+        if let Err(finish_err) = operator
+            .finish(database.clone(), &self.name, &self.config)
+            .await
+        {
+            log::error!("failed finishing operator {:?}: {finish_err}", self.name);
+        }
+        if let Some(database) = database.upgrade() {
+            database.retire_operator(&self.name, phase);
+        }
     }
 }
 

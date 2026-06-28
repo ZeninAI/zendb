@@ -2960,14 +2960,30 @@ mod tests {
     type TestKey = Vec<u8>;
     type TestVal = Vec<u8>;
 
-    fn tmp(label: &str) -> PathBuf {
+    /// RAII guard that removes the backing file when dropped.
+    struct TmpFile(PathBuf);
+
+    impl Drop for TmpFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for TmpFile {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    fn tmp(label: &str) -> TmpFile {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join("zendb_btree_tests");
         fs::create_dir_all(&dir).unwrap();
         let p = dir.join(format!("{}_{}_{}.bt", label, std::process::id(), n));
         let _ = fs::remove_file(&p);
-        p
+        TmpFile(p)
     }
 
     fn create(p: &Path) -> BPlusTree<TestKey, TestVal> {

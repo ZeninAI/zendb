@@ -97,6 +97,8 @@ where
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
 
+        drop(operators);
+
         let mut fired = Vec::with_capacity(due.len());
         for (key, entry) in due {
             if let Err(error) = timers.delete(&key) {

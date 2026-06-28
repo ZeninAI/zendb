@@ -199,13 +199,24 @@ where
     /// Transition catalog phase to `Finished` or `Failed` and remove from memory.
     /// Called by the run loop on natural exit.
     pub(crate) fn retire_operator(&self, name: &str, phase: OperatorPhase) {
-        self.operators.write().remove(name);
-        let mut catalog = self.operator_catalog.lock();
-        if let Some(entry) = catalog.get(&name.to_owned()) {
-            let config = entry.as_ref().config.clone();
-            if let Err(error) = catalog.put(name.to_owned(), OperatorEntry { config, phase }) {
-                log::error!("failed updating catalog phase for operator {name:?}: {error}");
-            }
+        let worker = self.operators.write().remove(name);
+
+        if let Some(worker) = worker {
+            worker.delete_inputs();
+        }
+        self.delete_operator_consumers(name);
+
+        if let Err(error) = self
+            .operator_catalog
+            .lock()
+            .update(&name.to_owned(), |entry| {
+                entry.map(|entry| OperatorEntry {
+                    config: entry.config,
+                    phase,
+                })
+            })
+        {
+            log::error!("failed updating catalog phase for operator {name:?}: {error}");
         }
     }
 }

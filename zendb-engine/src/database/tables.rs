@@ -154,4 +154,41 @@ where
         }
         Ok(to_spawn)
     }
+
+    /// Delete an operator's topic consumer from every cataloged table.
+    ///
+    /// Live readers owned by the worker must be deleted before this sweep; a
+    /// topic permits only one active reader for a consumer name.
+    pub(crate) fn delete_operator_consumers(&self, operator: &str) {
+        let tables: Vec<(String, TableConfig)> = self
+            .table_catalog
+            .lock()
+            .entries()
+            .map(|(name, config)| (name.into_owned(), config.into_owned()))
+            .collect();
+
+        for (table_name, config) in tables {
+            let result = if let Some(table) = self.tables.read().get(&table_name).cloned() {
+                table
+                    .read()
+                    .consumer(operator)
+                    .and_then(|consumer| consumer.delete())
+            } else {
+                let path = self.path.join(TABLES_DIR).join(&table_name);
+                Table::open(&path, config).and_then(|table| {
+                    table
+                        .consumer(operator)
+                        .and_then(|consumer| consumer.delete())
+                })
+            };
+
+            if let Err(error) = result {
+                log::error!(
+                    "failed deleting consumer {:?} from table {:?}: {error}",
+                    operator,
+                    table_name
+                );
+            }
+        }
+    }
 }

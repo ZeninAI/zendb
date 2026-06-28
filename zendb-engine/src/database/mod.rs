@@ -524,10 +524,18 @@ mod tests {
     }
 
     fn counting_config(tracker: String, finish: bool) -> TestOperatorConfig {
+        counting_config_with_subscription(tracker, finish, Subscription::pattern("users"))
+    }
+
+    fn counting_config_with_subscription(
+        tracker: String,
+        finish: bool,
+        subscription: Subscription,
+    ) -> TestOperatorConfig {
         let config = TestOperatorConfig {
             operator: TestOperatorConfigVariant::Count(CountingConfig { tracker, finish }),
             runtime: OperatorRuntimeConfig {
-                subscriptions: vec![Subscription::pattern("users")],
+                subscriptions: vec![subscription],
                 retry: Default::default(),
                 poll_size: 128,
             },
@@ -727,5 +735,53 @@ mod tests {
         db.operator("ticker", Some(timer_config(tracker))).unwrap();
 
         wait_until(|| fired.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[test]
+    fn retired_operator_deletes_consumers_from_unopened_tables() {
+        let path = tmp("retire_consumers");
+        {
+            let db =
+                TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
+                    .unwrap();
+            let orders = db.table("orders", Some(TableConfig::default())).unwrap();
+            let orders_table = orders.get().unwrap();
+
+            let stale_consumer = orders_table.read().consumer("counter").unwrap();
+            drop(stale_consumer);
+
+            orders_table
+                .write()
+                .insert_event(event("orders", 1, 100))
+                .unwrap();
+        }
+
+        let (tracker, _) = new_tracker("retire_consumers");
+        let db =
+            TestDatabase::open(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+        db.operator(
+            "counter",
+            Some(counting_config_with_subscription(
+                tracker,
+                true,
+                Subscription::pattern("*"),
+            )),
+        )
+        .unwrap();
+
+        let users = db.table("users", Some(TableConfig::default())).unwrap();
+        users
+            .get()
+            .unwrap()
+            .write()
+            .insert_event(event("users", 2, 110))
+            .unwrap();
+
+        wait_until(|| db.operator_phase("counter") == Some(OperatorPhase::Finished));
+
+        let orders = db.table("orders", None).unwrap();
+        let orders_table = orders.get().unwrap();
+        let mut consumer = orders_table.read().consumer("counter").unwrap();
+        assert!(consumer.next().is_none());
     }
 }

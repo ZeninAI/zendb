@@ -8,7 +8,7 @@ pub enum OperatorPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OperatorStatus {
+pub enum OperatorDirective {
     Continue,
     Finish,
 }

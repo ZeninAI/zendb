@@ -11,8 +11,8 @@ use std::{future::Future, pin::Pin};
 
 pub use config::{OperatorRuntimeConfig, RetryConfig, Subscription};
 pub use context::OperatorContext;
-pub use lifecycle::{OperatorPhase, OperatorStatus};
-pub use traits::{GlobalOperator, GlobalOperatorConfig, Operator};
+pub use lifecycle::{OperatorDirective, OperatorPhase};
+pub use traits::{DispatchOperator, DispatchOperatorConfig, Operator};
 pub use zendb_storage::frontend::state::State;
 pub use zendb_types::Change;
 

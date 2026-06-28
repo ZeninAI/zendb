@@ -9,13 +9,13 @@ use zendb_storage::{
     frontend::state::{State, StateConfig},
 };
 
-use crate::GlobalOperator;
+use crate::DispatchOperator;
 
 use super::{ConcurrentState, Database, ErasedStateHandle, StateHandle, STATES_DIR};
 
-impl<Ops> Database<Ops>
+impl<D> Database<D>
 where
-    Ops: GlobalOperator,
+    D: DispatchOperator,
 {
     /// Return an open state, opening it lazily from the catalog or creating it
     /// with `config`. If the state is in the catalog and a different `config` is

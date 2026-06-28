@@ -25,7 +25,8 @@ use zendb_storage::frontend::{
 };
 
 use crate::{
-    operator::worker::OperatorWorker, runtime::Executor, GlobalOperator, OperatorPhase, TableConfig,
+    operator::worker::OperatorWorker, runtime::Executor, DispatchOperator, OperatorPhase,
+    TableConfig,
 };
 
 use timers::{run_scheduler, TimerStore};
@@ -134,9 +135,9 @@ where
 /// The database is the single lifecycle root. It holds the only strong
 /// references to its tables, states, and operator workers; everything it owns
 /// is torn down deterministically when the last `Arc<Database>` is dropped.
-pub struct Database<Ops>
+pub struct Database<D>
 where
-    Ops: GlobalOperator,
+    D: DispatchOperator,
 {
     path: PathBuf,
     #[allow(dead_code)]
@@ -144,18 +145,18 @@ where
     pub(crate) executor: Arc<dyn Executor>,
     table_catalog: Mutex<TableCatalog>,
     state_catalog: Mutex<StateCatalog>,
-    operator_catalog: Mutex<OperatorCatalog<Ops::Config>>,
+    operator_catalog: Mutex<OperatorCatalog<D::DispatchConfig>>,
     pub(crate) tables: RwLock<HashMap<String, ConcurrentTable>>,
     states: RwLock<HashMap<String, ErasedStateHandle>>,
-    pub(crate) operators: RwLock<HashMap<String, Arc<OperatorWorker<Ops>>>>,
+    pub(crate) operators: RwLock<HashMap<String, Arc<OperatorWorker<D>>>>,
     timers: Arc<RwLock<TimerStore>>,
     /// Notified by `register_timer` to wake the scheduler early.
     pub(crate) timer_notify: Arc<(Mutex<()>, Condvar)>,
 }
 
-impl<Ops> Database<Ops>
+impl<D> Database<D>
 where
-    Ops: GlobalOperator,
+    D: DispatchOperator,
 {
     pub fn create(
         path: &Path,
@@ -167,7 +168,7 @@ where
             TableCatalog::create(&path.join(TABLE_CATALOG_FILE), KeyDirConfig::default())?;
         let state_catalog =
             StateCatalog::create(&path.join(STATE_CATALOG_FILE), KeyDirConfig::default())?;
-        let operator_catalog = OperatorCatalog::<Ops::Config>::create(
+        let operator_catalog = OperatorCatalog::<D::DispatchConfig>::create(
             &path.join(OPERATOR_CATALOG_FILE),
             KeyDirConfig::default(),
         )?;
@@ -192,7 +193,7 @@ where
             TableCatalog::open(&path.join(TABLE_CATALOG_FILE), KeyDirConfig::default())?;
         let state_catalog =
             StateCatalog::open(&path.join(STATE_CATALOG_FILE), KeyDirConfig::default())?;
-        let operator_catalog = OperatorCatalog::<Ops::Config>::open(
+        let operator_catalog = OperatorCatalog::<D::DispatchConfig>::open(
             &path.join(OPERATOR_CATALOG_FILE),
             KeyDirConfig::default(),
         )?;
@@ -213,7 +214,7 @@ where
         path: &Path,
         table_catalog: TableCatalog,
         state_catalog: StateCatalog,
-        operator_catalog: OperatorCatalog<Ops::Config>,
+        operator_catalog: OperatorCatalog<D::DispatchConfig>,
         timers: TimerStore,
         executor: Arc<dyn Executor>,
         config: DatabaseConfig,
@@ -251,8 +252,8 @@ fn resource_closed(kind: &str, name: &str) -> io::Error {
 mod tests {
     use super::*;
     use crate::{
-        Change, GlobalOperatorConfig, Operator, OperatorContext, OperatorRuntimeConfig,
-        OperatorStatus, Subscription, TableConfig,
+        Change, DispatchOperatorConfig, Operator, OperatorContext, OperatorDirective,
+        OperatorRuntimeConfig, Subscription, TableConfig,
     };
     use parking_lot::Mutex;
     use std::sync::{
@@ -317,28 +318,28 @@ mod tests {
             })
         }
 
-        fn open<'a, Ops>(
+        fn open<'a, D>(
             &'a mut self,
-            ctx: OperatorContext<Ops>,
-        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>>
+            ctx: OperatorContext<'a, Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
-            Ops: crate::GlobalOperator,
+            D: crate::DispatchOperator,
         {
             Box::pin(async move {
                 self.buffer = Some(ctx.state("counter/buffer", Some(StateConfig::default()))?);
                 self.index = Some(ctx.state("index", Some(StateConfig::default()))?);
                 self.output = Some(ctx.table("users", None)?);
-                Ok(OperatorStatus::Continue)
+                Ok(OperatorDirective::Continue)
             })
         }
 
-        fn process<'a, Ops>(
+        fn process<'a, D>(
             &'a mut self,
             changes: Vec<Change>,
-            _ctx: OperatorContext<Ops>,
-        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>>
+            _ctx: OperatorContext<'a, Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
-            Ops: crate::GlobalOperator,
+            D: crate::DispatchOperator,
         {
             Box::pin(async move {
                 self.count.fetch_add(changes.len(), Ordering::Relaxed);
@@ -357,19 +358,19 @@ mod tests {
                     state.put(key, count)?;
                 }
                 Ok(if self.finish {
-                    OperatorStatus::Finish
+                    OperatorDirective::Finish
                 } else {
-                    OperatorStatus::Continue
+                    OperatorDirective::Continue
                 })
             })
         }
 
-        fn finish<'a, Ops>(
+        fn finish<'a, D>(
             &'a mut self,
-            _ctx: OperatorContext<Ops>,
+            _ctx: OperatorContext<'a, Self, D>,
         ) -> crate::BoxFuture<'a, io::Result<()>>
         where
-            Ops: crate::GlobalOperator,
+            D: crate::DispatchOperator,
         {
             Box::pin(async move {
                 self.buffer = None;
@@ -402,20 +403,20 @@ mod tests {
             })
         }
 
-        fn process<'a, Ops>(
+        fn process<'a, D>(
             &'a mut self,
             changes: Vec<Change>,
-            _ctx: OperatorContext<Ops>,
-        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>>
+            _ctx: OperatorContext<'a, Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
-            Ops: crate::GlobalOperator,
+            D: crate::DispatchOperator,
         {
             Box::pin(async move {
                 if self.attempts.fetch_add(1, Ordering::Relaxed) == 0 {
                     return Err(io::Error::other("expected failure"));
                 }
                 self.processed.fetch_add(changes.len(), Ordering::Relaxed);
-                Ok(OperatorStatus::Continue)
+                Ok(OperatorDirective::Continue)
             })
         }
     }
@@ -439,12 +440,12 @@ mod tests {
             })
         }
 
-        fn open<'a, Ops>(
+        fn open<'a, D>(
             &'a mut self,
-            ctx: OperatorContext<Ops>,
-        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>>
+            ctx: OperatorContext<'a, Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
-            Ops: crate::GlobalOperator,
+            D: crate::DispatchOperator,
         {
             Box::pin(async move {
                 let now = std::time::SystemTime::now()
@@ -452,32 +453,32 @@ mod tests {
                     .unwrap()
                     .as_millis() as u64;
                 ctx.register_timer(now, &())?;
-                Ok(OperatorStatus::Continue)
+                Ok(OperatorDirective::Continue)
             })
         }
 
-        fn process<'a, Ops>(
+        fn process<'a, D>(
             &'a mut self,
             _changes: Vec<Change>,
-            _ctx: OperatorContext<Ops>,
-        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>>
+            _ctx: OperatorContext<'a, Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
-            Ops: crate::GlobalOperator,
+            D: crate::DispatchOperator,
         {
-            Box::pin(async { Ok(OperatorStatus::Continue) })
+            Box::pin(async { Ok(OperatorDirective::Continue) })
         }
 
-        fn handle_timer<'a, Ops>(
+        fn handle_timer<'a, D>(
             &'a mut self,
             _payload: (),
-            _ctx: OperatorContext<Ops>,
-        ) -> crate::BoxFuture<'a, io::Result<OperatorStatus>>
+            _ctx: OperatorContext<'a, Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
-            Ops: crate::GlobalOperator,
+            D: crate::DispatchOperator,
         {
             Box::pin(async move {
                 self.fired.fetch_add(1, Ordering::Relaxed);
-                Ok(OperatorStatus::Finish)
+                Ok(OperatorDirective::Finish)
             })
         }
     }
@@ -490,9 +491,9 @@ mod tests {
         }
     }
 
-    type TestDatabase = Database<test_operators::Instance>;
-    type TestOperatorConfig = test_operators::Config;
-    type TestOperatorInstanceConfig = test_operators::OperatorInstanceConfig;
+    type TestDatabase = Database<test_operators::OperatorInstance>;
+    type TestOperatorConfig = test_operators::OperatorConfig;
+    type TestOperatorConfigVariant = test_operators::OperatorConfigVariant;
 
     fn counter_trackers() -> &'static Mutex<HashMap<String, Arc<AtomicUsize>>> {
         static TRACKERS: OnceLock<Mutex<HashMap<String, Arc<AtomicUsize>>>> = OnceLock::new();
@@ -524,14 +525,14 @@ mod tests {
 
     fn counting_config(tracker: String, finish: bool) -> TestOperatorConfig {
         let config = TestOperatorConfig {
-            operator: TestOperatorInstanceConfig::Count(CountingConfig { tracker, finish }),
+            operator: TestOperatorConfigVariant::Count(CountingConfig { tracker, finish }),
             runtime: OperatorRuntimeConfig {
                 subscriptions: vec![Subscription::pattern("users")],
                 retry: Default::default(),
                 poll_size: 128,
             },
         };
-        assert_eq!(config.kind(), test_operators::Kind::Count);
+        assert_eq!(config.kind(), test_operators::OperatorKind::Count);
         let _ = config.operator();
         let _ = config.runtime_config();
         config
@@ -539,7 +540,7 @@ mod tests {
 
     fn retry_config(attempts_tracker: String, processed_tracker: String) -> TestOperatorConfig {
         let config = TestOperatorConfig {
-            operator: TestOperatorInstanceConfig::Retry(RetryOperatorConfig {
+            operator: TestOperatorConfigVariant::Retry(RetryOperatorConfig {
                 attempts_tracker,
                 processed_tracker,
             }),
@@ -549,7 +550,7 @@ mod tests {
                 poll_size: 128,
             },
         };
-        assert_eq!(config.kind(), test_operators::Kind::Retry);
+        assert_eq!(config.kind(), test_operators::OperatorKind::Retry);
         let _ = config.operator();
         let _ = config.runtime_config();
         config
@@ -557,14 +558,14 @@ mod tests {
 
     fn timer_config(tracker: String) -> TestOperatorConfig {
         let config = TestOperatorConfig {
-            operator: TestOperatorInstanceConfig::Timer(TimerOperatorConfig { tracker }),
+            operator: TestOperatorConfigVariant::Timer(TimerOperatorConfig { tracker }),
             runtime: OperatorRuntimeConfig {
                 subscriptions: vec![Subscription::pattern("users")],
                 retry: Default::default(),
                 poll_size: 128,
             },
         };
-        assert_eq!(config.kind(), test_operators::Kind::Timer);
+        assert_eq!(config.kind(), test_operators::OperatorKind::Timer);
         let _ = config.operator();
         let _ = config.runtime_config();
         config

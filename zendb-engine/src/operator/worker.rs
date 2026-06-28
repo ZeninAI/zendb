@@ -11,7 +11,8 @@ use parking_lot::Mutex;
 use zendb_storage::core::topic::TopicConsumer;
 
 use super::{
-    Change, GlobalOperator, GlobalOperatorConfig, OperatorContext, OperatorPhase, OperatorStatus,
+    Change, DispatchOperator, DispatchOperatorConfig, OperatorContext, OperatorDirective,
+    OperatorPhase,
 };
 use crate::{runtime::Executor, Database};
 
@@ -20,26 +21,26 @@ pub(crate) struct OperatorInput {
     pub(crate) reader: TopicConsumer<Change>,
 }
 
-pub(crate) struct OperatorWorker<Ops>
+pub(crate) struct OperatorWorker<D>
 where
-    Ops: GlobalOperator,
+    D: DispatchOperator,
 {
     pub(crate) name: String,
-    pub(crate) config: Ops::Config,
+    pub(crate) config: D::DispatchConfig,
     pub(crate) inputs: Mutex<Vec<OperatorInput>>,
-    operator: Mutex<Option<Ops>>,
+    operator: Mutex<Option<D>>,
     pub(crate) timer_inbox: Mutex<VecDeque<Vec<u8>>>,
 }
 
-impl<Ops> OperatorWorker<Ops>
+impl<D> OperatorWorker<D>
 where
-    Ops: GlobalOperator,
+    D: DispatchOperator,
 {
     pub(crate) fn new(
         name: String,
-        config: Ops::Config,
+        config: D::DispatchConfig,
         inputs: Vec<OperatorInput>,
-        operator: Ops,
+        operator: D,
     ) -> Arc<Self> {
         Arc::new(Self {
             name,
@@ -65,14 +66,14 @@ where
 
     /// Transition the operator to its terminal phase in the catalog.
     /// Called by the run loop when the operator finishes or exhausts retries.
-    fn retire(&self, database: &Weak<Database<Ops>>, phase: OperatorPhase) {
+    fn retire(&self, database: &Weak<Database<D>>, phase: OperatorPhase) {
         if let Some(database) = database.upgrade() {
             database.retire_operator(&self.name, phase);
         }
     }
 
     /// Extract the operator from its holding mutex and start the async run loop.
-    pub(crate) fn spawn(self: &Arc<Self>, database: &Arc<Database<Ops>>) {
+    pub(crate) fn spawn(self: &Arc<Self>, database: &Arc<Database<D>>) {
         let executor = Arc::clone(&database.executor);
         let database = Arc::downgrade(database);
         let operator = self
@@ -89,16 +90,20 @@ where
     /// apply exponential backoff on error, retire on `Finish` or exhausted retries.
     async fn run(
         self: Arc<Self>,
-        database: Weak<Database<Ops>>,
+        database: Weak<Database<D>>,
         executor: Arc<dyn Executor>,
-        mut operator: Ops,
+        mut operator: D,
     ) {
-        let make_ctx =
-            || OperatorContext::new(database.clone(), self.name.clone(), self.config.clone());
+        let make_ctx = || OperatorContext {
+            db: database.clone(),
+            name: &self.name,
+            config: self.config.clone(),
+            _phantom: std::marker::PhantomData,
+        };
 
         match operator.open(make_ctx()).await {
-            Ok(OperatorStatus::Continue) => {}
-            Ok(OperatorStatus::Finish) => {
+            Ok(OperatorDirective::Continue) => {}
+            Ok(OperatorDirective::Finish) => {
                 self.finish_and_retire(&database, &mut operator).await;
                 return;
             }
@@ -117,7 +122,8 @@ where
         let mut attempt: usize = 0;
 
         loop {
-            let changes = self.poll(self.config.runtime_config().poll_size.max(1));
+            let runtime = self.config.runtime_config();
+            let changes = self.poll(runtime.poll_size.max(1));
             let timers: Vec<Vec<u8>> = self.timer_inbox.lock().drain(..).collect();
 
             if changes.is_empty() && timers.is_empty() {
@@ -127,8 +133,8 @@ where
 
             for payload in timers {
                 match operator.handle_timer(payload, make_ctx()).await {
-                    Ok(OperatorStatus::Continue) => {}
-                    Ok(OperatorStatus::Finish) => {
+                    Ok(OperatorDirective::Continue) => {}
+                    Ok(OperatorDirective::Finish) => {
                         self.finish_and_retire(&database, &mut operator).await;
                         return;
                     }
@@ -143,7 +149,7 @@ where
             }
 
             match operator.process(changes, make_ctx()).await {
-                Ok(OperatorStatus::Continue) => {
+                Ok(OperatorDirective::Continue) => {
                     attempt = 0;
                     if let Err(error) = self.commit() {
                         log::error!("failed to commit operator {:?}: {error}", self.name);
@@ -153,7 +159,7 @@ where
                         executor.idle().await;
                     }
                 }
-                Ok(OperatorStatus::Finish) => {
+                Ok(OperatorDirective::Finish) => {
                     self.finish_and_retire(&database, &mut operator).await;
                     return;
                 }
@@ -165,13 +171,11 @@ where
                         self.name
                     );
 
-                    if self.config.runtime_config().retry.max_attempts > 0
-                        && attempt >= self.config.runtime_config().retry.max_attempts
-                    {
+                    if runtime.retry.max_attempts > 0 && attempt >= runtime.retry.max_attempts {
                         log::error!(
                             "operator {:?} exceeded max_attempts ({}) - retiring",
                             self.name,
-                            self.config.runtime_config().retry.max_attempts
+                            runtime.retry.max_attempts
                         );
                         if let Err(finish_err) = operator.finish(make_ctx()).await {
                             log::error!("failed finishing operator {:?}: {finish_err}", self.name);
@@ -184,15 +188,20 @@ where
                         log::error!("failed to reset operator {:?}: {reset_error}", self.name);
                     }
 
-                    let delay = backoff_delay(&self.config.runtime_config().retry, attempt);
+                    let delay = backoff_delay(&runtime.retry, attempt);
                     executor.sleep(delay).await;
                 }
             }
         }
     }
 
-    async fn finish_and_retire(&self, database: &Weak<Database<Ops>>, operator: &mut Ops) {
-        let ctx = OperatorContext::new(database.clone(), self.name.clone(), self.config.clone());
+    async fn finish_and_retire(&self, database: &Weak<Database<D>>, operator: &mut D) {
+        let ctx = OperatorContext {
+            db: database.clone(),
+            name: &self.name,
+            config: self.config.clone(),
+            _phantom: std::marker::PhantomData,
+        };
         if let Err(error) = operator.finish(ctx).await {
             log::error!("failed finishing operator {:?}: {error}", self.name);
         }

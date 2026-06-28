@@ -7,13 +7,13 @@ use zendb_storage::core::traits::{Backend, DurableStorage};
 use zendb_storage::frontend::table::{Table, TableConfig};
 
 use crate::operator::worker::{OperatorInput, OperatorWorker};
-use crate::{GlobalOperator, GlobalOperatorConfig, OperatorPhase};
+use crate::{DispatchOperator, DispatchOperatorConfig, OperatorPhase};
 
 use super::{ConcurrentTable, Database, OperatorCatalog, TableHandle, TABLES_DIR};
 
-impl<Ops> Database<Ops>
+impl<D> Database<D>
 where
-    Ops: GlobalOperator,
+    D: DispatchOperator,
 {
     /// Return an open table, opening it lazily from the catalog or creating it
     /// with `config`. If the table is in the catalog and a different `config` is
@@ -84,9 +84,9 @@ where
         self: &Arc<Self>,
         name: &str,
         table: &ConcurrentTable,
-        operator_catalog: &mut OperatorCatalog<Ops::Config>,
-    ) -> io::Result<Vec<Arc<OperatorWorker<Ops>>>> {
-        let matching_operators: Vec<(String, Ops::Config)> = operator_catalog
+        operator_catalog: &mut OperatorCatalog<D::DispatchConfig>,
+    ) -> io::Result<Vec<Arc<OperatorWorker<D>>>> {
+        let matching_operators: Vec<(String, D::DispatchConfig)> = operator_catalog
             .entries()
             .filter_map(|(op_name, entry)| {
                 let entry = entry.as_ref();

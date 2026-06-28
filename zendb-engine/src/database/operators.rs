@@ -6,14 +6,14 @@ use zendb_storage::core::traits::Backend;
 
 use crate::operator::{
     worker::{OperatorInput, OperatorWorker},
-    GlobalOperator, GlobalOperatorConfig, OperatorPhase,
+    DispatchOperator, DispatchOperatorConfig, OperatorPhase,
 };
 
 use super::{Database, OperatorEntry};
 
-impl<Ops> Database<Ops>
+impl<D> Database<D>
 where
-    Ops: GlobalOperator,
+    D: DispatchOperator,
 {
     /// Return the phase and effective config of an operator, ensuring it is
     /// running unless it is in a terminal state or no matching tables are open.
@@ -21,7 +21,7 @@ where
     /// - If already running in memory, returns `(Active, config)` immediately.
     /// - If in the catalog as `Active`, re-opens using the stored config (a new
     ///   `config` replaces the stored one). If no matching tables are open yet,
-    ///   the operator stays in the catalog without spawning — it will be started
+    ///   the operator stays in the catalog without spawning - it will be started
     ///   automatically when a matching table opens.
     /// - If in a terminal state (`Finished` / `Failed`), returns the phase and
     ///   stored config without starting anything.
@@ -32,9 +32,9 @@ where
     pub fn operator(
         self: &Arc<Self>,
         name: &str,
-        config: Option<Ops::Config>,
-    ) -> io::Result<(OperatorPhase, Ops::Config)> {
-        // Fast path: already running — return its config.
+        config: Option<D::DispatchConfig>,
+    ) -> io::Result<(OperatorPhase, D::DispatchConfig)> {
+        // Fast path: already running - return its config.
         if let Some(worker) = self.operators.read().get(name).cloned() {
             return Ok((OperatorPhase::Active, worker.config.clone()));
         }
@@ -65,7 +65,7 @@ where
                     let worker = self.build_worker(name.to_owned(), effective.clone())?;
                     if worker.inputs.lock().is_empty() {
                         // No matching tables open yet. Catalog entry is already
-                        // Active — activate_table_subscribers will spawn when one opens.
+                        // Active - activate_table_subscribers will spawn when one opens.
                         return Ok((OperatorPhase::Active, effective));
                     }
                     self.operators
@@ -86,7 +86,7 @@ where
                     })?;
                     let worker = self.build_worker(name.to_owned(), config.clone())?;
                     if worker.inputs.lock().is_empty() {
-                        // No matching tables open yet — persist to catalog only.
+                        // No matching tables open yet - persist to catalog only.
                         catalog.put(
                             name.to_owned(),
                             OperatorEntry {
@@ -127,9 +127,9 @@ where
     pub(super) fn build_worker(
         self: &Arc<Self>,
         name: String,
-        config: Ops::Config,
-    ) -> io::Result<Arc<OperatorWorker<Ops>>> {
-        let instance = Ops::new(&config)?;
+        config: D::DispatchConfig,
+    ) -> io::Result<Arc<OperatorWorker<D>>> {
+        let instance = D::new(&config)?;
         let mut inputs: Vec<OperatorInput> = Vec::new();
         for (table_name, table) in self.tables.read().iter() {
             if config

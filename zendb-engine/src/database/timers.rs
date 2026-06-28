@@ -4,7 +4,7 @@
 //! delivery has one global priority order across the whole database.
 //!
 //! The key is `TimerKey { fire_at_ms, operator }`. There is exactly **one**
-//! slot per `(operator, fire_at_ms)` pair — registering a timer with the same
+//! slot per `(operator, fire_at_ms)` pair - registering a timer with the same
 //! operator and time as an existing entry overwrites it (last-write-wins).
 //!
 //! The scheduler loop uses a condvar to sleep until the next timer is due,
@@ -24,7 +24,7 @@ use zendb_storage::core::traits::Backend;
 use zendb_storage::frontend::state::State;
 
 use super::Database;
-use crate::GlobalOperator;
+use crate::DispatchOperator;
 
 /// Ordering key: earliest `fire_at_ms` first; within the same millisecond,
 /// lexicographic by operator name.
@@ -49,14 +49,14 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-impl<Ops> Database<Ops>
+impl<D> Database<D>
 where
-    Ops: GlobalOperator,
+    D: DispatchOperator,
 {
     /// Register a processing-time timer for `operator`.
     ///
     /// If a timer already exists for the same `(operator, fire_at_ms)` pair it
-    /// is overwritten — no FIFO guarantee for equal-time timers on the same
+    /// is overwritten - no FIFO guarantee for equal-time timers on the same
     /// operator.
     pub fn register_timer(
         self: &Arc<Self>,
@@ -126,11 +126,9 @@ where
     }
 }
 
-pub(super) async fn run_scheduler<Ops>(
-    database: Weak<Database<Ops>>,
-    notify: Arc<(Mutex<()>, Condvar)>,
-) where
-    Ops: GlobalOperator,
+pub(super) async fn run_scheduler<D>(database: Weak<Database<D>>, notify: Arc<(Mutex<()>, Condvar)>)
+where
+    D: DispatchOperator,
 {
     let cap = Duration::from_secs(60);
     loop {
@@ -146,7 +144,7 @@ pub(super) async fn run_scheduler<Ops>(
             None => cap,
             Some(next) => {
                 if next <= now {
-                    // Deliverable timer is due immediately — loop without sleeping.
+                    // Deliverable timer is due immediately - loop without sleeping.
                     drop(db);
                     continue;
                 }

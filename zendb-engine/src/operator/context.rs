@@ -30,6 +30,15 @@ where
     O: Operator + ?Sized,
     D: DispatchOperator,
 {
+    pub fn new(db: Weak<Database<D>>, name: String, config: O::Config) -> Self {
+        Self {
+            db,
+            name,
+            config,
+            _phantom: PhantomData,
+        }
+    }
+
     /// The registration name of this operator.
     pub fn name(&self) -> &str {
         &self.name

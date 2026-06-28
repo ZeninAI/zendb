@@ -5,6 +5,7 @@ members = [
     "zendb-types",
     "zendb-storage",
     "zendb-engine",
+    "zendb-testing",
 ]
 
 [workspace.package]

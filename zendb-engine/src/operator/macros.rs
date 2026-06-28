@@ -91,12 +91,11 @@ macro_rules! define_operator_set {
                                         OperatorConfigVariant::$variant(c) => c.clone(),
                                         _ => ::std::unreachable!(),
                                     };
-                                    *cached_ctx = Some($crate::OperatorContext {
-                                        db: db.clone(),
-                                        name: name.to_owned(),
-                                        config: typed_config,
-                                        _phantom: ::std::marker::PhantomData,
-                                    });
+                                    *cached_ctx = Some($crate::OperatorContext::new(
+                                        db.clone(),
+                                        name.to_owned(),
+                                        typed_config,
+                                    ));
                                 }
                                 let typed_ctx = cached_ctx.as_ref().expect("operator context is cached");
                                 <$operator as $crate::Operator>::open(inner, typed_ctx)

@@ -182,6 +182,8 @@ impl<D> Database<D>
 where
     D: DispatchOperator,
 {
+    /// Create a new database at `path`. Fails if the directory already contains a
+    /// database; use [`Database::open`] to reopen an existing one.
     pub fn create(
         path: &Path,
         executor: Arc<dyn Executor>,
@@ -208,6 +210,8 @@ where
         )
     }
 
+    /// Open an existing database at `path`. Fails if the directory does not
+    /// contain a valid database.
     pub fn open(
         path: &Path,
         executor: Arc<dyn Executor>,
@@ -279,6 +283,7 @@ fn resource_closed(kind: &str, name: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator::prelude::{MerkleLeaf, MerkleTreeConfig, MerkleTreeOperator};
     use crate::{
         Change, DispatchOperatorConfig, Operator, OperatorContext, OperatorDirective,
         OperatorRuntimeConfig, Subscription, TableConfig,
@@ -571,12 +576,77 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Encode, Decode)]
+    struct SpawnerConfig {
+        child_tracker: String,
+    }
+
+    struct SpawnerOperator;
+
+    impl Operator for SpawnerOperator {
+        type Config = SpawnerConfig;
+        type Timer = ();
+
+        fn new(_config: &Self::Config) -> io::Result<Self> {
+            Ok(Self)
+        }
+
+        fn open<'a, D>(
+            &'a mut self,
+            ctx: &'a OperatorContext<Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+        where
+            D: crate::DispatchOperator,
+        {
+            Box::pin(async move {
+                ctx.operator(
+                    "spawned-counter",
+                    D::DispatchConfig::new::<CountingOperator>(
+                        CountingConfig {
+                            tracker: ctx.config().child_tracker.clone(),
+                            finish: false,
+                        },
+                        OperatorRuntimeConfig {
+                            subscriptions: vec![Subscription::pattern("users")],
+                            ..OperatorRuntimeConfig::default()
+                        },
+                    )?,
+                )?;
+
+                ctx.operator(
+                    "spawned-merkle",
+                    D::DispatchConfig::new::<MerkleTreeOperator>(
+                        MerkleTreeConfig::default(),
+                        OperatorRuntimeConfig {
+                            subscriptions: vec![Subscription::pattern("users")],
+                            ..OperatorRuntimeConfig::default()
+                        },
+                    )?,
+                )?;
+
+                Ok(OperatorDirective::Continue)
+            })
+        }
+
+        fn process<'a, D>(
+            &'a mut self,
+            _changes: Vec<Change>,
+            _ctx: &'a OperatorContext<Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+        where
+            D: crate::DispatchOperator,
+        {
+            Box::pin(async { Ok(OperatorDirective::Continue) })
+        }
+    }
+
     crate::define_operator_set! {
         mod test_operators {
             Count(CountingOperator),
             Retry(FailingOnceOperator),
             Timer(TimerOperator),
             InputLifecycle(InputLifecycleOperator),
+            Spawner(SpawnerOperator),
         }
     }
 
@@ -711,6 +781,21 @@ mod tests {
             },
         };
         assert_eq!(config.kind(), test_operators::OperatorKind::InputLifecycle);
+        let _ = config.operator();
+        let _ = config.runtime_config();
+        config
+    }
+
+    fn spawner_config(child_tracker: String) -> TestOperatorConfig {
+        let config = TestOperatorConfig {
+            operator: TestOperatorConfigVariant::Spawner(SpawnerConfig { child_tracker }),
+            runtime: OperatorRuntimeConfig {
+                subscriptions: vec![Subscription::pattern("users")],
+                retry: Default::default(),
+                poll_size: 128,
+            },
+        };
+        assert_eq!(config.kind(), test_operators::OperatorKind::Spawner);
         let _ = config.operator();
         let _ = config.runtime_config();
         config
@@ -888,6 +973,41 @@ mod tests {
         db.operator("ticker", Some(timer_config(tracker))).unwrap();
 
         wait_until(|| fired.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[test]
+    fn operators_can_spawn_user_and_prelude_operators_from_context() {
+        let path = tmp("operator_spawn_from_context");
+        let (tracker, child_count) = new_tracker("operator_spawn_from_context");
+        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
+            .unwrap();
+        let table = db.table("users", Some(TableConfig::default())).unwrap();
+        db.operator("spawner", Some(spawner_config(tracker)))
+            .unwrap();
+
+        wait_until(|| {
+            db.contains_operator("spawned-counter") && db.contains_operator("spawned-merkle")
+        });
+
+        table
+            .get()
+            .unwrap()
+            .write()
+            .insert_event(event("users", 1, 100))
+            .unwrap();
+
+        wait_until(|| child_count.load(Ordering::Relaxed) == 1);
+        let merkle = db
+            .state::<String, MerkleLeaf>("operator/prelude/merkle-tree", None)
+            .unwrap();
+        wait_until(|| {
+            merkle
+                .get()
+                .unwrap()
+                .read()
+                .get(&"__root".to_owned())
+                .is_some()
+        });
     }
 
     #[test]

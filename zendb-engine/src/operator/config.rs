@@ -1,5 +1,9 @@
 use bincode::{Decode, Encode};
 
+/// Glob-style table subscription filter used by operators to declare which
+/// tables they read from.
+///
+/// Build with [`Subscription::pattern`]; matches via [`Subscription::matches`].
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum Subscription {
     All,
@@ -14,6 +18,9 @@ pub enum Subscription {
 }
 
 impl Subscription {
+    /// Parse a glob-style subscription pattern. A single `*` matches any table;
+    /// `users-*` matches prefixes; `*-log` matches suffixes; `user-*-data`
+    /// matches tables with a middle segment.
     pub fn pattern(pattern: impl Into<String>) -> Self {
         let pattern = pattern.into();
         let parts: Vec<&str> = pattern.split('*').collect();
@@ -79,11 +86,14 @@ impl Subscription {
     }
 }
 
+/// Exponential-backoff retry policy for operators.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct RetryConfig {
+    /// Max retry attempts. 0 disables retry entirely.
     pub max_attempts: usize,
     pub initial_delay_ms: u64,
     pub max_delay_ms: u64,
+    /// Fraction of the computed backoff applied as random jitter (0.0–1.0).
     pub jitter_factor: f64,
 }
 
@@ -98,10 +108,13 @@ impl Default for RetryConfig {
     }
 }
 
+/// Runtime configuration for an operator: subscriptions, retry policy, and
+/// poll batch size.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct OperatorRuntimeConfig {
     pub subscriptions: Vec<Subscription>,
     pub retry: RetryConfig,
+    /// Max number of changes to collect per poll cycle.
     pub poll_size: usize,
 }
 

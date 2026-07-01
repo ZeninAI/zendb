@@ -226,9 +226,6 @@ fn document_indexing_pipeline() {
     drop(docs_read);
     drop(docs_handle);
 
-    db.register_timer("archiver", 1, vec![]).unwrap();
-    db.cancel_timer("archiver", 1).unwrap();
-
     // --- Phase 4: incremental indexing after reopen ---
     db.operator("indexer", Some(indexer_config())).unwrap();
     let documents = db.table("documents", None).unwrap();
@@ -449,10 +446,6 @@ fn timers_are_evicted_on_retirement() {
     );
     drop(reports_read);
     drop(reports_h);
-
-    // Verify no timers remain.
-    db.register_timer("archiver", 42, vec![1, 2, 3]).unwrap();
-    db.cancel_timer("archiver", 42).unwrap();
 
     // Verify consumer cleanup.
     let documents = db.table("documents", None).unwrap();

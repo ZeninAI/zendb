@@ -8,10 +8,13 @@ use crate::{
     StateHandle,
 };
 
+/// Key used to store the current Merkle root in the state.
 const ROOT_KEY: &str = "__root";
 
+/// Configuration for the Merkle tree operator.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct MerkleTreeConfig {
+    /// State key used to persist leaves and the root.
     pub state: String,
 }
 
@@ -23,6 +26,7 @@ impl Default for MerkleTreeConfig {
     }
 }
 
+/// A leaf node in the Merkle tree, repesenting a single table row.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct MerkleLeaf {
     pub table: String,
@@ -30,6 +34,8 @@ pub struct MerkleLeaf {
     pub hash: Vec<u8>,
 }
 
+/// Incrementally maintains a Merkle tree over subscribed tables, recomputing
+/// the root hash after every batch of changes.
 pub struct MerkleTreeOperator {
     state: Option<StateHandle<String, MerkleLeaf>>,
 }
@@ -110,6 +116,7 @@ impl Operator for MerkleTreeOperator {
     }
 }
 
+/// Build a state key for a leaf from the table ID and primary key hash.
 fn leaf_key(change: &Change) -> io::Result<String> {
     let key = encode_key(&change.event.primary_key)?;
     Ok(format!(
@@ -119,17 +126,21 @@ fn leaf_key(change: &Change) -> io::Result<String> {
     ))
 }
 
+/// Serialize a primary key to bytes for hashing.
 fn encode_key(key: &zendb_types::PrimaryKey) -> io::Result<Vec<u8>> {
     bincode::encode_to_vec(key, bincode::config::standard())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
+/// Hash a cell value with BLAKE3.
 fn hash_cell(cell: &zendb_types::Cell) -> io::Result<Vec<u8>> {
     let bytes = bincode::encode_to_vec(cell, bincode::config::standard())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     Ok(blake3::hash(&bytes).as_bytes().to_vec())
 }
 
+/// Compute the Merkle root from an unordered set of (key, leaf) pairs.
+/// Sorts by key before hashing to ensure determinism.
 fn compute_root(leaves: impl IntoIterator<Item = (String, MerkleLeaf)>) -> Vec<u8> {
     let mut leaves: Vec<_> = leaves.into_iter().collect();
     leaves.sort_unstable_by(|a, b| a.0.cmp(&b.0));

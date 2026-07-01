@@ -28,6 +28,8 @@ enum OperatorWorkerEvent {
     InputClosed(String),
 }
 
+/// Per-operator async run loop. Holds the operator instance, its inputs
+/// (topic consumers), a timer inbox, and lifecycle events.
 pub(crate) struct OperatorWorker<D>
 where
     D: DispatchOperator,
@@ -76,6 +78,7 @@ where
         !self.inputs.lock().is_empty()
     }
 
+    /// Attach a new topic consumer for `table_name`. Enqueues an `InputOpened` event.
     pub(crate) fn attach_input(&self, input: OperatorInput) {
         let table_name = input.table_name.clone();
         self.inputs.lock().push(input);
@@ -84,10 +87,12 @@ where
             .push_back(OperatorWorkerEvent::InputOpened(table_name));
     }
 
+    /// Push a timer payload from the scheduler into the worker's inbox.
     pub(crate) fn enqueue_timer(&self, fire_at_ms: u64, payload: Vec<u8>) {
         self.timer_inbox.lock().push_back((fire_at_ms, payload));
     }
 
+    /// Remove the consumer for `table_name`. Enqueues an `InputClosed` event.
     #[allow(dead_code)]
     pub(crate) fn detach_input(&self, table_name: String) {
         let mut inputs = self.inputs.lock();

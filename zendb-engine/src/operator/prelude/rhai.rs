@@ -5,11 +5,16 @@ use rhai::{Array, Dynamic, Engine, Map, Scope};
 
 use crate::{BoxFuture, Change, DispatchOperator, Operator, OperatorContext, OperatorDirective};
 
+/// Configuration for the Rhai scripting operator.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct RhaiOperatorConfig {
+    /// Rhai script source. See tests for examples.
     pub script: String,
 }
 
+/// Evaluates a Rhai script on every batch of changes. The script receives
+/// `name` (operator name) and `changes` (an array of change maps). Return
+/// `"continue"` / `"finish"` (or a bool) to control the operator lifecycle.
 pub struct RhaiOperator;
 
 impl Operator for RhaiOperator {
@@ -33,6 +38,7 @@ impl Operator for RhaiOperator {
     }
 }
 
+/// Compile and execute the script, returning the operator directive.
 fn run_script(
     name: &str,
     config: &RhaiOperatorConfig,
@@ -54,6 +60,7 @@ fn run_script(
     directive_from_dynamic(output)
 }
 
+/// Interpret a Rhai [`Dynamic`] value as an [`OperatorDirective`].
 fn directive_from_dynamic(output: Dynamic) -> io::Result<OperatorDirective> {
     if output.is_unit() {
         return Ok(OperatorDirective::Continue);
@@ -80,6 +87,7 @@ fn directive_from_dynamic(output: Dynamic) -> io::Result<OperatorDirective> {
     Ok(OperatorDirective::Continue)
 }
 
+/// Parse a directive from a string: `"continue"` or `"finish"` (case-insensitive).
 fn directive_from_str(value: &str) -> io::Result<OperatorDirective> {
     match value {
         "continue" | "Continue" => Ok(OperatorDirective::Continue),
@@ -91,6 +99,7 @@ fn directive_from_str(value: &str) -> io::Result<OperatorDirective> {
     }
 }
 
+/// Convert a batch of changes to a Rhai [`Array`] of maps.
 fn changes_to_array(changes: Vec<Change>) -> Array {
     changes
         .into_iter()
@@ -98,6 +107,8 @@ fn changes_to_array(changes: Vec<Change>) -> Array {
         .collect()
 }
 
+/// Convert a single [`Change`] to a Rhai [`Map`] with keys like `table`,
+/// `primary_key`, `op`, `previous`, `current`, etc.
 fn change_to_map(change: Change) -> Map {
     let mut map = Map::new();
     map.insert("table".into(), change.event.table_id.into());

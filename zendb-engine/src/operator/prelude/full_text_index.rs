@@ -9,9 +9,12 @@ use crate::{
     StateHandle,
 };
 
+/// Configuration for the full-text index operator.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct FullTextIndexConfig {
+    /// State key used to persist the index.
     pub state: String,
+    /// Minimum token length; shorter tokens are discarded (default: 2).
     pub min_token_len: u32,
 }
 
@@ -24,12 +27,14 @@ impl Default for FullTextIndexConfig {
     }
 }
 
+/// A posting in the inverted index referencing a table row.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub struct FullTextPosting {
     pub table: String,
     pub key: PrimaryKey,
 }
 
+/// Incrementally maintains an inverted (full-text) index across subscribed tables.
 pub struct FullTextIndexOperator {
     state: Option<StateHandle<String, Vec<FullTextPosting>>>,
 }
@@ -90,6 +95,7 @@ impl Operator for FullTextIndexOperator {
     }
 }
 
+/// Insert a posting into the index for the given token.
 fn add_posting(
     state: &mut zendb_storage::frontend::state::State<String, Vec<FullTextPosting>>,
     token: &str,
@@ -102,6 +108,7 @@ fn add_posting(
     })
 }
 
+/// Remove a posting from the index for the given token.
 fn remove_posting(
     state: &mut zendb_storage::frontend::state::State<String, Vec<FullTextPosting>>,
     token: &str,
@@ -118,6 +125,7 @@ fn remove_posting(
     })
 }
 
+/// Extract tokens from a cell value, filtered by minimum length.
 fn tokens(cell: Option<&Cell>, min_len: u32) -> BTreeSet<String> {
     let Some(cell) = cell else {
         return BTreeSet::new();
@@ -126,6 +134,8 @@ fn tokens(cell: Option<&Cell>, min_len: u32) -> BTreeSet<String> {
     tokenize(&text, min_len)
 }
 
+/// Tokenize text by splitting on non-alphanumeric characters, lowercasing,
+/// and filtering tokens shorter than `min_len`.
 fn tokenize(text: &str, min_len: u32) -> BTreeSet<String> {
     let min_len = min_len as usize;
     text.split(|ch: char| !ch.is_alphanumeric())

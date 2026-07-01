@@ -1,108 +1,10 @@
-use std::{
-    fmt::Debug,
-    io,
-    marker::PhantomData,
-    sync::{Arc, Weak},
-};
+use std::{fmt::Debug, io, sync::Weak};
 
 use bincode::{Decode, Encode};
-use zendb_storage::frontend::{state::StateConfig, table::TableConfig};
 
-use crate::{Database, StateHandle, TableHandle};
+use crate::Database;
 
-use super::{BoxFuture, Change, OperatorDirective, OperatorRuntimeConfig};
-
-/// Context passed to every [`Operator`] lifecycle method.
-///
-/// Carries the operator's own typed `Config` (not the union enum) and
-/// provides typed timer registration.
-///
-/// * `O` - the concrete operator type (e.g. `CountingOperator`).
-/// * `D` - the dispatch operator type (the generated `OperatorInstance` enum).
-pub struct OperatorContext<O, D>
-where
-    O: Operator + ?Sized,
-    D: DispatchOperator,
-{
-    pub(crate) db: Weak<Database<D>>,
-    pub(crate) name: String,
-    pub(crate) config: O::Config,
-    pub(crate) _phantom: PhantomData<fn(&O, &D)>,
-}
-
-impl<O, D> OperatorContext<O, D>
-where
-    O: Operator + ?Sized,
-    D: DispatchOperator,
-{
-    pub fn new(db: Weak<Database<D>>, name: String, config: O::Config) -> Self {
-        Self {
-            db,
-            name,
-            config,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// The registration name of this operator.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The operator's own typed config, not the union enum.
-    pub fn config(&self) -> &O::Config {
-        &self.config
-    }
-
-    /// Upgrade to a strong database reference, or `None` if closed.
-    pub fn database(&self) -> Option<Arc<Database<D>>> {
-        self.db.upgrade()
-    }
-
-    /// Get or create a table handle.
-    pub fn table(&self, name: &str, config: Option<TableConfig>) -> io::Result<TableHandle> {
-        self.require_db()?.table(name, config)
-    }
-
-    /// Get or create a typed state handle.
-    pub fn state<K, V>(
-        &self,
-        name: &str,
-        config: Option<StateConfig>,
-    ) -> io::Result<StateHandle<K, V>>
-    where
-        K: Encode + Decode<()> + std::hash::Hash + Eq + Clone + Ord + Send + Sync + 'static,
-        V: Encode + Decode<()> + Clone + Send + Sync + 'static,
-    {
-        self.require_db()?.state(name, config)
-    }
-
-    /// Register a processing-time timer, serializing the operator's own typed
-    /// `Timer` payload with bincode.
-    ///
-    /// The type is checked at compile time; you cannot accidentally register
-    /// a timer with a payload that doesn't match your [`Operator::Timer`].
-    ///
-    /// If a timer already exists for this operator at `fire_at_ms` it is
-    /// replaced (last-write-wins; no FIFO guarantee for equal times).
-    pub fn register_timer(&self, fire_at_ms: u64, payload: &O::Timer) -> io::Result<()> {
-        let bytes = bincode::encode_to_vec(payload, bincode::config::standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        self.require_db()?
-            .register_timer(&self.name, fire_at_ms, bytes)
-    }
-
-    /// Cancel a pending timer at `fire_at_ms` registered by this operator.
-    pub fn cancel_timer(&self, fire_at_ms: u64) -> io::Result<()> {
-        self.require_db()?.cancel_timer(&self.name, fire_at_ms)
-    }
-
-    fn require_db(&self) -> io::Result<Arc<Database<D>>> {
-        self.db
-            .upgrade()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "database is closed"))
-    }
-}
+use super::{BoxFuture, Change, OperatorContext, OperatorDirective, OperatorRuntimeConfig};
 
 /// Core operator trait implemented by every concrete operator.
 ///
@@ -115,10 +17,12 @@ pub trait Operator: Send + 'static {
     type Config: Debug + Clone + PartialEq + Encode + Decode<()> + 'static;
     type Timer: Encode + Decode<()> + 'static;
 
+    /// Construct the operator from its typed config.
     fn new(config: &Self::Config) -> io::Result<Self>
     where
         Self: Sized;
 
+    /// Called once after construction. The default returns `Continue`.
     fn open<'a, D>(
         &'a mut self,
         ctx: &'a OperatorContext<Self, D>,
@@ -130,14 +34,20 @@ pub trait Operator: Send + 'static {
         Box::pin(async { Ok(OperatorDirective::Continue) })
     }
 
+    /// Process a batch of changes. The default is a no-op returning `Continue`.
     fn process<'a, D>(
         &'a mut self,
         changes: Vec<Change>,
         ctx: &'a OperatorContext<Self, D>,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
     where
-        D: DispatchOperator;
+        D: DispatchOperator,
+    {
+        let _ = (changes, ctx);
+        Box::pin(async { Ok(OperatorDirective::Continue) })
+    }
 
+    /// Called when a new input table matching the subscription opens.
     fn on_input_opened<'a, D>(
         &'a mut self,
         table: String,
@@ -150,6 +60,7 @@ pub trait Operator: Send + 'static {
         Box::pin(async { Ok(OperatorDirective::Continue) })
     }
 
+    /// Called when a previously open input table closes.
     fn on_input_closed<'a, D>(
         &'a mut self,
         table: String,
@@ -162,6 +73,7 @@ pub trait Operator: Send + 'static {
         Box::pin(async { Ok(OperatorDirective::Continue) })
     }
 
+    /// Called when a registered processing-time timer fires.
     fn handle_timer<'a, D>(
         &'a mut self,
         payload: Self::Timer,
@@ -175,6 +87,7 @@ pub trait Operator: Send + 'static {
         Box::pin(async { Ok(OperatorDirective::Continue) })
     }
 
+    /// Called on teardown before the worker is removed from memory.
     fn finish<'a, D>(
         &'a mut self,
         ctx: &'a OperatorContext<Self, D>,
@@ -196,6 +109,12 @@ pub trait DispatchOperatorConfig:
     Debug + Clone + PartialEq + Encode + Decode<()> + Send + Sync + 'static
 {
     fn runtime_config(&self) -> &OperatorRuntimeConfig;
+
+    /// Construct the dispatch config from a typed operator config and runtime
+    /// config. The operator type must be part of this dispatch set.
+    fn new<O>(config: O::Config, runtime: OperatorRuntimeConfig) -> io::Result<Self>
+    where
+        O: Operator;
 }
 
 /// Dispatch trait for operator-set enums generated by [`define_operator_set!`].
@@ -207,10 +126,13 @@ pub trait DispatchOperatorConfig:
 pub trait DispatchOperator: Send + 'static {
     type DispatchConfig: DispatchOperatorConfig;
 
+    /// Instantiate the concrete operator for this variant.
     fn new(config: &Self::DispatchConfig) -> io::Result<Self>
     where
         Self: Sized;
 
+    /// Called once after construction. Decodes the typed config from the dispatch
+    /// config and delegates to [`Operator::open`].
     fn open<'a>(
         &'a mut self,
         db: Weak<Database<Self>>,
@@ -220,6 +142,7 @@ pub trait DispatchOperator: Send + 'static {
     where
         Self: Sized;
 
+    /// Delegates to [`Operator::process`] with the typed context.
     fn process<'a>(
         &'a mut self,
         changes: Vec<Change>,
@@ -230,6 +153,7 @@ pub trait DispatchOperator: Send + 'static {
     where
         Self: Sized;
 
+    /// Delegates to [`Operator::on_input_opened`].
     fn on_input_opened<'a>(
         &'a mut self,
         table: String,
@@ -240,6 +164,7 @@ pub trait DispatchOperator: Send + 'static {
     where
         Self: Sized;
 
+    /// Delegates to [`Operator::on_input_closed`].
     fn on_input_closed<'a>(
         &'a mut self,
         table: String,
@@ -250,6 +175,8 @@ pub trait DispatchOperator: Send + 'static {
     where
         Self: Sized;
 
+    /// Decodes the opaque `payload` bytes and delegates to
+    /// [`Operator::handle_timer`].
     fn handle_timer<'a>(
         &'a mut self,
         payload: Vec<u8>,
@@ -261,6 +188,7 @@ pub trait DispatchOperator: Send + 'static {
     where
         Self: Sized;
 
+    /// Delegates to [`Operator::finish`] for teardown.
     fn finish<'a>(
         &'a mut self,
         db: Weak<Database<Self>>,

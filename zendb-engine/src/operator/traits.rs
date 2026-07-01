@@ -1,10 +1,108 @@
-use std::{fmt::Debug, io, sync::Weak};
+use std::{
+    fmt::Debug,
+    io,
+    marker::PhantomData,
+    sync::{Arc, Weak},
+};
 
 use bincode::{Decode, Encode};
+use zendb_storage::frontend::{state::StateConfig, table::TableConfig};
 
-use crate::Database;
+use crate::{Database, StateHandle, TableHandle};
 
-use super::{BoxFuture, Change, OperatorContext, OperatorDirective, OperatorRuntimeConfig};
+use super::{BoxFuture, Change, OperatorDirective, OperatorRuntimeConfig};
+
+/// Context passed to every [`Operator`] lifecycle method.
+///
+/// Carries the operator's own typed `Config` (not the union enum) and
+/// provides typed timer registration.
+///
+/// * `O` - the concrete operator type (e.g. `CountingOperator`).
+/// * `D` - the dispatch operator type (the generated `OperatorInstance` enum).
+pub struct OperatorContext<O, D>
+where
+    O: Operator + ?Sized,
+    D: DispatchOperator,
+{
+    pub(crate) db: Weak<Database<D>>,
+    pub(crate) name: String,
+    pub(crate) config: O::Config,
+    pub(crate) _phantom: PhantomData<fn(&O, &D)>,
+}
+
+impl<O, D> OperatorContext<O, D>
+where
+    O: Operator + ?Sized,
+    D: DispatchOperator,
+{
+    pub fn new(db: Weak<Database<D>>, name: String, config: O::Config) -> Self {
+        Self {
+            db,
+            name,
+            config,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// The registration name of this operator.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The operator's own typed config, not the union enum.
+    pub fn config(&self) -> &O::Config {
+        &self.config
+    }
+
+    /// Upgrade to a strong database reference, or `None` if closed.
+    pub fn database(&self) -> Option<Arc<Database<D>>> {
+        self.db.upgrade()
+    }
+
+    /// Get or create a table handle.
+    pub fn table(&self, name: &str, config: Option<TableConfig>) -> io::Result<TableHandle> {
+        self.require_db()?.table(name, config)
+    }
+
+    /// Get or create a typed state handle.
+    pub fn state<K, V>(
+        &self,
+        name: &str,
+        config: Option<StateConfig>,
+    ) -> io::Result<StateHandle<K, V>>
+    where
+        K: Encode + Decode<()> + std::hash::Hash + Eq + Clone + Ord + Send + Sync + 'static,
+        V: Encode + Decode<()> + Clone + Send + Sync + 'static,
+    {
+        self.require_db()?.state(name, config)
+    }
+
+    /// Register a processing-time timer, serializing the operator's own typed
+    /// `Timer` payload with bincode.
+    ///
+    /// The type is checked at compile time; you cannot accidentally register
+    /// a timer with a payload that doesn't match your [`Operator::Timer`].
+    ///
+    /// If a timer already exists for this operator at `fire_at_ms` it is
+    /// replaced (last-write-wins; no FIFO guarantee for equal times).
+    pub fn register_timer(&self, fire_at_ms: u64, payload: &O::Timer) -> io::Result<()> {
+        let bytes = bincode::encode_to_vec(payload, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        self.require_db()?
+            .register_timer(&self.name, fire_at_ms, bytes)
+    }
+
+    /// Cancel a pending timer at `fire_at_ms` registered by this operator.
+    pub fn cancel_timer(&self, fire_at_ms: u64) -> io::Result<()> {
+        self.require_db()?.cancel_timer(&self.name, fire_at_ms)
+    }
+
+    fn require_db(&self) -> io::Result<Arc<Database<D>>> {
+        self.db
+            .upgrade()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "database is closed"))
+    }
+}
 
 /// Core operator trait implemented by every concrete operator.
 ///
@@ -23,11 +121,12 @@ pub trait Operator: Send + 'static {
 
     fn open<'a, D>(
         &'a mut self,
-        _ctx: &'a OperatorContext<Self, D>,
+        ctx: &'a OperatorContext<Self, D>,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
     where
         D: DispatchOperator,
     {
+        let _ = ctx;
         Box::pin(async { Ok(OperatorDirective::Continue) })
     }
 
@@ -39,25 +138,51 @@ pub trait Operator: Send + 'static {
     where
         D: DispatchOperator;
 
-    fn handle_timer<'a, D>(
+    fn on_input_opened<'a, D>(
         &'a mut self,
-        _payload: Self::Timer,
-        _fire_at_ms: u64,
-        _ctx: &'a OperatorContext<Self, D>,
+        table: String,
+        ctx: &'a OperatorContext<Self, D>,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
     where
         D: DispatchOperator,
     {
+        let _ = (table, ctx);
+        Box::pin(async { Ok(OperatorDirective::Continue) })
+    }
+
+    fn on_input_closed<'a, D>(
+        &'a mut self,
+        table: String,
+        ctx: &'a OperatorContext<Self, D>,
+    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    where
+        D: DispatchOperator,
+    {
+        let _ = (table, ctx);
+        Box::pin(async { Ok(OperatorDirective::Continue) })
+    }
+
+    fn handle_timer<'a, D>(
+        &'a mut self,
+        payload: Self::Timer,
+        fire_at_ms: u64,
+        ctx: &'a OperatorContext<Self, D>,
+    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    where
+        D: DispatchOperator,
+    {
+        let _ = (payload, fire_at_ms, ctx);
         Box::pin(async { Ok(OperatorDirective::Continue) })
     }
 
     fn finish<'a, D>(
         &'a mut self,
-        _ctx: &'a OperatorContext<Self, D>,
+        ctx: &'a OperatorContext<Self, D>,
     ) -> BoxFuture<'a, io::Result<()>>
     where
         D: DispatchOperator,
     {
+        let _ = ctx;
         Box::pin(async { Ok(()) })
     }
 }
@@ -98,6 +223,26 @@ pub trait DispatchOperator: Send + 'static {
     fn process<'a>(
         &'a mut self,
         changes: Vec<Change>,
+        db: Weak<Database<Self>>,
+        name: &'a str,
+        config: &'a Self::DispatchConfig,
+    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    where
+        Self: Sized;
+
+    fn on_input_opened<'a>(
+        &'a mut self,
+        table: String,
+        db: Weak<Database<Self>>,
+        name: &'a str,
+        config: &'a Self::DispatchConfig,
+    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    where
+        Self: Sized;
+
+    fn on_input_closed<'a>(
+        &'a mut self,
+        table: String,
         db: Weak<Database<Self>>,
         name: &'a str,
         config: &'a Self::DispatchConfig,

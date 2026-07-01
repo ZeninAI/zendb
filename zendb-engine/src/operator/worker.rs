@@ -13,19 +13,31 @@ use super::{Change, DispatchOperator, DispatchOperatorConfig, OperatorDirective,
 use crate::{runtime::Executor, Database};
 
 pub(crate) struct OperatorInput {
-    pub(crate) table_name: String,
-    pub(crate) reader: TopicConsumer<Change>,
+    table_name: String,
+    reader: TopicConsumer<Change>,
+}
+
+impl OperatorInput {
+    pub(crate) fn new(table_name: String, reader: TopicConsumer<Change>) -> Self {
+        Self { table_name, reader }
+    }
+}
+
+enum OperatorWorkerEvent {
+    InputOpened(String),
+    InputClosed(String),
 }
 
 pub(crate) struct OperatorWorker<D>
 where
     D: DispatchOperator,
 {
-    pub(crate) name: String,
-    pub(crate) config: D::DispatchConfig,
-    pub(crate) inputs: Mutex<Vec<OperatorInput>>,
+    name: String,
+    config: D::DispatchConfig,
+    inputs: Mutex<Vec<OperatorInput>>,
     operator: Mutex<Option<D>>,
-    pub(crate) timer_inbox: Mutex<VecDeque<(u64, Vec<u8>)>>,
+    timer_inbox: Mutex<VecDeque<(u64, Vec<u8>)>>,
+    events: Mutex<VecDeque<OperatorWorkerEvent>>,
 }
 
 impl<D> OperatorWorker<D>
@@ -38,13 +50,56 @@ where
         inputs: Vec<OperatorInput>,
         operator: D,
     ) -> Arc<Self> {
+        let events = inputs
+            .iter()
+            .map(|input| OperatorWorkerEvent::InputOpened(input.table_name.clone()))
+            .collect();
         Arc::new(Self {
             name,
             config,
             inputs: Mutex::new(inputs),
             operator: Mutex::new(Some(operator)),
             timer_inbox: Mutex::new(VecDeque::new()),
+            events: Mutex::new(events),
         })
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn config(&self) -> &D::DispatchConfig {
+        &self.config
+    }
+
+    pub(crate) fn has_inputs(&self) -> bool {
+        !self.inputs.lock().is_empty()
+    }
+
+    pub(crate) fn attach_input(&self, input: OperatorInput) {
+        let table_name = input.table_name.clone();
+        self.inputs.lock().push(input);
+        self.events
+            .lock()
+            .push_back(OperatorWorkerEvent::InputOpened(table_name));
+    }
+
+    pub(crate) fn enqueue_timer(&self, fire_at_ms: u64, payload: Vec<u8>) {
+        self.timer_inbox.lock().push_back((fire_at_ms, payload));
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn detach_input(&self, table_name: String) {
+        let mut inputs = self.inputs.lock();
+        if let Some(index) = inputs
+            .iter()
+            .position(|input| input.table_name == table_name)
+        {
+            inputs.remove(index);
+            self.events
+                .lock()
+                .push_back(OperatorWorkerEvent::InputClosed(table_name));
+        }
     }
 
     /// Delete all subscribed topic consumers and clear the inputs list on retirement.
@@ -62,7 +117,7 @@ where
 
     /// Extract the operator from its holding mutex and start the async run loop.
     pub(crate) fn spawn(self: &Arc<Self>, database: &Arc<Database<D>>) {
-        let executor = Arc::clone(&database.executor);
+        let executor = database.executor();
         let database = Arc::downgrade(database);
         let operator = self
             .operator
@@ -110,6 +165,42 @@ where
 
         'outer: loop {
             let runtime = self.config.runtime_config().clone();
+            let events: Vec<OperatorWorkerEvent> = self.events.lock().drain(..).collect();
+            for event in events {
+                let result = match event {
+                    OperatorWorkerEvent::InputOpened(table) => {
+                        operator
+                            .on_input_opened(table, database.clone(), &self.name, &self.config)
+                            .await
+                    }
+                    OperatorWorkerEvent::InputClosed(table) => {
+                        operator
+                            .on_input_closed(table, database.clone(), &self.name, &self.config)
+                            .await
+                    }
+                };
+
+                match result {
+                    Ok(OperatorDirective::Continue) => {}
+                    Ok(OperatorDirective::Finish) => {
+                        self.retire(&database, &mut operator, OperatorPhase::Finished)
+                            .await;
+                        return;
+                    }
+                    Err(error) => {
+                        log::error!("operator {:?} input lifecycle failed: {error}", self.name);
+                        self.retire(
+                            &database,
+                            &mut operator,
+                            OperatorPhase::Failed {
+                                error: error.to_string(),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
             let changes = self.poll(runtime.poll_size);
             let timers: Vec<(u64, Vec<u8>)> = self.timer_inbox.lock().drain(..).collect();
 
@@ -267,7 +358,11 @@ where
             log::error!("failed finishing operator {:?}: {finish_err}", self.name);
         }
         if let Some(database) = database.upgrade() {
-            database.retire_operator(&self.name, phase);
+            database.retire_operator(
+                &self.name,
+                phase,
+                &self.config.runtime_config().subscriptions,
+            );
         }
     }
 }

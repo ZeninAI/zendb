@@ -4,9 +4,12 @@ use std::{io, sync::Arc};
 
 use zendb_storage::core::traits::Backend;
 
-use crate::operator::{
-    worker::{OperatorInput, OperatorWorker},
-    DispatchOperator, DispatchOperatorConfig, OperatorPhase,
+use crate::{
+    operator::{
+        worker::{OperatorInput, OperatorWorker},
+        DispatchOperator, DispatchOperatorConfig, OperatorPhase,
+    },
+    Subscription,
 };
 
 use super::{Database, OperatorEntry};
@@ -76,14 +79,14 @@ where
     ) -> io::Result<(OperatorPhase, D::DispatchConfig)> {
         // Fast path: already running - return its config.
         if let Some(worker) = self.operators.read().get(name).cloned() {
-            return Ok((OperatorPhase::Active, worker.config.clone()));
+            return Ok((OperatorPhase::Active, worker.config().clone()));
         }
 
         let (phase, effective, worker_opt) = {
             let mut catalog = self.operator_catalog.lock();
             // Double-check under catalog lock
             if let Some(worker) = self.operators.read().get(name).cloned() {
-                return Ok((OperatorPhase::Active, worker.config.clone()));
+                return Ok((OperatorPhase::Active, worker.config().clone()));
             }
 
             match catalog.get(&name.to_owned()) {
@@ -103,7 +106,7 @@ where
                         _ => stored.clone(),
                     };
                     let worker = self.build_worker(name.to_owned(), effective.clone())?;
-                    if worker.inputs.lock().is_empty() {
+                    if !worker.has_inputs() {
                         // No matching tables open yet. Catalog entry is already
                         // Active - activate_table_subscribers will spawn when one opens.
                         return Ok((OperatorPhase::Active, effective));
@@ -125,7 +128,7 @@ where
                         )
                     })?;
                     let worker = self.build_worker(name.to_owned(), config.clone())?;
-                    if worker.inputs.lock().is_empty() {
+                    if !worker.has_inputs() {
                         // No matching tables open yet - persist to catalog only.
                         catalog.put(
                             name.to_owned(),
@@ -178,19 +181,10 @@ where
                 .iter()
                 .any(|s| s.matches(table_name))
             {
-                let reader = match table.read().consumer(&name) {
-                    Ok(reader) => reader,
-                    Err(error) => {
-                        for input in inputs {
-                            let _ = input.reader.delete();
-                        }
-                        return Err(error);
-                    }
-                };
-                inputs.push(OperatorInput {
-                    table_name: table_name.clone(),
-                    reader,
-                });
+                inputs.push(OperatorInput::new(
+                    table_name.clone(),
+                    table.read().consumer(&name)?,
+                ));
             }
         }
         Ok(OperatorWorker::new(name, config, inputs, instance))
@@ -198,13 +192,18 @@ where
 
     /// Transition catalog phase to `Finished` or `Failed` and remove from memory.
     /// Called by the run loop on natural exit.
-    pub(crate) fn retire_operator(&self, name: &str, phase: OperatorPhase) {
+    pub(crate) fn retire_operator(
+        &self,
+        name: &str,
+        phase: OperatorPhase,
+        subscriptions: &Vec<Subscription>,
+    ) {
         let worker = self.operators.write().remove(name);
 
         if let Some(worker) = worker {
             worker.delete_inputs();
         }
-        self.delete_operator_consumers(name);
+        self.delete_operator_consumers(name, subscriptions);
         self.cancel_operator_timers(name);
 
         if let Err(error) = self

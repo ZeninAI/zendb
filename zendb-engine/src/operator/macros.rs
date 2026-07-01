@@ -107,10 +107,11 @@ macro_rules! define_operator_set {
                 fn process<'a>(
                     &'a mut self,
                     changes: Vec<$crate::Change>,
-                    _db: ::std::sync::Weak<$crate::Database<Self>>,
-                    _name: &'a str,
-                    _config: &'a Self::DispatchConfig,
+                    db: ::std::sync::Weak<$crate::Database<Self>>,
+                    name: &'a str,
+                    config: &'a Self::DispatchConfig,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
+                    let _ = (&db, name, config);
                     match self {
                         $(
                             OperatorInstance::$variant(inner, cached_ctx) => {
@@ -123,14 +124,59 @@ macro_rules! define_operator_set {
                     }
                 }
 
+                fn on_input_opened<'a>(
+                    &'a mut self,
+                    table: String,
+                    db: ::std::sync::Weak<$crate::Database<Self>>,
+                    name: &'a str,
+                    config: &'a Self::DispatchConfig,
+                ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
+                    let _ = (&db, name, config);
+                    match self {
+                        $(
+                            OperatorInstance::$variant(inner, cached_ctx) => {
+                                let typed_ctx = cached_ctx
+                                    .as_ref()
+                                    .expect("operator context must be initialized by open");
+                                <$operator as $crate::Operator>::on_input_opened(
+                                    inner, table, typed_ctx,
+                                )
+                            }
+                        )+
+                    }
+                }
+
+                fn on_input_closed<'a>(
+                    &'a mut self,
+                    table: String,
+                    db: ::std::sync::Weak<$crate::Database<Self>>,
+                    name: &'a str,
+                    config: &'a Self::DispatchConfig,
+                ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
+                    let _ = (&db, name, config);
+                    match self {
+                        $(
+                            OperatorInstance::$variant(inner, cached_ctx) => {
+                                let typed_ctx = cached_ctx
+                                    .as_ref()
+                                    .expect("operator context must be initialized by open");
+                                <$operator as $crate::Operator>::on_input_closed(
+                                    inner, table, typed_ctx,
+                                )
+                            }
+                        )+
+                    }
+                }
+
                 fn handle_timer<'a>(
                     &'a mut self,
                     payload: Vec<u8>,
                     fire_at_ms: u64,
-                    _db: ::std::sync::Weak<$crate::Database<Self>>,
-                    _name: &'a str,
-                    _config: &'a Self::DispatchConfig,
+                    db: ::std::sync::Weak<$crate::Database<Self>>,
+                    name: &'a str,
+                    config: &'a Self::DispatchConfig,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
+                    let _ = (&db, name, config);
                     match self {
                         $(
                             OperatorInstance::$variant(inner, cached_ctx) => {
@@ -162,10 +208,11 @@ macro_rules! define_operator_set {
 
                 fn finish<'a>(
                     &'a mut self,
-                    _db: ::std::sync::Weak<$crate::Database<Self>>,
-                    _name: &'a str,
-                    _config: &'a Self::DispatchConfig,
+                    db: ::std::sync::Weak<$crate::Database<Self>>,
+                    name: &'a str,
+                    config: &'a Self::DispatchConfig,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<()>> {
+                    let _ = (&db, name, config);
                     match self {
                         $(
                             OperatorInstance::$variant(inner, cached_ctx) => {

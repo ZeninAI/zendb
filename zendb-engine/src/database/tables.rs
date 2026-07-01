@@ -7,9 +7,9 @@ use zendb_storage::core::traits::{Backend, DurableStorage};
 use zendb_storage::frontend::table::{Table, TableConfig};
 
 use crate::operator::worker::{OperatorInput, OperatorWorker};
-use crate::{DispatchOperator, DispatchOperatorConfig, OperatorPhase};
+use crate::{DispatchOperator, DispatchOperatorConfig, OperatorPhase, Subscription};
 
-use super::{ConcurrentTable, Database, OperatorCatalog, TableHandle, TABLES_DIR};
+use super::{ConcurrentTable, Database, TableHandle, TABLES_DIR};
 
 impl<D> Database<D>
 where
@@ -97,8 +97,7 @@ where
             self.tables
                 .write()
                 .insert(name.to_owned(), Arc::clone(&table));
-            let mut operator_catalog = self.operator_catalog.lock();
-            let workers = self.activate_table_subscribers(name, &table, &mut operator_catalog)?;
+            let workers = self.activate_table_subscribers(name, &table)?;
             (table, workers)
         };
         // Catalog locks released; safe to spawn (workers may call retire() immediately).
@@ -116,8 +115,8 @@ where
         self: &Arc<Self>,
         name: &str,
         table: &ConcurrentTable,
-        operator_catalog: &mut OperatorCatalog<D::DispatchConfig>,
     ) -> io::Result<Vec<Arc<OperatorWorker<D>>>> {
+        let operator_catalog = self.operator_catalog.lock(); // Hold this long for the duration of fn avoid race conditions
         let matching_operators: Vec<(String, D::DispatchConfig)> = operator_catalog
             .entries()
             .filter_map(|(op_name, entry)| {
@@ -141,11 +140,8 @@ where
         for (op_name, op_config) in matching_operators {
             let existing = self.operators.read().get(&op_name).cloned();
             if let Some(worker) = existing {
-                let reader = table.read().consumer(&worker.name)?;
-                worker.inputs.lock().push(OperatorInput {
-                    table_name: name.to_owned(),
-                    reader,
-                });
+                let reader = table.read().consumer(worker.name())?;
+                worker.attach_input(OperatorInput::new(name.to_owned(), reader));
             } else {
                 let worker = self.build_worker(op_name.clone(), op_config)?;
                 self.operators.write().insert(op_name, Arc::clone(&worker));
@@ -159,11 +155,16 @@ where
     ///
     /// Live readers owned by the worker must be deleted before this sweep; a
     /// topic permits only one active reader for a consumer name.
-    pub(crate) fn delete_operator_consumers(&self, operator: &str) {
+    pub(super) fn delete_operator_consumers(
+        &self,
+        operator: &str,
+        subscriptions: &Vec<Subscription>,
+    ) {
         let tables: Vec<(String, TableConfig)> = self
             .table_catalog
             .lock()
             .entries()
+            .filter(|(name, _)| subscriptions.iter().any(|sub| sub.matches(name.as_ref())))
             .map(|(name, config)| (name.into_owned(), config.into_owned()))
             .collect();
 

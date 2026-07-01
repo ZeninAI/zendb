@@ -37,7 +37,7 @@ where
     /// If a timer already exists for the same `(operator, fire_at_ms)` pair it
     /// is overwritten - no FIFO guarantee for equal-time timers on the same
     /// operator.
-    pub fn register_timer(
+    pub(crate) fn register_timer(
         self: &Arc<Self>,
         operator: &str,
         fire_at_ms: u64,
@@ -55,7 +55,11 @@ where
     }
 
     /// Cancel a pending timer for `operator` at `fire_at_ms`.
-    pub fn cancel_timer(self: &Arc<Self>, operator: &str, fire_at_ms: u64) -> io::Result<()> {
+    pub(crate) fn cancel_timer(
+        self: &Arc<Self>,
+        operator: &str,
+        fire_at_ms: u64,
+    ) -> io::Result<()> {
         let key = TimerKey {
             fire_at_ms,
             operator: operator.to_owned(),
@@ -105,7 +109,7 @@ where
     /// Delete every timer belonging to `operator` from the store.
     /// Called on operator retirement to prevent stale timers from
     /// accumulating.
-    pub(crate) fn cancel_operator_timers(&self, operator: &str) {
+    pub(super) fn cancel_operator_timers(&self, operator: &str) {
         let mut timers = self.timers.write();
         let keys: Vec<TimerKey> = timers
             .entries()
@@ -119,7 +123,7 @@ where
 
     fn deliver_timer(&self, operator: &str, fire_at_ms: u64, payload: Vec<u8>) {
         if let Some(worker) = self.operators.read().get(operator).cloned() {
-            worker.timer_inbox.lock().push_back((fire_at_ms, payload));
+            worker.enqueue_timer(fire_at_ms, payload);
         }
     }
 }

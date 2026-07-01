@@ -165,17 +165,17 @@ where
 {
     path: PathBuf,
     #[allow(dead_code)]
-    pub(crate) config: DatabaseConfig,
-    pub(crate) executor: Arc<dyn Executor>,
+    config: DatabaseConfig,
+    executor: Arc<dyn Executor>,
     table_catalog: Mutex<TableCatalog>,
     state_catalog: Mutex<StateCatalog>,
     operator_catalog: Mutex<OperatorCatalog<D::DispatchConfig>>,
-    pub(crate) tables: RwLock<HashMap<String, ConcurrentTable>>,
+    tables: RwLock<HashMap<String, ConcurrentTable>>,
     states: RwLock<HashMap<String, ErasedStateHandle>>,
-    pub(crate) operators: RwLock<HashMap<String, Arc<OperatorWorker<D>>>>,
+    operators: RwLock<HashMap<String, Arc<OperatorWorker<D>>>>,
     timers: Arc<RwLock<TimerStore>>,
     /// Notified by `register_timer` to wake the scheduler early.
-    pub(crate) timer_notify: Arc<(Mutex<()>, Condvar)>,
+    timer_notify: Arc<(Mutex<()>, Condvar)>,
 }
 
 impl<D> Database<D>
@@ -262,6 +262,10 @@ where
             .executor
             .spawn(Box::pin(run_scheduler(db_weak, timer_notify)));
         Ok(database)
+    }
+
+    pub(crate) fn executor(&self) -> Arc<dyn Executor> {
+        Arc::clone(&self.executor)
     }
 }
 
@@ -508,11 +512,71 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Encode, Decode)]
+    struct InputLifecycleConfig {
+        tracker: String,
+    }
+
+    struct InputLifecycleOperator {
+        opened: Arc<Mutex<Vec<String>>>,
+        closed: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Operator for InputLifecycleOperator {
+        type Config = InputLifecycleConfig;
+        type Timer = ();
+
+        fn new(config: &Self::Config) -> io::Result<Self> {
+            let (opened, closed) = lookup_input_tracker(&config.tracker)?;
+            Ok(Self { opened, closed })
+        }
+
+        fn process<'a, D>(
+            &'a mut self,
+            _changes: Vec<Change>,
+            _ctx: &'a OperatorContext<Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+        where
+            D: crate::DispatchOperator,
+        {
+            Box::pin(async { Ok(OperatorDirective::Continue) })
+        }
+
+        fn on_input_opened<'a, D>(
+            &'a mut self,
+            table: String,
+            _ctx: &'a OperatorContext<Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+        where
+            D: crate::DispatchOperator,
+        {
+            Box::pin(async move {
+                self.opened.lock().push(table);
+                Ok(OperatorDirective::Continue)
+            })
+        }
+
+        fn on_input_closed<'a, D>(
+            &'a mut self,
+            table: String,
+            _ctx: &'a OperatorContext<Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+        where
+            D: crate::DispatchOperator,
+        {
+            Box::pin(async move {
+                self.closed.lock().push(table);
+                Ok(OperatorDirective::Continue)
+            })
+        }
+    }
+
     crate::define_operator_set! {
         mod test_operators {
             Count(CountingOperator),
             Retry(FailingOnceOperator),
             Timer(TimerOperator),
+            InputLifecycle(InputLifecycleOperator),
         }
     }
 
@@ -544,6 +608,39 @@ mod tests {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("missing test counter tracker {key:?}"),
+            )
+        })
+    }
+
+    type InputTracker = (Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>);
+
+    fn input_trackers() -> &'static Mutex<HashMap<String, InputTracker>> {
+        static TRACKERS: OnceLock<Mutex<HashMap<String, InputTracker>>> = OnceLock::new();
+        TRACKERS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn new_input_tracker(
+        prefix: &str,
+    ) -> (String, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let key = format!(
+            "{prefix}_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let closed = Arc::new(Mutex::new(Vec::new()));
+        input_trackers()
+            .lock()
+            .insert(key.clone(), (Arc::clone(&opened), Arc::clone(&closed)));
+        (key, opened, closed)
+    }
+
+    fn lookup_input_tracker(key: &str) -> io::Result<InputTracker> {
+        input_trackers().lock().get(key).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("missing test input tracker {key:?}"),
             )
         })
     }
@@ -599,6 +696,21 @@ mod tests {
             },
         };
         assert_eq!(config.kind(), test_operators::OperatorKind::Timer);
+        let _ = config.operator();
+        let _ = config.runtime_config();
+        config
+    }
+
+    fn input_lifecycle_config(tracker: String, subscription: Subscription) -> TestOperatorConfig {
+        let config = TestOperatorConfig {
+            operator: TestOperatorConfigVariant::InputLifecycle(InputLifecycleConfig { tracker }),
+            runtime: OperatorRuntimeConfig {
+                subscriptions: vec![subscription],
+                retry: Default::default(),
+                poll_size: 128,
+            },
+        };
+        assert_eq!(config.kind(), test_operators::OperatorKind::InputLifecycle);
         let _ = config.operator();
         let _ = config.runtime_config();
         config
@@ -776,6 +888,49 @@ mod tests {
         db.operator("ticker", Some(timer_config(tracker))).unwrap();
 
         wait_until(|| fired.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[test]
+    fn operator_receives_opened_callbacks_for_initial_inputs() {
+        let path = tmp("input_lifecycle_initial");
+        let (tracker, opened, closed) = new_input_tracker("input_lifecycle_initial");
+        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
+            .unwrap();
+        db.table("users", Some(TableConfig::default())).unwrap();
+        db.operator(
+            "inputs",
+            Some(input_lifecycle_config(
+                tracker,
+                Subscription::pattern("users"),
+            )),
+        )
+        .unwrap();
+
+        wait_until(|| opened.lock().contains(&"users".to_owned()));
+        assert!(closed.lock().is_empty());
+    }
+
+    #[test]
+    fn operator_receives_opened_callbacks_for_later_inputs() {
+        let path = tmp("input_lifecycle_later");
+        let (tracker, opened, closed) = new_input_tracker("input_lifecycle_later");
+        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
+            .unwrap();
+        db.table("users", Some(TableConfig::default())).unwrap();
+        db.operator(
+            "inputs",
+            Some(input_lifecycle_config(tracker, Subscription::pattern("*"))),
+        )
+        .unwrap();
+
+        wait_until(|| opened.lock().contains(&"users".to_owned()));
+        db.table("orders", Some(TableConfig::default())).unwrap();
+
+        wait_until(|| {
+            let opened = opened.lock();
+            opened.contains(&"users".to_owned()) && opened.contains(&"orders".to_owned())
+        });
+        assert!(closed.lock().is_empty());
     }
 
     #[test]

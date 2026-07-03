@@ -1064,7 +1064,6 @@ dependencies = [
  "bincode",
  "hashbrown 0.15.5",
  "lmdb",
- "log",
  "memmap2",
  "parking_lot",
  "tempfile",

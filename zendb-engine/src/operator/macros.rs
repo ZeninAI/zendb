@@ -264,6 +264,31 @@ macro_rules! __zendb_define_operator_set {
                     }
                 }
 
+                fn close<'a>(
+                    &'a mut self,
+                    db: ::std::sync::Weak<$crate::Database<Self>>,
+                    name: &'a str,
+                    config: &'a Self::Config,
+                ) -> $crate::BoxFuture<'a, ::std::io::Result<()>> {
+                    let _ = (&db, name, config);
+                    match self {
+                        OperatorInstance::$first_variant(inner, cached_ctx) => {
+                            let typed_ctx = cached_ctx
+                                .as_ref()
+                                .expect("operator context must be initialized by open");
+                            <$first_operator as $crate::Operator>::close(inner, typed_ctx)
+                        }
+                        $(
+                            OperatorInstance::$variant(inner, cached_ctx) => {
+                                let typed_ctx = cached_ctx
+                                    .as_ref()
+                                    .expect("operator context must be initialized by open");
+                                <$operator as $crate::Operator>::close(inner, typed_ctx)
+                            }
+                        )*
+                    }
+                }
+
                 fn handle_timer<'a>(
                     &'a mut self,
                     payload: Vec<u8>,

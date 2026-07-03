@@ -2,6 +2,7 @@
 
 use std::{
     collections::VecDeque,
+    io,
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -23,9 +24,20 @@ impl OperatorInput {
     }
 }
 
+#[derive(Clone)]
 enum OperatorWorkerEvent {
+    Open,
     InputOpened(String),
     InputClosed(String),
+    Close,
+    Finish(OperatorPhase),
+}
+
+enum WorkerLoopAction {
+    AdvanceEvent,
+    BeginShutdown(OperatorPhase),
+    Retire(OperatorPhase),
+    Retry(io::Error),
 }
 
 /// Per-operator async run loop. Holds the operator instance, its inputs
@@ -40,6 +52,7 @@ where
     operator: Mutex<Option<D>>,
     timer_inbox: Mutex<VecDeque<(u64, Vec<u8>)>>,
     events: Mutex<VecDeque<OperatorWorkerEvent>>,
+    shutdown: Mutex<Option<OperatorPhase>>,
 }
 
 impl<D> OperatorWorker<D>
@@ -52,10 +65,12 @@ where
         inputs: Vec<OperatorInput>,
         operator: D,
     ) -> Arc<Self> {
-        let events = inputs
-            .iter()
-            .map(|input| OperatorWorkerEvent::InputOpened(input.table_name.clone()))
-            .collect();
+        let mut events = VecDeque::new();
+        events.push_back(OperatorWorkerEvent::Open);
+        for input in &inputs {
+            events.push_back(OperatorWorkerEvent::InputOpened(input.table_name.clone()));
+        }
+
         Arc::new(Self {
             name,
             config,
@@ -63,6 +78,7 @@ where
             operator: Mutex::new(Some(operator)),
             timer_inbox: Mutex::new(VecDeque::new()),
             events: Mutex::new(events),
+            shutdown: Mutex::new(None),
         })
     }
 
@@ -76,6 +92,17 @@ where
 
     /// Attach a new topic consumer for `table_name`. Enqueues an `InputOpened` event.
     pub(crate) fn attach_input(&self, input: OperatorInput) {
+        if self.is_shutting_down() {
+            if let Err(error) = input.reader.delete() {
+                log::error!(
+                    "failed deleting consumer {:?} from table {:?}: {error}",
+                    self.name,
+                    input.table_name
+                );
+            }
+            return;
+        }
+
         let table_name = input.table_name.clone();
         self.inputs.lock().push(input);
         self.events
@@ -83,27 +110,20 @@ where
             .push_back(OperatorWorkerEvent::InputOpened(table_name));
     }
 
+    /// Permanently cancel this operator. It will not be reopened from the catalog.
+    pub(crate) fn cancel(&self) {
+        self.begin_shutdown(OperatorPhase::Cancelled, true);
+    }
+
     /// Push a timer payload from the scheduler into the worker's inbox.
     pub(crate) fn enqueue_timer(&self, fire_at_ms: u64, payload: Vec<u8>) {
+        if self.is_shutting_down() {
+            return;
+        }
         self.timer_inbox.lock().push_back((fire_at_ms, payload));
     }
 
-    /// Remove the consumer for `table_name`. Enqueues an `InputClosed` event.
-    #[allow(dead_code)]
-    pub(crate) fn detach_input(&self, table_name: String) {
-        let mut inputs = self.inputs.lock();
-        if let Some(index) = inputs
-            .iter()
-            .position(|input| input.table_name == table_name)
-        {
-            inputs.remove(index);
-            self.events
-                .lock()
-                .push_back(OperatorWorkerEvent::InputClosed(table_name));
-        }
-    }
-
-    /// Delete all subscribed topic consumers and clear the inputs list on retirement.
+    /// Delete all subscribed topic consumers and clear the inputs list.
     pub(crate) fn delete_inputs(&self) {
         for input in std::mem::take(&mut *self.inputs.lock()) {
             if let Err(error) = input.reader.delete() {
@@ -130,78 +150,61 @@ where
             .spawn(Box::pin(Arc::clone(self).run(database, executor, operator)));
     }
 
-    /// Main event loop: drain timer inbox, poll changes, commit on success,
-    /// apply exponential backoff on error, retire on `Finish` or exhausted retries.
+    /// Main event loop: process lifecycle events from the queue front, handle
+    /// timers, poll changes, commit on success, and apply exponential backoff
+    /// retries on failure.
     async fn run(
         self: Arc<Self>,
         database: Weak<Database<D>>,
         executor: Arc<dyn Executor>,
         mut operator: D,
     ) {
-        match operator
-            .open(database.clone(), &self.name, &self.config)
-            .await
-        {
-            Ok(OperatorDirective::Continue) => {}
-            Ok(OperatorDirective::Finish) => {
-                self.retire(&database, &mut operator, OperatorPhase::Finished)
-                    .await;
-                return;
-            }
-            Err(error) => {
-                log::error!("failed opening operator {:?}: {error}", self.name);
-                self.retire(
-                    &database,
-                    &mut operator,
-                    OperatorPhase::Failed {
-                        error: error.to_string(),
-                    },
-                )
-                .await;
-                return;
-            }
-        }
-
         let mut attempt: usize = 0;
 
         'outer: loop {
-            let runtime = self.config.runtime_config().clone();
-            let events: Vec<OperatorWorkerEvent> = self.events.lock().drain(..).collect();
-            for event in events {
-                let result = match event {
-                    OperatorWorkerEvent::InputOpened(table) => {
-                        operator
-                            .on_input_opened(table, database.clone(), &self.name, &self.config)
-                            .await
-                    }
-                    OperatorWorkerEvent::InputClosed(table) => {
-                        operator
-                            .on_input_closed(table, database.clone(), &self.name, &self.config)
-                            .await
-                    }
-                };
+            let runtime = self.config.runtime_config();
 
-                match result {
-                    Ok(OperatorDirective::Continue) => {}
-                    Ok(OperatorDirective::Finish) => {
-                        self.retire(&database, &mut operator, OperatorPhase::Finished)
-                            .await;
+            while let Some(event) = self.peek_event() {
+                match self.handle_event(&database, &mut operator, event).await {
+                    WorkerLoopAction::AdvanceEvent => {
+                        self.pop_event();
+                        attempt = 0;
+                    }
+                    WorkerLoopAction::BeginShutdown(phase) => {
+                        if self.is_shutting_down() {
+                            self.pop_event();
+                        } else {
+                            self.begin_shutdown(phase, true);
+                        }
+                        attempt = 0;
+                        continue 'outer;
+                    }
+                    WorkerLoopAction::Retire(phase) => {
+                        self.retire(&database, phase).await;
                         return;
                     }
-                    Err(error) => {
-                        log::error!("operator {:?} input lifecycle failed: {error}", self.name);
-                        self.retire(
-                            &database,
-                            &mut operator,
-                            OperatorPhase::Failed {
-                                error: error.to_string(),
-                            },
-                        )
-                        .await;
-                        return;
+                    WorkerLoopAction::Retry(error) => {
+                        let error_msg = error.to_string();
+                        attempt += 1;
+
+                        if runtime.retry.max_attempts > 0 && attempt >= runtime.retry.max_attempts {
+                            if self.is_shutting_down() {
+                                self.retire(&database, OperatorPhase::Failed { error: error_msg })
+                                    .await;
+                                return;
+                            }
+                            self.begin_shutdown(OperatorPhase::Failed { error: error_msg }, true);
+                            attempt = 0;
+                            continue 'outer;
+                        }
+
+                        let delay = backoff_delay(&runtime.retry, attempt);
+                        executor.sleep(delay).await;
+                        continue 'outer;
                     }
                 }
             }
+
             let changes = self.poll(runtime.poll_size);
             let timers: Vec<(u64, Vec<u8>)> = self.timer_inbox.lock().drain(..).collect();
 
@@ -223,15 +226,18 @@ where
                     .await
                 {
                     Ok(OperatorDirective::Continue) => {
-                        // Evict the processed timer from the store.
                         if let Some(db) = database.upgrade() {
                             let _ = db.cancel_timer(&self.name, fire_at_ms);
                         }
+                        attempt = 0;
                     }
                     Ok(OperatorDirective::Finish) => {
-                        self.retire(&database, &mut operator, OperatorPhase::Finished)
-                            .await;
-                        return;
+                        if let Some(db) = database.upgrade() {
+                            let _ = db.cancel_timer(&self.name, fire_at_ms);
+                        }
+                        self.begin_shutdown(OperatorPhase::Finished, true);
+                        attempt = 0;
+                        continue 'outer;
                     }
                     Err(error) => {
                         let error_msg = error.to_string();
@@ -239,13 +245,9 @@ where
                         attempt += 1;
 
                         if runtime.retry.max_attempts > 0 && attempt >= runtime.retry.max_attempts {
-                            self.retire(
-                                &database,
-                                &mut operator,
-                                OperatorPhase::Failed { error: error_msg },
-                            )
-                            .await;
-                            return;
+                            self.begin_shutdown(OperatorPhase::Failed { error: error_msg }, true);
+                            attempt = 0;
+                            continue 'outer;
                         }
 
                         self.reset();
@@ -271,9 +273,10 @@ where
                     attempt = 0;
                 }
                 Ok(OperatorDirective::Finish) => {
-                    self.retire(&database, &mut operator, OperatorPhase::Finished)
-                        .await;
-                    return;
+                    self.commit();
+                    self.begin_shutdown(OperatorPhase::Finished, true);
+                    attempt = 0;
+                    continue 'outer;
                 }
                 Err(error) => {
                     attempt += 1;
@@ -284,13 +287,9 @@ where
                     );
 
                     if runtime.retry.max_attempts > 0 && attempt >= runtime.retry.max_attempts {
-                        self.retire(
-                            &database,
-                            &mut operator,
-                            OperatorPhase::Failed { error: error_msg },
-                        )
-                        .await;
-                        return;
+                        self.begin_shutdown(OperatorPhase::Failed { error: error_msg }, true);
+                        attempt = 0;
+                        continue 'outer;
                     }
 
                     self.reset();
@@ -300,6 +299,123 @@ where
                 }
             }
         }
+    }
+
+    async fn handle_event(
+        &self,
+        database: &Weak<Database<D>>,
+        operator: &mut D,
+        event: OperatorWorkerEvent,
+    ) -> WorkerLoopAction {
+        match event {
+            OperatorWorkerEvent::Open => match operator
+                .open(database.clone(), &self.name, &self.config)
+                .await
+            {
+                Ok(OperatorDirective::Continue) => WorkerLoopAction::AdvanceEvent,
+                Ok(OperatorDirective::Finish) => {
+                    WorkerLoopAction::BeginShutdown(OperatorPhase::Finished)
+                }
+                Err(error) => WorkerLoopAction::Retry(error),
+            },
+            OperatorWorkerEvent::InputOpened(table) => match operator
+                .on_input_opened(table, database.clone(), &self.name, &self.config)
+                .await
+            {
+                Ok(OperatorDirective::Continue) => WorkerLoopAction::AdvanceEvent,
+                Ok(OperatorDirective::Finish) => {
+                    WorkerLoopAction::BeginShutdown(OperatorPhase::Finished)
+                }
+                Err(error) => WorkerLoopAction::Retry(error),
+            },
+            OperatorWorkerEvent::InputClosed(table) => match operator
+                .on_input_closed(table, database.clone(), &self.name, &self.config)
+                .await
+            {
+                Ok(OperatorDirective::Continue) => WorkerLoopAction::AdvanceEvent,
+                Ok(OperatorDirective::Finish) => {
+                    WorkerLoopAction::BeginShutdown(OperatorPhase::Finished)
+                }
+                Err(error) => WorkerLoopAction::Retry(error),
+            },
+            OperatorWorkerEvent::Close => match operator
+                .close(database.clone(), &self.name, &self.config)
+                .await
+            {
+                Ok(()) => WorkerLoopAction::AdvanceEvent,
+                Err(error) => WorkerLoopAction::Retry(error),
+            },
+            OperatorWorkerEvent::Finish(phase) => match operator
+                .finish(database.clone(), &self.name, &self.config)
+                .await
+            {
+                Ok(()) => WorkerLoopAction::Retire(phase),
+                Err(error) => WorkerLoopAction::Retry(error),
+            },
+        }
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutdown.lock().is_some()
+    }
+
+    fn peek_event(&self) -> Option<OperatorWorkerEvent> {
+        self.events.lock().front().cloned()
+    }
+
+    fn pop_event(&self) {
+        let _ = self.events.lock().pop_front();
+    }
+
+    fn begin_shutdown(&self, phase: OperatorPhase, clear_pending: bool) {
+        let mut events = self.events.lock();
+        self.begin_shutdown_with_events(&mut events, phase, clear_pending);
+    }
+
+    fn begin_shutdown_with_events(
+        &self,
+        events: &mut VecDeque<OperatorWorkerEvent>,
+        phase: OperatorPhase,
+        clear_pending: bool,
+    ) {
+        let mut current = self.shutdown.lock();
+        if current.is_some() {
+            return;
+        }
+        *current = Some(phase.clone());
+        drop(current);
+
+        if clear_pending {
+            events.clear();
+            for table in self.input_tables() {
+                events.push_back(OperatorWorkerEvent::InputClosed(table));
+            }
+        }
+        self.push_shutdown_tail(events, phase);
+    }
+
+    fn push_shutdown_tail(&self, events: &mut VecDeque<OperatorWorkerEvent>, phase: OperatorPhase) {
+        let has_close = events
+            .iter()
+            .any(|event| matches!(event, OperatorWorkerEvent::Close));
+        if !has_close {
+            events.push_back(OperatorWorkerEvent::Close);
+        }
+
+        let has_finish = events
+            .iter()
+            .any(|event| matches!(event, OperatorWorkerEvent::Finish(_)));
+        if !has_finish {
+            events.push_back(OperatorWorkerEvent::Finish(phase));
+        }
+    }
+
+    fn input_tables(&self) -> Vec<String> {
+        self.inputs
+            .lock()
+            .iter()
+            .map(|input| input.table_name.clone())
+            .collect()
     }
 
     /// Round-robin across all table inputs, collecting up to `limit` changes.
@@ -350,21 +466,17 @@ where
         }
     }
 
-    /// Call `operator.finish()` then transition to a terminal phase in the catalog.
-    async fn retire(&self, database: &Weak<Database<D>>, operator: &mut D, phase: OperatorPhase) {
-        if let Err(finish_err) = operator
-            .finish(database.clone(), &self.name, &self.config)
-            .await
-        {
-            log::error!("failed finishing operator {:?}: {finish_err}", self.name);
-        }
-        if let Some(database) = database.upgrade() {
-            database.retire_operator(
-                &self.name,
-                phase,
-                &self.config.runtime_config().subscriptions,
-            );
-        }
+    /// Retire terminal workers and perform durable cleanup.
+    async fn retire(&self, database: &Weak<Database<D>>, phase: OperatorPhase) {
+        let Some(database) = database.upgrade() else {
+            return;
+        };
+        database.retire_operator(
+            &self.name,
+            phase,
+            &self.config.runtime_config().subscriptions,
+            Some(self),
+        );
     }
 }
 

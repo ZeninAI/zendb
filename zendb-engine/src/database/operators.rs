@@ -83,16 +83,6 @@ where
             }
 
             let worker = self.build_worker(name.to_owned(), config.clone())?;
-            if !worker.has_inputs() {
-                catalog.put(
-                    name.to_owned(),
-                    OperatorEntry {
-                        config,
-                        phase: OperatorPhase::Active,
-                    },
-                )?;
-                return Ok(());
-            }
             catalog.put(
                 name.to_owned(),
                 OperatorEntry {
@@ -100,14 +90,49 @@ where
                     phase: OperatorPhase::Active,
                 },
             )?;
-            self.operators
-                .write()
-                .insert(name.to_owned(), Arc::clone(&worker));
-            Some(worker)
+            if worker.has_inputs() {
+                self.operators
+                    .write()
+                    .insert(name.to_owned(), Arc::clone(&worker));
+                Some(worker)
+            } else {
+                None
+            }
         };
 
         if let Some(worker) = worker_opt {
             worker.spawn(self);
+        }
+        Ok(())
+    }
+
+    /// Permanently cancel an active operator. Cancelled operators are not reopened
+    /// when matching tables are opened again.
+    pub fn cancel_operator(self: &Arc<Self>, name: &str) -> io::Result<()> {
+        let entry = self
+            .operator_catalog
+            .lock()
+            .get(&name.to_owned())
+            .map(|entry| entry.into_owned())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("operator {name:?} does not exist"),
+                )
+            })?;
+        if entry.phase != OperatorPhase::Active {
+            return Ok(());
+        }
+
+        if let Some(worker) = self.operators.read().get(name).cloned() {
+            worker.cancel();
+        } else {
+            self.retire_operator(
+                name,
+                OperatorPhase::Cancelled,
+                &entry.config.runtime_config().subscriptions,
+                None,
+            );
         }
         Ok(())
     }
@@ -139,15 +164,28 @@ where
         Ok(OperatorWorker::new(name, config, inputs, instance))
     }
 
-    /// Transition catalog phase to `Finished` or `Failed` and remove from memory.
-    /// Called by the run loop on natural exit.
+    /// Transition catalog phase to a permanent terminal phase and remove from memory.
+    /// Called by the run loop on natural finish/failure/cancellation.
     pub(crate) fn retire_operator(
         &self,
         name: &str,
         phase: OperatorPhase,
         subscriptions: &Vec<Subscription>,
+        worker: Option<&OperatorWorker<D>>,
     ) {
-        let worker = self.operators.write().remove(name);
+        let worker = {
+            let mut operators = self.operators.write();
+            let should_remove = match (operators.get(name), worker) {
+                (Some(current), Some(worker)) => std::ptr::eq(Arc::as_ptr(current), worker),
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if should_remove {
+                operators.remove(name)
+            } else {
+                None
+            }
+        };
 
         if let Some(worker) = worker {
             worker.delete_inputs();

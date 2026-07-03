@@ -73,6 +73,18 @@ pub trait Operator: Send + 'static {
         Box::pin(async { Ok(OperatorDirective::Continue) })
     }
 
+    /// Called before terminal teardown after all input-closed notifications.
+    fn close<'a, D>(
+        &'a mut self,
+        ctx: &'a OperatorContext<Self, D>,
+    ) -> BoxFuture<'a, io::Result<()>>
+    where
+        D: DispatchOperator,
+    {
+        let _ = ctx;
+        Box::pin(async { Ok(()) })
+    }
+
     /// Called when a registered processing-time timer fires.
     fn handle_timer<'a, D>(
         &'a mut self,
@@ -172,6 +184,16 @@ pub trait DispatchOperator: Send + 'static {
         name: &'a str,
         config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    where
+        Self: Sized;
+
+    /// Delegates to [`Operator::close`] before the final [`Operator::finish`].
+    fn close<'a>(
+        &'a mut self,
+        db: Weak<Database<Self>>,
+        name: &'a str,
+        config: &'a Self::Config,
+    ) -> BoxFuture<'a, io::Result<()>>
     where
         Self: Sized;
 

@@ -9,6 +9,8 @@ pub enum OperatorPhase {
     Finished,
     /// Terminated by an unrecoverable error.
     Failed { error: String },
+    /// Permanently cancelled by the database owner.
+    Cancelled,
 }
 
 /// Returned by operator lifecycle methods to steer the worker run loop.

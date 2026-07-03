@@ -106,6 +106,7 @@ impl Table {
         let mut current = None;
         let mut changed = false;
         let mut novel = false;
+        let mut apply_error = None;
 
         self.cache.update(&event.primary_key, |cached| {
             let (mut cell, had_previous, visible) = match cached {
@@ -126,15 +127,15 @@ impl Table {
                 }
                 Ok(false) => visible.then_some((cell, had_previous)),
                 Err(error) => {
-                    log::warn!(
-                        "failed to apply event to table {:?}, key {:?}: {error}",
-                        event.table_id,
-                        event.primary_key
-                    );
-                    visible.then_some((cell, had_previous))
+                    apply_error = Some(io::Error::new(io::ErrorKind::Other, error));
+                    None
                 }
             }
         })?;
+
+        if let Some(error) = apply_error {
+            return Err(error);
+        }
 
         if changed {
             if novel {

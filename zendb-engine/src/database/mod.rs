@@ -17,6 +17,7 @@ use bincode::{Decode, Encode};
 use hashbrown::HashMap;
 use parking_lot::{Condvar, Mutex, RwLock};
 use zendb_storage::core::{
+    btree::{BPlusTree, BPlusTreeConfig},
     keydir::{KeyDir, KeyDirConfig},
     traits::DurableStorage,
 };
@@ -46,7 +47,7 @@ pub(crate) struct TimerEntry {
     pub(crate) payload: Vec<u8>,
 }
 
-pub(crate) type TimerStore = State<TimerKey, TimerEntry>;
+pub(crate) type TimerStore = BPlusTree<TimerKey, TimerEntry>;
 
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
@@ -198,7 +199,7 @@ where
             &path.join(OPERATOR_CATALOG_FILE),
             KeyDirConfig::default(),
         )?;
-        let timers = TimerStore::create(&path.join(TIMERS_FILE), StateConfig::default())?;
+        let timers = TimerStore::create(&path.join(TIMERS_FILE), BPlusTreeConfig::default())?;
         Self::from_parts(
             path,
             table_catalog,
@@ -225,7 +226,7 @@ where
             &path.join(OPERATOR_CATALOG_FILE),
             KeyDirConfig::default(),
         )?;
-        let timers = TimerStore::open(&path.join(TIMERS_FILE), StateConfig::default())?;
+        let timers = TimerStore::open(&path.join(TIMERS_FILE), BPlusTreeConfig::default())?;
         Self::from_parts(
             path,
             table_catalog,
@@ -577,6 +578,107 @@ mod tests {
     }
 
     #[derive(Debug, Clone, PartialEq, Encode, Decode)]
+    struct ShutdownLifecycleConfig {
+        tracker: String,
+    }
+
+    struct ShutdownLifecycleOperator {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Operator for ShutdownLifecycleOperator {
+        type Config = ShutdownLifecycleConfig;
+        type Timer = ();
+
+        fn new(config: &Self::Config) -> io::Result<Self> {
+            Ok(Self {
+                log: lookup_lifecycle_log(&config.tracker)?,
+            })
+        }
+
+        fn open<'a, D>(
+            &'a mut self,
+            _ctx: &'a OperatorContext<Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+        where
+            D: crate::DispatchOperator,
+        {
+            Box::pin(async move {
+                self.log.lock().push("open".to_owned());
+                Ok(OperatorDirective::Continue)
+            })
+        }
+
+        fn process<'a, D>(
+            &'a mut self,
+            changes: Vec<Change>,
+            _ctx: &'a OperatorContext<Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+        where
+            D: crate::DispatchOperator,
+        {
+            Box::pin(async move {
+                self.log.lock().push(format!("process:{}", changes.len()));
+                Ok(OperatorDirective::Finish)
+            })
+        }
+
+        fn on_input_opened<'a, D>(
+            &'a mut self,
+            table: String,
+            _ctx: &'a OperatorContext<Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+        where
+            D: crate::DispatchOperator,
+        {
+            Box::pin(async move {
+                self.log.lock().push(format!("opened:{table}"));
+                Ok(OperatorDirective::Continue)
+            })
+        }
+
+        fn on_input_closed<'a, D>(
+            &'a mut self,
+            table: String,
+            _ctx: &'a OperatorContext<Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+        where
+            D: crate::DispatchOperator,
+        {
+            Box::pin(async move {
+                self.log.lock().push(format!("closed:{table}"));
+                Ok(OperatorDirective::Continue)
+            })
+        }
+
+        fn close<'a, D>(
+            &'a mut self,
+            _ctx: &'a OperatorContext<Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<()>>
+        where
+            D: crate::DispatchOperator,
+        {
+            Box::pin(async move {
+                self.log.lock().push("close".to_owned());
+                Ok(())
+            })
+        }
+
+        fn finish<'a, D>(
+            &'a mut self,
+            _ctx: &'a OperatorContext<Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<()>>
+        where
+            D: crate::DispatchOperator,
+        {
+            Box::pin(async move {
+                self.log.lock().push("finish".to_owned());
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Encode, Decode)]
     struct SpawnerConfig {
         child_tracker: String,
     }
@@ -642,6 +744,7 @@ mod tests {
             Retry(FailingOnceOperator),
             Timer(TimerOperator),
             InputLifecycle(InputLifecycleOperator),
+            ShutdownLifecycle(ShutdownLifecycleOperator),
             Spawner(SpawnerOperator),
         }
     }
@@ -708,6 +811,35 @@ mod tests {
         })
     }
 
+    fn lifecycle_logs() -> &'static Mutex<HashMap<String, Arc<Mutex<Vec<String>>>>> {
+        static TRACKERS: OnceLock<Mutex<HashMap<String, Arc<Mutex<Vec<String>>>>>> =
+            OnceLock::new();
+        TRACKERS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn new_lifecycle_log(prefix: &str) -> (String, Arc<Mutex<Vec<String>>>) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let key = format!(
+            "{prefix}_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let log = Arc::new(Mutex::new(Vec::new()));
+        lifecycle_logs()
+            .lock()
+            .insert(key.clone(), Arc::clone(&log));
+        (key, log)
+    }
+
+    fn lookup_lifecycle_log(key: &str) -> io::Result<Arc<Mutex<Vec<String>>>> {
+        lifecycle_logs().lock().get(key).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("missing lifecycle log tracker {key:?}"),
+            )
+        })
+    }
+
     fn runtime_config(subscription: Subscription) -> OperatorRuntimeConfig {
         OperatorRuntimeConfig {
             subscriptions: vec![subscription],
@@ -756,6 +888,14 @@ mod tests {
     }
 
     fn spawner_runtime_config() -> OperatorRuntimeConfig {
+        runtime_config(Subscription::pattern("users"))
+    }
+
+    fn shutdown_lifecycle_config(tracker: String) -> ShutdownLifecycleConfig {
+        ShutdownLifecycleConfig { tracker }
+    }
+
+    fn shutdown_lifecycle_runtime_config() -> OperatorRuntimeConfig {
         runtime_config(Subscription::pattern("users"))
     }
 
@@ -938,6 +1078,93 @@ mod tests {
     }
 
     #[test]
+    fn active_operators_respawn_after_database_reopen() {
+        let path = tmp("operator_reopen");
+        let (tracker, count) = new_tracker("operator_reopen");
+        {
+            let db =
+                TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
+                    .unwrap();
+            let users = db.table("users", Some(TableConfig::default())).unwrap();
+            db.dispatch_operator::<CountingOperator>(
+                "counter",
+                counting_config(tracker.clone(), false),
+                counting_runtime_config(Subscription::pattern("users")),
+            )
+            .unwrap();
+
+            users
+                .get()
+                .unwrap()
+                .write()
+                .insert_event(event("users", 1, 100))
+                .unwrap();
+            wait_until(|| count.load(Ordering::Relaxed) == 1);
+            assert_eq!(db.operator_phase("counter"), Some(OperatorPhase::Active));
+        }
+
+        let db =
+            TestDatabase::open(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+        let users = db.table("users", None).unwrap();
+        assert_eq!(db.operator_phase("counter"), Some(OperatorPhase::Active));
+
+        users
+            .get()
+            .unwrap()
+            .write()
+            .insert_event(event("users", 2, 110))
+            .unwrap();
+        wait_until(|| count.load(Ordering::Relaxed) == 2);
+    }
+
+    #[test]
+    fn cancelled_operator_is_permanent_and_not_reopened() {
+        let path = tmp("operator_cancel");
+        let (tracker, log) = new_lifecycle_log("operator_cancel");
+        {
+            let db =
+                TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
+                    .unwrap();
+            db.table("users", Some(TableConfig::default())).unwrap();
+            db.dispatch_operator::<ShutdownLifecycleOperator>(
+                "lifecycle",
+                shutdown_lifecycle_config(tracker.clone()),
+                shutdown_lifecycle_runtime_config(),
+            )
+            .unwrap();
+
+            wait_until(|| log.lock().contains(&"opened:users".to_owned()));
+            db.cancel_operator("lifecycle").unwrap();
+            wait_until(|| db.operator_phase("lifecycle") == Some(OperatorPhase::Cancelled));
+            wait_until(|| !db.is_operator_open("lifecycle"));
+        }
+
+        {
+            let log = log.lock();
+            assert!(log.contains(&"closed:users".to_owned()), "{log:?}");
+            assert!(log.contains(&"close".to_owned()), "{log:?}");
+            assert!(log.contains(&"finish".to_owned()), "{log:?}");
+        }
+
+        let db =
+            TestDatabase::open(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+        db.table("users", None).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            db.operator_phase("lifecycle"),
+            Some(OperatorPhase::Cancelled)
+        );
+        assert!(!db.is_operator_open("lifecycle"));
+        assert_eq!(
+            log.lock()
+                .iter()
+                .filter(|entry| entry.as_str() == "opened:users")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn processing_time_timers_fire_and_survive_restart() {
         let path = tmp("timers");
         let (tracker, fired) = new_tracker("timers");
@@ -1078,5 +1305,51 @@ mod tests {
         let orders_table = orders.get().unwrap();
         let mut consumer = orders_table.read().consumer("counter").unwrap();
         assert!(consumer.next().is_none());
+    }
+
+    #[test]
+    fn shutdown_runs_input_closed_before_close_and_finish() {
+        let path = tmp("shutdown_lifecycle");
+        let (tracker, log) = new_lifecycle_log("shutdown_lifecycle");
+        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
+            .unwrap();
+        let users = db.table("users", Some(TableConfig::default())).unwrap();
+        db.dispatch_operator::<ShutdownLifecycleOperator>(
+            "shutdown-lifecycle",
+            shutdown_lifecycle_config(tracker),
+            shutdown_lifecycle_runtime_config(),
+        )
+        .unwrap();
+
+        wait_until(|| log.lock().contains(&"opened:users".to_owned()));
+
+        users
+            .get()
+            .unwrap()
+            .write()
+            .insert_event(event("users", 1, 100))
+            .unwrap();
+
+        wait_until(|| db.operator_phase("shutdown-lifecycle") == Some(OperatorPhase::Finished));
+
+        let log = log.lock().clone();
+        let closed = log
+            .iter()
+            .position(|entry| entry == "closed:users")
+            .expect("closed event is recorded");
+        let close = log
+            .iter()
+            .position(|entry| entry == "close")
+            .expect("close event is recorded");
+        let finish = log
+            .iter()
+            .position(|entry| entry == "finish")
+            .expect("finish event is recorded");
+
+        assert!(
+            closed < close,
+            "on_input_closed must run before close: {log:?}"
+        );
+        assert!(close < finish, "close must run before finish: {log:?}");
     }
 }

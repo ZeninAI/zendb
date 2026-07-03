@@ -255,6 +255,12 @@ impl DurableStorage for Table {
     }
 }
 
+impl Drop for Table {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
 impl Backend<PrimaryKey, Cell> for Table {
     // ---- reads --------------------------------------------------------
 
@@ -767,6 +773,23 @@ mod tests {
         assert_eq!(table.cache.size(), 0);
         assert_eq!(table.state.size(), 1);
         assert_eq!(table.topic.stats().records, 1);
+    }
+
+    #[test]
+    fn drop_materializes_pending_cache_to_state() {
+        let path = tmp_path("drop_flush");
+        let config = TableConfig::default();
+        {
+            let mut table = Table::create(&path, config.clone()).unwrap();
+            table.insert_event(event("a", 1, hlc(100))).unwrap();
+        }
+
+        let state = State::<PrimaryKey, Cell>::open(&path.join("state"), config.state).unwrap();
+        let key = PrimaryKey::String("a".into());
+        assert_eq!(
+            state.get(&key).unwrap().into_owned().value,
+            Some(Value::Int(1))
+        );
     }
 
     fn manual_config() -> TableConfig {

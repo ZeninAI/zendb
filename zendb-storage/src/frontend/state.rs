@@ -50,6 +50,22 @@ pub enum State<K: Ord, V> {
     },
 }
 
+impl<K: Ord, V> State<K, V> {
+    fn flush_on_drop(&mut self) -> io::Result<()> {
+        match self {
+            Self::Ordered { backend, .. } => backend.flush_on_drop(),
+            Self::Unordered { backend, .. } => backend.flush_on_drop(),
+            Self::InMemory { .. } => Ok(()),
+        }
+    }
+}
+
+impl<K: Ord, V> Drop for State<K, V> {
+    fn drop(&mut self) {
+        let _ = self.flush_on_drop();
+    }
+}
+
 impl<K, V> Storage for State<K, V>
 where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
@@ -123,11 +139,7 @@ where
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Ordered { backend, .. } => backend.flush(),
-            Self::Unordered { backend, .. } => backend.flush(),
-            Self::InMemory { .. } => Ok(()),
-        }
+        self.flush_on_drop()
     }
 
     fn sync(&mut self) -> io::Result<()> {
@@ -407,6 +419,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+
+    struct TmpFile(PathBuf);
+
+    impl Drop for TmpFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for TmpFile {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    fn tmp(label: &str) -> TmpFile {
+        let unique = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "zendb-state-{label}-{}-{unique}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        TmpFile(path)
+    }
 
     #[test]
     fn in_memory_state_uses_skiplist_without_creating_a_file() {
@@ -422,5 +465,41 @@ mod tests {
         assert!(matches!(state, State::InMemory { .. }));
         assert_eq!(state.keys().map(|key| *key).collect::<Vec<_>>(), vec![1, 2]);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn drop_flushes_ordered_state() {
+        let path = tmp("ordered-drop");
+        {
+            let mut state = State::<u64, u64>::create(
+                &path,
+                StateConfig::Ordered(BPlusTreeConfig::default()),
+            )
+            .unwrap();
+            state.put(1, 10).unwrap();
+        }
+
+        let state =
+            State::<u64, u64>::open(&path, StateConfig::Ordered(BPlusTreeConfig::default()))
+                .unwrap();
+        assert_eq!(state.get(&1).map(|value| *value), Some(10));
+    }
+
+    #[test]
+    fn drop_flushes_unordered_state() {
+        let path = tmp("unordered-drop");
+        {
+            let mut state = State::<u64, u64>::create(
+                &path,
+                StateConfig::Unordered(KeyDirConfig::default()),
+            )
+            .unwrap();
+            state.put(1, 10).unwrap();
+        }
+
+        let state =
+            State::<u64, u64>::open(&path, StateConfig::Unordered(KeyDirConfig::default()))
+                .unwrap();
+        assert_eq!(state.get(&1).map(|value| *value), Some(10));
     }
 }

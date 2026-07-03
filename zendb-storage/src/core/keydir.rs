@@ -262,6 +262,12 @@ pub struct KeyDir<K, V> {
     _phantom: PhantomData<V>,
 }
 
+impl<K, V> KeyDir<K, V> {
+    pub(crate) fn flush_on_drop(&mut self) -> io::Result<()> {
+        self.mmap.flush_async()
+    }
+}
+
 impl<K, V> KeyDir<K, V>
 where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
@@ -359,7 +365,7 @@ impl<K, V> Drop for KeyDir<K, V> {
     /// need durability should call [`Backend::sync`] explicitly before
     /// dropping.
     fn drop(&mut self) {
-        let _ = self.mmap.flush_async();
+        let _ = self.flush_on_drop();
     }
 }
 
@@ -484,7 +490,7 @@ where
     /// Schedule mmap writeback asynchronously. Returns once the OS has
     /// accepted the request; use [`sync`](Self::sync) to wait for it.
     fn flush(&mut self) -> io::Result<()> {
-        self.mmap.flush_async()
+        self.flush_on_drop()
     }
 
     /// Block until pending mmap writes have been flushed by the OS.

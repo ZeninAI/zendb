@@ -105,6 +105,13 @@ pub struct Topic<T> {
     stats: TopicStats,
 }
 
+impl<T> Topic<T> {
+    fn flush_on_drop(&mut self) -> io::Result<()> {
+        self.active.flush()?;
+        self.shared.offsets.lock().flush()
+    }
+}
+
 /// Named consumer handle over a topic.
 pub struct TopicConsumer<T> {
     topic: Arc<TopicShared<T>>,
@@ -373,8 +380,7 @@ where
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.active.flush()?;
-        self.shared.offsets.lock().flush()
+        self.flush_on_drop()
     }
 
     fn sync(&mut self) -> io::Result<()> {
@@ -385,8 +391,7 @@ where
 
 impl<T> Drop for Topic<T> {
     fn drop(&mut self) {
-        let _ = self.active.flush();
-        let _ = self.shared.offsets.lock().flush();
+        let _ = self.flush_on_drop();
     }
 }
 
@@ -516,6 +521,11 @@ where
 
 impl<T> Drop for TopicConsumer<T> {
     fn drop(&mut self) {
+        // Reset the volatile uncommited offsets
+        self.consumer.volatile.store(
+            self.consumer.committed.load(Ordering::Acquire),
+            Ordering::Release,
+        );
         self.consumer.reader_active.store(false, Ordering::Release);
     }
 }
@@ -669,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_reader_preserves_volatile_progress_until_commit() {
+    fn dropping_reader_resets_volatile_progress_to_committed() {
         let path = tmp("volatile");
         let mut topic = Topic::<u64>::create(&path, TopicConfig::default()).unwrap();
         let reader = topic.consumer("c").unwrap();
@@ -682,7 +692,7 @@ mod tests {
         }
         {
             let mut reader = topic.consumer("c").unwrap();
-            assert_eq!(reader.next().unwrap().unwrap(), 2);
+            assert_eq!(reader.next().unwrap().unwrap(), 1);
             reader.commit().unwrap();
         }
 
@@ -691,7 +701,7 @@ mod tests {
 
         let topic = Topic::<u64>::open(&path, TopicConfig::default()).unwrap();
         let mut reader = topic.consumer("c").unwrap();
-        assert_eq!(reader.next().unwrap().unwrap(), 3);
+        assert_eq!(reader.next().unwrap().unwrap(), 2);
     }
 
     #[test]

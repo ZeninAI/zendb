@@ -306,6 +306,12 @@ pub struct BPlusTree<K, V> {
     _phantom: PhantomData<(K, V)>,
 }
 
+impl<K, V> BPlusTree<K, V> {
+    pub(crate) fn flush_on_drop(&mut self) -> io::Result<()> {
+        self.mmap.flush_async()
+    }
+}
+
 struct RawBTreeEntries<'a, K, V> {
     tree: &'a BPlusTree<K, V>,
     page: u64,
@@ -2189,7 +2195,7 @@ where
 
     /// Schedule mmap writeback asynchronously.
     fn flush(&mut self) -> io::Result<()> {
-        self.mmap.flush_async()
+        self.flush_on_drop()
     }
 
     /// Block until pending mmap writes have been flushed.
@@ -2937,7 +2943,7 @@ impl<K, V> Drop for BPlusTree<K, V> {
     /// crash recovery; callers that need durability should call
     /// `Backend::sync` explicitly before dropping.
     fn drop(&mut self) {
-        let _ = self.mmap.flush_async();
+        let _ = self.flush_on_drop();
     }
 }
 

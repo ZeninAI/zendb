@@ -169,7 +169,7 @@ where
     executor: Arc<dyn Executor>,
     table_catalog: Mutex<TableCatalog>,
     state_catalog: Mutex<StateCatalog>,
-    operator_catalog: Mutex<OperatorCatalog<D::DispatchConfig>>,
+    operator_catalog: Mutex<OperatorCatalog<D::Config>>,
     tables: RwLock<HashMap<String, ConcurrentTable>>,
     states: RwLock<HashMap<String, ErasedStateHandle>>,
     operators: RwLock<HashMap<String, Arc<OperatorWorker<D>>>>,
@@ -194,7 +194,7 @@ where
             TableCatalog::create(&path.join(TABLE_CATALOG_FILE), KeyDirConfig::default())?;
         let state_catalog =
             StateCatalog::create(&path.join(STATE_CATALOG_FILE), KeyDirConfig::default())?;
-        let operator_catalog = OperatorCatalog::<D::DispatchConfig>::create(
+        let operator_catalog = OperatorCatalog::<D::Config>::create(
             &path.join(OPERATOR_CATALOG_FILE),
             KeyDirConfig::default(),
         )?;
@@ -221,7 +221,7 @@ where
             TableCatalog::open(&path.join(TABLE_CATALOG_FILE), KeyDirConfig::default())?;
         let state_catalog =
             StateCatalog::open(&path.join(STATE_CATALOG_FILE), KeyDirConfig::default())?;
-        let operator_catalog = OperatorCatalog::<D::DispatchConfig>::open(
+        let operator_catalog = OperatorCatalog::<D::Config>::open(
             &path.join(OPERATOR_CATALOG_FILE),
             KeyDirConfig::default(),
         )?;
@@ -242,7 +242,7 @@ where
         path: &Path,
         table_catalog: TableCatalog,
         state_catalog: StateCatalog,
-        operator_catalog: OperatorCatalog<D::DispatchConfig>,
+        operator_catalog: OperatorCatalog<D::Config>,
         timers: TimerStore,
         executor: Arc<dyn Executor>,
         config: DatabaseConfig,
@@ -285,8 +285,8 @@ mod tests {
     use super::*;
     use crate::operator::prelude::{MerkleLeaf, MerkleTreeConfig, MerkleTreeOperator};
     use crate::{
-        Change, DispatchOperatorConfig, Operator, OperatorContext, OperatorDirective,
-        OperatorRuntimeConfig, Subscription, TableConfig,
+        Change, Operator, OperatorContext, OperatorDirective, OperatorRuntimeConfig, Subscription,
+        TableConfig,
     };
     use parking_lot::Mutex;
     use std::sync::{
@@ -599,29 +599,25 @@ mod tests {
             D: crate::DispatchOperator,
         {
             Box::pin(async move {
-                ctx.operator(
+                ctx.dispatch_operator::<CountingOperator>(
                     "spawned-counter",
-                    D::DispatchConfig::new::<CountingOperator>(
-                        CountingConfig {
-                            tracker: ctx.config().child_tracker.clone(),
-                            finish: false,
-                        },
-                        OperatorRuntimeConfig {
-                            subscriptions: vec![Subscription::pattern("users")],
-                            ..OperatorRuntimeConfig::default()
-                        },
-                    )?,
+                    CountingConfig {
+                        tracker: ctx.config().child_tracker.clone(),
+                        finish: false,
+                    },
+                    OperatorRuntimeConfig {
+                        subscriptions: vec![Subscription::pattern("users")],
+                        ..OperatorRuntimeConfig::default()
+                    },
                 )?;
 
-                ctx.operator(
+                ctx.dispatch_operator::<MerkleTreeOperator>(
                     "spawned-merkle",
-                    D::DispatchConfig::new::<MerkleTreeOperator>(
-                        MerkleTreeConfig::default(),
-                        OperatorRuntimeConfig {
-                            subscriptions: vec![Subscription::pattern("users")],
-                            ..OperatorRuntimeConfig::default()
-                        },
-                    )?,
+                    MerkleTreeConfig::default(),
+                    OperatorRuntimeConfig {
+                        subscriptions: vec![Subscription::pattern("users")],
+                        ..OperatorRuntimeConfig::default()
+                    },
                 )?;
 
                 Ok(OperatorDirective::Continue)
@@ -651,9 +647,6 @@ mod tests {
     }
 
     type TestDatabase = Database<test_operators::OperatorInstance>;
-    type TestOperatorConfig = test_operators::OperatorConfig;
-    type TestOperatorConfigVariant = test_operators::OperatorConfigVariant;
-
     fn counter_trackers() -> &'static Mutex<HashMap<String, Arc<AtomicUsize>>> {
         static TRACKERS: OnceLock<Mutex<HashMap<String, Arc<AtomicUsize>>>> = OnceLock::new();
         TRACKERS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -715,90 +708,55 @@ mod tests {
         })
     }
 
-    fn counting_config(tracker: String, finish: bool) -> TestOperatorConfig {
-        counting_config_with_subscription(tracker, finish, Subscription::pattern("users"))
+    fn runtime_config(subscription: Subscription) -> OperatorRuntimeConfig {
+        OperatorRuntimeConfig {
+            subscriptions: vec![subscription],
+            retry: Default::default(),
+            poll_size: 128,
+        }
     }
 
-    fn counting_config_with_subscription(
-        tracker: String,
-        finish: bool,
-        subscription: Subscription,
-    ) -> TestOperatorConfig {
-        let config = TestOperatorConfig {
-            operator: TestOperatorConfigVariant::Count(CountingConfig { tracker, finish }),
-            runtime: OperatorRuntimeConfig {
-                subscriptions: vec![subscription],
-                retry: Default::default(),
-                poll_size: 128,
-            },
-        };
-        assert_eq!(config.kind(), test_operators::OperatorKind::Count);
-        let _ = config.operator();
-        let _ = config.runtime_config();
-        config
+    fn counting_config(tracker: String, finish: bool) -> CountingConfig {
+        CountingConfig { tracker, finish }
     }
 
-    fn retry_config(attempts_tracker: String, processed_tracker: String) -> TestOperatorConfig {
-        let config = TestOperatorConfig {
-            operator: TestOperatorConfigVariant::Retry(RetryOperatorConfig {
-                attempts_tracker,
-                processed_tracker,
-            }),
-            runtime: OperatorRuntimeConfig {
-                subscriptions: vec![Subscription::pattern("users")],
-                retry: Default::default(),
-                poll_size: 128,
-            },
-        };
-        assert_eq!(config.kind(), test_operators::OperatorKind::Retry);
-        let _ = config.operator();
-        let _ = config.runtime_config();
-        config
+    fn counting_runtime_config(subscription: Subscription) -> OperatorRuntimeConfig {
+        runtime_config(subscription)
     }
 
-    fn timer_config(tracker: String) -> TestOperatorConfig {
-        let config = TestOperatorConfig {
-            operator: TestOperatorConfigVariant::Timer(TimerOperatorConfig { tracker }),
-            runtime: OperatorRuntimeConfig {
-                subscriptions: vec![Subscription::pattern("users")],
-                retry: Default::default(),
-                poll_size: 128,
-            },
-        };
-        assert_eq!(config.kind(), test_operators::OperatorKind::Timer);
-        let _ = config.operator();
-        let _ = config.runtime_config();
-        config
+    fn retry_config(attempts_tracker: String, processed_tracker: String) -> RetryOperatorConfig {
+        RetryOperatorConfig {
+            attempts_tracker,
+            processed_tracker,
+        }
     }
 
-    fn input_lifecycle_config(tracker: String, subscription: Subscription) -> TestOperatorConfig {
-        let config = TestOperatorConfig {
-            operator: TestOperatorConfigVariant::InputLifecycle(InputLifecycleConfig { tracker }),
-            runtime: OperatorRuntimeConfig {
-                subscriptions: vec![subscription],
-                retry: Default::default(),
-                poll_size: 128,
-            },
-        };
-        assert_eq!(config.kind(), test_operators::OperatorKind::InputLifecycle);
-        let _ = config.operator();
-        let _ = config.runtime_config();
-        config
+    fn retry_runtime_config() -> OperatorRuntimeConfig {
+        runtime_config(Subscription::pattern("users"))
     }
 
-    fn spawner_config(child_tracker: String) -> TestOperatorConfig {
-        let config = TestOperatorConfig {
-            operator: TestOperatorConfigVariant::Spawner(SpawnerConfig { child_tracker }),
-            runtime: OperatorRuntimeConfig {
-                subscriptions: vec![Subscription::pattern("users")],
-                retry: Default::default(),
-                poll_size: 128,
-            },
-        };
-        assert_eq!(config.kind(), test_operators::OperatorKind::Spawner);
-        let _ = config.operator();
-        let _ = config.runtime_config();
-        config
+    fn timer_config(tracker: String) -> TimerOperatorConfig {
+        TimerOperatorConfig { tracker }
+    }
+
+    fn timer_runtime_config() -> OperatorRuntimeConfig {
+        runtime_config(Subscription::pattern("users"))
+    }
+
+    fn input_lifecycle_config(tracker: String) -> InputLifecycleConfig {
+        InputLifecycleConfig { tracker }
+    }
+
+    fn input_lifecycle_runtime_config(subscription: Subscription) -> OperatorRuntimeConfig {
+        runtime_config(subscription)
+    }
+
+    fn spawner_config(child_tracker: String) -> SpawnerConfig {
+        SpawnerConfig { child_tracker }
+    }
+
+    fn spawner_runtime_config() -> OperatorRuntimeConfig {
+        runtime_config(Subscription::pattern("users"))
     }
 
     fn event(table: &str, value: i64, ms: u64) -> Event {
@@ -848,8 +806,12 @@ mod tests {
         let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
             .unwrap();
         let table = db.table("users", Some(TableConfig::default())).unwrap();
-        db.operator("counter", Some(counting_config(tracker, false)))
-            .unwrap();
+        db.dispatch_operator::<CountingOperator>(
+            "counter",
+            counting_config(tracker, false),
+            counting_runtime_config(Subscription::pattern("users")),
+        )
+        .unwrap();
 
         table
             .get()
@@ -878,8 +840,12 @@ mod tests {
         let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
             .unwrap();
         let table = db.table("users", Some(TableConfig::default())).unwrap();
-        db.operator("retry", Some(retry_config(attempts_key, processed_key)))
-            .unwrap();
+        db.dispatch_operator::<FailingOnceOperator>(
+            "retry",
+            retry_config(attempts_key, processed_key),
+            retry_runtime_config(),
+        )
+        .unwrap();
 
         table
             .get()
@@ -905,8 +871,12 @@ mod tests {
         let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
             .unwrap();
         db.table("users", Some(TableConfig::default())).unwrap();
-        db.operator("counter", Some(counting_config(tracker, false)))
-            .unwrap();
+        db.dispatch_operator::<CountingOperator>(
+            "counter",
+            counting_config(tracker, false),
+            counting_runtime_config(Subscription::pattern("users")),
+        )
+        .unwrap();
 
         wait_until(|| db.state::<Vec<u8>, Vec<u8>>("index", None).is_ok());
         let index = db.state::<Vec<u8>, Vec<u8>>("index", None).unwrap();
@@ -937,8 +907,12 @@ mod tests {
                 TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
                     .unwrap();
             db.table("users", Some(TableConfig::default())).unwrap();
-            db.operator("counter", Some(counting_config(tracker.clone(), false)))
-                .unwrap();
+            db.dispatch_operator::<CountingOperator>(
+                "counter",
+                counting_config(tracker.clone(), false),
+                counting_runtime_config(Subscription::pattern("users")),
+            )
+            .unwrap();
             wait_until(|| db.state::<Vec<u8>, Vec<u8>>("index", None).is_ok());
             db.state::<Vec<u8>, Vec<u8>>("index", None)
                 .unwrap()
@@ -970,7 +944,12 @@ mod tests {
         let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
             .unwrap();
         db.table("users", Some(TableConfig::default())).unwrap();
-        db.operator("ticker", Some(timer_config(tracker))).unwrap();
+        db.dispatch_operator::<TimerOperator>(
+            "ticker",
+            timer_config(tracker),
+            timer_runtime_config(),
+        )
+        .unwrap();
 
         wait_until(|| fired.load(Ordering::Relaxed) >= 1);
     }
@@ -982,8 +961,12 @@ mod tests {
         let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
             .unwrap();
         let table = db.table("users", Some(TableConfig::default())).unwrap();
-        db.operator("spawner", Some(spawner_config(tracker)))
-            .unwrap();
+        db.dispatch_operator::<SpawnerOperator>(
+            "spawner",
+            spawner_config(tracker),
+            spawner_runtime_config(),
+        )
+        .unwrap();
 
         wait_until(|| {
             db.contains_operator("spawned-counter") && db.contains_operator("spawned-merkle")
@@ -1017,12 +1000,10 @@ mod tests {
         let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
             .unwrap();
         db.table("users", Some(TableConfig::default())).unwrap();
-        db.operator(
+        db.dispatch_operator::<InputLifecycleOperator>(
             "inputs",
-            Some(input_lifecycle_config(
-                tracker,
-                Subscription::pattern("users"),
-            )),
+            input_lifecycle_config(tracker),
+            input_lifecycle_runtime_config(Subscription::pattern("users")),
         )
         .unwrap();
 
@@ -1037,9 +1018,10 @@ mod tests {
         let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
             .unwrap();
         db.table("users", Some(TableConfig::default())).unwrap();
-        db.operator(
+        db.dispatch_operator::<InputLifecycleOperator>(
             "inputs",
-            Some(input_lifecycle_config(tracker, Subscription::pattern("*"))),
+            input_lifecycle_config(tracker),
+            input_lifecycle_runtime_config(Subscription::pattern("*")),
         )
         .unwrap();
 
@@ -1075,13 +1057,10 @@ mod tests {
         let (tracker, _) = new_tracker("retire_consumers");
         let db =
             TestDatabase::open(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
-        db.operator(
+        db.dispatch_operator::<CountingOperator>(
             "counter",
-            Some(counting_config_with_subscription(
-                tracker,
-                true,
-                Subscription::pattern("*"),
-            )),
+            counting_config(tracker, true),
+            counting_runtime_config(Subscription::pattern("*")),
         )
         .unwrap();
 

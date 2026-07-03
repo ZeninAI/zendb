@@ -70,8 +70,6 @@ define_operator_set! {
     }
 }
 
-pub(crate) use doc_operators::{OperatorConfig, OperatorConfigVariant};
-
 // ---------------------------------------------------------------------------
 // Indexer operator
 // ---------------------------------------------------------------------------
@@ -351,24 +349,26 @@ impl Operator for ArchiverOp {
 // Config builders
 // ---------------------------------------------------------------------------
 
-pub(crate) fn indexer_config() -> OperatorConfig {
-    OperatorConfig {
-        operator: OperatorConfigVariant::Indexer(IndexerConfig),
-        runtime: OperatorRuntimeConfig {
-            subscriptions: vec![Subscription::pattern("documents")],
-            retry: RetryConfig::default(),
-            poll_size: 128,
-        },
+pub(crate) fn indexer_config() -> IndexerConfig {
+    IndexerConfig
+}
+
+pub(crate) fn indexer_runtime_config() -> OperatorRuntimeConfig {
+    OperatorRuntimeConfig {
+        subscriptions: vec![Subscription::pattern("documents")],
+        retry: RetryConfig::default(),
+        poll_size: 128,
     }
 }
 
-pub(crate) fn archiver_config(max_reports: u64) -> OperatorConfig {
-    OperatorConfig {
-        operator: OperatorConfigVariant::Archiver(ArchiverConfig { max_reports }),
-        runtime: OperatorRuntimeConfig {
-            subscriptions: vec![Subscription::pattern("documents")],
-            retry: RetryConfig::default(),
-            poll_size: 128,
-        },
+pub(crate) fn archiver_config(max_reports: u64) -> ArchiverConfig {
+    ArchiverConfig { max_reports }
+}
+
+pub(crate) fn archiver_runtime_config() -> OperatorRuntimeConfig {
+    OperatorRuntimeConfig {
+        subscriptions: vec![Subscription::pattern("documents")],
+        retry: RetryConfig::default(),
+        poll_size: 128,
     }
 }

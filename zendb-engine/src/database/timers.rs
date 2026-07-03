@@ -106,21 +106,6 @@ where
         (fired, next_ms)
     }
 
-    /// Delete every timer belonging to `operator` from the store.
-    /// Called on operator retirement to prevent stale timers from
-    /// accumulating.
-    pub(super) fn cancel_operator_timers(&self, operator: &str) {
-        let mut timers = self.timers.write();
-        let keys: Vec<TimerKey> = timers
-            .entries()
-            .filter(|(key, _)| key.operator == operator)
-            .map(|(k, _)| k.into_owned())
-            .collect();
-        for key in keys {
-            let _ = timers.delete(&key);
-        }
-    }
-
     fn deliver_timer(&self, operator: &str, fire_at_ms: u64, payload: Vec<u8>) {
         if let Some(worker) = self.operators.read().get(operator).cloned() {
             worker.enqueue_timer(fire_at_ms, payload);

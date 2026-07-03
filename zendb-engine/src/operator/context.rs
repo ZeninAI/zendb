@@ -9,7 +9,7 @@ use zendb_storage::frontend::{state::StateConfig, table::TableConfig};
 
 use crate::{Database, StateHandle, TableHandle};
 
-use super::{DispatchOperator, Operator, OperatorPhase};
+use super::{DispatchOperator, Operator, OperatorRuntimeConfig};
 
 /// Context passed to every [`Operator`] lifecycle method.
 ///
@@ -91,13 +91,18 @@ where
         self.require_db()?.cancel_timer(&self.name, fire_at_ms)
     }
 
-    /// Register or update an operator using a dispatch config.
-    pub fn operator(
+    /// Register a new operator using a typed operator config and runtime config.
+    pub fn dispatch_operator<V>(
         &self,
         name: &str,
-        config: D::DispatchConfig,
-    ) -> io::Result<(OperatorPhase, D::DispatchConfig)> {
-        self.require_db()?.operator(name, Some(config))
+        config: V::Config,
+        runtime_config: OperatorRuntimeConfig,
+    ) -> io::Result<()>
+    where
+        V: Operator,
+    {
+        self.require_db()?
+            .dispatch_operator::<V>(name, config, runtime_config)
     }
 
     fn require_db(&self) -> io::Result<Arc<Database<D>>> {

@@ -1,7 +1,7 @@
 /// Generate a type-safe dispatch enum for a set of operators.
 ///
-/// Produces `OperatorKind`, `OperatorConfig`, `OperatorConfigVariant`, and
-/// `OperatorInstance` (the generated enum that implements [`DispatchOperator`]).
+/// Produces `OperatorConfig`, `OperatorConfigVariant`, and `OperatorInstance`
+/// (the generated enum that implements [`DispatchOperator`]).
 ///
 /// ## Example
 ///
@@ -15,9 +15,9 @@
 /// }
 /// ```
 ///
-/// This creates `ops::OperatorInstance`, `ops::OperatorKind`,
-/// `ops::OperatorConfig`, and `ops::OperatorConfigVariant`. Use it as the `D`
-/// type parameter when creating a [`Database`].
+/// This creates `ops::OperatorInstance`, `ops::OperatorConfig`, and
+/// `ops::OperatorConfigVariant`. Use it as the `D` type parameter when creating
+/// a [`Database`].
 #[macro_export]
 macro_rules! define_operator_set {
     (
@@ -47,23 +47,6 @@ macro_rules! __zendb_define_operator_set {
             #[allow(unused_imports)]
             use super::*;
 
-            #[derive(
-                Debug,
-                Clone,
-                Copy,
-                PartialEq,
-                Eq,
-                PartialOrd,
-                Ord,
-                Hash,
-                ::bincode::Encode,
-                ::bincode::Decode,
-            )]
-            pub enum OperatorKind {
-                $first_variant,
-                $( $variant, )*
-            }
-
             #[derive(Debug, Clone, PartialEq, ::bincode::Encode, ::bincode::Decode)]
             pub enum OperatorConfigVariant {
                 $first_variant(<$first_operator as $crate::Operator>::Config),
@@ -89,20 +72,7 @@ macro_rules! __zendb_define_operator_set {
                 )*
             }
 
-            impl OperatorConfig {
-                pub fn kind(&self) -> OperatorKind {
-                    match &self.operator {
-                        OperatorConfigVariant::$first_variant(_) => OperatorKind::$first_variant,
-                        $( OperatorConfigVariant::$variant(_) => OperatorKind::$variant, )*
-                    }
-                }
-
-                pub fn operator(&self) -> &OperatorConfigVariant {
-                    &self.operator
-                }
-            }
-
-            impl $crate::DispatchOperatorConfig for OperatorConfig {
+            impl $crate::DispatchConfig for OperatorConfig {
                 fn runtime_config(&self) -> &$crate::OperatorRuntimeConfig {
                     &self.runtime
                 }
@@ -153,9 +123,9 @@ macro_rules! __zendb_define_operator_set {
             }
 
             impl $crate::DispatchOperator for OperatorInstance {
-                type DispatchConfig = OperatorConfig;
+                type Config = OperatorConfig;
 
-                fn new(config: &Self::DispatchConfig) -> ::std::io::Result<Self> {
+                fn new(config: &Self::Config) -> ::std::io::Result<Self> {
                     match &config.operator {
                         OperatorConfigVariant::$first_variant(inner) => {
                             <$first_operator as $crate::Operator>::new(inner)
@@ -174,7 +144,7 @@ macro_rules! __zendb_define_operator_set {
                     &'a mut self,
                     db: ::std::sync::Weak<$crate::Database<Self>>,
                     name: &'a str,
-                    config: &'a Self::DispatchConfig,
+                    config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
                     match self {
                         OperatorInstance::$first_variant(inner, cached_ctx) => {
@@ -213,7 +183,7 @@ macro_rules! __zendb_define_operator_set {
                     changes: Vec<$crate::Change>,
                     db: ::std::sync::Weak<$crate::Database<Self>>,
                     name: &'a str,
-                    config: &'a Self::DispatchConfig,
+                    config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
                     let _ = (&db, name, config);
                     match self {
@@ -239,7 +209,7 @@ macro_rules! __zendb_define_operator_set {
                     table: String,
                     db: ::std::sync::Weak<$crate::Database<Self>>,
                     name: &'a str,
-                    config: &'a Self::DispatchConfig,
+                    config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
                     let _ = (&db, name, config);
                     match self {
@@ -269,7 +239,7 @@ macro_rules! __zendb_define_operator_set {
                     table: String,
                     db: ::std::sync::Weak<$crate::Database<Self>>,
                     name: &'a str,
-                    config: &'a Self::DispatchConfig,
+                    config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
                     let _ = (&db, name, config);
                     match self {
@@ -300,7 +270,7 @@ macro_rules! __zendb_define_operator_set {
                     fire_at_ms: u64,
                     db: ::std::sync::Weak<$crate::Database<Self>>,
                     name: &'a str,
-                    config: &'a Self::DispatchConfig,
+                    config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
                     let _ = (&db, name, config);
                     match self {
@@ -359,7 +329,7 @@ macro_rules! __zendb_define_operator_set {
                     &'a mut self,
                     db: ::std::sync::Weak<$crate::Database<Self>>,
                     name: &'a str,
-                    config: &'a Self::DispatchConfig,
+                    config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<()>> {
                     let _ = (&db, name, config);
                     match self {

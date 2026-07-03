@@ -7,7 +7,7 @@ use zendb_storage::core::traits::{Backend, DurableStorage};
 use zendb_storage::frontend::table::{Table, TableConfig};
 
 use crate::operator::worker::{OperatorInput, OperatorWorker};
-use crate::{DispatchOperator, DispatchOperatorConfig, OperatorPhase, Subscription};
+use crate::{DispatchConfig, DispatchOperator, OperatorPhase};
 
 use super::{ConcurrentTable, Database, TableHandle, TABLES_DIR};
 
@@ -117,7 +117,7 @@ where
         table: &ConcurrentTable,
     ) -> io::Result<Vec<Arc<OperatorWorker<D>>>> {
         let operator_catalog = self.operator_catalog.lock(); // Hold this long for the duration of fn avoid race conditions
-        let matching_operators: Vec<(String, D::DispatchConfig)> = operator_catalog
+        let matching_operators: Vec<(String, D::Config)> = operator_catalog
             .entries()
             .filter_map(|(op_name, entry)| {
                 let entry = entry.as_ref();
@@ -149,47 +149,5 @@ where
             }
         }
         Ok(to_spawn)
-    }
-
-    /// Delete an operator's topic consumer from every cataloged table.
-    ///
-    /// Live readers owned by the worker must be deleted before this sweep; a
-    /// topic permits only one active reader for a consumer name.
-    pub(super) fn delete_operator_consumers(
-        &self,
-        operator: &str,
-        subscriptions: &Vec<Subscription>,
-    ) {
-        let tables: Vec<(String, TableConfig)> = self
-            .table_catalog
-            .lock()
-            .entries()
-            .filter(|(name, _)| subscriptions.iter().any(|sub| sub.matches(name.as_ref())))
-            .map(|(name, config)| (name.into_owned(), config.into_owned()))
-            .collect();
-
-        for (table_name, config) in tables {
-            let result = if let Some(table) = self.tables.read().get(&table_name).cloned() {
-                table
-                    .read()
-                    .consumer(operator)
-                    .and_then(|consumer| consumer.delete())
-            } else {
-                let path = self.path.join(TABLES_DIR).join(&table_name);
-                Table::open(&path, config).and_then(|table| {
-                    table
-                        .consumer(operator)
-                        .and_then(|consumer| consumer.delete())
-                })
-            };
-
-            if let Err(error) = result {
-                log::error!(
-                    "failed deleting consumer {:?} from table {:?}: {error}",
-                    operator,
-                    table_name
-                );
-            }
-        }
     }
 }

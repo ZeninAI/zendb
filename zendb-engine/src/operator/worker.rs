@@ -9,7 +9,7 @@ use std::{
 use parking_lot::Mutex;
 use zendb_storage::core::topic::TopicConsumer;
 
-use super::{Change, DispatchOperator, DispatchOperatorConfig, OperatorDirective, OperatorPhase};
+use super::{Change, DispatchConfig, DispatchOperator, OperatorDirective, OperatorPhase};
 use crate::{runtime::Executor, Database};
 
 pub(crate) struct OperatorInput {
@@ -35,7 +35,7 @@ where
     D: DispatchOperator,
 {
     name: String,
-    config: D::DispatchConfig,
+    config: D::Config,
     inputs: Mutex<Vec<OperatorInput>>,
     operator: Mutex<Option<D>>,
     timer_inbox: Mutex<VecDeque<(u64, Vec<u8>)>>,
@@ -48,7 +48,7 @@ where
 {
     pub(crate) fn new(
         name: String,
-        config: D::DispatchConfig,
+        config: D::Config,
         inputs: Vec<OperatorInput>,
         operator: D,
     ) -> Arc<Self> {
@@ -68,10 +68,6 @@ where
 
     pub(crate) fn name(&self) -> &str {
         &self.name
-    }
-
-    pub(crate) fn config(&self) -> &D::DispatchConfig {
-        &self.config
     }
 
     pub(crate) fn has_inputs(&self) -> bool {

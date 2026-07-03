@@ -105,7 +105,7 @@ pub trait Operator: Send + 'static {
 /// The generated `OperatorConfig` struct implements this; every operator-set
 /// config is required to so that the database and worker can access retry
 /// policy, subscriptions, and poll size generically.
-pub trait DispatchOperatorConfig:
+pub trait DispatchConfig:
     Debug + Clone + PartialEq + Encode + Decode<()> + Send + Sync + 'static
 {
     fn runtime_config(&self) -> &OperatorRuntimeConfig;
@@ -124,10 +124,10 @@ pub trait DispatchOperatorConfig:
 /// byte payloads, while the generated `OperatorInstance` enum decodes them and
 /// delegates to the typed [`Operator`] methods.
 pub trait DispatchOperator: Send + 'static {
-    type DispatchConfig: DispatchOperatorConfig;
+    type Config: DispatchConfig;
 
     /// Instantiate the concrete operator for this variant.
-    fn new(config: &Self::DispatchConfig) -> io::Result<Self>
+    fn new(config: &Self::Config) -> io::Result<Self>
     where
         Self: Sized;
 
@@ -137,7 +137,7 @@ pub trait DispatchOperator: Send + 'static {
         &'a mut self,
         db: Weak<Database<Self>>,
         name: &'a str,
-        config: &'a Self::DispatchConfig,
+        config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
     where
         Self: Sized;
@@ -148,7 +148,7 @@ pub trait DispatchOperator: Send + 'static {
         changes: Vec<Change>,
         db: Weak<Database<Self>>,
         name: &'a str,
-        config: &'a Self::DispatchConfig,
+        config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
     where
         Self: Sized;
@@ -159,7 +159,7 @@ pub trait DispatchOperator: Send + 'static {
         table: String,
         db: Weak<Database<Self>>,
         name: &'a str,
-        config: &'a Self::DispatchConfig,
+        config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
     where
         Self: Sized;
@@ -170,7 +170,7 @@ pub trait DispatchOperator: Send + 'static {
         table: String,
         db: Weak<Database<Self>>,
         name: &'a str,
-        config: &'a Self::DispatchConfig,
+        config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
     where
         Self: Sized;
@@ -183,7 +183,7 @@ pub trait DispatchOperator: Send + 'static {
         fire_at_ms: u64,
         db: Weak<Database<Self>>,
         name: &'a str,
-        config: &'a Self::DispatchConfig,
+        config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
     where
         Self: Sized;
@@ -193,7 +193,7 @@ pub trait DispatchOperator: Send + 'static {
         &'a mut self,
         db: Weak<Database<Self>>,
         name: &'a str,
-        config: &'a Self::DispatchConfig,
+        config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<()>>
     where
         Self: Sized;

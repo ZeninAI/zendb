@@ -2,17 +2,18 @@
 
 use std::{io, sync::Arc};
 
-use zendb_storage::core::traits::Backend;
+use zendb_storage::core::traits::{Backend, DurableStorage};
+use zendb_storage::frontend::table::{Table, TableConfig};
 
 use crate::{
     operator::{
         worker::{OperatorInput, OperatorWorker},
-        DispatchOperator, DispatchOperatorConfig, OperatorPhase,
+        DispatchConfig, DispatchOperator, Operator, OperatorPhase, OperatorRuntimeConfig,
     },
     Subscription,
 };
 
-use super::{Database, OperatorEntry};
+use super::{Database, OperatorEntry, TimerKey, TABLES_DIR};
 
 impl<D> Database<D>
 where
@@ -51,116 +52,64 @@ where
     }
 
     /// Return the persisted config for an operator, if the catalog contains one.
-    pub fn operator_config(&self, name: &str) -> Option<D::DispatchConfig> {
+    pub fn operator_config(&self, name: &str) -> Option<D::Config> {
         self.operator_catalog
             .lock()
             .get(&name.to_owned())
             .map(|entry| entry.as_ref().config.clone())
     }
 
-    /// Return the phase and effective config of an operator, ensuring it is
-    /// running unless it is in a terminal state or no matching tables are open.
-    ///
-    /// - If already running in memory, returns `(Active, config)` immediately.
-    /// - If in the catalog as `Active`, re-opens using the stored config (a new
-    ///   `config` replaces the stored one). If no matching tables are open yet,
-    ///   the operator stays in the catalog without spawning - it will be started
-    ///   automatically when a matching table opens.
-    /// - If in a terminal state (`Finished` / `Failed`), returns the phase and
-    ///   stored config without starting anything.
-    /// - If not in the catalog, creates it with `config` (required for new
-    ///   operators; returns an error if `config` is `None`). If no matching
-    ///   tables are open yet, the operator is persisted to the catalog only and
-    ///   will be started when a matching table opens.
-    pub fn operator(
+    /// Register a new operator. If matching tables are already open it is
+    /// spawned immediately; otherwise it is persisted and will be spawned when
+    /// a matching table opens. Returns an error if an operator with `name`
+    /// already exists in the durable catalog.
+    pub fn dispatch_operator<V>(
         self: &Arc<Self>,
         name: &str,
-        config: Option<D::DispatchConfig>,
-    ) -> io::Result<(OperatorPhase, D::DispatchConfig)> {
-        // Fast path: already running - return its config.
-        if let Some(worker) = self.operators.read().get(name).cloned() {
-            return Ok((OperatorPhase::Active, worker.config().clone()));
-        }
-
-        let (phase, effective, worker_opt) = {
+        config: V::Config,
+        runtime_config: OperatorRuntimeConfig,
+    ) -> io::Result<()>
+    where
+        V: Operator,
+    {
+        let config = D::Config::new::<V>(config, runtime_config)?;
+        let worker_opt = {
             let mut catalog = self.operator_catalog.lock();
-            // Double-check under catalog lock
-            if let Some(worker) = self.operators.read().get(name).cloned() {
-                return Ok((OperatorPhase::Active, worker.config().clone()));
+            if catalog.contains(&name.to_owned()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("operator {name:?} already exists"),
+                ));
             }
 
-            match catalog.get(&name.to_owned()) {
-                Some(entry) if entry.phase == OperatorPhase::Active => {
-                    let stored = &entry.as_ref().config;
-                    let effective = match &config {
-                        Some(new_config) if new_config != stored => {
-                            catalog.put(
-                                name.to_owned(),
-                                OperatorEntry {
-                                    config: new_config.clone(),
-                                    phase: OperatorPhase::Active,
-                                },
-                            )?;
-                            new_config.clone()
-                        }
-                        _ => stored.clone(),
-                    };
-                    let worker = self.build_worker(name.to_owned(), effective.clone())?;
-                    if !worker.has_inputs() {
-                        // No matching tables open yet. Catalog entry is already
-                        // Active - activate_table_subscribers will spawn when one opens.
-                        return Ok((OperatorPhase::Active, effective));
-                    }
-                    self.operators
-                        .write()
-                        .insert(name.to_owned(), Arc::clone(&worker));
-                    (OperatorPhase::Active, effective, Some(worker))
-                }
-                Some(entry) => {
-                    let e = entry.as_ref();
-                    (e.phase.clone(), e.config.clone(), None)
-                }
-                None => {
-                    let config = config.ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("operator {name:?} does not exist and no config was provided"),
-                        )
-                    })?;
-                    let worker = self.build_worker(name.to_owned(), config.clone())?;
-                    if !worker.has_inputs() {
-                        // No matching tables open yet - persist to catalog only.
-                        catalog.put(
-                            name.to_owned(),
-                            OperatorEntry {
-                                config: config.clone(),
-                                phase: OperatorPhase::Active,
-                            },
-                        )?;
-                        return Ok((OperatorPhase::Active, config));
-                    }
-                    if let Err(error) = catalog.put(
-                        name.to_owned(),
-                        OperatorEntry {
-                            config: config.clone(),
-                            phase: OperatorPhase::Active,
-                        },
-                    ) {
-                        worker.delete_inputs();
-                        return Err(error);
-                    }
-                    self.operators
-                        .write()
-                        .insert(name.to_owned(), Arc::clone(&worker));
-                    (OperatorPhase::Active, config, Some(worker))
-                }
+            let worker = self.build_worker(name.to_owned(), config.clone())?;
+            if !worker.has_inputs() {
+                catalog.put(
+                    name.to_owned(),
+                    OperatorEntry {
+                        config,
+                        phase: OperatorPhase::Active,
+                    },
+                )?;
+                return Ok(());
             }
+            catalog.put(
+                name.to_owned(),
+                OperatorEntry {
+                    config,
+                    phase: OperatorPhase::Active,
+                },
+            )?;
+            self.operators
+                .write()
+                .insert(name.to_owned(), Arc::clone(&worker));
+            Some(worker)
         };
 
         if let Some(worker) = worker_opt {
             worker.spawn(self);
         }
-        Ok((phase, effective))
+        Ok(())
     }
 
     /// Instantiate the operator from its typed config and acquire one topic
@@ -170,7 +119,7 @@ where
     pub(super) fn build_worker(
         self: &Arc<Self>,
         name: String,
-        config: D::DispatchConfig,
+        config: D::Config,
     ) -> io::Result<Arc<OperatorWorker<D>>> {
         let instance = D::new(&config)?;
         let mut inputs: Vec<OperatorInput> = Vec::new();
@@ -217,6 +166,59 @@ where
             })
         {
             log::error!("failed updating catalog phase for operator {name:?}: {error}");
+        }
+    }
+
+    /// Delete an operator's topic consumer from every cataloged table.
+    ///
+    /// Live readers owned by the worker must be deleted before this sweep; a
+    /// topic permits only one active reader for a consumer name.
+    fn delete_operator_consumers(&self, operator: &str, subscriptions: &Vec<Subscription>) {
+        let tables: Vec<(String, TableConfig)> = self
+            .table_catalog
+            .lock()
+            .entries()
+            .filter(|(name, _)| subscriptions.iter().any(|sub| sub.matches(name.as_ref())))
+            .map(|(name, config)| (name.into_owned(), config.into_owned()))
+            .collect();
+
+        for (table_name, config) in tables {
+            let result = if let Some(table) = self.tables.read().get(&table_name).cloned() {
+                table
+                    .read()
+                    .consumer(operator)
+                    .and_then(|consumer| consumer.delete())
+            } else {
+                let path = self.path.join(TABLES_DIR).join(&table_name);
+                Table::open(&path, config).and_then(|table| {
+                    table
+                        .consumer(operator)
+                        .and_then(|consumer| consumer.delete())
+                })
+            };
+
+            if let Err(error) = result {
+                log::error!(
+                    "failed deleting consumer {:?} from table {:?}: {error}",
+                    operator,
+                    table_name
+                );
+            }
+        }
+    }
+
+    /// Delete every timer belonging to `operator` from the store.
+    /// Called on operator retirement to prevent stale timers from
+    /// accumulating.
+    fn cancel_operator_timers(&self, operator: &str) {
+        let mut timers = self.timers.write();
+        let keys: Vec<TimerKey> = timers
+            .entries()
+            .filter(|(key, _)| key.operator == operator)
+            .map(|(k, _)| k.into_owned())
+            .collect();
+        for key in keys {
+            let _ = timers.delete(&key);
         }
     }
 }

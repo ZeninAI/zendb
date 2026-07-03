@@ -12,7 +12,8 @@ use zendb_types::{Event, Op, Path as ValuePath, PrimaryKey};
 
 use crate::executor::ThreadExecutor;
 use crate::operators::{
-    archiver_config, doc_event, doc_operators::OperatorInstance, hlc, indexer_config, wait_until,
+    archiver_config, archiver_runtime_config, doc_event, doc_operators::OperatorInstance, hlc,
+    indexer_config, indexer_runtime_config, wait_until, ArchiverOp, IndexerOp,
 };
 
 type TestDatabase = Database<OperatorInstance>;
@@ -67,7 +68,8 @@ fn document_indexing_pipeline() {
     let documents = db
         .table("documents", Some(zendb_engine::TableConfig::default()))
         .unwrap();
-    db.operator("indexer", Some(indexer_config())).unwrap();
+    db.dispatch_operator::<IndexerOp>("indexer", indexer_config(), indexer_runtime_config())
+        .unwrap();
 
     documents
         .get()
@@ -154,7 +156,8 @@ fn document_indexing_pipeline() {
     drop(stats_handle);
 
     // Register the archiver.
-    db.operator("archiver", Some(archiver_config(3))).unwrap();
+    db.dispatch_operator::<ArchiverOp>("archiver", archiver_config(3), archiver_runtime_config())
+        .unwrap();
 
     wait_until(
         || db.operator_phase("archiver") == Some(OperatorPhase::Finished),
@@ -227,7 +230,6 @@ fn document_indexing_pipeline() {
     drop(docs_handle);
 
     // --- Phase 4: incremental indexing after reopen ---
-    db.operator("indexer", Some(indexer_config())).unwrap();
     let documents = db.table("documents", None).unwrap();
     documents
         .get()
@@ -281,7 +283,8 @@ fn document_delete_removes_from_index() {
     let documents = db
         .table("documents", Some(zendb_engine::TableConfig::default()))
         .unwrap();
-    db.operator("indexer", Some(indexer_config())).unwrap();
+    db.dispatch_operator::<IndexerOp>("indexer", indexer_config(), indexer_runtime_config())
+        .unwrap();
 
     documents
         .get()
@@ -367,8 +370,10 @@ fn multiple_operators_share_table_cleanly() {
         .table("documents", Some(zendb_engine::TableConfig::default()))
         .unwrap();
 
-    db.operator("indexer_a", Some(indexer_config())).unwrap();
-    db.operator("indexer_b", Some(indexer_config())).unwrap();
+    db.dispatch_operator::<IndexerOp>("indexer_a", indexer_config(), indexer_runtime_config())
+        .unwrap();
+    db.dispatch_operator::<IndexerOp>("indexer_b", indexer_config(), indexer_runtime_config())
+        .unwrap();
 
     documents
         .get()
@@ -427,7 +432,8 @@ fn timers_are_evicted_on_retirement() {
     db.table("reports", Some(zendb_engine::TableConfig::default()))
         .unwrap();
 
-    db.operator("archiver", Some(archiver_config(1))).unwrap();
+    db.dispatch_operator::<ArchiverOp>("archiver", archiver_config(1), archiver_runtime_config())
+        .unwrap();
 
     wait_until(
         || db.operator_phase("archiver") == Some(OperatorPhase::Finished),

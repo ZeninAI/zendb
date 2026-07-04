@@ -122,7 +122,47 @@ pub(crate) async fn run<D>(
 
         // --- Process lifecycle events ---
         while let Some(event) = worker.peek_event() {
-            match handle_event(&worker, &db, &mut operator, event).await {
+            let action = match event {
+                LifecycleEvent::InputOpened(table) => {
+                    match operator
+                        .on_input_opened(table, &db, worker.name(), config)
+                        .await
+                    {
+                        Ok(OperatorDirective::Continue) => LoopAction::AdvanceEvent,
+                        Ok(OperatorDirective::Finish) => {
+                            LoopAction::BeginShutdown(OperatorPhase::Finished)
+                        }
+                        Err(error) => LoopAction::BeginShutdown(OperatorPhase::Failed {
+                            error: error.to_string(),
+                        }),
+                    }
+                }
+                LifecycleEvent::InputClosed(table) => {
+                    match operator
+                        .on_input_closed(table, &db, worker.name(), config)
+                        .await
+                    {
+                        Ok(OperatorDirective::Continue) => LoopAction::AdvanceEvent,
+                        Ok(OperatorDirective::Finish) => {
+                            LoopAction::BeginShutdown(OperatorPhase::Finished)
+                        }
+                        Err(error) => LoopAction::BeginShutdown(OperatorPhase::Failed {
+                            error: error.to_string(),
+                        }),
+                    }
+                }
+                LifecycleEvent::Teardown(reason) => {
+                    let phase = reason_to_phase(&reason);
+                    match operator.teardown(&reason, &db, worker.name(), config).await {
+                        Ok(()) => LoopAction::Retire(phase),
+                        Err(error) => LoopAction::Retire(OperatorPhase::Failed {
+                            error: error.to_string(),
+                        }),
+                    }
+                }
+            };
+
+            match action {
                 LoopAction::AdvanceEvent => {
                     worker.pop_event();
                 }
@@ -201,53 +241,6 @@ pub(crate) async fn run<D>(
                     error: error.to_string(),
                 });
                 continue 'outer;
-            }
-        }
-    }
-}
-
-async fn handle_event<D>(
-    worker: &OperatorWorker<D>,
-    db: &Arc<Database<D>>,
-    operator: &mut D,
-    event: LifecycleEvent,
-) -> LoopAction
-where
-    D: DispatchOperator,
-{
-    let config = worker.config();
-    match event {
-        LifecycleEvent::InputOpened(table) => {
-            match operator
-                .on_input_opened(table, db, worker.name(), config)
-                .await
-            {
-                Ok(OperatorDirective::Continue) => LoopAction::AdvanceEvent,
-                Ok(OperatorDirective::Finish) => LoopAction::BeginShutdown(OperatorPhase::Finished),
-                Err(error) => LoopAction::BeginShutdown(OperatorPhase::Failed {
-                    error: error.to_string(),
-                }),
-            }
-        }
-        LifecycleEvent::InputClosed(table) => {
-            match operator
-                .on_input_closed(table, db, worker.name(), config)
-                .await
-            {
-                Ok(OperatorDirective::Continue) => LoopAction::AdvanceEvent,
-                Ok(OperatorDirective::Finish) => LoopAction::BeginShutdown(OperatorPhase::Finished),
-                Err(error) => LoopAction::BeginShutdown(OperatorPhase::Failed {
-                    error: error.to_string(),
-                }),
-            }
-        }
-        LifecycleEvent::Teardown(reason) => {
-            let phase = reason_to_phase(&reason);
-            match operator.teardown(&reason, db, worker.name(), config).await {
-                Ok(()) => LoopAction::Retire(phase),
-                Err(error) => LoopAction::Retire(OperatorPhase::Failed {
-                    error: error.to_string(),
-                }),
             }
         }
     }

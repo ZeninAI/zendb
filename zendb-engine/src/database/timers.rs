@@ -47,6 +47,21 @@ where
         self.register_timer_raw(operator, fire_at_ms, bytes)
     }
 
+    /// Cancel a pending timer for `operator` at `fire_at_ms`.
+    pub fn cancel_timer(
+        self: &Arc<Self>,
+        operator: &str,
+        fire_at_ms: u64,
+    ) -> io::Result<()> {
+        let key = TimerKey {
+            fire_at_ms,
+            operator: operator.to_owned(),
+        };
+        self.timers.write().delete(&key).map(|_| ())
+    }
+
+    // --- Internal ---
+
     /// Register a raw (pre-serialized) timer. Used internally by the dispatch layer.
     pub(crate) fn register_timer_raw(
         self: &Arc<Self>,
@@ -63,19 +78,6 @@ where
         )?;
         self.timer_notify.1.notify_all();
         Ok(())
-    }
-
-    /// Cancel a pending timer for `operator` at `fire_at_ms`.
-    pub fn cancel_timer(
-        self: &Arc<Self>,
-        operator: &str,
-        fire_at_ms: u64,
-    ) -> io::Result<()> {
-        let key = TimerKey {
-            fire_at_ms,
-            operator: operator.to_owned(),
-        };
-        self.timers.write().delete(&key).map(|_| ())
     }
 
     /// Pop due timers for loaded operators and return the next deliverable

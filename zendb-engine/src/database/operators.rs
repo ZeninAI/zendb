@@ -128,6 +128,33 @@ where
         Ok(())
     }
 
+    /// Delete an operator from the durable catalog. Only operators in a
+    /// terminal state (Finished, Failed, Cancelled) can be deleted. Active
+    /// operators must be cancelled first.
+    pub fn delete_terminal_operator(&self, name: &str) -> io::Result<()> {
+        let mut catalog = self.operator_catalog.lock();
+        let phase = catalog
+            .get(&name.to_owned())
+            .map(|entry| entry.as_ref().phase.clone());
+
+        match phase {
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("operator {name:?} does not exist"),
+            )),
+            Some(OperatorPhase::Active) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("operator {name:?} is not in a terminal state, please cancel first"),
+            )),
+            Some(OperatorPhase::Finished | OperatorPhase::Failed { .. } | OperatorPhase::Cancelled) => {
+                catalog.delete(&name.to_owned())?;
+                Ok(())
+            }
+        }
+    }
+
+    // --- Internal ---
+
     /// Acquire topic consumers for currently-open tables that match the
     /// subscription. The operator instance is created lazily by the run loop.
     pub(super) fn build_worker(
@@ -221,31 +248,6 @@ where
             })
         {
             log::error!("failed updating catalog phase for operator {name:?}: {error}");
-        }
-    }
-
-    /// Delete an operator from the durable catalog. Only operators in a
-    /// terminal state (Finished, Failed, Cancelled) can be deleted. Active
-    /// operators must be cancelled first.
-    pub fn delete_terminal_operator(&self, name: &str) -> io::Result<()> {
-        let mut catalog = self.operator_catalog.lock();
-        let phase = catalog
-            .get(&name.to_owned())
-            .map(|entry| entry.as_ref().phase.clone());
-
-        match phase {
-            None => Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("operator {name:?} does not exist"),
-            )),
-            Some(OperatorPhase::Active) => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("operator {name:?} is not in a terminal state, please cancel first"),
-            )),
-            Some(OperatorPhase::Finished | OperatorPhase::Failed { .. } | OperatorPhase::Cancelled) => {
-                catalog.delete(&name.to_owned())?;
-                Ok(())
-            }
         }
     }
 

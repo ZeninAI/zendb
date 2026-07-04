@@ -228,18 +228,18 @@ macro_rules! __zendb_define_operator_set {
 
                 fn teardown<'a>(
                     &'a mut self,
-                    reason: &'a $crate::TeardownReason,
+                    phase: &'a $crate::OperatorPhase,
                     db: &'a ::std::sync::Arc<$crate::Database<Self>>,
                     name: &'a str,
                     config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<()>> {
                     match (self, &config.operator) {
                         (OperatorInstance::$first_variant(inner), OperatorConfigVariant::$first_variant(cfg)) => {
-                            <$first_operator as $crate::Operator>::teardown(inner, reason, db, name, cfg)
+                            <$first_operator as $crate::Operator>::teardown(inner, phase, db, name, cfg)
                         }
                         $(
                             (OperatorInstance::$variant(inner), OperatorConfigVariant::$variant(cfg)) => {
-                                <$operator as $crate::Operator>::teardown(inner, reason, db, name, cfg)
+                                <$operator as $crate::Operator>::teardown(inner, phase, db, name, cfg)
                             }
                         )*
                         _ => ::std::unreachable!("operator instance/config variant mismatch"),

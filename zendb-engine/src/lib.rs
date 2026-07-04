@@ -9,7 +9,7 @@ pub use database::{
 };
 pub use operator::{
     BoxFuture, Change, DispatchConfig, DispatchOperator, Operator,
-    OperatorDirective, OperatorPhase, OperatorRuntimeConfig, State, Subscription, TeardownReason,
+    OperatorDirective, OperatorPhase, OperatorRuntimeConfig, State, Subscription,
 };
 pub use runtime::{Executor, RuntimeFuture};
 pub use zendb_storage::frontend::{

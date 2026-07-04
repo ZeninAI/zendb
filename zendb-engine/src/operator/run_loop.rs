@@ -11,7 +11,6 @@ use crate::{runtime::Executor, Database};
 
 use super::{
     worker::OperatorWorker, DispatchConfig, DispatchOperator, OperatorDirective, OperatorPhase,
-    TeardownReason,
 };
 
 /// Events processed by the run loop in FIFO order.
@@ -19,7 +18,7 @@ use super::{
 pub(crate) enum LifecycleEvent {
     InputOpened(String),
     InputClosed(String),
-    Teardown(TeardownReason),
+    Teardown(OperatorPhase),
 }
 
 /// Encapsulates the shutdown state for an operator.
@@ -48,13 +47,13 @@ impl LifecycleState {
         if self.phase.is_some() {
             return;
         }
-        let reason = TeardownReason::from(&phase);
-        self.phase = Some(phase);
         self.events.clear();
         for table in input_tables {
             self.events.push_back(LifecycleEvent::InputClosed(table));
         }
-        self.events.push_back(LifecycleEvent::Teardown(reason));
+        self.events
+            .push_back(LifecycleEvent::Teardown(phase.clone()));
+        self.phase = Some(phase);
     }
 
     pub(crate) fn peek(&self) -> Option<&LifecycleEvent> {
@@ -149,38 +148,42 @@ pub(crate) async fn run<D>(
                         }
                     }
                 }
-                LifecycleEvent::Teardown(reason) => {
-                    let phase = OperatorPhase::from(&reason);
-                    match operator.teardown(&reason, &db, worker.name(), config).await {
-                        Ok(()) => {
-                            db.retire_operator(
-                                worker.name(),
-                                phase,
-                                &worker.config().runtime_config().subscriptions,
-                            );
-                            return;
-                        }
-                        Err(error) => {
-                            db.retire_operator(
-                                worker.name(),
-                                OperatorPhase::Failed {
-                                    error: error.to_string(),
-                                },
-                                &worker.config().runtime_config().subscriptions,
-                            );
-                            return;
-                        }
-                    }
+                LifecycleEvent::Teardown(phase) => {
+                    let _ = operator.teardown(&phase, &db, worker.name(), config).await;
+                    db.retire_operator(
+                        worker.name(),
+                        phase,
+                        &worker.config().runtime_config().subscriptions,
+                    );
+                    return;
                 }
             }
         }
 
         // --- Suspend if no inputs remain ---
         if !worker.has_inputs() {
+            let _ = operator
+                .teardown(&OperatorPhase::Active, &db, worker.name(), config)
+                .await;
             if db.suspend_operator(worker.name()) {
                 return;
             }
             // A table was attached during the race window — keep running.
+            // Re-create since we already tore down.
+            match D::create(&db, worker.name(), config).await {
+                Ok(op) => operator = op,
+                Err(error) => {
+                    log::error!("operator {:?} re-create failed: {error}", worker.name());
+                    db.retire_operator(
+                        worker.name(),
+                        OperatorPhase::Failed {
+                            error: error.to_string(),
+                        },
+                        &worker.config().runtime_config().subscriptions,
+                    );
+                    return;
+                }
+            }
             continue 'outer;
         }
 

@@ -666,7 +666,7 @@ mod tests {
 
         fn teardown<'a, D>(
             &'a mut self,
-            _reason: &'a crate::TeardownReason,
+            _phase: &'a crate::OperatorPhase,
             _db: &'a Arc<Database<D>>,
             _name: &'a str,
             _config: &'a Self::Config,

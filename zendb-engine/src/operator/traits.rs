@@ -4,7 +4,7 @@ use bincode::{Decode, Encode};
 
 use crate::Database;
 
-use super::{BoxFuture, Change, OperatorDirective, OperatorRuntimeConfig, TeardownReason};
+use super::{BoxFuture, Change, OperatorDirective, OperatorPhase, OperatorRuntimeConfig};
 
 /// Core operator trait implemented by every concrete operator.
 ///
@@ -131,10 +131,16 @@ pub trait Operator: Send + 'static {
         Box::pin(async { Ok(OperatorDirective::Continue) })
     }
 
-    /// Called exactly once when the operator is being permanently removed.
+    /// Called when the operator is stopping.
+    ///
+    /// The `phase` indicates why:
+    /// - `Active` — suspending (no inputs remain, may be respawned later)
+    /// - `Finished` — operator returned [`OperatorDirective::Finish`]
+    /// - `Failed` — an unrecoverable error occurred
+    /// - `Cancelled` — permanently cancelled by the database owner
     fn teardown<'a, D>(
         &'a mut self,
-        reason: &'a TeardownReason,
+        phase: &'a OperatorPhase,
         db: &'a Arc<Database<D>>,
         name: &'a str,
         config: &'a Self::Config,
@@ -142,7 +148,7 @@ pub trait Operator: Send + 'static {
     where
         D: DispatchOperator,
     {
-        let _ = (reason, db, name, config);
+        let _ = (phase, db, name, config);
         Box::pin(async { Ok(()) })
     }
 }
@@ -217,7 +223,7 @@ pub trait DispatchOperator: Send + 'static {
 
     fn teardown<'a>(
         &'a mut self,
-        reason: &'a TeardownReason,
+        phase: &'a OperatorPhase,
         db: &'a Arc<Database<Self>>,
         name: &'a str,
         config: &'a Self::Config,

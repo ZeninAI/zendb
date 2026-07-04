@@ -12,10 +12,7 @@
 //! | Timer inbox | Poll + commit, idle/wake |
 //! | Spawn entry point | Operator instance and lifecycle dispatch |
 
-use std::{
-    collections::VecDeque,
-    sync::Arc,
-};
+use std::{collections::VecDeque, sync::Arc};
 
 use parking_lot::Mutex;
 use zendb_storage::core::topic::TopicConsumer;
@@ -57,11 +54,7 @@ impl<D> OperatorWorker<D>
 where
     D: DispatchOperator,
 {
-    pub(crate) fn new(
-        name: String,
-        config: D::Config,
-        inputs: Vec<OperatorInput>,
-    ) -> Arc<Self> {
+    pub(crate) fn new(name: String, config: D::Config, inputs: Vec<OperatorInput>) -> Arc<Self> {
         let mut lifecycle = LifecycleState::new();
         for input in &inputs {
             lifecycle.push_event(LifecycleEvent::InputOpened(input.table_name.clone()));
@@ -153,10 +146,6 @@ where
     pub(crate) fn begin_shutdown(&self, phase: OperatorPhase) {
         let input_tables = self.input_tables();
         self.lifecycle.lock().begin_shutdown(phase, input_tables);
-    }
-
-    pub(crate) fn is_shutting_down(&self) -> bool {
-        self.lifecycle.lock().is_shutting_down()
     }
 
     pub(crate) fn peek_event(&self) -> Option<LifecycleEvent> {

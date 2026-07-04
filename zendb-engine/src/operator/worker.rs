@@ -1,26 +1,15 @@
-//! Operator worker: input management, timer inbox, and spawn.
+//! Operator worker: input management, timer inbox, lifecycle events, and spawn.
 //!
-//! The worker is a thin coordination layer between the database (which
+//! The worker is the coordination layer between the database (which
 //! attaches/detaches inputs and enqueues timers) and the async run loop
 //! (which drives the operator through its lifecycle).
-//!
-//! # Responsibilities
-//!
-//! | Worker owns | Run loop owns |
-//! |-------------|---------------|
-//! | Input attachment/detachment | Event queue, shutdown state machine |
-//! | Timer inbox | Poll + commit, idle/wake |
-//! | Spawn entry point | Operator instance and lifecycle dispatch |
 
 use std::{collections::VecDeque, sync::Arc};
 
 use parking_lot::Mutex;
 use zendb_storage::core::topic::TopicConsumer;
 
-use super::{
-    run_loop::{self, LifecycleEvent, LifecycleState},
-    Change, DispatchOperator, OperatorPhase,
-};
+use super::{run_loop::LifecycleEvent, Change, DispatchOperator, OperatorPhase};
 use crate::Database;
 
 /// A single input source: a topic consumer bound to a table name.
@@ -37,7 +26,7 @@ impl OperatorInput {
 
 /// Per-operator coordination struct.
 ///
-/// Holds the inputs (topic consumers), timer inbox, and lifecycle state.
+/// Holds the inputs (topic consumers), timer inbox, and lifecycle event queue.
 /// The actual operator instance is created and owned by the run loop.
 pub(crate) struct OperatorWorker<D>
 where
@@ -47,7 +36,8 @@ where
     config: D::Config,
     inputs: Mutex<Vec<OperatorInput>>,
     timer_inbox: Mutex<VecDeque<(u64, Vec<u8>)>>,
-    lifecycle: Mutex<LifecycleState>,
+    events: Mutex<VecDeque<LifecycleEvent>>,
+    shutdown_phase: Mutex<Option<OperatorPhase>>,
 }
 
 impl<D> OperatorWorker<D>
@@ -55,9 +45,9 @@ where
     D: DispatchOperator,
 {
     pub(crate) fn new(name: String, config: D::Config, inputs: Vec<OperatorInput>) -> Arc<Self> {
-        let mut lifecycle = LifecycleState::new();
+        let mut events = VecDeque::new();
         for input in &inputs {
-            lifecycle.push_event(LifecycleEvent::InputOpened(input.table_name.clone()));
+            events.push_back(LifecycleEvent::InputOpened(input.table_name.clone()));
         }
 
         Arc::new(Self {
@@ -65,11 +55,12 @@ where
             config,
             inputs: Mutex::new(inputs),
             timer_inbox: Mutex::new(VecDeque::new()),
-            lifecycle: Mutex::new(lifecycle),
+            events: Mutex::new(events),
+            shutdown_phase: Mutex::new(None),
         })
     }
 
-    // --- Public accessors ---
+    // --- Accessors ---
 
     pub(crate) fn name(&self) -> &str {
         &self.name
@@ -83,17 +74,22 @@ where
         !self.inputs.lock().is_empty()
     }
 
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.shutdown_phase.lock().is_some()
+    }
+
     // --- Input management ---
 
-    /// Attach a new topic consumer for `table_name`. Enqueues an `InputOpened` event.
+    /// Attach a new topic consumer. Enqueues `InputOpened` unless shutting down.
     pub(crate) fn attach_input(&self, input: OperatorInput) {
-        let mut lifecycle = self.lifecycle.lock();
-        if lifecycle.is_shutting_down() {
+        if self.shutdown_phase.lock().is_some() {
             return;
         }
         let table_name = input.table_name.clone();
         self.inputs.lock().push(input);
-        lifecycle.push_event(LifecycleEvent::InputOpened(table_name));
+        self.events
+            .lock()
+            .push_back(LifecycleEvent::InputOpened(table_name));
     }
 
     /// Detach the topic consumer for `table_name`. Enqueues `InputClosed`.
@@ -105,59 +101,75 @@ where
                 .position(|input| input.table_name == table_name)
                 .map(|index| inputs.remove(index))
         };
-        let Some(_input) = removed else {
+        if removed.is_none() {
             return false;
-        };
-        let mut lifecycle = self.lifecycle.lock();
-        if !lifecycle.is_shutting_down() {
-            lifecycle.push_event(LifecycleEvent::InputClosed(table_name.to_owned()));
+        }
+        if self.shutdown_phase.lock().is_none() {
+            self.events
+                .lock()
+                .push_back(LifecycleEvent::InputClosed(table_name.to_owned()));
         }
         true
     }
 
-    /// Delete all subscribed topic consumers and clear the inputs list.
+    /// Drop all topic consumers.
     pub(crate) fn delete_inputs(&self) {
         self.inputs.lock().clear();
     }
 
     // --- Timer inbox ---
 
-    /// Push a timer payload from the scheduler into the worker's inbox.
+    /// Push a timer payload into the worker's inbox (ignored if shutting down).
     pub(crate) fn enqueue_timer(&self, fire_at_ms: u64, payload: Vec<u8>) {
-        if self.lifecycle.lock().is_shutting_down() {
+        if self.shutdown_phase.lock().is_some() {
             return;
         }
         self.timer_inbox.lock().push_back((fire_at_ms, payload));
     }
 
-    /// Drain all pending timers from the inbox.
+    /// Drain all pending timers.
     pub(crate) fn drain_timers(&self) -> Vec<(u64, Vec<u8>)> {
         self.timer_inbox.lock().drain(..).collect()
     }
 
-    // --- Lifecycle state (called by run loop) ---
+    // --- Lifecycle ---
 
-    /// Begin the shutdown sequence: clear events, enqueue InputClosed + Teardown.
+    /// Begin shutdown: clear pending events, enqueue InputClosed for each
+    /// open table, then enqueue Teardown. Idempotent — ignored if already
+    /// shutting down.
     pub(crate) fn begin_shutdown(&self, phase: OperatorPhase) {
-        let input_tables = self.input_tables();
-        self.lifecycle.lock().begin_shutdown(phase, input_tables);
+        let mut shutdown = self.shutdown_phase.lock();
+        if shutdown.is_some() {
+            return;
+        }
+        let input_tables: Vec<String> = self
+            .inputs
+            .lock()
+            .iter()
+            .map(|i| i.table_name.clone())
+            .collect();
+        let mut events = self.events.lock();
+        events.clear();
+        for table in input_tables {
+            events.push_back(LifecycleEvent::InputClosed(table));
+        }
+        events.push_back(LifecycleEvent::Teardown(phase.clone()));
+        *shutdown = Some(phase);
     }
 
-    pub(crate) fn is_shutting_down(&self) -> bool {
-        self.lifecycle.lock().is_shutting_down()
-    }
-
+    /// Peek at the next lifecycle event without consuming it.
     pub(crate) fn peek_event(&self) -> Option<LifecycleEvent> {
-        self.lifecycle.lock().peek().cloned()
+        self.events.lock().front().cloned()
     }
 
+    /// Consume the front lifecycle event.
     pub(crate) fn pop_event(&self) {
-        self.lifecycle.lock().pop();
+        self.events.lock().pop_front();
     }
 
-    // --- Polling (called by run loop) ---
+    // --- Polling ---
 
-    /// Round-robin across all table inputs, collecting up to `limit` changes.
+    /// Round-robin across inputs, collecting up to `limit` changes.
     pub(crate) fn poll(&self, limit: usize) -> Vec<Change> {
         let mut changes = Vec::with_capacity(limit);
         let mut inputs = self.inputs.lock();
@@ -207,16 +219,6 @@ where
         let worker = Arc::clone(self);
         executor
             .clone()
-            .spawn(Box::pin(run_loop::run(worker, database, executor)));
-    }
-
-    // --- Helpers ---
-
-    fn input_tables(&self) -> Vec<String> {
-        self.inputs
-            .lock()
-            .iter()
-            .map(|input| input.table_name.clone())
-            .collect()
+            .spawn(Box::pin(super::run_loop::run(worker, database, executor)));
     }
 }

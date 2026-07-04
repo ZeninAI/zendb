@@ -1,10 +1,9 @@
-//! Operator run loop: event queue, shutdown state machine, poll + commit.
+//! Operator run loop: event processing, shutdown, poll + commit.
 //!
 //! This module owns the async execution logic that drives an operator through
-//! its lifecycle. The [`OperatorWorker`] struct in `worker.rs` owns the
-//! inputs and spawning; the run loop handles everything after spawn.
+//! its lifecycle. The [`OperatorWorker`] in `worker.rs` owns the inputs,
+//! event queue, and spawning; this module drives the loop after spawn.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 
 use crate::{runtime::Executor, Database};
@@ -19,50 +18,6 @@ pub(crate) enum LifecycleEvent {
     InputOpened(String),
     InputClosed(String),
     Teardown(OperatorPhase),
-}
-
-/// Encapsulates the shutdown state for an operator.
-pub(crate) struct LifecycleState {
-    events: VecDeque<LifecycleEvent>,
-    phase: Option<OperatorPhase>,
-}
-
-impl LifecycleState {
-    pub(crate) fn new() -> Self {
-        Self {
-            events: VecDeque::new(),
-            phase: None,
-        }
-    }
-
-    pub(crate) fn is_shutting_down(&self) -> bool {
-        self.phase.is_some()
-    }
-
-    pub(crate) fn push_event(&mut self, event: LifecycleEvent) {
-        self.events.push_back(event);
-    }
-
-    pub(crate) fn begin_shutdown(&mut self, phase: OperatorPhase, input_tables: Vec<String>) {
-        if self.phase.is_some() {
-            return;
-        }
-        self.events.clear();
-        for table in input_tables {
-            self.events.push_back(LifecycleEvent::InputClosed(table));
-        }
-        self.events
-            .push_back(LifecycleEvent::Teardown(phase.clone()));
-        self.phase = Some(phase);
-    }
-
-    pub(crate) fn peek(&self) -> Option<&LifecycleEvent> {
-        self.events.front()
-    }
-
-    pub(crate) fn pop(&mut self) {
-        self.events.pop_front();
-    }
 }
 
 /// Main async run loop.

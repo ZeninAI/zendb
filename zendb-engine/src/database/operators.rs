@@ -124,7 +124,6 @@ where
             name,
             OperatorPhase::Cancelled,
             &config.runtime_config().subscriptions,
-            None,
         );
         Ok(())
     }
@@ -160,23 +159,8 @@ where
         name: &str,
         phase: OperatorPhase,
         subscriptions: &[Subscription],
-        worker: Option<&OperatorWorker<D>>,
     ) {
-        let worker = {
-            let mut operators = self.operators.write();
-            let should_remove = match (operators.get(name), worker) {
-                (Some(current), Some(worker)) => std::ptr::eq(Arc::as_ptr(current), worker),
-                (Some(_), None) => true,
-                (None, _) => false,
-            };
-            if should_remove {
-                operators.remove(name)
-            } else {
-                None
-            }
-        };
-
-        if let Some(worker) = worker {
+        if let Some(worker) = self.operators.write().remove(name) {
             worker.delete_inputs();
         }
 
@@ -238,14 +222,7 @@ where
     /// Remove a live worker from memory without changing its durable phase.
     /// Used when an active operator runs out of open input tables and should be
     /// respawned later if a matching table reopens.
-    pub(crate) fn suspend_operator(&self, name: &str, worker: &OperatorWorker<D>) {
-        let mut operators = self.operators.write();
-        let should_remove = operators
-            .get(name)
-            .map(|current| std::ptr::eq(Arc::as_ptr(current), worker))
-            .unwrap_or(false);
-        if should_remove {
-            operators.remove(name);
-        }
+    pub(crate) fn suspend_operator(&self, name: &str) {
+        self.operators.write().remove(name);
     }
 }

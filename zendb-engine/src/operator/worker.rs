@@ -208,7 +208,7 @@ where
 
     /// Remove the live worker from memory (no inputs left, may resume later).
     pub(crate) fn suspend(&self, database: &Arc<Database<D>>) {
-        database.suspend_operator(&self.name, self);
+        database.suspend_operator(&self.name);
     }
 
     // --- Helpers ---

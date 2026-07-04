@@ -103,7 +103,6 @@ pub(crate) async fn run<D>(
                 worker.name(),
                 phase,
                 &worker.config().runtime_config().subscriptions,
-                Some(&worker),
             );
             return;
         }
@@ -169,7 +168,6 @@ pub(crate) async fn run<D>(
                                 worker.name(),
                                 phase,
                                 &worker.config().runtime_config().subscriptions,
-                                Some(&worker),
                             );
                             return;
                         }
@@ -180,7 +178,6 @@ pub(crate) async fn run<D>(
                                     error: error.to_string(),
                                 },
                                 &worker.config().runtime_config().subscriptions,
-                                Some(&worker),
                             );
                             return;
                         }

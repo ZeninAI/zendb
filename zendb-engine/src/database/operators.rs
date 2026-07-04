@@ -179,9 +179,48 @@ where
         if let Some(worker) = worker {
             worker.delete_inputs();
         }
-        self.delete_operator_consumers(name, subscriptions);
-        self.cancel_operator_timers(name);
 
+        // Delete consumer offsets from every matching table.
+        let tables: Vec<(String, TableConfig)> = self
+            .table_catalog
+            .lock()
+            .entries()
+            .filter(|(tbl, _)| subscriptions.iter().any(|sub| sub.matches(tbl.as_ref())))
+            .map(|(tbl, cfg)| (tbl.into_owned(), cfg.into_owned()))
+            .collect();
+
+        for (table_name, config) in tables {
+            let result = if let Some(table) = self.tables.read().get(&table_name).cloned() {
+                table
+                    .read()
+                    .consumer(name)
+                    .and_then(|consumer| consumer.delete())
+            } else {
+                let path = self.path.join(TABLES_DIR).join(&table_name);
+                Table::open(&path, config).and_then(|table| {
+                    table.consumer(name).and_then(|consumer| consumer.delete())
+                })
+            };
+            if let Err(error) = result {
+                log::error!(
+                    "failed deleting consumer {name:?} from table {table_name:?}: {error}"
+                );
+            }
+        }
+
+        // Delete all timers belonging to this operator.
+        let mut timers = self.timers.write();
+        let keys: Vec<TimerKey> = timers
+            .entries()
+            .filter(|(key, _)| key.operator == name)
+            .map(|(k, _)| k.into_owned())
+            .collect();
+        for key in keys {
+            let _ = timers.delete(&key);
+        }
+        drop(timers);
+
+        // Update the catalog phase.
         if let Err(error) = self
             .operator_catalog
             .lock()
@@ -207,59 +246,6 @@ where
             .unwrap_or(false);
         if should_remove {
             operators.remove(name);
-        }
-    }
-
-    /// Delete an operator's topic consumer from every cataloged table.
-    ///
-    /// Live readers owned by the worker must be deleted before this sweep; a
-    /// topic permits only one active reader for a consumer name.
-    fn delete_operator_consumers(&self, operator: &str, subscriptions: &Vec<Subscription>) {
-        let tables: Vec<(String, TableConfig)> = self
-            .table_catalog
-            .lock()
-            .entries()
-            .filter(|(name, _)| subscriptions.iter().any(|sub| sub.matches(name.as_ref())))
-            .map(|(name, config)| (name.into_owned(), config.into_owned()))
-            .collect();
-
-        for (table_name, config) in tables {
-            let result = if let Some(table) = self.tables.read().get(&table_name).cloned() {
-                table
-                    .read()
-                    .consumer(operator)
-                    .and_then(|consumer| consumer.delete())
-            } else {
-                let path = self.path.join(TABLES_DIR).join(&table_name);
-                Table::open(&path, config).and_then(|table| {
-                    table
-                        .consumer(operator)
-                        .and_then(|consumer| consumer.delete())
-                })
-            };
-
-            if let Err(error) = result {
-                log::error!(
-                    "failed deleting consumer {:?} from table {:?}: {error}",
-                    operator,
-                    table_name
-                );
-            }
-        }
-    }
-
-    /// Delete every timer belonging to `operator` from the store.
-    /// Called on operator retirement to prevent stale timers from
-    /// accumulating.
-    fn cancel_operator_timers(&self, operator: &str) {
-        let mut timers = self.timers.write();
-        let keys: Vec<TimerKey> = timers
-            .entries()
-            .filter(|(key, _)| key.operator == operator)
-            .map(|(k, _)| k.into_owned())
-            .collect();
-        for key in keys {
-            let _ = timers.delete(&key);
         }
     }
 }

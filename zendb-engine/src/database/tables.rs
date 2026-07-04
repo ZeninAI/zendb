@@ -63,6 +63,39 @@ where
         true
     }
 
+    /// Delete a table entirely: evict from memory, notify operators, remove
+    /// from the catalog, and delete its on-disk directory.
+    ///
+    /// Running operators that subscribe to this table receive an `InputClosed`
+    /// event. If that was their only input, they will suspend (remain active in
+    /// the catalog but not running). The operator's consumer offsets for this
+    /// table are destroyed along with the table files.
+    ///
+    /// Returns `Ok(true)` if the table existed, `Ok(false)` if it was not in
+    /// the catalog.
+    pub fn delete_table(&self, name: &str) -> io::Result<bool> {
+        // 1. Evict from memory and notify running operators.
+        let was_open = self.tables.write().remove(name).is_some();
+        if was_open {
+            let workers: Vec<_> = self.operators.read().values().cloned().collect();
+            for worker in workers {
+                worker.detach_input(name);
+            }
+        }
+
+        // 2. Remove from catalog.
+        if !self.table_catalog.lock().delete(&name.to_owned())? {
+            return Ok(false);
+        }
+
+        // 3. Delete on-disk files (includes all consumer offsets).
+        let path = self.path.join(TABLES_DIR).join(name);
+        if path.exists() {
+            fs::remove_dir_all(&path)?;
+        }
+        Ok(true)
+    }
+
     /// Return an open table, opening it lazily from the catalog or creating it
     /// with `config`. If the table is in the catalog and a different `config` is
     /// supplied, the catalog is updated before opening. Automatically starts

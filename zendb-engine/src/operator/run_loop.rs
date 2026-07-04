@@ -99,7 +99,12 @@ pub(crate) async fn run<D>(
             let phase = OperatorPhase::Failed {
                 error: error.to_string(),
             };
-            retire(&worker, &db, phase);
+            db.retire_operator(
+                worker.name(),
+                phase,
+                &worker.config().runtime_config().subscriptions,
+                Some(&worker),
+            );
             return;
         }
     };
@@ -160,16 +165,22 @@ pub(crate) async fn run<D>(
                     let phase = reason_to_phase(&reason);
                     match operator.teardown(&reason, &db, worker.name(), config).await {
                         Ok(()) => {
-                            retire(&worker, &db, phase);
+                            db.retire_operator(
+                                worker.name(),
+                                phase,
+                                &worker.config().runtime_config().subscriptions,
+                                Some(&worker),
+                            );
                             return;
                         }
                         Err(error) => {
-                            retire(
-                                &worker,
-                                &db,
+                            db.retire_operator(
+                                worker.name(),
                                 OperatorPhase::Failed {
                                     error: error.to_string(),
                                 },
+                                &worker.config().runtime_config().subscriptions,
+                                Some(&worker),
                             );
                             return;
                         }
@@ -241,18 +252,6 @@ pub(crate) async fn run<D>(
             }
         }
     }
-}
-
-fn retire<D>(worker: &OperatorWorker<D>, database: &Arc<Database<D>>, phase: OperatorPhase)
-where
-    D: DispatchOperator,
-{
-    database.retire_operator(
-        worker.name(),
-        phase,
-        &worker.config().runtime_config().subscriptions,
-        Some(worker),
-    );
 }
 
 fn reason_to_phase(reason: &TeardownReason) -> OperatorPhase {

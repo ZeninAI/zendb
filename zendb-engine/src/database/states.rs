@@ -61,11 +61,9 @@ where
     pub fn delete_state(&self, name: &str) -> io::Result<bool> {
         self.states.write().remove(name);
 
-        let mut catalog = self.state_catalog.lock();
-        if !catalog.contains(&name.to_owned()) {
+        if !self.state_catalog.lock().delete(&name.to_owned())? {
             return Ok(false);
         }
-        catalog.delete(&name.to_owned())?;
 
         let path = self.path.join(STATES_DIR).join(name);
         if path.exists() {

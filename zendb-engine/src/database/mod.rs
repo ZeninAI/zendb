@@ -367,7 +367,9 @@ mod tests {
         fn process<'a, D>(
             &'a mut self,
             changes: Vec<Change>,
-            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
+            _db: &'a Arc<Database<D>>,
+            _name: &'a str,
+            _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -427,7 +429,9 @@ mod tests {
         fn process<'a, D>(
             &'a mut self,
             changes: Vec<Change>,
-            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
+            _db: &'a Arc<Database<D>>,
+            _name: &'a str,
+            _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -477,7 +481,9 @@ mod tests {
         fn process<'a, D>(
             &'a mut self,
             _changes: Vec<Change>,
-            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
+            _db: &'a Arc<Database<D>>,
+            _name: &'a str,
+            _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -489,7 +495,9 @@ mod tests {
             &'a mut self,
             _payload: (),
             _fire_at_ms: u64,
-            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
+            _db: &'a Arc<Database<D>>,
+            _name: &'a str,
+            _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -533,7 +541,9 @@ mod tests {
         fn process<'a, D>(
             &'a mut self,
             _changes: Vec<Change>,
-            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
+            _db: &'a Arc<Database<D>>,
+            _name: &'a str,
+            _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -544,7 +554,9 @@ mod tests {
         fn on_input_opened<'a, D>(
             &'a mut self,
             table: String,
-            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
+            _db: &'a Arc<Database<D>>,
+            _name: &'a str,
+            _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -558,7 +570,9 @@ mod tests {
         fn on_input_closed<'a, D>(
             &'a mut self,
             table: String,
-            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
+            _db: &'a Arc<Database<D>>,
+            _name: &'a str,
+            _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -602,7 +616,9 @@ mod tests {
         fn process<'a, D>(
             &'a mut self,
             changes: Vec<Change>,
-            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
+            _db: &'a Arc<Database<D>>,
+            _name: &'a str,
+            _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -616,7 +632,9 @@ mod tests {
         fn on_input_opened<'a, D>(
             &'a mut self,
             table: String,
-            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
+            _db: &'a Arc<Database<D>>,
+            _name: &'a str,
+            _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -630,7 +648,9 @@ mod tests {
         fn on_input_closed<'a, D>(
             &'a mut self,
             table: String,
-            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
+            _db: &'a Arc<Database<D>>,
+            _name: &'a str,
+            _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -644,7 +664,9 @@ mod tests {
         fn teardown<'a, D>(
             &'a mut self,
             _reason: &'a crate::TeardownReason,
-            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
+            _db: &'a Arc<Database<D>>,
+            _name: &'a str,
+            _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<()>>
         where
             D: crate::DispatchOperator,
@@ -705,7 +727,9 @@ mod tests {
         fn process<'a, D>(
             &'a mut self,
             _changes: Vec<Change>,
-            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
+            _db: &'a Arc<Database<D>>,
+            _name: &'a str,
+            _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,

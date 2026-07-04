@@ -159,7 +159,7 @@ where
         &self,
         name: &str,
         phase: OperatorPhase,
-        subscriptions: &Vec<Subscription>,
+        subscriptions: &[Subscription],
         worker: Option<&OperatorWorker<D>>,
     ) {
         let worker = {

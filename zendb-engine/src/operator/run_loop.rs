@@ -48,13 +48,13 @@ impl LifecycleState {
         if self.phase.is_some() {
             return;
         }
-        self.phase = Some(phase.clone());
+        let reason = phase_to_reason(&phase);
+        self.phase = Some(phase);
         self.events.clear();
         for table in input_tables {
             self.events.push_back(LifecycleEvent::InputClosed(table));
         }
-        self.events
-            .push_back(LifecycleEvent::Teardown(phase_to_reason(&phase)));
+        self.events.push_back(LifecycleEvent::Teardown(reason));
     }
 
     pub(crate) fn peek(&self) -> Option<&LifecycleEvent> {
@@ -99,7 +99,6 @@ pub(crate) async fn run<D>(
             let phase = OperatorPhase::Failed {
                 error: error.to_string(),
             };
-            worker.begin_shutdown(phase.clone());
             retire(&worker, &db, phase);
             return;
         }

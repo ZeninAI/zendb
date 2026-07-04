@@ -118,7 +118,7 @@ where
     }
 
     fn deliver_timer(&self, operator: &str, fire_at_ms: u64, payload: Vec<u8>) {
-        if let Some(worker) = self.operators.read().get(operator).cloned() {
+        if let Some(worker) = self.operators.read().get(operator) {
             worker.enqueue_timer(fire_at_ms, payload);
         }
     }

@@ -113,9 +113,12 @@ impl TableHandle {
     /// Upgrade to a strong handle for a single operation, or fail if the owning
     /// database has been dropped.
     pub fn get(&self) -> io::Result<ConcurrentTable> {
-        self.inner
-            .upgrade()
-            .ok_or_else(|| resource_closed("table", &self.name))
+        self.inner.upgrade().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("table {:?} is unavailable because its database was dropped", self.name),
+            )
+        })
     }
 }
 
@@ -151,9 +154,12 @@ where
     /// Upgrade to a strong handle for a single operation, or fail if the owning
     /// database has been dropped.
     pub fn get(&self) -> io::Result<ConcurrentState<K, V>> {
-        self.inner
-            .upgrade()
-            .ok_or_else(|| resource_closed("state", &self.name))
+        self.inner.upgrade().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("state {:?} is unavailable because its database was dropped", self.name),
+            )
+        })
     }
 }
 
@@ -165,7 +171,6 @@ where
     D: DispatchOperator,
 {
     path: PathBuf,
-    #[allow(dead_code)]
     config: DatabaseConfig,
     executor: Arc<dyn Executor>,
     table_catalog: Mutex<TableCatalog>,
@@ -272,13 +277,11 @@ where
     pub(crate) fn executor(&self) -> Arc<dyn Executor> {
         Arc::clone(&self.executor)
     }
-}
 
-fn resource_closed(kind: &str, name: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::NotConnected,
-        format!("{kind} {name:?} is unavailable because its database was dropped"),
-    )
+    /// Return a reference to the database configuration.
+    pub fn config(&self) -> &DatabaseConfig {
+        &self.config
+    }
 }
 
 #[cfg(test)]

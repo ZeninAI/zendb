@@ -206,11 +206,6 @@ where
             .spawn(Box::pin(run_loop::run(worker, database, executor)));
     }
 
-    /// Remove the live worker from memory (no inputs left, may resume later).
-    pub(crate) fn suspend(&self, database: &Arc<Database<D>>) {
-        database.suspend_operator(&self.name);
-    }
-
     // --- Helpers ---
 
     fn input_tables(&self) -> Vec<String> {

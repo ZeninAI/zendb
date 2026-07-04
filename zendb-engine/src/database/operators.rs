@@ -222,7 +222,17 @@ where
     /// Remove a live worker from memory without changing its durable phase.
     /// Used when an active operator runs out of open input tables and should be
     /// respawned later if a matching table reopens.
-    pub(crate) fn suspend_operator(&self, name: &str) {
-        self.operators.write().remove(name);
+    ///
+    /// Returns `true` if the operator was suspended, `false` if it gained
+    /// inputs during the race window (caller should continue running).
+    pub(crate) fn suspend_operator(&self, name: &str) -> bool {
+        let mut operators = self.operators.write();
+        if let Some(worker) = operators.get(name) {
+            if worker.has_inputs() {
+                return false;
+            }
+        }
+        operators.remove(name);
+        true
     }
 }

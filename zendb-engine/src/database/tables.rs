@@ -187,13 +187,15 @@ where
 
         let mut to_spawn = Vec::new();
         for (op_name, op_config) in matching_operators {
-            let existing = self.operators.read().get(&op_name).cloned();
-            if let Some(worker) = existing {
+            // Hold the write lock to serialize with suspend_operator — prevents
+            // attaching to a worker that is concurrently being removed.
+            let mut operators = self.operators.write();
+            if let Some(worker) = operators.get(&op_name).cloned() {
                 let reader = table.read().consumer(worker.name())?;
                 worker.attach_input(OperatorInput::new(name.to_owned(), reader));
             } else {
                 let worker = self.build_worker(op_name.clone(), op_config)?;
-                self.operators.write().insert(op_name, Arc::clone(&worker));
+                operators.insert(op_name, Arc::clone(&worker));
                 to_spawn.push(worker);
             }
         }

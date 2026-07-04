@@ -48,7 +48,7 @@ impl LifecycleState {
         if self.phase.is_some() {
             return;
         }
-        let reason = phase_to_reason(&phase);
+        let reason = TeardownReason::from(&phase);
         self.phase = Some(phase);
         self.events.clear();
         for table in input_tables {
@@ -63,17 +63,6 @@ impl LifecycleState {
 
     pub(crate) fn pop(&mut self) {
         self.events.pop_front();
-    }
-}
-
-fn phase_to_reason(phase: &OperatorPhase) -> TeardownReason {
-    match phase {
-        OperatorPhase::Finished => TeardownReason::Finished,
-        OperatorPhase::Failed { error } => TeardownReason::Failed {
-            error: error.clone(),
-        },
-        OperatorPhase::Cancelled => TeardownReason::Cancelled,
-        OperatorPhase::Active => TeardownReason::Finished,
     }
 }
 
@@ -161,7 +150,7 @@ pub(crate) async fn run<D>(
                     }
                 }
                 LifecycleEvent::Teardown(reason) => {
-                    let phase = reason_to_phase(&reason);
+                    let phase = OperatorPhase::from(&reason);
                     match operator.teardown(&reason, &db, worker.name(), config).await {
                         Ok(()) => {
                             db.retire_operator(
@@ -188,8 +177,11 @@ pub(crate) async fn run<D>(
 
         // --- Suspend if no inputs remain ---
         if !worker.has_inputs() {
-            worker.suspend(&db);
-            return;
+            if db.suspend_operator(worker.name()) {
+                return;
+            }
+            // A table was attached during the race window — keep running.
+            continue 'outer;
         }
 
         // --- Poll changes and timers ---
@@ -248,15 +240,5 @@ pub(crate) async fn run<D>(
                 continue 'outer;
             }
         }
-    }
-}
-
-fn reason_to_phase(reason: &TeardownReason) -> OperatorPhase {
-    match reason {
-        TeardownReason::Finished => OperatorPhase::Finished,
-        TeardownReason::Failed { error } => OperatorPhase::Failed {
-            error: error.clone(),
-        },
-        TeardownReason::Cancelled => OperatorPhase::Cancelled,
     }
 }

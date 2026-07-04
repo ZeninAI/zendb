@@ -61,3 +61,27 @@ pub enum TeardownReason {
     /// The database owner permanently cancelled this operator.
     Cancelled,
 }
+
+impl From<&OperatorPhase> for TeardownReason {
+    fn from(phase: &OperatorPhase) -> Self {
+        match phase {
+            OperatorPhase::Finished | OperatorPhase::Active => TeardownReason::Finished,
+            OperatorPhase::Failed { error } => TeardownReason::Failed {
+                error: error.clone(),
+            },
+            OperatorPhase::Cancelled => TeardownReason::Cancelled,
+        }
+    }
+}
+
+impl From<&TeardownReason> for OperatorPhase {
+    fn from(reason: &TeardownReason) -> Self {
+        match reason {
+            TeardownReason::Finished => OperatorPhase::Finished,
+            TeardownReason::Failed { error } => OperatorPhase::Failed {
+                error: error.clone(),
+            },
+            TeardownReason::Cancelled => OperatorPhase::Cancelled,
+        }
+    }
+}

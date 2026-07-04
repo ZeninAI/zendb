@@ -106,47 +106,36 @@ where
         Ok(())
     }
 
-    /// Permanently cancel an active operator. Cancelled operators are not reopened
-    /// when matching tables are opened again.
-    pub fn cancel_operator(self: &Arc<Self>, name: &str) -> io::Result<()> {
-        let entry = self
-            .operator_catalog
-            .lock()
-            .get(&name.to_owned())
-            .map(|entry| entry.into_owned())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("operator {name:?} does not exist"),
-                )
-            })?;
-        if entry.phase != OperatorPhase::Active {
+    /// Permanently cancel an operator. Live workers are asked to shut down;
+    /// catalog-only operators are marked cancelled immediately.
+    pub fn cancel_operator(&self, name: &str) -> io::Result<()> {
+        if let Some(worker) = self.operators.read().get(name).cloned() {
+            worker.cancel();
             return Ok(());
         }
 
-        if let Some(worker) = self.operators.read().get(name).cloned() {
-            worker.cancel();
-        } else {
-            self.retire_operator(
-                name,
-                OperatorPhase::Cancelled,
-                &entry.config.runtime_config().subscriptions,
-                None,
-            );
-        }
+        let Some(config) = self.operator_config(name) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("operator {name:?} does not exist"),
+            ));
+        };
+        self.retire_operator(
+            name,
+            OperatorPhase::Cancelled,
+            &config.runtime_config().subscriptions,
+            None,
+        );
         Ok(())
     }
 
-    /// Instantiate the operator from its typed config and acquire one topic
-    /// consumer per currently-open table that matches the subscription. Does
-    /// NOT validate that all subscribed tables exist - in the lazy model,
-    /// tables may open later.
+    /// Acquire topic consumers for currently-open tables that match the
+    /// subscription. The operator instance is created lazily by the run loop.
     pub(super) fn build_worker(
         self: &Arc<Self>,
         name: String,
         config: D::Config,
     ) -> io::Result<Arc<OperatorWorker<D>>> {
-        let instance = D::new(&config)?;
         let mut inputs: Vec<OperatorInput> = Vec::new();
         for (table_name, table) in self.tables.read().iter() {
             if config
@@ -161,7 +150,7 @@ where
                 ));
             }
         }
-        Ok(OperatorWorker::new(name, config, inputs, instance))
+        Ok(OperatorWorker::new(name, config, inputs))
     }
 
     /// Transition catalog phase to a permanent terminal phase and remove from memory.
@@ -204,6 +193,20 @@ where
             })
         {
             log::error!("failed updating catalog phase for operator {name:?}: {error}");
+        }
+    }
+
+    /// Remove a live worker from memory without changing its durable phase.
+    /// Used when an active operator runs out of open input tables and should be
+    /// respawned later if a matching table reopens.
+    pub(crate) fn suspend_operator(&self, name: &str, worker: &OperatorWorker<D>) {
+        let mut operators = self.operators.write();
+        let should_remove = operators
+            .get(name)
+            .map(|current| std::ptr::eq(Arc::as_ptr(current), worker))
+            .unwrap_or(false);
+        if should_remove {
+            operators.remove(name);
         }
     }
 

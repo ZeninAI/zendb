@@ -86,34 +86,10 @@ impl Subscription {
     }
 }
 
-/// Exponential-backoff retry policy for operators.
-#[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub struct RetryConfig {
-    /// Max retry attempts. 0 disables retry entirely.
-    pub max_attempts: usize,
-    pub initial_delay_ms: u64,
-    pub max_delay_ms: u64,
-    /// Fraction of the computed backoff applied as random jitter (0.0–1.0).
-    pub jitter_factor: f64,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_attempts: 5,
-            initial_delay_ms: 100,
-            max_delay_ms: 30_000,
-            jitter_factor: 0.25,
-        }
-    }
-}
-
-/// Runtime configuration for an operator: subscriptions, retry policy, and
-/// poll batch size.
+/// Runtime configuration for an operator: subscriptions and poll batch size.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct OperatorRuntimeConfig {
     pub subscriptions: Vec<Subscription>,
-    pub retry: RetryConfig,
     /// Max number of changes to collect per poll cycle.
     pub poll_size: usize,
 }
@@ -122,7 +98,6 @@ impl Default for OperatorRuntimeConfig {
     fn default() -> Self {
         Self {
             subscriptions: Vec::new(),
-            retry: RetryConfig::default(),
             poll_size: 128,
         }
     }

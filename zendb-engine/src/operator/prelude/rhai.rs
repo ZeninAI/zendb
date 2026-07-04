@@ -21,8 +21,14 @@ impl Operator for RhaiOperator {
     type Config = RhaiOperatorConfig;
     type Timer = ();
 
-    fn new(_config: &Self::Config) -> io::Result<Self> {
-        Ok(Self)
+    fn create<'a, D>(
+        _ctx: &'a OperatorContext<Self, D>,
+    ) -> BoxFuture<'a, io::Result<Self>>
+    where
+        D: DispatchOperator,
+        Self: Sized,
+    {
+        Box::pin(async { Ok(Self) })
     }
 
     fn process<'a, D>(

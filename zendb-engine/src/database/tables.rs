@@ -47,6 +47,22 @@ where
             .map(|config| config.into_owned())
     }
 
+    /// Remove an open table from the in-memory cache and notify live operators
+    /// that the input closed. The durable table remains in the catalog and can
+    /// be reopened later with [`Database::table`].
+    pub fn close_table(&self, name: &str) -> bool {
+        let removed = self.tables.write().remove(name).is_some();
+        if !removed {
+            return false;
+        }
+
+        let workers: Vec<_> = self.operators.read().values().cloned().collect();
+        for worker in workers {
+            worker.detach_input(name);
+        }
+        true
+    }
+
     /// Return an open table, opening it lazily from the catalog or creating it
     /// with `config`. If the table is in the catalog and a different `config` is
     /// supplied, the catalog is updated before opening. Automatically starts

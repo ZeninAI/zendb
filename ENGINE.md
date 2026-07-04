@@ -239,43 +239,44 @@ boilerplate:
 ```rust
 struct Totals { /* ... */ }
 
-impl TypedOperator for Totals {
+impl Operator for Totals {
     type Config = TotalsConfig;   // serde / bincode, not ad-hoc bytes
-    type Timer = TotalsTimer;     // decoded before handle_timer is called
+    type Timer = TotalsTimer;     // decoded before on_timer is called
 
-    fn process<'a>(&'a mut self, changes: Vec<Change>, ctx: OperatorContext)
-        -> BoxFuture<'a, io::Result<OperatorStatus>>
+    fn create<'a>(ctx: &'a OperatorContext<Self, D>) -> BoxFuture<'a, io::Result<Self>> {
+        Box::pin(async move {
+            let state = ctx.state("totals", Some(StateConfig::default()))?;
+            Ok(Self { state })
+        })
+    }
+
+    fn process<'a>(&'a mut self, changes: Vec<Change>, ctx: &'a OperatorContext<Self, D>)
+        -> BoxFuture<'a, io::Result<OperatorDirective>>
     { /* ... */ }
 
-    fn handle_timer<'a>(&'a mut self, payload: TotalsTimer, ctx: OperatorContext)
-        -> BoxFuture<'a, io::Result<()>>
+    fn on_timer<'a>(&'a mut self, payload: TotalsTimer, fire_at_ms: u64, ctx: &'a OperatorContext<Self, D>)
+        -> BoxFuture<'a, io::Result<OperatorDirective>>
     { /* ... */ }
 }
 ```
 
-A blanket `impl<T: TypedOperator> Operator for T` provides the `on_timer`
-decode step and forwards to the typed `handle_timer`. Register with the
-registry:
+The generated `OperatorInstance` enum provides the dispatch layer via
+`DispatchOperator`. It handles the `on_timer` bincode decode step and forwards
+to the typed method. Register with the database:
 
 ```rust
-registry.register_operator::<Totals>("totals", |config: TotalsConfig| {
-    Ok(Totals::new(config))
-});
-```
-
-Build the `OperatorConfig` with the associated type inferred:
-
-```rust
-OperatorConfig::for_operator::<Totals>(
+db.dispatch_operator::<Totals>(
     "totals",
-    &TotalsConfig { /* ... */ },
-    vec![Subscription::pattern("users")],
-    RetryConfig::default(),
-)?
+    TotalsConfig { /* ... */ },
+    OperatorRuntimeConfig {
+        subscriptions: vec![Subscription::pattern("users")],
+        ..Default::default()
+    },
+)?;
 ```
 
 Use `type Timer = ()` for operators that never register timers (the default
-`handle_timer` is a no-op).
+`on_timer` is a no-op).
 
 
 
@@ -342,40 +343,42 @@ pub struct TableHandle { /* Weak<RwLock<Table>> */ }
 
 State types and state names are not registered in `OperatorRegistry`, and
 `OperatorConfig` does not declare states. Instead, operators create/open
-resources in `open()` through `OperatorContext` and store the returned weak
-handles:
+resources in `create()` through `OperatorContext` and store the returned weak
+handles directly on the struct (no `Option<>` wrapping needed):
 
 ```rust
 struct Totals {
-    totals: Option<StateHandle<String, u64>>,
-    output: Option<TableHandle>,
+    totals: StateHandle<String, u64>,
+    output: TableHandle,
 }
 
 impl Operator for Totals {
-    fn open<'a>(&'a mut self, ctx: OperatorContext) -> BoxFuture<'a, io::Result<()>> {
+    fn create<'a, D>(ctx: &'a OperatorContext<Self, D>) -> BoxFuture<'a, io::Result<Self>>
+    where D: DispatchOperator, Self: Sized {
         Box::pin(async move {
-            self.totals = Some(ctx.state("totals", Some(StateConfig::default()))?);
-            self.output = Some(ctx.table("summary", None)?);
-            Ok(())
+            let totals = ctx.state("totals", Some(StateConfig::default()))?;
+            let output = ctx.table("summary", None)?;
+            Ok(Self { totals, output })
         })
     }
 
-    fn process<'a>(
+    fn process<'a, D>(
         &'a mut self,
         changes: Vec<Change>,
-        _ctx: OperatorContext,
-    ) -> BoxFuture<'a, io::Result<OperatorStatus>> {
+        _ctx: &'a OperatorContext<Self, D>,
+    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    where D: DispatchOperator {
         Box::pin(async move {
-            self.totals.as_ref().unwrap().get()?
+            self.totals.get()?
                 .write().put("users".into(), changes.len() as u64)?;
-            let _guard = self.output.as_ref().unwrap().get()?.write();
-            Ok(OperatorStatus::Continue)
+            let _guard = self.output.get()?.write();
+            Ok(OperatorDirective::Continue)
         })
     }
 }
 ```
 
-`open`, `process`, `on_timer`, and `finish` all receive an `OperatorContext`,
+`create`, `process`, `on_timer`, and `teardown` all receive an `OperatorContext`,
 which provides scoped access to tables, states, and timers. The context carries
 the operator's own name so `register_timer` no longer needs an explicit name
 argument, and the upgrade boilerplate (`Weak::upgrade().ok_or(...)`) is hidden

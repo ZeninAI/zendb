@@ -333,37 +333,33 @@ mod tests {
     struct CountingOperator {
         count: Arc<AtomicUsize>,
         finish: bool,
-        buffer: Option<StateHandle<String, u64>>,
-        index: Option<StateHandle<Vec<u8>, Vec<u8>>>,
-        output: Option<TableHandle>,
+        buffer: StateHandle<String, u64>,
+        index: StateHandle<Vec<u8>, Vec<u8>>,
+        output: TableHandle,
     }
 
     impl Operator for CountingOperator {
         type Config = CountingConfig;
         type Timer = ();
 
-        fn new(config: &Self::Config) -> io::Result<Self> {
-            Ok(Self {
-                count: lookup_counter(&config.tracker)?,
-                finish: config.finish,
-                buffer: None,
-                index: None,
-                output: None,
-            })
-        }
-
-        fn open<'a, D>(
-            &'a mut self,
+        fn create<'a, D>(
             ctx: &'a OperatorContext<Self, D>,
-        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+        ) -> crate::BoxFuture<'a, io::Result<Self>>
         where
             D: crate::DispatchOperator,
+            Self: Sized,
         {
             Box::pin(async move {
-                self.buffer = Some(ctx.state("counter/buffer", Some(StateConfig::default()))?);
-                self.index = Some(ctx.state("index", Some(StateConfig::default()))?);
-                self.output = Some(ctx.table("users", None)?);
-                Ok(OperatorDirective::Continue)
+                let buffer = ctx.state("counter/buffer", Some(StateConfig::default()))?;
+                let index = ctx.state("index", Some(StateConfig::default()))?;
+                let output = ctx.table("users", None)?;
+                Ok(Self {
+                    count: lookup_counter(&ctx.config().tracker)?,
+                    finish: ctx.config().finish,
+                    buffer,
+                    index,
+                    output,
+                })
             })
         }
 
@@ -377,15 +373,13 @@ mod tests {
         {
             Box::pin(async move {
                 self.count.fetch_add(changes.len(), Ordering::Relaxed);
-                if let Some(state) = &self.index {
-                    state.get()?.write().put(
-                        b"count".to_vec(),
-                        self.count.load(Ordering::Relaxed).to_le_bytes().to_vec(),
-                    )?;
-                }
-                if let Some(state) = &self.buffer {
+                self.index.get()?.write().put(
+                    b"count".to_vec(),
+                    self.count.load(Ordering::Relaxed).to_le_bytes().to_vec(),
+                )?;
+                {
                     let key = "count".to_owned();
-                    let state = state.get()?;
+                    let state = self.buffer.get()?;
                     let mut state = state.write();
                     let count = state.get(&key).map(|value| value.into_owned()).unwrap_or(0)
                         + changes.len() as u64;
@@ -398,42 +392,32 @@ mod tests {
                 })
             })
         }
-
-        fn finish<'a, D>(
-            &'a mut self,
-            _ctx: &'a OperatorContext<Self, D>,
-        ) -> crate::BoxFuture<'a, io::Result<()>>
-        where
-            D: crate::DispatchOperator,
-        {
-            Box::pin(async move {
-                self.buffer = None;
-                self.index = None;
-                self.output = None;
-                Ok(())
-            })
-        }
     }
 
     #[derive(Debug, Clone, PartialEq, Encode, Decode)]
-    struct RetryOperatorConfig {
+    struct FailingOperatorConfig {
         attempts_tracker: String,
-        processed_tracker: String,
     }
 
-    struct FailingOnceOperator {
+    struct FailingOperator {
         attempts: Arc<AtomicUsize>,
-        processed: Arc<AtomicUsize>,
     }
 
-    impl Operator for FailingOnceOperator {
-        type Config = RetryOperatorConfig;
+    impl Operator for FailingOperator {
+        type Config = FailingOperatorConfig;
         type Timer = ();
 
-        fn new(config: &Self::Config) -> io::Result<Self> {
-            Ok(Self {
-                attempts: lookup_counter(&config.attempts_tracker)?,
-                processed: lookup_counter(&config.processed_tracker)?,
+        fn create<'a, D>(
+            ctx: &'a OperatorContext<Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<Self>>
+        where
+            D: crate::DispatchOperator,
+            Self: Sized,
+        {
+            Box::pin(async move {
+                Ok(Self {
+                    attempts: lookup_counter(&ctx.config().attempts_tracker)?,
+                })
             })
         }
 
@@ -446,11 +430,9 @@ mod tests {
             D: crate::DispatchOperator,
         {
             Box::pin(async move {
-                if self.attempts.fetch_add(1, Ordering::Relaxed) == 0 {
-                    return Err(io::Error::other("expected failure"));
-                }
-                self.processed.fetch_add(changes.len(), Ordering::Relaxed);
-                Ok(OperatorDirective::Continue)
+                let _ = changes;
+                self.attempts.fetch_add(1, Ordering::Relaxed);
+                Err(io::Error::other("expected failure"))
             })
         }
     }
@@ -468,18 +450,12 @@ mod tests {
         type Config = TimerOperatorConfig;
         type Timer = ();
 
-        fn new(config: &Self::Config) -> io::Result<Self> {
-            Ok(Self {
-                fired: lookup_counter(&config.tracker)?,
-            })
-        }
-
-        fn open<'a, D>(
-            &'a mut self,
+        fn create<'a, D>(
             ctx: &'a OperatorContext<Self, D>,
-        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+        ) -> crate::BoxFuture<'a, io::Result<Self>>
         where
             D: crate::DispatchOperator,
+            Self: Sized,
         {
             Box::pin(async move {
                 let now = std::time::SystemTime::now()
@@ -487,7 +463,9 @@ mod tests {
                     .unwrap()
                     .as_millis() as u64;
                 ctx.register_timer(now, &())?;
-                Ok(OperatorDirective::Continue)
+                Ok(Self {
+                    fired: lookup_counter(&ctx.config().tracker)?,
+                })
             })
         }
 
@@ -502,7 +480,7 @@ mod tests {
             Box::pin(async { Ok(OperatorDirective::Continue) })
         }
 
-        fn handle_timer<'a, D>(
+        fn on_timer<'a, D>(
             &'a mut self,
             _payload: (),
             _fire_at_ms: u64,
@@ -532,9 +510,17 @@ mod tests {
         type Config = InputLifecycleConfig;
         type Timer = ();
 
-        fn new(config: &Self::Config) -> io::Result<Self> {
-            let (opened, closed) = lookup_input_tracker(&config.tracker)?;
-            Ok(Self { opened, closed })
+        fn create<'a, D>(
+            ctx: &'a OperatorContext<Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<Self>>
+        where
+            D: crate::DispatchOperator,
+            Self: Sized,
+        {
+            Box::pin(async move {
+                let (opened, closed) = lookup_input_tracker(&ctx.config().tracker)?;
+                Ok(Self { opened, closed })
+            })
         }
 
         fn process<'a, D>(
@@ -590,22 +576,17 @@ mod tests {
         type Config = ShutdownLifecycleConfig;
         type Timer = ();
 
-        fn new(config: &Self::Config) -> io::Result<Self> {
-            Ok(Self {
-                log: lookup_lifecycle_log(&config.tracker)?,
-            })
-        }
-
-        fn open<'a, D>(
-            &'a mut self,
-            _ctx: &'a OperatorContext<Self, D>,
-        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+        fn create<'a, D>(
+            ctx: &'a OperatorContext<Self, D>,
+        ) -> crate::BoxFuture<'a, io::Result<Self>>
         where
             D: crate::DispatchOperator,
+            Self: Sized,
         {
             Box::pin(async move {
-                self.log.lock().push("open".to_owned());
-                Ok(OperatorDirective::Continue)
+                let log = lookup_lifecycle_log(&ctx.config().tracker)?;
+                log.lock().push("create".to_owned());
+                Ok(Self { log })
             })
         }
 
@@ -651,28 +632,16 @@ mod tests {
             })
         }
 
-        fn close<'a, D>(
+        fn teardown<'a, D>(
             &'a mut self,
+            _reason: &'a crate::TeardownReason,
             _ctx: &'a OperatorContext<Self, D>,
         ) -> crate::BoxFuture<'a, io::Result<()>>
         where
             D: crate::DispatchOperator,
         {
             Box::pin(async move {
-                self.log.lock().push("close".to_owned());
-                Ok(())
-            })
-        }
-
-        fn finish<'a, D>(
-            &'a mut self,
-            _ctx: &'a OperatorContext<Self, D>,
-        ) -> crate::BoxFuture<'a, io::Result<()>>
-        where
-            D: crate::DispatchOperator,
-        {
-            Box::pin(async move {
-                self.log.lock().push("finish".to_owned());
+                self.log.lock().push("teardown".to_owned());
                 Ok(())
             })
         }
@@ -689,16 +658,12 @@ mod tests {
         type Config = SpawnerConfig;
         type Timer = ();
 
-        fn new(_config: &Self::Config) -> io::Result<Self> {
-            Ok(Self)
-        }
-
-        fn open<'a, D>(
-            &'a mut self,
+        fn create<'a, D>(
             ctx: &'a OperatorContext<Self, D>,
-        ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+        ) -> crate::BoxFuture<'a, io::Result<Self>>
         where
             D: crate::DispatchOperator,
+            Self: Sized,
         {
             Box::pin(async move {
                 ctx.dispatch_operator::<CountingOperator>(
@@ -722,7 +687,7 @@ mod tests {
                     },
                 )?;
 
-                Ok(OperatorDirective::Continue)
+                Ok(Self)
             })
         }
 
@@ -741,7 +706,7 @@ mod tests {
     crate::define_operator_set! {
         mod test_operators {
             Count(CountingOperator),
-            Retry(FailingOnceOperator),
+            Retry(FailingOperator),
             Timer(TimerOperator),
             InputLifecycle(InputLifecycleOperator),
             ShutdownLifecycle(ShutdownLifecycleOperator),
@@ -843,7 +808,6 @@ mod tests {
     fn runtime_config(subscription: Subscription) -> OperatorRuntimeConfig {
         OperatorRuntimeConfig {
             subscriptions: vec![subscription],
-            retry: Default::default(),
             poll_size: 128,
         }
     }
@@ -856,11 +820,8 @@ mod tests {
         runtime_config(subscription)
     }
 
-    fn retry_config(attempts_tracker: String, processed_tracker: String) -> RetryOperatorConfig {
-        RetryOperatorConfig {
-            attempts_tracker,
-            processed_tracker,
-        }
+    fn retry_config(attempts_tracker: String) -> FailingOperatorConfig {
+        FailingOperatorConfig { attempts_tracker }
     }
 
     fn retry_runtime_config() -> OperatorRuntimeConfig {
@@ -973,16 +934,15 @@ mod tests {
     }
 
     #[test]
-    fn failed_process_resets_readers_to_committed_offsets() {
-        let path = tmp("retry");
+    fn failed_process_transitions_operator_to_failed() {
+        let path = tmp("failed");
         let (attempts_key, attempts) = new_tracker("retry_attempts");
-        let (processed_key, processed) = new_tracker("retry_processed");
         let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
             .unwrap();
         let table = db.table("users", Some(TableConfig::default())).unwrap();
-        db.dispatch_operator::<FailingOnceOperator>(
+        db.dispatch_operator::<FailingOperator>(
             "retry",
-            retry_config(attempts_key, processed_key),
+            retry_config(attempts_key),
             retry_runtime_config(),
         )
         .unwrap();
@@ -1000,8 +960,14 @@ mod tests {
             .insert_event(event("users", 2, 110))
             .unwrap();
 
-        wait_until(|| attempts.load(Ordering::Relaxed) >= 2);
-        wait_until(|| processed.load(Ordering::Relaxed) == 2);
+        wait_until(|| {
+            db.operator_phase("retry")
+                == Some(OperatorPhase::Failed {
+                    error: "expected failure".to_owned(),
+                })
+        });
+        wait_until(|| !db.is_operator_open("retry"));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1142,8 +1108,7 @@ mod tests {
         {
             let log = log.lock();
             assert!(log.contains(&"closed:users".to_owned()), "{log:?}");
-            assert!(log.contains(&"close".to_owned()), "{log:?}");
-            assert!(log.contains(&"finish".to_owned()), "{log:?}");
+            assert!(log.contains(&"teardown".to_owned()), "{log:?}");
         }
 
         let db =
@@ -1263,6 +1228,47 @@ mod tests {
     }
 
     #[test]
+    fn close_table_evicts_cache_notifies_and_allows_reopen() {
+        let path = tmp("close_table");
+        let (tracker, opened, closed) = new_input_tracker("close_table");
+        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
+            .unwrap();
+        let users = db.table("users", Some(TableConfig::default())).unwrap();
+        db.dispatch_operator::<InputLifecycleOperator>(
+            "inputs",
+            input_lifecycle_config(tracker),
+            input_lifecycle_runtime_config(Subscription::pattern("users")),
+        )
+        .unwrap();
+
+        wait_until(|| opened.lock().contains(&"users".to_owned()));
+        assert!(db.is_table_open("users"));
+        assert!(db.is_operator_open("inputs"));
+
+        assert!(db.close_table("users"));
+
+        wait_until(|| closed.lock().contains(&"users".to_owned()));
+        wait_until(|| !db.is_operator_open("inputs"));
+        assert!(!db.is_table_open("users"));
+        assert!(matches!(
+            users.get(),
+            Err(error) if error.kind() == io::ErrorKind::NotConnected
+        ));
+
+        db.table("users", None).unwrap();
+
+        wait_until(|| {
+            db.is_operator_open("inputs")
+                && opened
+                    .lock()
+                    .iter()
+                    .filter(|table| table.as_str() == "users")
+                    .count()
+                    == 2
+        });
+    }
+
+    #[test]
     fn retired_operator_deletes_consumers_from_unopened_tables() {
         let path = tmp("retire_consumers");
         {
@@ -1308,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_runs_input_closed_before_close_and_finish() {
+    fn shutdown_runs_input_closed_before_teardown() {
         let path = tmp("shutdown_lifecycle");
         let (tracker, log) = new_lifecycle_log("shutdown_lifecycle");
         let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
@@ -1337,19 +1343,14 @@ mod tests {
             .iter()
             .position(|entry| entry == "closed:users")
             .expect("closed event is recorded");
-        let close = log
+        let teardown = log
             .iter()
-            .position(|entry| entry == "close")
-            .expect("close event is recorded");
-        let finish = log
-            .iter()
-            .position(|entry| entry == "finish")
-            .expect("finish event is recorded");
+            .position(|entry| entry == "teardown")
+            .expect("teardown event is recorded");
 
         assert!(
-            closed < close,
-            "on_input_closed must run before close: {log:?}"
+            closed < teardown,
+            "on_input_closed must run before teardown: {log:?}"
         );
-        assert!(close < finish, "close must run before finish: {log:?}");
     }
 }

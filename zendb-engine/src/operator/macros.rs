@@ -62,12 +62,12 @@ macro_rules! __zendb_define_operator_set {
             pub enum OperatorInstance {
                 $first_variant(
                     $first_operator,
-                    Option<$crate::OperatorContext<$first_operator, OperatorInstance>>,
+                    $crate::OperatorContext<$first_operator, OperatorInstance>,
                 ),
                 $(
                     $variant(
                         $operator,
-                        Option<$crate::OperatorContext<$operator, OperatorInstance>>,
+                        $crate::OperatorContext<$operator, OperatorInstance>,
                     ),
                 )*
             }
@@ -125,54 +125,34 @@ macro_rules! __zendb_define_operator_set {
             impl $crate::DispatchOperator for OperatorInstance {
                 type Config = OperatorConfig;
 
-                fn new(config: &Self::Config) -> ::std::io::Result<Self> {
-                    match &config.operator {
-                        OperatorConfigVariant::$first_variant(inner) => {
-                            <$first_operator as $crate::Operator>::new(inner)
-                                .map(|operator| OperatorInstance::$first_variant(operator, None))
-                        }
-                        $(
-                            OperatorConfigVariant::$variant(inner) => {
-                                <$operator as $crate::Operator>::new(inner)
-                                    .map(|operator| OperatorInstance::$variant(operator, None))
-                            }
-                        )*
-                    }
-                }
-
-                fn open<'a>(
-                    &'a mut self,
+                fn create<'a>(
                     db: ::std::sync::Weak<$crate::Database<Self>>,
                     name: &'a str,
                     config: &'a Self::Config,
-                ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
-                    match self {
-                        OperatorInstance::$first_variant(inner, cached_ctx) => {
-                            let typed_config = match &config.operator {
-                                OperatorConfigVariant::$first_variant(c) => c.clone(),
-                                _ => ::std::unreachable!("operator instance/config mismatch"),
-                            };
-                            *cached_ctx = Some($crate::OperatorContext::new(
-                                db.clone(),
+                ) -> $crate::BoxFuture<'a, ::std::io::Result<Self>> {
+                    match &config.operator {
+                        OperatorConfigVariant::$first_variant(inner) => {
+                            let ctx = $crate::OperatorContext::new(
+                                db,
                                 name.to_owned(),
-                                typed_config,
-                            ));
-                            let typed_ctx = cached_ctx.as_ref().expect("operator context is cached");
-                            <$first_operator as $crate::Operator>::open(inner, typed_ctx)
+                                inner.clone(),
+                            );
+                            Box::pin(async move {
+                                let operator = <$first_operator as $crate::Operator>::create(&ctx).await?;
+                                Ok(OperatorInstance::$first_variant(operator, ctx))
+                            })
                         }
                         $(
-                            OperatorInstance::$variant(inner, cached_ctx) => {
-                                let typed_config = match &config.operator {
-                                    OperatorConfigVariant::$variant(c) => c.clone(),
-                                    _ => ::std::unreachable!("operator instance/config mismatch"),
-                                };
-                                *cached_ctx = Some($crate::OperatorContext::new(
-                                    db.clone(),
+                            OperatorConfigVariant::$variant(inner) => {
+                                let ctx = $crate::OperatorContext::new(
+                                    db,
                                     name.to_owned(),
-                                    typed_config,
-                                ));
-                                let typed_ctx = cached_ctx.as_ref().expect("operator context is cached");
-                                <$operator as $crate::Operator>::open(inner, typed_ctx)
+                                    inner.clone(),
+                                );
+                                Box::pin(async move {
+                                    let operator = <$operator as $crate::Operator>::create(&ctx).await?;
+                                    Ok(OperatorInstance::$variant(operator, ctx))
+                                })
                             }
                         )*
                     }
@@ -181,24 +161,17 @@ macro_rules! __zendb_define_operator_set {
                 fn process<'a>(
                     &'a mut self,
                     changes: Vec<$crate::Change>,
-                    db: ::std::sync::Weak<$crate::Database<Self>>,
-                    name: &'a str,
-                    config: &'a Self::Config,
+                    _db: ::std::sync::Weak<$crate::Database<Self>>,
+                    _name: &'a str,
+                    _config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
-                    let _ = (&db, name, config);
                     match self {
-                        OperatorInstance::$first_variant(inner, cached_ctx) => {
-                            let typed_ctx = cached_ctx
-                                .as_ref()
-                                .expect("operator context must be initialized by open");
-                            <$first_operator as $crate::Operator>::process(inner, changes, typed_ctx)
+                        OperatorInstance::$first_variant(inner, ctx) => {
+                            <$first_operator as $crate::Operator>::process(inner, changes, ctx)
                         }
                         $(
-                            OperatorInstance::$variant(inner, cached_ctx) => {
-                                let typed_ctx = cached_ctx
-                                    .as_ref()
-                                    .expect("operator context must be initialized by open");
-                                <$operator as $crate::Operator>::process(inner, changes, typed_ctx)
+                            OperatorInstance::$variant(inner, ctx) => {
+                                <$operator as $crate::Operator>::process(inner, changes, ctx)
                             }
                         )*
                     }
@@ -207,27 +180,20 @@ macro_rules! __zendb_define_operator_set {
                 fn on_input_opened<'a>(
                     &'a mut self,
                     table: String,
-                    db: ::std::sync::Weak<$crate::Database<Self>>,
-                    name: &'a str,
-                    config: &'a Self::Config,
+                    _db: ::std::sync::Weak<$crate::Database<Self>>,
+                    _name: &'a str,
+                    _config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
-                    let _ = (&db, name, config);
                     match self {
-                        OperatorInstance::$first_variant(inner, cached_ctx) => {
-                            let typed_ctx = cached_ctx
-                                .as_ref()
-                                .expect("operator context must be initialized by open");
+                        OperatorInstance::$first_variant(inner, ctx) => {
                             <$first_operator as $crate::Operator>::on_input_opened(
-                                inner, table, typed_ctx,
+                                inner, table, ctx,
                             )
                         }
                         $(
-                            OperatorInstance::$variant(inner, cached_ctx) => {
-                                let typed_ctx = cached_ctx
-                                    .as_ref()
-                                    .expect("operator context must be initialized by open");
+                            OperatorInstance::$variant(inner, ctx) => {
                                 <$operator as $crate::Operator>::on_input_opened(
-                                    inner, table, typed_ctx,
+                                    inner, table, ctx,
                                 )
                             }
                         )*
@@ -237,72 +203,36 @@ macro_rules! __zendb_define_operator_set {
                 fn on_input_closed<'a>(
                     &'a mut self,
                     table: String,
-                    db: ::std::sync::Weak<$crate::Database<Self>>,
-                    name: &'a str,
-                    config: &'a Self::Config,
+                    _db: ::std::sync::Weak<$crate::Database<Self>>,
+                    _name: &'a str,
+                    _config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
-                    let _ = (&db, name, config);
                     match self {
-                        OperatorInstance::$first_variant(inner, cached_ctx) => {
-                            let typed_ctx = cached_ctx
-                                .as_ref()
-                                .expect("operator context must be initialized by open");
+                        OperatorInstance::$first_variant(inner, ctx) => {
                             <$first_operator as $crate::Operator>::on_input_closed(
-                                inner, table, typed_ctx,
+                                inner, table, ctx,
                             )
                         }
                         $(
-                            OperatorInstance::$variant(inner, cached_ctx) => {
-                                let typed_ctx = cached_ctx
-                                    .as_ref()
-                                    .expect("operator context must be initialized by open");
+                            OperatorInstance::$variant(inner, ctx) => {
                                 <$operator as $crate::Operator>::on_input_closed(
-                                    inner, table, typed_ctx,
+                                    inner, table, ctx,
                                 )
                             }
                         )*
                     }
                 }
 
-                fn close<'a>(
-                    &'a mut self,
-                    db: ::std::sync::Weak<$crate::Database<Self>>,
-                    name: &'a str,
-                    config: &'a Self::Config,
-                ) -> $crate::BoxFuture<'a, ::std::io::Result<()>> {
-                    let _ = (&db, name, config);
-                    match self {
-                        OperatorInstance::$first_variant(inner, cached_ctx) => {
-                            let typed_ctx = cached_ctx
-                                .as_ref()
-                                .expect("operator context must be initialized by open");
-                            <$first_operator as $crate::Operator>::close(inner, typed_ctx)
-                        }
-                        $(
-                            OperatorInstance::$variant(inner, cached_ctx) => {
-                                let typed_ctx = cached_ctx
-                                    .as_ref()
-                                    .expect("operator context must be initialized by open");
-                                <$operator as $crate::Operator>::close(inner, typed_ctx)
-                            }
-                        )*
-                    }
-                }
-
-                fn handle_timer<'a>(
+                fn on_timer<'a>(
                     &'a mut self,
                     payload: Vec<u8>,
                     fire_at_ms: u64,
-                    db: ::std::sync::Weak<$crate::Database<Self>>,
-                    name: &'a str,
-                    config: &'a Self::Config,
+                    _db: ::std::sync::Weak<$crate::Database<Self>>,
+                    _name: &'a str,
+                    _config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
-                    let _ = (&db, name, config);
                     match self {
-                        OperatorInstance::$first_variant(inner, cached_ctx) => {
-                            let typed_ctx = cached_ctx
-                                .as_ref()
-                                .expect("operator context must be initialized by open");
+                        OperatorInstance::$first_variant(inner, ctx) => {
                             Box::pin(async move {
                                 let timer: <$first_operator as $crate::Operator>::Timer =
                                     ::bincode::decode_from_slice(
@@ -316,17 +246,14 @@ macro_rules! __zendb_define_operator_set {
                                             error.to_string(),
                                         )
                                     })?;
-                                <$first_operator as $crate::Operator>::handle_timer(
-                                    inner, timer, fire_at_ms, typed_ctx,
+                                <$first_operator as $crate::Operator>::on_timer(
+                                    inner, timer, fire_at_ms, ctx,
                                 )
                                 .await
                             })
                         }
                         $(
-                            OperatorInstance::$variant(inner, cached_ctx) => {
-                                let typed_ctx = cached_ctx
-                                    .as_ref()
-                                    .expect("operator context must be initialized by open");
+                            OperatorInstance::$variant(inner, ctx) => {
                                 Box::pin(async move {
                                     let timer: <$operator as $crate::Operator>::Timer =
                                         ::bincode::decode_from_slice(
@@ -340,8 +267,8 @@ macro_rules! __zendb_define_operator_set {
                                                 error.to_string(),
                                             )
                                         })?;
-                                    <$operator as $crate::Operator>::handle_timer(
-                                        inner, timer, fire_at_ms, typed_ctx,
+                                    <$operator as $crate::Operator>::on_timer(
+                                        inner, timer, fire_at_ms, ctx,
                                     )
                                     .await
                                 })
@@ -350,26 +277,20 @@ macro_rules! __zendb_define_operator_set {
                     }
                 }
 
-                fn finish<'a>(
+                fn teardown<'a>(
                     &'a mut self,
-                    db: ::std::sync::Weak<$crate::Database<Self>>,
-                    name: &'a str,
-                    config: &'a Self::Config,
+                    reason: &'a $crate::TeardownReason,
+                    _db: ::std::sync::Weak<$crate::Database<Self>>,
+                    _name: &'a str,
+                    _config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<()>> {
-                    let _ = (&db, name, config);
                     match self {
-                        OperatorInstance::$first_variant(inner, cached_ctx) => {
-                            let typed_ctx = cached_ctx
-                                .as_ref()
-                                .expect("operator context must be initialized by open");
-                            <$first_operator as $crate::Operator>::finish(inner, typed_ctx)
+                        OperatorInstance::$first_variant(inner, ctx) => {
+                            <$first_operator as $crate::Operator>::teardown(inner, reason, ctx)
                         }
                         $(
-                            OperatorInstance::$variant(inner, cached_ctx) => {
-                                let typed_ctx = cached_ctx
-                                    .as_ref()
-                                    .expect("operator context must be initialized by open");
-                                <$operator as $crate::Operator>::finish(inner, typed_ctx)
+                            OperatorInstance::$variant(inner, ctx) => {
+                                <$operator as $crate::Operator>::teardown(inner, reason, ctx)
                             }
                         )*
                     }

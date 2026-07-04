@@ -13,7 +13,7 @@
 //! once the operator is activated again.
 //!
 //! Timer eviction is owned by the worker: `cancel_timer` is called after
-//! successful `handle_timer`. On operator retirement, `cancel_operator_timers`
+//! successful `on_timer`. On operator retirement, `cancel_operator_timers`
 //! sweeps any remaining timers for that operator.
 
 use std::{
@@ -71,7 +71,7 @@ where
     /// timestamp (if any) so the scheduler can sleep until then.
     ///
     /// Timers are NOT deleted here — eviction is owned by the worker after
-    /// successful `handle_timer`.
+    /// successful `on_timer`.
     ///
     /// Returns `(fired_timers, next_deliverable_ms)`.
     fn take_due_timers(&self, now: u64) -> (Vec<(String, u64, Vec<u8>)>, Option<u64>) {

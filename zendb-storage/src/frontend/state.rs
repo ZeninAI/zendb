@@ -471,11 +471,9 @@ mod tests {
     fn drop_flushes_ordered_state() {
         let path = tmp("ordered-drop");
         {
-            let mut state = State::<u64, u64>::create(
-                &path,
-                StateConfig::Ordered(BPlusTreeConfig::default()),
-            )
-            .unwrap();
+            let mut state =
+                State::<u64, u64>::create(&path, StateConfig::Ordered(BPlusTreeConfig::default()))
+                    .unwrap();
             state.put(1, 10).unwrap();
         }
 
@@ -489,17 +487,14 @@ mod tests {
     fn drop_flushes_unordered_state() {
         let path = tmp("unordered-drop");
         {
-            let mut state = State::<u64, u64>::create(
-                &path,
-                StateConfig::Unordered(KeyDirConfig::default()),
-            )
-            .unwrap();
+            let mut state =
+                State::<u64, u64>::create(&path, StateConfig::Unordered(KeyDirConfig::default()))
+                    .unwrap();
             state.put(1, 10).unwrap();
         }
 
-        let state =
-            State::<u64, u64>::open(&path, StateConfig::Unordered(KeyDirConfig::default()))
-                .unwrap();
+        let state = State::<u64, u64>::open(&path, StateConfig::Unordered(KeyDirConfig::default()))
+            .unwrap();
         assert_eq!(state.get(&1).map(|value| *value), Some(10));
     }
 }

@@ -37,27 +37,23 @@ pub struct MerkleLeaf {
 /// Incrementally maintains a Merkle tree over subscribed tables, recomputing
 /// the root hash after every batch of changes.
 pub struct MerkleTreeOperator {
-    state: Option<StateHandle<String, MerkleLeaf>>,
+    state: StateHandle<String, MerkleLeaf>,
 }
 
 impl Operator for MerkleTreeOperator {
     type Config = MerkleTreeConfig;
     type Timer = ();
 
-    fn new(_config: &Self::Config) -> io::Result<Self> {
-        Ok(Self { state: None })
-    }
-
-    fn open<'a, D>(
-        &'a mut self,
+    fn create<'a, D>(
         ctx: &'a OperatorContext<Self, D>,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> BoxFuture<'a, io::Result<Self>>
     where
         D: DispatchOperator,
+        Self: Sized,
     {
         Box::pin(async move {
-            self.state = Some(ctx.state(&ctx.config().state, Some(StateConfig::default()))?);
-            Ok(OperatorDirective::Continue)
+            let state = ctx.state(&ctx.config().state, Some(StateConfig::default()))?;
+            Ok(Self { state })
         })
     }
 
@@ -70,11 +66,7 @@ impl Operator for MerkleTreeOperator {
         D: DispatchOperator,
     {
         Box::pin(async move {
-            let state = self
-                .state
-                .as_ref()
-                .expect("merkle state must be initialized by open")
-                .get()?;
+            let state = self.state.get()?;
             let mut state = state.write();
 
             for change in changes {

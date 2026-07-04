@@ -110,7 +110,7 @@ where
     /// catalog-only operators are marked cancelled immediately.
     pub fn cancel_operator(&self, name: &str) -> io::Result<()> {
         if let Some(worker) = self.operators.read().get(name).cloned() {
-            worker.cancel();
+            worker.begin_shutdown(OperatorPhase::Cancelled);
             return Ok(());
         }
 

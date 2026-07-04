@@ -137,11 +137,6 @@ where
 
     // --- Lifecycle state (called by run loop) ---
 
-    /// Permanently cancel this operator.
-    pub(crate) fn cancel(&self) {
-        self.begin_shutdown(OperatorPhase::Cancelled);
-    }
-
     /// Begin the shutdown sequence: clear events, enqueue InputClosed + Teardown.
     pub(crate) fn begin_shutdown(&self, phase: OperatorPhase) {
         let input_tables = self.input_tables();

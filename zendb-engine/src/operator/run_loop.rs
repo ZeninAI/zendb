@@ -22,12 +22,6 @@ pub(crate) enum LifecycleEvent {
     Teardown(TeardownReason),
 }
 
-enum LoopAction {
-    AdvanceEvent,
-    BeginShutdown(OperatorPhase),
-    Retire(OperatorPhase),
-}
-
 /// Encapsulates the shutdown state for an operator.
 pub(crate) struct LifecycleState {
     events: VecDeque<LifecycleEvent>,
@@ -122,19 +116,25 @@ pub(crate) async fn run<D>(
 
         // --- Process lifecycle events ---
         while let Some(event) = worker.peek_event() {
-            let action = match event {
+            match event {
                 LifecycleEvent::InputOpened(table) => {
                     match operator
                         .on_input_opened(table, &db, worker.name(), config)
                         .await
                     {
-                        Ok(OperatorDirective::Continue) => LoopAction::AdvanceEvent,
-                        Ok(OperatorDirective::Finish) => {
-                            LoopAction::BeginShutdown(OperatorPhase::Finished)
+                        Ok(OperatorDirective::Continue) => {
+                            worker.pop_event();
                         }
-                        Err(error) => LoopAction::BeginShutdown(OperatorPhase::Failed {
-                            error: error.to_string(),
-                        }),
+                        Ok(OperatorDirective::Finish) => {
+                            worker.begin_shutdown(OperatorPhase::Finished);
+                            continue 'outer;
+                        }
+                        Err(error) => {
+                            worker.begin_shutdown(OperatorPhase::Failed {
+                                error: error.to_string(),
+                            });
+                            continue 'outer;
+                        }
                     }
                 }
                 LifecycleEvent::InputClosed(table) => {
@@ -142,41 +142,39 @@ pub(crate) async fn run<D>(
                         .on_input_closed(table, &db, worker.name(), config)
                         .await
                     {
-                        Ok(OperatorDirective::Continue) => LoopAction::AdvanceEvent,
-                        Ok(OperatorDirective::Finish) => {
-                            LoopAction::BeginShutdown(OperatorPhase::Finished)
+                        Ok(OperatorDirective::Continue) => {
+                            worker.pop_event();
                         }
-                        Err(error) => LoopAction::BeginShutdown(OperatorPhase::Failed {
-                            error: error.to_string(),
-                        }),
+                        Ok(OperatorDirective::Finish) => {
+                            worker.begin_shutdown(OperatorPhase::Finished);
+                            continue 'outer;
+                        }
+                        Err(error) => {
+                            worker.begin_shutdown(OperatorPhase::Failed {
+                                error: error.to_string(),
+                            });
+                            continue 'outer;
+                        }
                     }
                 }
                 LifecycleEvent::Teardown(reason) => {
                     let phase = reason_to_phase(&reason);
                     match operator.teardown(&reason, &db, worker.name(), config).await {
-                        Ok(()) => LoopAction::Retire(phase),
-                        Err(error) => LoopAction::Retire(OperatorPhase::Failed {
-                            error: error.to_string(),
-                        }),
+                        Ok(()) => {
+                            retire(&worker, &db, phase);
+                            return;
+                        }
+                        Err(error) => {
+                            retire(
+                                &worker,
+                                &db,
+                                OperatorPhase::Failed {
+                                    error: error.to_string(),
+                                },
+                            );
+                            return;
+                        }
                     }
-                }
-            };
-
-            match action {
-                LoopAction::AdvanceEvent => {
-                    worker.pop_event();
-                }
-                LoopAction::BeginShutdown(phase) => {
-                    if worker.is_shutting_down() {
-                        worker.pop_event();
-                    } else {
-                        worker.begin_shutdown(phase);
-                    }
-                    continue 'outer;
-                }
-                LoopAction::Retire(phase) => {
-                    retire(&worker, &db, phase);
-                    return;
                 }
             }
         }

@@ -63,7 +63,6 @@
 //! | `RunLoop` | Event queue, shutdown state machine, poll+commit, idle/wake | What the operator does with changes |
 
 mod config;
-mod context;
 mod lifecycle;
 mod macros;
 pub mod prelude;
@@ -74,7 +73,6 @@ pub(crate) mod worker;
 use std::{future::Future, pin::Pin};
 
 pub use config::{OperatorRuntimeConfig, Subscription};
-pub use context::OperatorContext;
 pub use lifecycle::{OperatorDirective, OperatorPhase, TeardownReason};
 pub use traits::{DispatchConfig, DispatchOperator, Operator};
 pub use zendb_storage::frontend::state::State;

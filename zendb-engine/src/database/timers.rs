@@ -32,12 +32,23 @@ impl<D> Database<D>
 where
     D: DispatchOperator,
 {
-    /// Register a processing-time timer for `operator`.
+    /// Register a typed processing-time timer for `operator`.
     ///
-    /// If a timer already exists for the same `(operator, fire_at_ms)` pair it
-    /// is overwritten - no FIFO guarantee for equal-time timers on the same
-    /// operator.
-    pub(crate) fn register_timer(
+    /// The payload is serialized via bincode. If a timer already exists for the
+    /// same `(operator, fire_at_ms)` pair it is overwritten (last-write-wins).
+    pub fn register_timer<T: bincode::Encode>(
+        self: &Arc<Self>,
+        operator: &str,
+        fire_at_ms: u64,
+        payload: &T,
+    ) -> io::Result<()> {
+        let bytes = bincode::encode_to_vec(payload, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        self.register_timer_raw(operator, fire_at_ms, bytes)
+    }
+
+    /// Register a raw (pre-serialized) timer. Used internally by the dispatch layer.
+    pub(crate) fn register_timer_raw(
         self: &Arc<Self>,
         operator: &str,
         fire_at_ms: u64,
@@ -55,7 +66,7 @@ where
     }
 
     /// Cancel a pending timer for `operator` at `fire_at_ms`.
-    pub(crate) fn cancel_timer(
+    pub fn cancel_timer(
         self: &Arc<Self>,
         operator: &str,
         fire_at_ms: u64,

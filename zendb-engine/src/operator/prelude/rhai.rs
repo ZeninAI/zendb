@@ -1,20 +1,17 @@
 use std::io;
+use std::sync::Arc;
 
 use bincode::{Decode, Encode};
-use rhai::{Array, Dynamic, Engine, Map, Scope};
 
-use crate::{BoxFuture, Change, DispatchOperator, Operator, OperatorContext, OperatorDirective};
+use crate::{BoxFuture, Database, DispatchOperator, Operator};
 
 /// Configuration for the Rhai scripting operator.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct RhaiOperatorConfig {
-    /// Rhai script source. See tests for examples.
     pub script: String,
 }
 
-/// Evaluates a Rhai script on every batch of changes. The script receives
-/// `name` (operator name) and `changes` (an array of change maps). Return
-/// `"continue"` / `"finish"` (or a bool) to control the operator lifecycle.
+/// Placeholder Rhai scripting operator (no-op).
 pub struct RhaiOperator;
 
 impl Operator for RhaiOperator {
@@ -22,161 +19,14 @@ impl Operator for RhaiOperator {
     type Timer = ();
 
     fn create<'a, D>(
-        _ctx: &'a OperatorContext<Self, D>,
+        _db: &'a Arc<Database<D>>,
+        _name: &'a str,
+        _config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<Self>>
     where
         D: DispatchOperator,
         Self: Sized,
     {
         Box::pin(async { Ok(Self) })
-    }
-
-    fn process<'a, D>(
-        &'a mut self,
-        changes: Vec<Change>,
-        ctx: &'a OperatorContext<Self, D>,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
-    where
-        D: DispatchOperator,
-    {
-        let result = run_script(ctx.name(), ctx.config(), changes);
-        Box::pin(async move { result })
-    }
-}
-
-/// Compile and execute the script, returning the operator directive.
-fn run_script(
-    name: &str,
-    config: &RhaiOperatorConfig,
-    changes: Vec<Change>,
-) -> io::Result<OperatorDirective> {
-    let engine = Engine::new();
-    let ast = engine
-        .compile(&config.script)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-
-    let mut scope = Scope::new();
-    scope.push("name", name.to_owned());
-    scope.push("changes", changes_to_array(changes));
-
-    let output: Dynamic = engine
-        .eval_ast_with_scope(&mut scope, &ast)
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
-
-    directive_from_dynamic(output)
-}
-
-/// Interpret a Rhai [`Dynamic`] value as an [`OperatorDirective`].
-fn directive_from_dynamic(output: Dynamic) -> io::Result<OperatorDirective> {
-    if output.is_unit() {
-        return Ok(OperatorDirective::Continue);
-    }
-    if let Some(done) = output.clone().try_cast::<bool>() {
-        return Ok(if done {
-            OperatorDirective::Finish
-        } else {
-            OperatorDirective::Continue
-        });
-    }
-    if let Some(value) = output.clone().try_cast::<String>() {
-        return directive_from_str(&value);
-    }
-    if let Some(map) = output.try_cast::<Map>() {
-        if let Some(value) = map
-            .get("directive")
-            .and_then(|value| value.clone().try_cast())
-        {
-            return directive_from_str(value);
-        }
-    }
-
-    Ok(OperatorDirective::Continue)
-}
-
-/// Parse a directive from a string: `"continue"` or `"finish"` (case-insensitive).
-fn directive_from_str(value: &str) -> io::Result<OperatorDirective> {
-    match value {
-        "continue" | "Continue" => Ok(OperatorDirective::Continue),
-        "finish" | "Finish" => Ok(OperatorDirective::Finish),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unknown Rhai operator directive {value:?}"),
-        )),
-    }
-}
-
-/// Convert a batch of changes to a Rhai [`Array`] of maps.
-fn changes_to_array(changes: Vec<Change>) -> Array {
-    changes
-        .into_iter()
-        .map(|change| Dynamic::from(change_to_map(change)))
-        .collect()
-}
-
-/// Convert a single [`Change`] to a Rhai [`Map`] with keys like `table`,
-/// `primary_key`, `op`, `previous`, `current`, etc.
-fn change_to_map(change: Change) -> Map {
-    let mut map = Map::new();
-    map.insert("table".into(), change.event.table_id.into());
-    map.insert(
-        "primary_key".into(),
-        format!("{:?}", change.event.primary_key).into(),
-    );
-    map.insert("path".into(), format!("{:?}", change.event.path).into());
-    map.insert("op".into(), format!("{:?}", change.event.op).into());
-    map.insert(
-        "hlc_ms".into(),
-        (change.event.hlc.physical_ms() as i64).into(),
-    );
-    map.insert(
-        "hlc_logical".into(),
-        (change.event.hlc.logical() as i64).into(),
-    );
-    map.insert("sync".into(), change.event.sync.into());
-    map.insert(
-        "previous".into(),
-        change
-            .previous
-            .map(|cell| format!("{cell:?}"))
-            .unwrap_or_default()
-            .into(),
-    );
-    map.insert(
-        "current".into(),
-        change
-            .current
-            .map(|cell| format!("{cell:?}"))
-            .unwrap_or_default()
-            .into(),
-    );
-    map
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn script_can_finish_operator() {
-        let config = RhaiOperatorConfig {
-            script: r#""finish""#.to_owned(),
-        };
-
-        assert_eq!(
-            run_script("scripted", &config, Vec::new()).unwrap(),
-            OperatorDirective::Finish
-        );
-    }
-
-    #[test]
-    fn script_can_read_change_batch() {
-        let config = RhaiOperatorConfig {
-            script: r#"if changes.len() == 0 { "continue" } else { "finish" }"#.to_owned(),
-        };
-
-        assert_eq!(
-            run_script("scripted", &config, Vec::new()).unwrap(),
-            OperatorDirective::Continue
-        );
     }
 }

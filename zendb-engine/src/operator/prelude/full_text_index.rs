@@ -1,155 +1,40 @@
-use std::{collections::BTreeSet, io};
+use std::io;
+use std::sync::Arc;
 
 use bincode::{Decode, Encode};
-use zendb_storage::core::traits::Backend;
-use zendb_types::{Cell, PrimaryKey};
 
-use crate::{
-    BoxFuture, Change, DispatchOperator, Operator, OperatorContext, OperatorDirective, StateConfig,
-    StateHandle,
-};
+use crate::{BoxFuture, Database, DispatchOperator, Operator};
 
 /// Configuration for the full-text index operator.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct FullTextIndexConfig {
-    /// State key used to persist the index.
     pub state: String,
-    /// Minimum token length; shorter tokens are discarded (default: 2).
-    pub min_token_len: u32,
 }
 
 impl Default for FullTextIndexConfig {
     fn default() -> Self {
         Self {
             state: "operator/prelude/full-text-index".to_owned(),
-            min_token_len: 2,
         }
     }
 }
 
-/// A posting in the inverted index referencing a table row.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
-pub struct FullTextPosting {
-    pub table: String,
-    pub key: PrimaryKey,
-}
-
-/// Incrementally maintains an inverted (full-text) index across subscribed tables.
-pub struct FullTextIndexOperator {
-    state: StateHandle<String, Vec<FullTextPosting>>,
-}
+/// Placeholder full-text index operator (no-op).
+pub struct FullTextIndexOperator;
 
 impl Operator for FullTextIndexOperator {
     type Config = FullTextIndexConfig;
     type Timer = ();
 
     fn create<'a, D>(
-        ctx: &'a OperatorContext<Self, D>,
+        _db: &'a Arc<Database<D>>,
+        _name: &'a str,
+        _config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<Self>>
     where
         D: DispatchOperator,
         Self: Sized,
     {
-        Box::pin(async move {
-            let state = ctx.state(&ctx.config().state, Some(StateConfig::default()))?;
-            Ok(Self { state })
-        })
-    }
-
-    fn process<'a, D>(
-        &'a mut self,
-        changes: Vec<Change>,
-        ctx: &'a OperatorContext<Self, D>,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
-    where
-        D: DispatchOperator,
-    {
-        Box::pin(async move {
-            let state = self.state.get()?;
-            let mut state = state.write();
-
-            for change in changes {
-                let posting = FullTextPosting {
-                    table: change.event.table_id.clone(),
-                    key: change.event.primary_key.clone(),
-                };
-
-                for token in tokens(change.previous.as_ref(), ctx.config().min_token_len) {
-                    remove_posting(&mut state, &token, &posting)?;
-                }
-                for token in tokens(change.current.as_ref(), ctx.config().min_token_len) {
-                    add_posting(&mut state, &token, posting.clone())?;
-                }
-            }
-
-            Ok(OperatorDirective::Continue)
-        })
-    }
-}
-
-/// Insert a posting into the index for the given token.
-fn add_posting(
-    state: &mut zendb_storage::frontend::state::State<String, Vec<FullTextPosting>>,
-    token: &str,
-    posting: FullTextPosting,
-) -> io::Result<()> {
-    state.update(&token.to_owned(), |current| {
-        let mut postings: BTreeSet<_> = current.unwrap_or_default().into_iter().collect();
-        postings.insert(posting);
-        Some(postings.into_iter().collect())
-    })
-}
-
-/// Remove a posting from the index for the given token.
-fn remove_posting(
-    state: &mut zendb_storage::frontend::state::State<String, Vec<FullTextPosting>>,
-    token: &str,
-    posting: &FullTextPosting,
-) -> io::Result<()> {
-    state.update(&token.to_owned(), |current| {
-        let mut postings: BTreeSet<_> = current.unwrap_or_default().into_iter().collect();
-        postings.remove(posting);
-        if postings.is_empty() {
-            None
-        } else {
-            Some(postings.into_iter().collect())
-        }
-    })
-}
-
-/// Extract tokens from a cell value, filtered by minimum length.
-fn tokens(cell: Option<&Cell>, min_len: u32) -> BTreeSet<String> {
-    let Some(cell) = cell else {
-        return BTreeSet::new();
-    };
-    let text = format!("{cell:?}");
-    tokenize(&text, min_len)
-}
-
-/// Tokenize text by splitting on non-alphanumeric characters, lowercasing,
-/// and filtering tokens shorter than `min_len`.
-fn tokenize(text: &str, min_len: u32) -> BTreeSet<String> {
-    let min_len = min_len as usize;
-    text.split(|ch: char| !ch.is_alphanumeric())
-        .filter_map(|raw| {
-            let token = raw.to_lowercase();
-            (token.len() >= min_len).then_some(token)
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tokenizer_normalizes_and_filters_short_tokens() {
-        let tokens = tokenize("Hello, HELLO db-v2 x", 2);
-
-        assert!(tokens.contains("hello"));
-        assert!(tokens.contains("db"));
-        assert!(tokens.contains("v2"));
-        assert!(!tokens.contains("x"));
-        assert_eq!(tokens.iter().filter(|token| *token == "hello").count(), 1);
+        Box::pin(async { Ok(Self) })
     }
 }

@@ -8,7 +8,7 @@ pub use database::{
     ConcurrentState, ConcurrentTable, Database, DatabaseConfig, StateHandle, TableHandle,
 };
 pub use operator::{
-    BoxFuture, Change, DispatchConfig, DispatchOperator, Operator, OperatorContext,
+    BoxFuture, Change, DispatchConfig, DispatchOperator, Operator,
     OperatorDirective, OperatorPhase, OperatorRuntimeConfig, State, Subscription, TeardownReason,
 };
 pub use runtime::{Executor, RuntimeFuture};

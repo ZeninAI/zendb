@@ -1,12 +1,13 @@
 //! Document indexing pipeline operators and helpers.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::io;
 use std::time::{Duration, Instant};
 
 use bincode::{Decode, Encode};
 use zendb_engine::{
-    define_operator_set, BoxFuture, Change, DispatchOperator, Operator, OperatorContext,
+    define_operator_set, BoxFuture, Change, Database, DispatchOperator, Operator,
     OperatorDirective, OperatorRuntimeConfig, StateHandle, Subscription, TableConfig, TableHandle,
 };
 use zendb_storage::{core::traits::Backend, frontend::state::StateConfig};
@@ -92,15 +93,15 @@ impl Operator for IndexerOp {
     type Timer = ();
 
     fn create<'a, D>(
-        ctx: &'a OperatorContext<Self, D>,
+        db: &'a Arc<Database<D>>, name: &'a str, config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<Self>>
     where
         D: DispatchOperator,
         Self: Sized,
     {
         Box::pin(async move {
-            let index = ctx.state("index", Some(StateConfig::default()))?;
-            let stats = ctx.state("doc_stats", Some(StateConfig::default()))?;
+            let index = db.state("index", Some(StateConfig::default()))?;
+            let stats = db.state("doc_stats", Some(StateConfig::default()))?;
             Ok(Self { index, stats })
         })
     }
@@ -108,7 +109,7 @@ impl Operator for IndexerOp {
     fn process<'a, D>(
         &'a mut self,
         changes: Vec<Change>,
-        _ctx: &'a OperatorContext<Self, D>,
+        _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
     where
         D: DispatchOperator,
@@ -207,25 +208,25 @@ impl Operator for ArchiverOp {
     type Timer = ();
 
     fn create<'a, D>(
-        ctx: &'a OperatorContext<Self, D>,
+        db: &'a Arc<Database<D>>, name: &'a str, config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<Self>>
     where
         D: DispatchOperator,
         Self: Sized,
     {
         Box::pin(async move {
-            let output = ctx.table("reports", Some(TableConfig::default()))?;
-            let source_stats = ctx.state("doc_stats", None)?;
+            let output = db.table("reports", Some(TableConfig::default()))?;
+            let source_stats = db.state("doc_stats", None)?;
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64;
-            ctx.register_timer(now + 50, &())?;
+            db.register_timer(name, now + 50, &())?;
 
             Ok(Self {
                 reports_written: 0,
-                max_reports: ctx.config().max_reports,
+                max_reports: config.max_reports,
                 output,
                 source_stats,
             })
@@ -235,7 +236,7 @@ impl Operator for ArchiverOp {
     fn process<'a, D>(
         &'a mut self,
         _changes: Vec<Change>,
-        _ctx: &'a OperatorContext<Self, D>,
+        _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
     where
         D: DispatchOperator,
@@ -247,7 +248,7 @@ impl Operator for ArchiverOp {
         &'a mut self,
         _payload: (),
         _fire_at_ms: u64,
-        ctx: &'a OperatorContext<Self, D>,
+        db: &'a Arc<Database<D>>, name: &'a str, config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
     where
         D: DispatchOperator,
@@ -288,7 +289,7 @@ impl Operator for ArchiverOp {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as u64;
-                ctx.register_timer(now + 50, &())?;
+                db.register_timer(name, now + 50, &())?;
                 Ok(OperatorDirective::Continue)
             }
         })

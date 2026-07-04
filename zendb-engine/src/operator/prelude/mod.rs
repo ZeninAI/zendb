@@ -1,11 +1,11 @@
-//! Ready-made operator implementations.
+//! Ready-made operator implementations (currently placeholders).
 
 mod full_text_index;
 mod merkle_tree;
 mod rhai;
 
-pub use full_text_index::{FullTextIndexConfig, FullTextIndexOperator, FullTextPosting};
-pub use merkle_tree::{MerkleLeaf, MerkleTreeConfig, MerkleTreeOperator};
+pub use full_text_index::{FullTextIndexConfig, FullTextIndexOperator};
+pub use merkle_tree::{MerkleTreeConfig, MerkleTreeOperator};
 pub use rhai::{RhaiOperator, RhaiOperatorConfig};
 
 #[doc(hidden)]

@@ -14,10 +14,6 @@
 ///     }
 /// }
 /// ```
-///
-/// This creates `ops::OperatorInstance`, `ops::OperatorConfig`, and
-/// `ops::OperatorConfigVariant`. Use it as the `D` type parameter when creating
-/// a [`Database`].
 #[macro_export]
 macro_rules! define_operator_set {
     (
@@ -60,16 +56,8 @@ macro_rules! __zendb_define_operator_set {
             }
 
             pub enum OperatorInstance {
-                $first_variant(
-                    $first_operator,
-                    $crate::OperatorContext<$first_operator, OperatorInstance>,
-                ),
-                $(
-                    $variant(
-                        $operator,
-                        $crate::OperatorContext<$operator, OperatorInstance>,
-                    ),
-                )*
+                $first_variant($first_operator),
+                $( $variant($operator), )*
             }
 
             impl $crate::DispatchConfig for OperatorConfig {
@@ -115,10 +103,7 @@ macro_rules! __zendb_define_operator_set {
                         ));
                     };
 
-                    Ok(Self {
-                        operator,
-                        runtime,
-                    })
+                    Ok(Self { operator, runtime })
                 }
             }
 
@@ -126,32 +111,22 @@ macro_rules! __zendb_define_operator_set {
                 type Config = OperatorConfig;
 
                 fn create<'a>(
-                    db: ::std::sync::Weak<$crate::Database<Self>>,
+                    db: &'a ::std::sync::Arc<$crate::Database<Self>>,
                     name: &'a str,
                     config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<Self>> {
                     match &config.operator {
                         OperatorConfigVariant::$first_variant(inner) => {
-                            let ctx = $crate::OperatorContext::new(
-                                db,
-                                name.to_owned(),
-                                inner.clone(),
-                            );
                             Box::pin(async move {
-                                let operator = <$first_operator as $crate::Operator>::create(&ctx).await?;
-                                Ok(OperatorInstance::$first_variant(operator, ctx))
+                                let op = <$first_operator as $crate::Operator>::create(db, name, inner).await?;
+                                Ok(OperatorInstance::$first_variant(op))
                             })
                         }
                         $(
                             OperatorConfigVariant::$variant(inner) => {
-                                let ctx = $crate::OperatorContext::new(
-                                    db,
-                                    name.to_owned(),
-                                    inner.clone(),
-                                );
                                 Box::pin(async move {
-                                    let operator = <$operator as $crate::Operator>::create(&ctx).await?;
-                                    Ok(OperatorInstance::$variant(operator, ctx))
+                                    let op = <$operator as $crate::Operator>::create(db, name, inner).await?;
+                                    Ok(OperatorInstance::$variant(op))
                                 })
                             }
                         )*
@@ -161,65 +136,60 @@ macro_rules! __zendb_define_operator_set {
                 fn process<'a>(
                     &'a mut self,
                     changes: Vec<$crate::Change>,
-                    _db: ::std::sync::Weak<$crate::Database<Self>>,
-                    _name: &'a str,
-                    _config: &'a Self::Config,
+                    db: &'a ::std::sync::Arc<$crate::Database<Self>>,
+                    name: &'a str,
+                    config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
-                    match self {
-                        OperatorInstance::$first_variant(inner, ctx) => {
-                            <$first_operator as $crate::Operator>::process(inner, changes, ctx)
+                    match (self, &config.operator) {
+                        (OperatorInstance::$first_variant(inner), OperatorConfigVariant::$first_variant(cfg)) => {
+                            <$first_operator as $crate::Operator>::process(inner, changes, db, name, cfg)
                         }
                         $(
-                            OperatorInstance::$variant(inner, ctx) => {
-                                <$operator as $crate::Operator>::process(inner, changes, ctx)
+                            (OperatorInstance::$variant(inner), OperatorConfigVariant::$variant(cfg)) => {
+                                <$operator as $crate::Operator>::process(inner, changes, db, name, cfg)
                             }
                         )*
+                        _ => ::std::unreachable!("operator instance/config variant mismatch"),
                     }
                 }
 
                 fn on_input_opened<'a>(
                     &'a mut self,
                     table: String,
-                    _db: ::std::sync::Weak<$crate::Database<Self>>,
-                    _name: &'a str,
-                    _config: &'a Self::Config,
+                    db: &'a ::std::sync::Arc<$crate::Database<Self>>,
+                    name: &'a str,
+                    config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
-                    match self {
-                        OperatorInstance::$first_variant(inner, ctx) => {
-                            <$first_operator as $crate::Operator>::on_input_opened(
-                                inner, table, ctx,
-                            )
+                    match (self, &config.operator) {
+                        (OperatorInstance::$first_variant(inner), OperatorConfigVariant::$first_variant(cfg)) => {
+                            <$first_operator as $crate::Operator>::on_input_opened(inner, table, db, name, cfg)
                         }
                         $(
-                            OperatorInstance::$variant(inner, ctx) => {
-                                <$operator as $crate::Operator>::on_input_opened(
-                                    inner, table, ctx,
-                                )
+                            (OperatorInstance::$variant(inner), OperatorConfigVariant::$variant(cfg)) => {
+                                <$operator as $crate::Operator>::on_input_opened(inner, table, db, name, cfg)
                             }
                         )*
+                        _ => ::std::unreachable!("operator instance/config variant mismatch"),
                     }
                 }
 
                 fn on_input_closed<'a>(
                     &'a mut self,
                     table: String,
-                    _db: ::std::sync::Weak<$crate::Database<Self>>,
-                    _name: &'a str,
-                    _config: &'a Self::Config,
+                    db: &'a ::std::sync::Arc<$crate::Database<Self>>,
+                    name: &'a str,
+                    config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
-                    match self {
-                        OperatorInstance::$first_variant(inner, ctx) => {
-                            <$first_operator as $crate::Operator>::on_input_closed(
-                                inner, table, ctx,
-                            )
+                    match (self, &config.operator) {
+                        (OperatorInstance::$first_variant(inner), OperatorConfigVariant::$first_variant(cfg)) => {
+                            <$first_operator as $crate::Operator>::on_input_closed(inner, table, db, name, cfg)
                         }
                         $(
-                            OperatorInstance::$variant(inner, ctx) => {
-                                <$operator as $crate::Operator>::on_input_closed(
-                                    inner, table, ctx,
-                                )
+                            (OperatorInstance::$variant(inner), OperatorConfigVariant::$variant(cfg)) => {
+                                <$operator as $crate::Operator>::on_input_closed(inner, table, db, name, cfg)
                             }
                         )*
+                        _ => ::std::unreachable!("operator instance/config variant mismatch"),
                     }
                 }
 
@@ -227,72 +197,52 @@ macro_rules! __zendb_define_operator_set {
                     &'a mut self,
                     payload: Vec<u8>,
                     fire_at_ms: u64,
-                    _db: ::std::sync::Weak<$crate::Database<Self>>,
-                    _name: &'a str,
-                    _config: &'a Self::Config,
+                    db: &'a ::std::sync::Arc<$crate::Database<Self>>,
+                    name: &'a str,
+                    config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
-                    match self {
-                        OperatorInstance::$first_variant(inner, ctx) => {
+                    match (self, &config.operator) {
+                        (OperatorInstance::$first_variant(inner), OperatorConfigVariant::$first_variant(cfg)) => {
                             Box::pin(async move {
                                 let timer: <$first_operator as $crate::Operator>::Timer =
-                                    ::bincode::decode_from_slice(
-                                        &payload,
-                                        ::bincode::config::standard(),
-                                    )
-                                    .map(|(timer, _)| timer)
-                                    .map_err(|error| {
-                                        ::std::io::Error::new(
-                                            ::std::io::ErrorKind::InvalidData,
-                                            error.to_string(),
-                                        )
-                                    })?;
-                                <$first_operator as $crate::Operator>::on_timer(
-                                    inner, timer, fire_at_ms, ctx,
-                                )
-                                .await
+                                    ::bincode::decode_from_slice(&payload, ::bincode::config::standard())
+                                        .map(|(t, _)| t)
+                                        .map_err(|e| ::std::io::Error::new(::std::io::ErrorKind::InvalidData, e.to_string()))?;
+                                <$first_operator as $crate::Operator>::on_timer(inner, timer, fire_at_ms, db, name, cfg).await
                             })
                         }
                         $(
-                            OperatorInstance::$variant(inner, ctx) => {
+                            (OperatorInstance::$variant(inner), OperatorConfigVariant::$variant(cfg)) => {
                                 Box::pin(async move {
                                     let timer: <$operator as $crate::Operator>::Timer =
-                                        ::bincode::decode_from_slice(
-                                            &payload,
-                                            ::bincode::config::standard(),
-                                        )
-                                        .map(|(timer, _)| timer)
-                                        .map_err(|error| {
-                                            ::std::io::Error::new(
-                                                ::std::io::ErrorKind::InvalidData,
-                                                error.to_string(),
-                                            )
-                                        })?;
-                                    <$operator as $crate::Operator>::on_timer(
-                                        inner, timer, fire_at_ms, ctx,
-                                    )
-                                    .await
+                                        ::bincode::decode_from_slice(&payload, ::bincode::config::standard())
+                                            .map(|(t, _)| t)
+                                            .map_err(|e| ::std::io::Error::new(::std::io::ErrorKind::InvalidData, e.to_string()))?;
+                                    <$operator as $crate::Operator>::on_timer(inner, timer, fire_at_ms, db, name, cfg).await
                                 })
                             }
                         )*
+                        _ => ::std::unreachable!("operator instance/config variant mismatch"),
                     }
                 }
 
                 fn teardown<'a>(
                     &'a mut self,
                     reason: &'a $crate::TeardownReason,
-                    _db: ::std::sync::Weak<$crate::Database<Self>>,
-                    _name: &'a str,
-                    _config: &'a Self::Config,
+                    db: &'a ::std::sync::Arc<$crate::Database<Self>>,
+                    name: &'a str,
+                    config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<()>> {
-                    match self {
-                        OperatorInstance::$first_variant(inner, ctx) => {
-                            <$first_operator as $crate::Operator>::teardown(inner, reason, ctx)
+                    match (self, &config.operator) {
+                        (OperatorInstance::$first_variant(inner), OperatorConfigVariant::$first_variant(cfg)) => {
+                            <$first_operator as $crate::Operator>::teardown(inner, reason, db, name, cfg)
                         }
                         $(
-                            OperatorInstance::$variant(inner, ctx) => {
-                                <$operator as $crate::Operator>::teardown(inner, reason, ctx)
+                            (OperatorInstance::$variant(inner), OperatorConfigVariant::$variant(cfg)) => {
+                                <$operator as $crate::Operator>::teardown(inner, reason, db, name, cfg)
                             }
                         )*
+                        _ => ::std::unreachable!("operator instance/config variant mismatch"),
                     }
                 }
             }

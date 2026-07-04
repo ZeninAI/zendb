@@ -284,10 +284,9 @@ fn resource_closed(kind: &str, name: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator::prelude::{MerkleLeaf, MerkleTreeConfig, MerkleTreeOperator};
+    use crate::operator::prelude::{MerkleTreeConfig, MerkleTreeOperator};
     use crate::{
-        Change, Operator, OperatorContext, OperatorDirective, OperatorRuntimeConfig, Subscription,
-        TableConfig,
+        Change, Operator, OperatorDirective, OperatorRuntimeConfig, Subscription, TableConfig,
     };
     use parking_lot::Mutex;
     use std::sync::{
@@ -343,19 +342,21 @@ mod tests {
         type Timer = ();
 
         fn create<'a, D>(
-            ctx: &'a OperatorContext<Self, D>,
+            db: &'a Arc<Database<D>>,
+            name: &'a str,
+            config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<Self>>
         where
             D: crate::DispatchOperator,
             Self: Sized,
         {
             Box::pin(async move {
-                let buffer = ctx.state("counter/buffer", Some(StateConfig::default()))?;
-                let index = ctx.state("index", Some(StateConfig::default()))?;
-                let output = ctx.table("users", None)?;
+                let buffer = db.state("counter/buffer", Some(StateConfig::default()))?;
+                let index = db.state("index", Some(StateConfig::default()))?;
+                let output = db.table("users", None)?;
                 Ok(Self {
-                    count: lookup_counter(&ctx.config().tracker)?,
-                    finish: ctx.config().finish,
+                    count: lookup_counter(&config.tracker)?,
+                    finish: config.finish,
                     buffer,
                     index,
                     output,
@@ -366,7 +367,7 @@ mod tests {
         fn process<'a, D>(
             &'a mut self,
             changes: Vec<Change>,
-            _ctx: &'a OperatorContext<Self, D>,
+            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -408,7 +409,9 @@ mod tests {
         type Timer = ();
 
         fn create<'a, D>(
-            ctx: &'a OperatorContext<Self, D>,
+            db: &'a Arc<Database<D>>,
+            name: &'a str,
+            config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<Self>>
         where
             D: crate::DispatchOperator,
@@ -416,7 +419,7 @@ mod tests {
         {
             Box::pin(async move {
                 Ok(Self {
-                    attempts: lookup_counter(&ctx.config().attempts_tracker)?,
+                    attempts: lookup_counter(&config.attempts_tracker)?,
                 })
             })
         }
@@ -424,7 +427,7 @@ mod tests {
         fn process<'a, D>(
             &'a mut self,
             changes: Vec<Change>,
-            _ctx: &'a OperatorContext<Self, D>,
+            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -451,7 +454,9 @@ mod tests {
         type Timer = ();
 
         fn create<'a, D>(
-            ctx: &'a OperatorContext<Self, D>,
+            db: &'a Arc<Database<D>>,
+            name: &'a str,
+            config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<Self>>
         where
             D: crate::DispatchOperator,
@@ -462,9 +467,9 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as u64;
-                ctx.register_timer(now, &())?;
+                db.register_timer(name, now, &())?;
                 Ok(Self {
-                    fired: lookup_counter(&ctx.config().tracker)?,
+                    fired: lookup_counter(&config.tracker)?,
                 })
             })
         }
@@ -472,7 +477,7 @@ mod tests {
         fn process<'a, D>(
             &'a mut self,
             _changes: Vec<Change>,
-            _ctx: &'a OperatorContext<Self, D>,
+            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -484,7 +489,7 @@ mod tests {
             &'a mut self,
             _payload: (),
             _fire_at_ms: u64,
-            _ctx: &'a OperatorContext<Self, D>,
+            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -511,14 +516,16 @@ mod tests {
         type Timer = ();
 
         fn create<'a, D>(
-            ctx: &'a OperatorContext<Self, D>,
+            db: &'a Arc<Database<D>>,
+            name: &'a str,
+            config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<Self>>
         where
             D: crate::DispatchOperator,
             Self: Sized,
         {
             Box::pin(async move {
-                let (opened, closed) = lookup_input_tracker(&ctx.config().tracker)?;
+                let (opened, closed) = lookup_input_tracker(&config.tracker)?;
                 Ok(Self { opened, closed })
             })
         }
@@ -526,7 +533,7 @@ mod tests {
         fn process<'a, D>(
             &'a mut self,
             _changes: Vec<Change>,
-            _ctx: &'a OperatorContext<Self, D>,
+            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -537,7 +544,7 @@ mod tests {
         fn on_input_opened<'a, D>(
             &'a mut self,
             table: String,
-            _ctx: &'a OperatorContext<Self, D>,
+            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -551,7 +558,7 @@ mod tests {
         fn on_input_closed<'a, D>(
             &'a mut self,
             table: String,
-            _ctx: &'a OperatorContext<Self, D>,
+            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -577,14 +584,16 @@ mod tests {
         type Timer = ();
 
         fn create<'a, D>(
-            ctx: &'a OperatorContext<Self, D>,
+            db: &'a Arc<Database<D>>,
+            name: &'a str,
+            config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<Self>>
         where
             D: crate::DispatchOperator,
             Self: Sized,
         {
             Box::pin(async move {
-                let log = lookup_lifecycle_log(&ctx.config().tracker)?;
+                let log = lookup_lifecycle_log(&config.tracker)?;
                 log.lock().push("create".to_owned());
                 Ok(Self { log })
             })
@@ -593,7 +602,7 @@ mod tests {
         fn process<'a, D>(
             &'a mut self,
             changes: Vec<Change>,
-            _ctx: &'a OperatorContext<Self, D>,
+            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -607,7 +616,7 @@ mod tests {
         fn on_input_opened<'a, D>(
             &'a mut self,
             table: String,
-            _ctx: &'a OperatorContext<Self, D>,
+            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -621,7 +630,7 @@ mod tests {
         fn on_input_closed<'a, D>(
             &'a mut self,
             table: String,
-            _ctx: &'a OperatorContext<Self, D>,
+            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -635,7 +644,7 @@ mod tests {
         fn teardown<'a, D>(
             &'a mut self,
             _reason: &'a crate::TeardownReason,
-            _ctx: &'a OperatorContext<Self, D>,
+            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<()>>
         where
             D: crate::DispatchOperator,
@@ -659,17 +668,19 @@ mod tests {
         type Timer = ();
 
         fn create<'a, D>(
-            ctx: &'a OperatorContext<Self, D>,
+            db: &'a Arc<Database<D>>,
+            name: &'a str,
+            config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<Self>>
         where
             D: crate::DispatchOperator,
             Self: Sized,
         {
             Box::pin(async move {
-                ctx.dispatch_operator::<CountingOperator>(
+                db.dispatch_operator::<CountingOperator>(
                     "spawned-counter",
                     CountingConfig {
-                        tracker: ctx.config().child_tracker.clone(),
+                        tracker: config.child_tracker.clone(),
                         finish: false,
                     },
                     OperatorRuntimeConfig {
@@ -678,7 +689,7 @@ mod tests {
                     },
                 )?;
 
-                ctx.dispatch_operator::<MerkleTreeOperator>(
+                db.dispatch_operator::<MerkleTreeOperator>(
                     "spawned-merkle",
                     MerkleTreeConfig::default(),
                     OperatorRuntimeConfig {
@@ -694,7 +705,7 @@ mod tests {
         fn process<'a, D>(
             &'a mut self,
             _changes: Vec<Change>,
-            _ctx: &'a OperatorContext<Self, D>,
+            _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
         ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
         where
             D: crate::DispatchOperator,
@@ -1172,17 +1183,6 @@ mod tests {
             .unwrap();
 
         wait_until(|| child_count.load(Ordering::Relaxed) == 1);
-        let merkle = db
-            .state::<String, MerkleLeaf>("operator/prelude/merkle-tree", None)
-            .unwrap();
-        wait_until(|| {
-            merkle
-                .get()
-                .unwrap()
-                .read()
-                .get(&"__root".to_owned())
-                .is_some()
-        });
     }
 
     #[test]

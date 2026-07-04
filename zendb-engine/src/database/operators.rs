@@ -160,14 +160,17 @@ where
         phase: OperatorPhase,
         subscriptions: &[Subscription],
     ) {
+        // Remove from in-memory workers (drops the inputs/consumers).
         if let Some(worker) = self.operators.write().remove(name) {
             worker.delete_inputs();
         }
 
         // Delete consumer offsets from every matching table.
-        let tables: Vec<(String, TableConfig)> = self
-            .table_catalog
-            .lock()
+        // Hold table_catalog lock for the entire loop to serialize with
+        // db.table()'s slow path — prevents two threads from opening the
+        // same table file simultaneously.
+        let table_catalog = self.table_catalog.lock();
+        let tables: Vec<(String, TableConfig)> = table_catalog
             .entries()
             .filter(|(tbl, _)| subscriptions.iter().any(|sub| sub.matches(tbl.as_ref())))
             .map(|(tbl, cfg)| (tbl.into_owned(), cfg.into_owned()))
@@ -191,6 +194,7 @@ where
                 );
             }
         }
+        drop(table_catalog);
 
         // Delete all timers belonging to this operator.
         let mut timers = self.timers.write();
@@ -204,7 +208,8 @@ where
         }
         drop(timers);
 
-        // Update the catalog phase.
+        // Update the catalog phase LAST so external observers can rely on the
+        // terminal phase as a signal that all cleanup is done.
         if let Err(error) = self
             .operator_catalog
             .lock()
@@ -224,11 +229,11 @@ where
     /// respawned later if a matching table reopens.
     ///
     /// Returns `true` if the operator was suspended, `false` if it gained
-    /// inputs during the race window (caller should continue running).
+    /// inputs during the race window or is being shut down by another thread.
     pub(crate) fn suspend_operator(&self, name: &str) -> bool {
         let mut operators = self.operators.write();
         if let Some(worker) = operators.get(name) {
-            if worker.has_inputs() {
+            if worker.has_inputs() || worker.is_shutting_down() {
                 return false;
             }
         }

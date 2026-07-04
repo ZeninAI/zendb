@@ -1332,12 +1332,17 @@ mod tests {
             .insert_event(event("users", 2, 110))
             .unwrap();
 
-        wait_until(|| db.operator_phase("counter") == Some(OperatorPhase::Finished));
+        wait_until(|| {
+            db.operator_phase("counter") == Some(OperatorPhase::Finished)
+                && !db.is_operator_open("counter")
+        });
 
         let orders = db.table("orders", None).unwrap();
         let orders_table = orders.get().unwrap();
-        let mut consumer = orders_table.read().consumer("counter").unwrap();
-        assert!(consumer.next().is_none());
+        wait_until(|| {
+            let mut consumer = orders_table.read().consumer("counter").unwrap();
+            consumer.next().is_none()
+        });
     }
 
     #[test]

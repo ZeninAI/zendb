@@ -143,6 +143,10 @@ where
         self.lifecycle.lock().begin_shutdown(phase, input_tables);
     }
 
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.lifecycle.lock().is_shutting_down()
+    }
+
     pub(crate) fn peek_event(&self) -> Option<LifecycleEvent> {
         self.lifecycle.lock().peek().cloned()
     }

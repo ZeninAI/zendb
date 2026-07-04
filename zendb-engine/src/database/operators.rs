@@ -224,6 +224,31 @@ where
         }
     }
 
+    /// Delete an operator from the durable catalog. Only operators in a
+    /// terminal state (Finished, Failed, Cancelled) can be deleted. Active
+    /// operators must be cancelled first.
+    pub fn delete_terminal_operator(&self, name: &str) -> io::Result<()> {
+        let mut catalog = self.operator_catalog.lock();
+        let phase = catalog
+            .get(&name.to_owned())
+            .map(|entry| entry.as_ref().phase.clone());
+
+        match phase {
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("operator {name:?} does not exist"),
+            )),
+            Some(OperatorPhase::Active) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("operator {name:?} is not in a terminal state, please cancel first"),
+            )),
+            Some(OperatorPhase::Finished | OperatorPhase::Failed { .. } | OperatorPhase::Cancelled) => {
+                catalog.delete(&name.to_owned())?;
+                Ok(())
+            }
+        }
+    }
+
     /// Remove a live worker from memory without changing its durable phase.
     /// Used when an active operator runs out of open input tables and should be
     /// respawned later if a matching table reopens.

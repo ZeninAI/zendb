@@ -83,7 +83,7 @@ pub struct DatabaseConfig {
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
-            graceful_shutdown_max_duration: Duration::from_secs(5),
+            graceful_shutdown_max_duration: Duration::from_secs(7),
         }
     }
 }

@@ -5,8 +5,7 @@ mod merkle_tree;
 mod rhai;
 
 pub use full_text_index::{
-    FtiStateKey, FtiStateValue, FullTextIndexConfig, FullTextIndexFacet, FullTextIndexOperator,
-    SearchHit,
+    FullTextIndexConfig, FullTextIndexFacet, FullTextIndexOperator, SearchHit,
 };
 pub use merkle_tree::{
     MerkleEntry, MerkleLeaf, MerkleNode, MerkleRoot, MerkleTreeConfig, MerkleTreeFacet,

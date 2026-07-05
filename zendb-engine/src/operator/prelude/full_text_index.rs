@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashSet;
 use std::future::Future;
 use std::io;
@@ -7,12 +6,12 @@ use std::sync::Arc;
 use bincode::{Decode, Encode};
 use hashbrown::HashMap;
 use parking_lot::RwLock;
+use zendb_storage::core::keydir::KeyDirConfig;
 use zendb_storage::core::traits::Backend;
 use zendb_types::{Cell, PrimaryKey, Value};
 
 use crate::{
-    Change, Database, DispatchOperator, Operator, OperatorDirective, StateConfig,
-    StateHandle,
+    Change, Database, DispatchOperator, Operator, OperatorDirective, StateConfig, StateHandle,
 };
 
 /// Configuration for the full-text index operator.
@@ -33,25 +32,6 @@ impl Default for FullTextIndexConfig {
     }
 }
 
-/// Key for the full-text index state.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
-pub enum FtiStateKey {
-    /// Posting list for a token: maps token → set of (table, primary_key).
-    Posting(String),
-    /// Forward index: maps (table, primary_key) → set of tokens for that entry.
-    /// Used for efficient deletion/update without scanning all posting lists.
-    Forward(PrimaryKey),
-}
-
-/// Value for the full-text index state.
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub enum FtiStateValue {
-    /// Set of (table, primary_key) pairs that contain this token.
-    PostingList(HashSet<PrimaryKey>),
-    /// Set of tokens extracted from a particular entry.
-    TokenSet(HashSet<String>),
-}
-
 /// A single search hit with its score.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchHit {
@@ -63,6 +43,23 @@ pub struct SearchHit {
     pub score: f64,
 }
 
+/// Per-table index state handles.
+struct TableIndex {
+    /// Posting lists: token → set of primary keys containing that token.
+    posting: StateHandle<String, HashSet<PrimaryKey>>,
+    /// Forward index: primary key → set of tokens for that entry.
+    forward: StateHandle<PrimaryKey, HashSet<String>>,
+}
+
+impl Clone for TableIndex {
+    fn clone(&self) -> Self {
+        Self {
+            posting: self.posting.clone(),
+            forward: self.forward.clone(),
+        }
+    }
+}
+
 /// Full-text index operator.
 ///
 /// Maintains a token-level inverted index (posting lists) and a forward index
@@ -70,7 +67,7 @@ pub struct SearchHit {
 /// `Value::String` cells; other value types are ignored.
 pub struct FullTextIndexOperator {
     base_state: String,
-    states: Arc<RwLock<HashMap<String, StateHandle<FtiStateKey, FtiStateValue>>>>,
+    indexes: Arc<RwLock<HashMap<String, TableIndex>>>,
     min_token_len: usize,
 }
 
@@ -79,7 +76,7 @@ pub struct FullTextIndexOperator {
 /// Obtained via [`Database::facet`] while the operator is running.
 #[derive(Clone)]
 pub struct FullTextIndexFacet {
-    states: Arc<RwLock<HashMap<String, StateHandle<FtiStateKey, FtiStateValue>>>>,
+    indexes: Arc<RwLock<HashMap<String, TableIndex>>>,
 }
 
 impl FullTextIndexFacet {
@@ -97,40 +94,33 @@ impl FullTextIndexFacet {
 
     /// Return all entries in `table` containing the exact token.
     pub fn lookup_token(&self, table: &str, token: &str) -> io::Result<HashSet<PrimaryKey>> {
-        let Some(state) = self.table_state(table) else {
+        let Some(index) = self.table_index(table) else {
             return Ok(HashSet::new());
         };
-        let state = state.get()?;
+        let state = index.posting.get()?;
         let guard = state.read();
-        let key = FtiStateKey::Posting(token.to_lowercase());
-        Ok(match guard.get(&key) {
-            Some(value) => match value.into_owned() {
-                FtiStateValue::PostingList(set) => set,
-                _ => HashSet::new(),
-            },
-            None => HashSet::new(),
-        })
+        let key = token.to_lowercase();
+        Ok(guard
+            .get(&key)
+            .map(|v| v.into_owned())
+            .unwrap_or_default())
     }
 
     /// Return the set of tokens indexed for a particular entry.
     pub fn tokens_for_entry(&self, table: &str, key: &PrimaryKey) -> io::Result<HashSet<String>> {
-        let Some(state) = self.table_state(table) else {
+        let Some(index) = self.table_index(table) else {
             return Ok(HashSet::new());
         };
-        let state = state.get()?;
+        let state = index.forward.get()?;
         let guard = state.read();
-        let fwd_key = FtiStateKey::Forward(key.clone());
-        Ok(match guard.get(&fwd_key) {
-            Some(value) => match value.into_owned() {
-                FtiStateValue::TokenSet(set) => set,
-                _ => HashSet::new(),
-            },
-            None => HashSet::new(),
-        })
+        Ok(guard
+            .get(key)
+            .map(|v| v.into_owned())
+            .unwrap_or_default())
     }
 
-    fn table_state(&self, table: &str) -> Option<StateHandle<FtiStateKey, FtiStateValue>> {
-        self.states.read().get(table).cloned()
+    fn table_index(&self, table: &str) -> Option<TableIndex> {
+        self.indexes.read().get(table).cloned()
     }
 
     fn search_tokens(
@@ -139,28 +129,23 @@ impl FullTextIndexFacet {
         tokens: &[String],
         limit: usize,
     ) -> io::Result<Vec<SearchHit>> {
-        let Some(state) = self.table_state(table) else {
+        let Some(index) = self.table_index(table) else {
             return Ok(Vec::new());
         };
-        let state = state.get()?;
+        let state = index.posting.get()?;
         let guard = state.read();
 
-        // Collect posting lists for each query token.
         let mut hit_counts: HashMap<PrimaryKey, usize> = HashMap::new();
         let num_query_tokens = tokens.len();
 
         for token in tokens {
-            let key = FtiStateKey::Posting(token.clone());
-            if let Some(value) = guard.get(&key) {
-                if let FtiStateValue::PostingList(postings) = value.into_owned() {
-                    for pk in postings {
-                        *hit_counts.entry(pk).or_insert(0) += 1;
-                    }
+            if let Some(postings) = guard.get(token) {
+                for pk in postings.into_owned() {
+                    *hit_counts.entry(pk).or_insert(0) += 1;
                 }
             }
         }
 
-        // Score and rank.
         let mut hits: Vec<SearchHit> = hit_counts
             .into_iter()
             .map(|(key, matched)| {
@@ -174,7 +159,6 @@ impl FullTextIndexFacet {
             })
             .collect();
 
-        // Sort by score descending, then by matched_tokens descending.
         hits.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -184,6 +168,11 @@ impl FullTextIndexFacet {
         hits.truncate(limit);
         Ok(hits)
     }
+}
+
+/// State config for FTI: unordered (KeyDir) since we only do exact lookups.
+fn state_config() -> StateConfig {
+    StateConfig::Unordered(KeyDirConfig::default())
 }
 
 impl Operator for FullTextIndexOperator {
@@ -203,7 +192,7 @@ impl Operator for FullTextIndexOperator {
         async move {
             let mut op = Self {
                 base_state: config.state.clone(),
-                states: Arc::new(RwLock::new(HashMap::new())),
+                indexes: Arc::new(RwLock::new(HashMap::new())),
                 min_token_len: config.min_token_len,
             };
             op.reconcile_orphaned_tables(db)?;
@@ -213,7 +202,7 @@ impl Operator for FullTextIndexOperator {
 
     fn facet(&self) -> FullTextIndexFacet {
         FullTextIndexFacet {
-            states: Arc::clone(&self.states),
+            indexes: Arc::clone(&self.indexes),
         }
     }
 
@@ -228,7 +217,17 @@ impl Operator for FullTextIndexOperator {
         D: DispatchOperator,
     {
         async move {
-            self.rebuild_table(db, &table)?;
+            // Only rebuild if we don't already have index state for this table.
+            // The operator processes changes incrementally via process(), so
+            // a rebuild is only needed on first open or after state was deleted.
+            let needs_rebuild = {
+                let indexes = self.indexes.read();
+                !indexes.contains_key(&table)
+            };
+
+            if needs_rebuild {
+                self.rebuild_table(db, &table)?;
+            }
             Ok(OperatorDirective::Continue)
         }
     }
@@ -244,13 +243,11 @@ impl Operator for FullTextIndexOperator {
         D: DispatchOperator,
     {
         async move {
-            // If the table was deleted (not just closed), clean up its index entries.
-            // The table is already removed from the catalog by this point.
-            // For now, we keep the index entries alive — they can be cleaned up
-            // on the next rebuild if the table reappears, or removed explicitly.
+            // If the table was deleted, clean up its index state.
             if !db.contains_table(&table) {
-                self.states.write().remove(&table);
-                let _ = db.delete_state(&table_state_name(&self.base_state, &table))?;
+                self.indexes.write().remove(&table);
+                let _ = db.delete_state(&posting_state_name(&self.base_state, &table));
+                let _ = db.delete_state(&forward_state_name(&self.base_state, &table));
             }
             Ok(OperatorDirective::Continue)
         }
@@ -267,50 +264,90 @@ impl Operator for FullTextIndexOperator {
         D: DispatchOperator,
     {
         async move {
+            // Group changes by table to reduce state handle lookups.
+            let mut by_table: HashMap<String, Vec<(PrimaryKey, Option<Cell>, Option<Cell>)>> =
+                HashMap::new();
+
             for change in changes {
-                let table = change.event.table_id.clone();
-                let pk = change.event.primary_key.clone();
-                let state = self.table_state(db, &table)?;
-                let state = state.get()?;
-                let mut state = state.write();
+                let table = change.event.table_id;
+                let pk = change.event.primary_key;
+                by_table
+                    .entry(table)
+                    .or_default()
+                    .push((pk, change.previous, change.current));
+            }
 
-                let old_tokens = get_forward_tokens(&state, &pk);
-                let new_tokens = change
-                    .current
-                    .as_ref()
-                    .map(|cell| extract_tokens(cell, self.min_token_len))
-                    .unwrap_or_default();
+            for (table, table_changes) in by_table {
+                let index = self.table_index(db, &table)?;
+                let posting_state = index.posting.get()?;
+                let forward_state = index.forward.get()?;
 
-                // Compute tokens to remove and add.
-                let to_remove: Vec<String> = old_tokens.difference(&new_tokens).cloned().collect();
-                let to_add: Vec<String> = new_tokens.difference(&old_tokens).cloned().collect();
+                // Batch updates: collect all posting list modifications.
+                let mut posting_removals: HashMap<String, Vec<PrimaryKey>> = HashMap::new();
+                let mut posting_additions: HashMap<String, Vec<PrimaryKey>> = HashMap::new();
 
-                if to_remove.is_empty() && to_add.is_empty() {
-                    continue;
+                for (pk, _previous, current) in table_changes {
+                    // Get old tokens from forward index.
+                    let old_tokens: HashSet<String> = forward_state
+                        .read()
+                        .get(&pk)
+                        .map(|v| v.into_owned())
+                        .unwrap_or_default();
+
+                    // Extract new tokens from current cell.
+                    let new_tokens = current
+                        .as_ref()
+                        .map(|cell| extract_tokens(cell, self.min_token_len))
+                        .unwrap_or_default();
+
+                    // Compute diff.
+                    for token in old_tokens.difference(&new_tokens) {
+                        posting_removals
+                            .entry(token.clone())
+                            .or_default()
+                            .push(pk.clone());
+                    }
+                    for token in new_tokens.difference(&old_tokens) {
+                        posting_additions
+                            .entry(token.clone())
+                            .or_default()
+                            .push(pk.clone());
+                    }
+
+                    // Update forward index.
+                    let mut forward_write = forward_state.write();
+                    if new_tokens.is_empty() {
+                        forward_write.delete(&pk)?;
+                    } else {
+                        forward_write.put(pk, new_tokens)?;
+                    }
                 }
 
-                // Remove from old posting lists.
-                for token in &to_remove {
-                    let posting_key = FtiStateKey::Posting(token.clone());
-                    update_posting_list(&mut state, &posting_key, |set| {
-                        set.remove(&pk);
-                    })?;
+                // Apply batched posting list updates.
+                let mut posting_write = posting_state.write();
+
+                for (token, pks_to_remove) in posting_removals {
+                    if let Some(mut set) = posting_write.get(&token).map(|v| v.into_owned()) {
+                        for pk in pks_to_remove {
+                            set.remove(&pk);
+                        }
+                        if set.is_empty() {
+                            posting_write.delete(&token)?;
+                        } else {
+                            posting_write.put(token, set)?;
+                        }
+                    }
                 }
 
-                // Add to new posting lists.
-                for token in &to_add {
-                    let posting_key = FtiStateKey::Posting(token.clone());
-                    update_posting_list(&mut state, &posting_key, |set| {
-                        set.insert(pk.clone());
-                    })?;
-                }
-
-                // Update forward index.
-                let fwd_key = FtiStateKey::Forward(pk);
-                if new_tokens.is_empty() {
-                    state.delete(&fwd_key)?;
-                } else {
-                    state.put(fwd_key, FtiStateValue::TokenSet(new_tokens))?;
+                for (token, pks_to_add) in posting_additions {
+                    let mut set = posting_write
+                        .get(&token)
+                        .map(|v| v.into_owned())
+                        .unwrap_or_default();
+                    for pk in pks_to_add {
+                        set.insert(pk);
+                    }
+                    posting_write.put(token, set)?;
                 }
             }
 
@@ -320,24 +357,23 @@ impl Operator for FullTextIndexOperator {
 }
 
 impl FullTextIndexOperator {
-    fn table_state<D>(
+    fn table_index<D>(
         &mut self,
         db: &Arc<Database<D>>,
         table: &str,
-    ) -> io::Result<StateHandle<FtiStateKey, FtiStateValue>>
+    ) -> io::Result<TableIndex>
     where
         D: DispatchOperator,
     {
-        if let Some(state) = self.states.read().get(table).cloned() {
-            return Ok(state);
+        if let Some(index) = self.indexes.read().get(table).cloned() {
+            return Ok(index);
         }
 
-        let state = db.state(
-            &table_state_name(&self.base_state, table),
-            Some(StateConfig::default()),
-        )?;
-        self.states.write().insert(table.to_owned(), state.clone());
-        Ok(state)
+        let posting = db.state(&posting_state_name(&self.base_state, table), Some(state_config()))?;
+        let forward = db.state(&forward_state_name(&self.base_state, table), Some(state_config()))?;
+        let index = TableIndex { posting, forward };
+        self.indexes.write().insert(table.to_owned(), index.clone());
+        Ok(index)
     }
 
     /// Full rebuild: scan all entries in the table and reindex from scratch.
@@ -349,12 +385,20 @@ impl FullTextIndexOperator {
         let table_guard = table_handle.get()?;
         let table_read = table_guard.read();
 
-        let state = self.table_state(db, table)?;
-        let state = state.get()?;
-        let mut state = state.write();
-        state.clear()?;
+        let index = self.table_index(db, table)?;
+        let posting_state = index.posting.get()?;
+        let forward_state = index.forward.get()?;
 
-        // Rebuild from table contents.
+        // Clear existing index data.
+        posting_state.write().clear()?;
+        forward_state.write().clear()?;
+
+        // Build posting lists in memory first, then write all at once before
+        // writing forward entries. This ensures posting lists are available
+        // when forward index is queried.
+        let mut posting_lists: HashMap<String, HashSet<PrimaryKey>> = HashMap::new();
+        let mut forward_entries: Vec<(PrimaryKey, HashSet<String>)> = Vec::new();
+
         for (pk, cell) in table_read.entries() {
             let pk = pk.into_owned();
             let tokens = extract_tokens(cell.as_ref(), self.min_token_len);
@@ -363,35 +407,61 @@ impl FullTextIndexOperator {
             }
 
             for token in &tokens {
-                let posting_key = FtiStateKey::Posting(token.clone());
-                update_posting_list(&mut state, &posting_key, |set| {
-                    set.insert(pk.clone());
-                })?;
+                posting_lists
+                    .entry(token.clone())
+                    .or_default()
+                    .insert(pk.clone());
             }
 
-            state.put(FtiStateKey::Forward(pk), FtiStateValue::TokenSet(tokens))?;
+            forward_entries.push((pk, tokens));
+        }
+
+        // Write posting lists FIRST.
+        {
+            let mut posting_write = posting_state.write();
+            for (token, pks) in posting_lists {
+                posting_write.put(token, pks)?;
+            }
+        }
+
+        // Then write forward entries. This is what wait_until checks,
+        // so posting lists must be complete before this.
+        {
+            let mut forward_write = forward_state.write();
+            for (pk, tokens) in forward_entries {
+                forward_write.put(pk, tokens)?;
+            }
         }
 
         Ok(())
     }
 
     /// Remove index entries for tables that no longer exist in the catalog.
-    /// Called once during `create()` to handle tables deleted while the
-    /// operator was suspended.
     fn reconcile_orphaned_tables<D>(&mut self, db: &Arc<Database<D>>) -> io::Result<()>
     where
         D: DispatchOperator,
     {
-        let prefix = format!("{}/", self.base_state.trim_end_matches('/'));
+        let posting_prefix = format!("{}/posting/", self.base_state.trim_end_matches('/'));
+        let forward_prefix = format!("{}/forward/", self.base_state.trim_end_matches('/'));
+
         for state_name in db.list_states() {
-            let Some(table) = state_name.strip_prefix(&prefix) else {
+            let table = if let Some(t) = state_name.strip_prefix(&posting_prefix) {
+                t
+            } else if let Some(t) = state_name.strip_prefix(&forward_prefix) {
+                t
+            } else {
                 continue;
             };
+
             if db.contains_table(table) {
-                let state = db.state(&state_name, Some(StateConfig::default()))?;
-                self.states.write().insert(table.to_owned(), state);
+                // Load existing index handles.
+                let posting = db.state(&posting_state_name(&self.base_state, table), Some(state_config()))?;
+                let forward = db.state(&forward_state_name(&self.base_state, table), Some(state_config()))?;
+                self.indexes.write().insert(table.to_owned(), TableIndex { posting, forward });
             } else {
-                let _ = db.delete_state(&state_name)?;
+                // Orphaned — delete.
+                let _ = db.delete_state(&posting_state_name(&self.base_state, table));
+                let _ = db.delete_state(&forward_state_name(&self.base_state, table));
             }
         }
         Ok(())
@@ -402,8 +472,12 @@ impl FullTextIndexOperator {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn table_state_name(base: &str, table: &str) -> String {
-    format!("{}/{}", base.trim_end_matches('/'), table)
+fn posting_state_name(base: &str, table: &str) -> String {
+    format!("{}/posting/{}", base.trim_end_matches('/'), table)
+}
+
+fn forward_state_name(base: &str, table: &str) -> String {
+    format!("{}/forward/{}", base.trim_end_matches('/'), table)
 }
 
 /// Tokenize text: lowercase, split on non-alphanumeric, filter by min length.
@@ -415,88 +489,47 @@ fn tokenize(text: &str, min_len: usize) -> Vec<String> {
         .collect()
 }
 
-/// Recursively collect all text fragments from a value.
-fn collect_text(value: &Value, out: &mut Vec<String>) {
+/// Extract indexable tokens from a cell value.
+fn extract_tokens(cell: &Cell, min_token_len: usize) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    if let Some(value) = &cell.value {
+        extract_tokens_from_value(value, min_token_len, &mut tokens);
+    }
+    tokens
+}
+
+fn extract_tokens_from_value(value: &Value, min_len: usize, tokens: &mut HashSet<String>) {
     match value {
         Value::String(s) => {
-            if !s.is_empty() {
-                out.push(s.clone());
+            for token in tokenize(s, min_len) {
+                tokens.insert(token);
             }
         }
         Value::Text(t) => {
             let s = t.string();
-            if !s.is_empty() {
-                out.push(s);
+            for token in tokenize(&s, min_len) {
+                tokens.insert(token);
             }
         }
         Value::Record(r) => {
             for (_, cell) in r.fields() {
                 if let Some(v) = &cell.value {
-                    collect_text(v, out);
+                    extract_tokens_from_value(v, min_len, tokens);
                 }
             }
         }
         Value::List(l) => {
             for cell in l.cells() {
                 if let Some(v) = &cell.value {
-                    collect_text(v, out);
+                    extract_tokens_from_value(v, min_len, tokens);
                 }
             }
         }
         Value::MvRegister(mv) => {
             for v in mv.values() {
-                collect_text(v, out);
+                extract_tokens_from_value(v, min_len, tokens);
             }
         }
         _ => {}
     }
-}
-
-/// Extract indexable tokens from a cell value by recursively walking containers.
-fn extract_tokens(cell: &Cell, min_token_len: usize) -> HashSet<String> {
-    let mut texts = Vec::new();
-    if let Some(value) = &cell.value {
-        collect_text(value, &mut texts);
-    }
-    let mut tokens = HashSet::new();
-    for text in texts {
-        for token in tokenize(&text, min_token_len) {
-            tokens.insert(token);
-        }
-    }
-    tokens
-}
-
-/// Read the forward token set for an entry from state.
-fn get_forward_tokens(
-    state: &crate::State<FtiStateKey, FtiStateValue>,
-    key: &PrimaryKey,
-) -> HashSet<String> {
-    let fwd_key = FtiStateKey::Forward(key.clone());
-    match state.get(&fwd_key) {
-        Some(value) => match value.into_owned() {
-            FtiStateValue::TokenSet(set) => set,
-            _ => HashSet::new(),
-        },
-        None => HashSet::new(),
-    }
-}
-
-/// Update a posting list in-place: read, apply mutation, write back (or delete if empty).
-fn update_posting_list(
-    state: &mut crate::State<FtiStateKey, FtiStateValue>,
-    key: &FtiStateKey,
-    f: impl FnOnce(&mut HashSet<PrimaryKey>),
-) -> io::Result<()> {
-    let mut set = match state.get(key).map(Cow::into_owned) {
-        Some(FtiStateValue::PostingList(s)) => s,
-        _ => HashSet::new(),
-    };
-    f(&mut set);
-    if set.is_empty() {
-        state.delete(key)?;
-    } else {
-        state.put(key.clone(), FtiStateValue::PostingList(set))?;
-    }
-    Ok(())
 }

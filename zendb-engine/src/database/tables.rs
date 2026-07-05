@@ -2,6 +2,7 @@
 
 use std::{fs, io, sync::Arc};
 
+use log::{debug, info, trace};
 use parking_lot::RwLock;
 use zendb_storage::core::traits::{Backend, DurableStorage};
 use zendb_storage::frontend::table::{Table, TableConfig};
@@ -56,6 +57,7 @@ where
             return false;
         }
 
+        info!("closing table {name:?}");
         let workers: Vec<_> = self.operators.read().values().cloned().collect();
         for worker in workers {
             worker.detach_input(name);
@@ -93,6 +95,7 @@ where
         if path.exists() {
             fs::remove_dir_all(&path)?;
         }
+        info!("deleted table {name:?}");
         Ok(true)
     }
 
@@ -107,6 +110,7 @@ where
     ) -> io::Result<TableHandle> {
         // Fast path: already open
         if let Some(table) = self.tables.read().get(name).cloned() {
+            trace!("table {name:?} already open, returning cached handle");
             return Ok(TableHandle::new(name, &table));
         }
 
@@ -129,6 +133,7 @@ where
                         _ => saved_config.clone(),
                     };
                     let path = self.path.join(TABLES_DIR).join(name);
+                    info!("opening existing table {name:?}");
                     Arc::new(RwLock::new(Table::open(&path, effective_config)?))
                 }
                 None => {
@@ -137,6 +142,7 @@ where
                     if let Some(parent) = path.parent() {
                         fs::create_dir_all(parent)?;
                     }
+                    info!("creating new table {name:?}");
                     let raw = Table::create(&path, config.clone())?;
                     table_catalog.put(name.to_owned(), config)?;
                     Arc::new(RwLock::new(raw))
@@ -151,6 +157,10 @@ where
         };
         // Catalog locks released; safe to spawn (workers may call retire() immediately).
 
+        debug!(
+            "spawning {} subscriber(s) for table {name:?}",
+            workers_to_spawn.len()
+        );
         for worker in workers_to_spawn {
             worker.spawn(self);
         }
@@ -185,6 +195,11 @@ where
             })
             .collect();
 
+        debug!(
+            "table {name:?} matched {} operator(s)",
+            matching_operators.len()
+        );
+
         let mut to_spawn = Vec::new();
         for (op_name, op_config) in matching_operators {
             // Hold the write lock to serialize with suspend_operator — prevents
@@ -192,8 +207,10 @@ where
             let mut operators = self.operators.write();
             if let Some(worker) = operators.get(&op_name).cloned() {
                 let reader = table.read().consumer(worker.name())?;
+                trace!("attaching input {name:?} to running operator {op_name:?}");
                 worker.attach_input(OperatorInput::new(name.to_owned(), reader));
             } else {
+                trace!("building new worker for catalog operator {op_name:?}");
                 let worker = self.build_worker(op_name.clone(), op_config)?;
                 operators.insert(op_name, Arc::clone(&worker));
                 to_spawn.push(worker);

@@ -33,7 +33,7 @@ use super::{BoxFuture, Change, OperatorDirective, OperatorPhase, OperatorRuntime
 ///                                   │
 ///                                   ▼
 ///                          ┌────────────────┐
-///                          │   teardown     │ ← reason: Finished/Failed/Cancelled
+///                          │   teardown     │ ← reason: Active/Finished/Failed/Cancelled
 ///                          └────────────────┘
 /// ```
 ///

@@ -13,7 +13,7 @@
 //! once the operator is activated again.
 //!
 //! Timer eviction is owned by the worker: `cancel_timer` is called after
-//! successful `on_timer`. On operator retirement, `cancel_operator_timers`
+//! successful `on_timer`. On operator retirement, `retire_operator`
 //! sweeps any remaining timers for that operator.
 
 use std::{
@@ -22,6 +22,7 @@ use std::{
     time::Duration,
 };
 
+use log::{debug, trace};
 use parking_lot::{Condvar, Mutex};
 use zendb_storage::core::traits::Backend;
 
@@ -42,25 +43,21 @@ where
         fire_at_ms: u64,
         payload: &T,
     ) -> io::Result<()> {
+        trace!("registering timer for operator {operator:?} at {fire_at_ms}ms");
         let bytes = bincode::encode_to_vec(payload, bincode::config::standard())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         self.register_timer_raw(operator, fire_at_ms, bytes)
     }
 
     /// Cancel a pending timer for `operator` at `fire_at_ms`.
-    pub fn cancel_timer(
-        self: &Arc<Self>,
-        operator: &str,
-        fire_at_ms: u64,
-    ) -> io::Result<()> {
+    pub fn cancel_timer(self: &Arc<Self>, operator: &str, fire_at_ms: u64) -> io::Result<()> {
+        trace!("cancelling timer for operator {operator:?} at {fire_at_ms}ms");
         let key = TimerKey {
             fire_at_ms,
             operator: operator.to_owned(),
         };
         self.timers.write().delete(&key).map(|_| ())
     }
-
-    // --- Internal ---
 
     /// Register a raw (pre-serialized) timer. Used internally by the dispatch layer.
     pub(crate) fn register_timer_raw(
@@ -137,6 +134,9 @@ where
         };
         let now = now_ms();
         let (fired, next_ms) = db.take_due_timers(now);
+        if !fired.is_empty() {
+            debug!("timer scheduler firing {} timer(s)", fired.len());
+        }
         for (operator, fire_at_ms, payload) in fired {
             db.deliver_timer(&operator, fire_at_ms, payload);
         }

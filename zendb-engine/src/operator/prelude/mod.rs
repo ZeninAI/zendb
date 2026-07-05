@@ -5,7 +5,10 @@ mod merkle_tree;
 mod rhai;
 
 pub use full_text_index::{FullTextIndexConfig, FullTextIndexOperator};
-pub use merkle_tree::{MerkleTreeConfig, MerkleTreeOperator};
+pub use merkle_tree::{
+    MerkleEntry, MerkleLeaf, MerkleNode, MerkleRoot, MerkleTreeConfig, MerkleTreeOperator,
+    MerkleTreeStateKey, MerkleTreeStateValue,
+};
 pub use rhai::{RhaiOperator, RhaiOperatorConfig};
 
 #[doc(hidden)]

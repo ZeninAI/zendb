@@ -26,6 +26,8 @@ use zendb_storage::frontend::{
     table::Table,
 };
 
+use log::{debug, info};
+
 use crate::{
     operator::worker::OperatorWorker, runtime::Executor, DispatchOperator, OperatorPhase,
     TableConfig,
@@ -116,7 +118,10 @@ impl TableHandle {
         self.inner.upgrade().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
-                format!("table {:?} is unavailable because its database was dropped", self.name),
+                format!(
+                    "table {:?} is unavailable because its database was dropped",
+                    self.name
+                ),
             )
         })
     }
@@ -157,7 +162,10 @@ where
         self.inner.upgrade().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
-                format!("state {:?} is unavailable because its database was dropped", self.name),
+                format!(
+                    "state {:?} is unavailable because its database was dropped",
+                    self.name
+                ),
             )
         })
     }
@@ -205,6 +213,7 @@ where
             KeyDirConfig::default(),
         )?;
         let timers = TimerStore::create(&path.join(TIMERS_FILE), BPlusTreeConfig::default())?;
+        info!("creating database at {:?}", path);
         Self::from_parts(
             path,
             table_catalog,
@@ -232,6 +241,7 @@ where
             KeyDirConfig::default(),
         )?;
         let timers = TimerStore::open(&path.join(TIMERS_FILE), BPlusTreeConfig::default())?;
+        info!("opening database at {:?}", path);
         Self::from_parts(
             path,
             table_catalog,
@@ -268,6 +278,7 @@ where
             timer_notify: Arc::clone(&timer_notify),
         });
         let db_weak = Arc::downgrade(&database);
+        debug!("spawning background timer scheduler");
         database
             .executor
             .spawn(Box::pin(run_scheduler(db_weak, timer_notify)));
@@ -969,6 +980,70 @@ mod tests {
                 .value,
             Some(Value::Int(1))
         );
+    }
+
+    #[test]
+    fn merkle_tree_operator_maintains_table_root() {
+        let path = tmp("merkle");
+        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
+            .unwrap();
+        let table = db.table("users", Some(TableConfig::default())).unwrap();
+        let config = MerkleTreeConfig {
+            state: "operator/prelude/merkle-tree-test".to_owned(),
+            leaf_bits: 8,
+        };
+        db.dispatch_operator::<MerkleTreeOperator>(
+            "merkle",
+            config.clone(),
+            runtime_config(Subscription::pattern("users")),
+        )
+        .unwrap();
+
+        wait_until(|| {
+            MerkleTreeOperator::root(&db, &config, "users")
+                .unwrap()
+                .is_some()
+        });
+        let empty = MerkleTreeOperator::root(&db, &config, "users")
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty.entries, 0);
+
+        table
+            .get()
+            .unwrap()
+            .write()
+            .insert_event(event("users", 1, 100))
+            .unwrap();
+        wait_until(|| {
+            MerkleTreeOperator::root(&db, &config, "users")
+                .unwrap()
+                .is_some_and(|root| root.entries == 1 && root.hash != empty.hash)
+        });
+        let inserted = MerkleTreeOperator::root(&db, &config, "users")
+            .unwrap()
+            .unwrap();
+
+        table
+            .get()
+            .unwrap()
+            .write()
+            .insert_event(Event {
+                table_id: "users".into(),
+                primary_key: PrimaryKey::String("u1".into()),
+                path: ValuePath::new(),
+                op: Op::Delete,
+                hlc: Hlc::with_device_id(200, 0, device_id()).unwrap(),
+                sync: false,
+                signature: Vec::new(),
+            })
+            .unwrap();
+
+        wait_until(|| {
+            MerkleTreeOperator::root(&db, &config, "users")
+                .unwrap()
+                .is_some_and(|root| root.entries == 1 && root.hash != inserted.hash)
+        });
     }
 
     #[test]

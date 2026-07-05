@@ -6,6 +6,8 @@
 
 use std::sync::{Arc, Weak};
 
+use log::{debug, info, trace};
+
 use crate::{runtime::Executor, Database};
 
 use super::{
@@ -36,7 +38,10 @@ pub(crate) async fn run<D>(
     };
 
     let mut operator = match D::create(&db, worker.name(), config).await {
-        Ok(op) => op,
+        Ok(op) => {
+            info!("operator {:?} created successfully", worker.name());
+            op
+        }
         Err(error) => {
             log::error!("operator {:?} create failed: {error}", worker.name());
             let phase = OperatorPhase::Failed {
@@ -64,6 +69,7 @@ pub(crate) async fn run<D>(
         while let Some(event) = worker.peek_event() {
             match event {
                 LifecycleEvent::InputOpened(table) => {
+                    trace!("operator {:?} on_input_opened({table:?})", worker.name());
                     match operator
                         .on_input_opened(table, &db, worker.name(), config)
                         .await
@@ -84,6 +90,7 @@ pub(crate) async fn run<D>(
                     }
                 }
                 LifecycleEvent::InputClosed(table) => {
+                    trace!("operator {:?} on_input_closed({table:?})", worker.name());
                     match operator
                         .on_input_closed(table, &db, worker.name(), config)
                         .await
@@ -104,6 +111,7 @@ pub(crate) async fn run<D>(
                     }
                 }
                 LifecycleEvent::Teardown(phase) => {
+                    debug!("operator {:?} teardown ({phase:?})", worker.name());
                     let _ = operator.teardown(&phase, &db, worker.name(), config).await;
                     db.retire_operator(
                         worker.name(),
@@ -117,6 +125,7 @@ pub(crate) async fn run<D>(
 
         // --- Suspend if no inputs remain ---
         if !worker.has_inputs() {
+            debug!("operator {:?} has no inputs, suspending", worker.name());
             let _ = operator
                 .teardown(&OperatorPhase::Active, &db, worker.name(), config)
                 .await;
@@ -126,7 +135,10 @@ pub(crate) async fn run<D>(
             // A table was attached during the race window — keep running.
             // Re-create since we already tore down.
             match D::create(&db, worker.name(), config).await {
-                Ok(op) => operator = op,
+                Ok(op) => {
+                    info!("operator {:?} re-created after suspend race", worker.name());
+                    operator = op;
+                }
                 Err(error) => {
                     log::error!("operator {:?} re-create failed: {error}", worker.name());
                     db.retire_operator(
@@ -145,6 +157,13 @@ pub(crate) async fn run<D>(
         // --- Poll changes and timers ---
         let changes = worker.poll(runtime.poll_size);
         let timers: Vec<(u64, Vec<u8>)> = worker.drain_timers();
+
+        trace!(
+            "operator {:?} polled {} change(s), {} timer(s)",
+            worker.name(),
+            changes.len(),
+            timers.len()
+        );
 
         if changes.is_empty() && timers.is_empty() {
             drop(db);
@@ -184,6 +203,7 @@ pub(crate) async fn run<D>(
         match operator.process(changes, &db, worker.name(), config).await {
             Ok(OperatorDirective::Continue) => {
                 worker.commit();
+                trace!("operator {:?} commit after process", worker.name());
             }
             Ok(OperatorDirective::Finish) => {
                 worker.commit();

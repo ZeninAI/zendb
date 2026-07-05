@@ -28,7 +28,7 @@
 //!
 //! ```text
 //! ┌─────────┐
-//! │ create  │  ← OperatorContext available; set up state handles and tables
+//! │ create  │  ← Database available; set up state handles and tables
 //! └────┬────┘
 //!      │  (for each matching table already open)
 //!      ▼
@@ -49,7 +49,7 @@
 //!                                   │
 //!                                   ▼
 //!                          ┌────────────────┐
-//!                          │   teardown     │ ← reason: Finished/Failed/Cancelled
+//!                          │   teardown     │ ← reason: Active/Finished/Failed/Cancelled
 //!                          └────────────────┘
 //! ```
 //!
@@ -58,7 +58,7 @@
 //! | Layer | Owns | Does NOT own |
 //! |-------|------|-------------|
 //! | `Operator` (user code) | Business logic, state handles, timer payloads | Polling, commit offsets, event ordering |
-//! | `OperatorContext` | DB access, timer registration, table/state creation | Lifecycle transitions |
+//! | `Database` | DB access, timer registration, table/state creation | Lifecycle transitions |
 //! | `OperatorWorker` | Input attachment/detachment, timer inbox, spawn | Run loop details |
 //! | `RunLoop` | Event queue, shutdown state machine, poll+commit, idle/wake | What the operator does with changes |
 

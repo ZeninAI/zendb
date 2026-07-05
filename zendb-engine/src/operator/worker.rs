@@ -6,6 +6,7 @@
 
 use std::{collections::VecDeque, sync::Arc};
 
+use log::{debug, trace};
 use parking_lot::Mutex;
 use zendb_storage::core::topic::TopicConsumer;
 
@@ -85,6 +86,11 @@ where
         if self.shutdown_phase.lock().is_some() {
             return;
         }
+        trace!(
+            "attaching input {:?} to operator {:?}",
+            input.table_name,
+            self.name
+        );
         let table_name = input.table_name.clone();
         self.inputs.lock().push(input);
         self.events
@@ -104,6 +110,10 @@ where
         if removed.is_none() {
             return false;
         }
+        trace!(
+            "detaching input {table_name:?} from operator {:?}",
+            self.name
+        );
         if self.shutdown_phase.lock().is_none() {
             self.events
                 .lock()
@@ -142,6 +152,7 @@ where
         if shutdown.is_some() {
             return;
         }
+        debug!("operator {:?} beginning shutdown ({phase:?})", self.name);
         let input_tables: Vec<String> = self
             .inputs
             .lock()

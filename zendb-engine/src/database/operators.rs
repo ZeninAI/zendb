@@ -2,6 +2,7 @@
 
 use std::{io, sync::Arc};
 
+use log::{debug, info, trace};
 use zendb_storage::core::traits::{Backend, DurableStorage};
 use zendb_storage::frontend::table::{Table, TableConfig};
 
@@ -101,7 +102,10 @@ where
         };
 
         if let Some(worker) = worker_opt {
+            info!("dispatching operator {name:?} (immediate start)");
             worker.spawn(self);
+        } else {
+            info!("dispatching operator {name:?} (waiting for matching tables)");
         }
         Ok(())
     }
@@ -109,6 +113,7 @@ where
     /// Permanently cancel an operator. Live workers are asked to shut down;
     /// catalog-only operators are marked cancelled immediately.
     pub fn cancel_operator(&self, name: &str) -> io::Result<()> {
+        info!("cancelling operator {name:?}");
         if let Some(worker) = self.operators.read().get(name).cloned() {
             worker.begin_shutdown(OperatorPhase::Cancelled);
             return Ok(());
@@ -146,8 +151,11 @@ where
                 io::ErrorKind::InvalidInput,
                 format!("operator {name:?} is not in a terminal state, please cancel first"),
             )),
-            Some(OperatorPhase::Finished | OperatorPhase::Failed { .. } | OperatorPhase::Cancelled) => {
+            Some(
+                OperatorPhase::Finished | OperatorPhase::Failed { .. } | OperatorPhase::Cancelled,
+            ) => {
                 catalog.delete(&name.to_owned())?;
+                info!("deleted terminal operator {name:?}");
                 Ok(())
             }
         }
@@ -176,6 +184,7 @@ where
                 ));
             }
         }
+        debug!("built worker {name:?} with {} input(s)", inputs.len());
         Ok(OperatorWorker::new(name, config, inputs))
     }
 
@@ -187,6 +196,8 @@ where
         phase: OperatorPhase,
         subscriptions: &[Subscription],
     ) {
+        info!("retiring operator {name:?} (phase: {phase:?})");
+
         // Remove from in-memory workers (drops the inputs/consumers).
         if let Some(worker) = self.operators.write().remove(name) {
             worker.delete_inputs();
@@ -203,6 +214,10 @@ where
             .map(|(tbl, cfg)| (tbl.into_owned(), cfg.into_owned()))
             .collect();
 
+        trace!(
+            "retiring operator {name:?}: cleaning up {} consumer(s)",
+            tables.len()
+        );
         for (table_name, config) in tables {
             let result = if let Some(table) = self.tables.read().get(&table_name).cloned() {
                 table
@@ -211,14 +226,11 @@ where
                     .and_then(|consumer| consumer.delete())
             } else {
                 let path = self.path.join(TABLES_DIR).join(&table_name);
-                Table::open(&path, config).and_then(|table| {
-                    table.consumer(name).and_then(|consumer| consumer.delete())
-                })
+                Table::open(&path, config)
+                    .and_then(|table| table.consumer(name).and_then(|consumer| consumer.delete()))
             };
             if let Err(error) = result {
-                log::error!(
-                    "failed deleting consumer {name:?} from table {table_name:?}: {error}"
-                );
+                log::error!("failed deleting consumer {name:?} from table {table_name:?}: {error}");
             }
         }
         drop(table_catalog);
@@ -230,10 +242,13 @@ where
             .filter(|(key, _)| key.operator == name)
             .map(|(k, _)| k.into_owned())
             .collect();
+        let num_timers = keys.len();
         for key in keys {
             let _ = timers.delete(&key);
         }
         drop(timers);
+
+        debug!("retired operator {name:?}: cleaned up {num_timers} timer(s)");
 
         // Update the catalog phase LAST so external observers can rely on the
         // terminal phase as a signal that all cleanup is done.
@@ -264,7 +279,9 @@ where
                 return false;
             }
         }
-        operators.remove(name);
+        if operators.remove(name).is_some() {
+            info!("suspended operator {name:?} (no open inputs)");
+        }
         true
     }
 }

@@ -3,6 +3,7 @@
 use std::{fs, io, sync::Arc};
 
 use bincode::{Decode, Encode};
+use log::{info, trace};
 use parking_lot::RwLock;
 use zendb_storage::{
     core::traits::{Backend, DurableStorage},
@@ -52,7 +53,11 @@ where
     /// Remove an open state from the in-memory cache. The durable state remains
     /// in the catalog and can be reopened later with [`Database::state`].
     pub fn close_state(&self, name: &str) -> bool {
-        self.states.write().remove(name).is_some()
+        let removed = self.states.write().remove(name).is_some();
+        if removed {
+            info!("closing state {name:?}");
+        }
+        removed
     }
 
     /// Delete a state entirely: evict from memory, remove from the catalog,
@@ -69,6 +74,7 @@ where
         if path.exists() {
             fs::remove_dir_all(&path)?;
         }
+        info!("deleted state {name:?}");
         Ok(true)
     }
 
@@ -86,6 +92,7 @@ where
     {
         // Fast path: already open
         if let Some(erased) = self.states.read().get(name).cloned() {
+            trace!("state {name:?} already open, returning cached handle");
             let state = downcast_state::<K, V>(erased)?;
             return Ok(StateHandle::new(name, &state));
         }
@@ -93,6 +100,7 @@ where
         let mut catalog = self.state_catalog.lock();
         // Double-check under catalog lock to avoid racing with another opener
         if let Some(erased) = self.states.read().get(name).cloned() {
+            trace!("state {name:?} already open (race), returning cached handle");
             let state = downcast_state::<K, V>(erased)?;
             return Ok(StateHandle::new(name, &state));
         }
@@ -107,6 +115,7 @@ where
                     }
                     _ => saved_config.clone(),
                 };
+                info!("opening existing state {name:?}");
                 Arc::new(RwLock::new(State::<K, V>::open(
                     &self.path.join(STATES_DIR).join(name),
                     effective_config,
@@ -118,6 +127,7 @@ where
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)?;
                 }
+                info!("creating new state {name:?}");
                 let state = Arc::new(RwLock::new(State::<K, V>::create(&path, config.clone())?));
                 catalog.put(name.to_owned(), config)?;
                 state

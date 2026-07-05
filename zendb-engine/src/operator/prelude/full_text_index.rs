@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use zendb_storage::core::traits::Backend;
 use zendb_types::{Cell, PrimaryKey, Value};
 
 use crate::{
-    BoxFuture, Change, Database, DispatchOperator, Operator, OperatorDirective, StateConfig,
+    Change, Database, DispatchOperator, Operator, OperatorDirective, StateConfig,
     StateHandle,
 };
 
@@ -194,12 +195,12 @@ impl Operator for FullTextIndexOperator {
         db: &'a Arc<Database<D>>,
         _name: &'a str,
         config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<Self>>
+    ) -> impl Future<Output = io::Result<Self>> + Send + 'a
     where
         D: DispatchOperator,
         Self: Sized,
     {
-        Box::pin(async move {
+        async move {
             let mut op = Self {
                 base_state: config.state.clone(),
                 states: Arc::new(RwLock::new(HashMap::new())),
@@ -207,7 +208,7 @@ impl Operator for FullTextIndexOperator {
             };
             op.reconcile_orphaned_tables(db)?;
             Ok(op)
-        })
+        }
     }
 
     fn facet(&self) -> FullTextIndexFacet {
@@ -222,14 +223,14 @@ impl Operator for FullTextIndexOperator {
         db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             self.rebuild_table(db, &table)?;
             Ok(OperatorDirective::Continue)
-        })
+        }
     }
 
     fn on_input_closed<'a, D>(
@@ -238,11 +239,11 @@ impl Operator for FullTextIndexOperator {
         db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             // If the table was deleted (not just closed), clean up its index entries.
             // The table is already removed from the catalog by this point.
             // For now, we keep the index entries alive — they can be cleaned up
@@ -252,7 +253,7 @@ impl Operator for FullTextIndexOperator {
                 let _ = db.delete_state(&table_state_name(&self.base_state, &table))?;
             }
             Ok(OperatorDirective::Continue)
-        })
+        }
     }
 
     fn process<'a, D>(
@@ -261,11 +262,11 @@ impl Operator for FullTextIndexOperator {
         db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             for change in changes {
                 let table = change.event.table_id.clone();
                 let pk = change.event.primary_key.clone();
@@ -314,7 +315,7 @@ impl Operator for FullTextIndexOperator {
             }
 
             Ok(OperatorDirective::Continue)
-        })
+        }
     }
 }
 

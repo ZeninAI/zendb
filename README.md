@@ -232,7 +232,7 @@ impl Operator for MyIndexer {
     type Timer = ();
     type Facet = MyIndexerFacet;  // <-- the facet type
 
-    fn create(db, name, config) -> BoxFuture<io::Result<Self>> {
+    fn create(db, name, config) -> impl Future<Output = io::Result<Self>> + Send {
         // open state handles, store them on self
     }
 
@@ -241,7 +241,7 @@ impl Operator for MyIndexer {
         MyIndexerFacet { index: self.index.clone() }
     }
 
-    fn process(&mut self, changes, db, name, config) -> BoxFuture<io::Result<OperatorDirective>> {
+    fn process(&mut self, changes, db, name, config) -> impl Future<Output = io::Result<OperatorDirective>> + Send {
         // update self.index as changes arrive
     }
 }
@@ -337,20 +337,20 @@ struct MyIndexer {
 }
 
 impl Operator for MyIndexer {
-    fn create(db, name, config) -> BoxFuture<io::Result<Self>> {
-        Box::pin(async move {
+    fn create(db, name, config) -> impl Future<Output = io::Result<Self>> + Send {
+        async move {
             // Open (or create) a typed state
             let index = db.state("my-index", Some(StateConfig::default()))?;
             Ok(Self { index })
-        })
+        }
     }
 
-    fn process(&mut self, changes, db, name, config) -> BoxFuture<io::Result<OperatorDirective>> {
-        Box::pin(async move {
+    fn process(&mut self, changes, db, name, config) -> impl Future<Output = io::Result<OperatorDirective>> + Send {
+        async move {
             let state = self.index.get()?;   // upgrade for this operation
             state.write().put("hello".into(), doc_ids)?;
             Ok(OperatorDirective::Continue)
-        })
+        }
     }
 }
 ```
@@ -438,9 +438,9 @@ type DocDb = Database<doc_ops::OperatorInstance>;
 ### Step 2: The Indexer operator
 
 ```rust
-use std::{collections::HashSet, io, sync::Arc};
+use std::{collections::HashSet, future::Future, io, sync::Arc};
 use zendb_engine::{
-    BoxFuture, Change, Database, DispatchOperator, Operator,
+    Change, Database, DispatchOperator, Operator,
     OperatorDirective, StateHandle, Subscription,
 };
 use zendb_storage::frontend::state::StateConfig;
@@ -479,14 +479,14 @@ impl Operator for IndexerOp {
         db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<Self>>
+    ) -> impl Future<Output = io::Result<Self>> + Send + 'a
     where D: DispatchOperator
     {
-        Box::pin(async move {
+        async move {
             let index = db.state("indexer/index", Some(StateConfig::default()))?;
             let docs  = db.state("indexer/docs", Some(StateConfig::default()))?;
             Ok(Self { index, docs })
-        })
+        }
     }
 
     fn facet(&self) -> IndexerFacet {
@@ -499,10 +499,10 @@ impl Operator for IndexerOp {
         db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where D: DispatchOperator
     {
-        Box::pin(async move {
+        async move {
             for change in changes {
                 match (&change.previous, &change.current) {
                     // New or updated document
@@ -531,7 +531,7 @@ impl Operator for IndexerOp {
                 }
             }
             Ok(OperatorDirective::Continue)
-        })
+        }
     }
 }
 ```

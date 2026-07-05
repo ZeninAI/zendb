@@ -1,9 +1,10 @@
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 
 use bincode::{Decode, Encode};
 
-use crate::{BoxFuture, Database, DispatchOperator, Operator};
+use crate::{Database, DispatchOperator, Operator};
 
 /// Configuration for the Rhai scripting operator.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -23,12 +24,12 @@ impl Operator for RhaiOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<Self>>
+    ) -> impl Future<Output = io::Result<Self>> + Send + 'a
     where
         D: DispatchOperator,
         Self: Sized,
     {
-        Box::pin(async { Ok(Self) })
+        async { Ok(Self) }
     }
 
     fn facet(&self) {}

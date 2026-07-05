@@ -2,6 +2,7 @@ use super::super::*;
 use crate::operator::prelude::{MerkleTreeConfig, MerkleTreeOperator};
 use crate::{Change, Operator, OperatorDirective, OperatorRuntimeConfig, Subscription};
 use parking_lot::Mutex;
+use std::future::Future;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     OnceLock,
@@ -58,12 +59,12 @@ impl Operator for CountingOperator {
         db: &'a Arc<Database<D>>,
         _name: &'a str,
         config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<Self>>
+    ) -> impl Future<Output = io::Result<Self>> + Send + 'a
     where
         D: crate::DispatchOperator,
         Self: Sized,
     {
-        Box::pin(async move {
+        async move {
             let buffer = db.state("counter/buffer", Some(StateConfig::default()))?;
             let index = db.state("index", Some(StateConfig::default()))?;
             Ok(Self {
@@ -72,7 +73,7 @@ impl Operator for CountingOperator {
                 buffer,
                 index,
             })
-        })
+        }
     }
 
     fn facet(&self) {}
@@ -83,11 +84,11 @@ impl Operator for CountingOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: crate::DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             self.count.fetch_add(changes.len(), Ordering::Relaxed);
             self.index.get()?.write().put(
                 b"count".to_vec(),
@@ -106,7 +107,7 @@ impl Operator for CountingOperator {
             } else {
                 OperatorDirective::Continue
             })
-        })
+        }
     }
 }
 
@@ -128,16 +129,16 @@ impl Operator for FailingOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<Self>>
+    ) -> impl Future<Output = io::Result<Self>> + Send + 'a
     where
         D: crate::DispatchOperator,
         Self: Sized,
     {
-        Box::pin(async move {
+        async move {
             Ok(Self {
                 attempts: lookup_counter(&config.attempts_tracker)?,
             })
-        })
+        }
     }
 
     fn facet(&self) {}
@@ -148,15 +149,15 @@ impl Operator for FailingOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: crate::DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             let _ = changes;
             self.attempts.fetch_add(1, Ordering::Relaxed);
             Err(io::Error::other("expected failure"))
-        })
+        }
     }
 }
 
@@ -178,12 +179,12 @@ impl Operator for TimerOperator {
         db: &'a Arc<Database<D>>,
         name: &'a str,
         config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<Self>>
+    ) -> impl Future<Output = io::Result<Self>> + Send + 'a
     where
         D: crate::DispatchOperator,
         Self: Sized,
     {
-        Box::pin(async move {
+        async move {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -192,7 +193,7 @@ impl Operator for TimerOperator {
             Ok(Self {
                 fired: lookup_counter(&config.tracker)?,
             })
-        })
+        }
     }
 
     fn facet(&self) {}
@@ -203,11 +204,11 @@ impl Operator for TimerOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: crate::DispatchOperator,
     {
-        Box::pin(async { Ok(OperatorDirective::Continue) })
+        async { Ok(OperatorDirective::Continue) }
     }
 
     fn on_timer<'a, D>(
@@ -217,14 +218,14 @@ impl Operator for TimerOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: crate::DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             self.fired.fetch_add(1, Ordering::Relaxed);
             Ok(OperatorDirective::Finish)
-        })
+        }
     }
 }
 
@@ -247,15 +248,15 @@ impl Operator for InputLifecycleOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<Self>>
+    ) -> impl Future<Output = io::Result<Self>> + Send + 'a
     where
         D: crate::DispatchOperator,
         Self: Sized,
     {
-        Box::pin(async move {
+        async move {
             let (opened, closed) = lookup_input_tracker(&config.tracker)?;
             Ok(Self { opened, closed })
-        })
+        }
     }
 
     fn facet(&self) {}
@@ -266,11 +267,11 @@ impl Operator for InputLifecycleOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: crate::DispatchOperator,
     {
-        Box::pin(async { Ok(OperatorDirective::Continue) })
+        async { Ok(OperatorDirective::Continue) }
     }
 
     fn on_input_opened<'a, D>(
@@ -279,14 +280,14 @@ impl Operator for InputLifecycleOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: crate::DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             self.opened.lock().push(table);
             Ok(OperatorDirective::Continue)
-        })
+        }
     }
 
     fn on_input_closed<'a, D>(
@@ -295,14 +296,14 @@ impl Operator for InputLifecycleOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: crate::DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             self.closed.lock().push(table);
             Ok(OperatorDirective::Continue)
-        })
+        }
     }
 }
 
@@ -324,16 +325,16 @@ impl Operator for ShutdownLifecycleOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<Self>>
+    ) -> impl Future<Output = io::Result<Self>> + Send + 'a
     where
         D: crate::DispatchOperator,
         Self: Sized,
     {
-        Box::pin(async move {
+        async move {
             let log = lookup_lifecycle_log(&config.tracker)?;
             log.lock().push("create".to_owned());
             Ok(Self { log })
-        })
+        }
     }
 
     fn facet(&self) {}
@@ -344,14 +345,14 @@ impl Operator for ShutdownLifecycleOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: crate::DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             self.log.lock().push(format!("process:{}", changes.len()));
             Ok(OperatorDirective::Finish)
-        })
+        }
     }
 
     fn on_input_opened<'a, D>(
@@ -360,14 +361,14 @@ impl Operator for ShutdownLifecycleOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: crate::DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             self.log.lock().push(format!("opened:{table}"));
             Ok(OperatorDirective::Continue)
-        })
+        }
     }
 
     fn on_input_closed<'a, D>(
@@ -376,14 +377,14 @@ impl Operator for ShutdownLifecycleOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: crate::DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             self.log.lock().push(format!("closed:{table}"));
             Ok(OperatorDirective::Continue)
-        })
+        }
     }
 
     fn teardown<'a, D>(
@@ -392,14 +393,14 @@ impl Operator for ShutdownLifecycleOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<()>>
+    ) -> impl Future<Output = io::Result<()>> + Send + 'a
     where
         D: crate::DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             self.log.lock().push("teardown".to_owned());
             Ok(())
-        })
+        }
     }
 }
 
@@ -419,12 +420,12 @@ impl Operator for SpawnerOperator {
         db: &'a Arc<Database<D>>,
         _name: &'a str,
         config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<Self>>
+    ) -> impl Future<Output = io::Result<Self>> + Send + 'a
     where
         D: crate::DispatchOperator,
         Self: Sized,
     {
-        Box::pin(async move {
+        async move {
             db.dispatch_operator::<CountingOperator>(
                 "spawned-counter",
                 CountingConfig {
@@ -447,7 +448,7 @@ impl Operator for SpawnerOperator {
             )?;
 
             Ok(Self)
-        })
+        }
     }
 
     fn facet(&self) {}
@@ -458,11 +459,11 @@ impl Operator for SpawnerOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> crate::BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: crate::DispatchOperator,
     {
-        Box::pin(async { Ok(OperatorDirective::Continue) })
+        async { Ok(OperatorDirective::Continue) }
     }
 }
 

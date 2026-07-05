@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use zendb_storage::core::traits::Backend;
 use zendb_types::{Cell, PrimaryKey};
 
 use crate::{
-    BoxFuture, Change, Database, DispatchOperator, Operator, OperatorDirective, StateConfig,
+    Change, Database, DispatchOperator, Operator, OperatorDirective, StateConfig,
     StateHandle,
 };
 
@@ -207,16 +208,16 @@ impl Operator for MerkleTreeOperator {
         db: &'a Arc<Database<D>>,
         _name: &'a str,
         config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<Self>>
+    ) -> impl Future<Output = io::Result<Self>> + Send + 'a
     where
         D: DispatchOperator,
         Self: Sized,
     {
-        Box::pin(async move {
+        async move {
             let leaf_bits = validate_leaf_bits(config.leaf_bits)?;
             let state = db.state(&config.state, Some(StateConfig::default()))?;
             Ok(Self { state, leaf_bits })
-        })
+        }
     }
 
     fn facet(&self) -> MerkleTreeFacet {
@@ -232,14 +233,14 @@ impl Operator for MerkleTreeOperator {
         db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             self.rebuild_table(db, &table)?;
             Ok(OperatorDirective::Continue)
-        })
+        }
     }
 
     fn on_input_closed<'a, D>(
@@ -248,11 +249,11 @@ impl Operator for MerkleTreeOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: DispatchOperator,
     {
-        Box::pin(async { Ok(OperatorDirective::Continue) })
+        async { Ok(OperatorDirective::Continue) }
     }
 
     fn process<'a, D>(
@@ -261,11 +262,11 @@ impl Operator for MerkleTreeOperator {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             let mut touched = HashMap::<String, HashSet<u64>>::new();
             {
                 let state = self.state.get()?;
@@ -297,7 +298,7 @@ impl Operator for MerkleTreeOperator {
                 }
             }
             Ok(OperatorDirective::Continue)
-        })
+        }
     }
 }
 

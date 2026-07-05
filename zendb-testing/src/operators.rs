@@ -1,13 +1,14 @@
 //! Document indexing pipeline operators and helpers.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bincode::{Decode, Encode};
 use zendb_engine::{
-    define_operator_set, BoxFuture, Change, Database, DispatchOperator, Operator,
+    define_operator_set, Change, Database, DispatchOperator, Operator,
     OperatorDirective, OperatorRuntimeConfig, StateHandle, Subscription, TableConfig, TableHandle,
 };
 use zendb_storage::{core::traits::Backend, frontend::state::StateConfig};
@@ -97,16 +98,16 @@ impl Operator for IndexerOp {
         db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<Self>>
+    ) -> impl Future<Output = io::Result<Self>> + Send + 'a
     where
         D: DispatchOperator,
         Self: Sized,
     {
-        Box::pin(async move {
+        async move {
             let index = db.state("index", Some(StateConfig::default()))?;
             let stats = db.state("doc_stats", Some(StateConfig::default()))?;
             Ok(Self { index, stats })
-        })
+        }
     }
 
     fn facet(&self) {}
@@ -117,11 +118,11 @@ impl Operator for IndexerOp {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             for change in &changes {
                 let doc_id = match &change.event.primary_key {
                     PrimaryKey::String(s) => s.clone(),
@@ -190,7 +191,7 @@ impl Operator for IndexerOp {
                 }
             }
             Ok(OperatorDirective::Continue)
-        })
+        }
     }
 }
 
@@ -219,12 +220,12 @@ impl Operator for ArchiverOp {
         db: &'a Arc<Database<D>>,
         name: &'a str,
         config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<Self>>
+    ) -> impl Future<Output = io::Result<Self>> + Send + 'a
     where
         D: DispatchOperator,
         Self: Sized,
     {
-        Box::pin(async move {
+        async move {
             let output = db.table("reports", Some(TableConfig::default()))?;
             let source_stats = db.state("doc_stats", None)?;
 
@@ -240,7 +241,7 @@ impl Operator for ArchiverOp {
                 output,
                 source_stats,
             })
-        })
+        }
     }
 
     fn facet(&self) {}
@@ -251,11 +252,11 @@ impl Operator for ArchiverOp {
         _db: &'a Arc<Database<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: DispatchOperator,
     {
-        Box::pin(async { Ok(OperatorDirective::Continue) })
+        async { Ok(OperatorDirective::Continue) }
     }
 
     fn on_timer<'a, D>(
@@ -265,11 +266,11 @@ impl Operator for ArchiverOp {
         db: &'a Arc<Database<D>>,
         name: &'a str,
         _config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: DispatchOperator,
     {
-        Box::pin(async move {
+        async move {
             self.reports_written += 1;
 
             let stats_snapshot: Vec<(String, u64)> = {
@@ -308,7 +309,7 @@ impl Operator for ArchiverOp {
                 db.register_timer(name, now + 50, &())?;
                 Ok(OperatorDirective::Continue)
             }
-        })
+        }
     }
 }
 

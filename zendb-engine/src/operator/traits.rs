@@ -1,4 +1,4 @@
-use std::{any::Any, fmt::Debug, io, sync::Arc};
+use std::{any::Any, fmt::Debug, future::Future, io, sync::Arc};
 
 use bincode::{Decode, Encode};
 
@@ -76,7 +76,7 @@ pub trait Operator: Send + 'static {
         db: &'a Arc<Database<D>>,
         name: &'a str,
         config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<Self>>
+    ) -> impl Future<Output = io::Result<Self>> + Send + 'a
     where
         D: DispatchOperator,
         Self: Sized;
@@ -98,12 +98,12 @@ pub trait Operator: Send + 'static {
         db: &'a Arc<Database<D>>,
         name: &'a str,
         config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: DispatchOperator,
     {
         let _ = (changes, db, name, config);
-        Box::pin(async { Ok(OperatorDirective::Continue) })
+        async { Ok(OperatorDirective::Continue) }
     }
 
     /// Called when a new input table matching the subscription appears.
@@ -113,12 +113,12 @@ pub trait Operator: Send + 'static {
         db: &'a Arc<Database<D>>,
         name: &'a str,
         config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: DispatchOperator,
     {
         let _ = (table, db, name, config);
-        Box::pin(async { Ok(OperatorDirective::Continue) })
+        async { Ok(OperatorDirective::Continue) }
     }
 
     /// Called when a previously open input table disappears.
@@ -128,12 +128,12 @@ pub trait Operator: Send + 'static {
         db: &'a Arc<Database<D>>,
         name: &'a str,
         config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: DispatchOperator,
     {
         let _ = (table, db, name, config);
-        Box::pin(async { Ok(OperatorDirective::Continue) })
+        async { Ok(OperatorDirective::Continue) }
     }
 
     /// Called when a registered processing-time timer fires.
@@ -144,12 +144,12 @@ pub trait Operator: Send + 'static {
         db: &'a Arc<Database<D>>,
         name: &'a str,
         config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
     where
         D: DispatchOperator,
     {
         let _ = (payload, fire_at_ms, db, name, config);
-        Box::pin(async { Ok(OperatorDirective::Continue) })
+        async { Ok(OperatorDirective::Continue) }
     }
 
     /// Called when the operator is stopping.
@@ -165,12 +165,12 @@ pub trait Operator: Send + 'static {
         db: &'a Arc<Database<D>>,
         name: &'a str,
         config: &'a Self::Config,
-    ) -> BoxFuture<'a, io::Result<()>>
+    ) -> impl Future<Output = io::Result<()>> + Send + 'a
     where
         D: DispatchOperator,
     {
         let _ = (phase, db, name, config);
-        Box::pin(async { Ok(()) })
+        async { Ok(()) }
     }
 }
 

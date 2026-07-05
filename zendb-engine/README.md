@@ -106,13 +106,13 @@ pub trait Operator: Send + 'static {
     type Timer: Encode + Decode<()> + 'static;
     type Facet: Send + Sync + 'static;
 
-    fn create(db, name, config) -> BoxFuture<io::Result<Self>>;
+    fn create(db, name, config) -> impl Future<Output = io::Result<Self>> + Send;
     fn facet(&self) -> Self::Facet;
-    fn process(&mut self, changes, db, name, config) -> BoxFuture<io::Result<OperatorDirective>>;
-    fn on_timer(&mut self, payload, fire_at_ms, db, name, config) -> BoxFuture<io::Result<OperatorDirective>>;
-    fn on_input_opened(&mut self, table, db, name, config) -> BoxFuture<io::Result<OperatorDirective>>;
-    fn on_input_closed(&mut self, table, db, name, config) -> BoxFuture<io::Result<OperatorDirective>>;
-    fn teardown(&mut self, phase, db, name, config) -> BoxFuture<io::Result<()>>;
+    fn process(&mut self, changes, db, name, config) -> impl Future<Output = io::Result<OperatorDirective>> + Send;
+    fn on_timer(&mut self, payload, fire_at_ms, db, name, config) -> impl Future<Output = io::Result<OperatorDirective>> + Send;
+    fn on_input_opened(&mut self, table, db, name, config) -> impl Future<Output = io::Result<OperatorDirective>> + Send;
+    fn on_input_closed(&mut self, table, db, name, config) -> impl Future<Output = io::Result<OperatorDirective>> + Send;
+    fn teardown(&mut self, phase, db, name, config) -> impl Future<Output = io::Result<()>> + Send;
 }
 ```
 

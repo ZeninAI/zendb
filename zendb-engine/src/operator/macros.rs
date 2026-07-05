@@ -155,11 +155,11 @@ macro_rules! __zendb_define_operator_set {
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
                     match (self, &config.operator) {
                         (OperatorInstance::$first_variant(inner), OperatorConfigVariant::$first_variant(cfg)) => {
-                            <$first_operator as $crate::Operator>::process(inner, changes, db, name, cfg)
+                            Box::pin(<$first_operator as $crate::Operator>::process(inner, changes, db, name, cfg))
                         }
                         $(
                             (OperatorInstance::$variant(inner), OperatorConfigVariant::$variant(cfg)) => {
-                                <$operator as $crate::Operator>::process(inner, changes, db, name, cfg)
+                                Box::pin(<$operator as $crate::Operator>::process(inner, changes, db, name, cfg))
                             }
                         )*
                         _ => ::std::unreachable!("operator instance/config variant mismatch"),
@@ -175,11 +175,11 @@ macro_rules! __zendb_define_operator_set {
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
                     match (self, &config.operator) {
                         (OperatorInstance::$first_variant(inner), OperatorConfigVariant::$first_variant(cfg)) => {
-                            <$first_operator as $crate::Operator>::on_input_opened(inner, table, db, name, cfg)
+                            Box::pin(<$first_operator as $crate::Operator>::on_input_opened(inner, table, db, name, cfg))
                         }
                         $(
                             (OperatorInstance::$variant(inner), OperatorConfigVariant::$variant(cfg)) => {
-                                <$operator as $crate::Operator>::on_input_opened(inner, table, db, name, cfg)
+                                Box::pin(<$operator as $crate::Operator>::on_input_opened(inner, table, db, name, cfg))
                             }
                         )*
                         _ => ::std::unreachable!("operator instance/config variant mismatch"),
@@ -195,11 +195,11 @@ macro_rules! __zendb_define_operator_set {
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
                     match (self, &config.operator) {
                         (OperatorInstance::$first_variant(inner), OperatorConfigVariant::$first_variant(cfg)) => {
-                            <$first_operator as $crate::Operator>::on_input_closed(inner, table, db, name, cfg)
+                            Box::pin(<$first_operator as $crate::Operator>::on_input_closed(inner, table, db, name, cfg))
                         }
                         $(
                             (OperatorInstance::$variant(inner), OperatorConfigVariant::$variant(cfg)) => {
-                                <$operator as $crate::Operator>::on_input_closed(inner, table, db, name, cfg)
+                                Box::pin(<$operator as $crate::Operator>::on_input_closed(inner, table, db, name, cfg))
                             }
                         )*
                         _ => ::std::unreachable!("operator instance/config variant mismatch"),
@@ -248,11 +248,11 @@ macro_rules! __zendb_define_operator_set {
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<()>> {
                     match (self, &config.operator) {
                         (OperatorInstance::$first_variant(inner), OperatorConfigVariant::$first_variant(cfg)) => {
-                            <$first_operator as $crate::Operator>::teardown(inner, phase, db, name, cfg)
+                            Box::pin(<$first_operator as $crate::Operator>::teardown(inner, phase, db, name, cfg))
                         }
                         $(
                             (OperatorInstance::$variant(inner), OperatorConfigVariant::$variant(cfg)) => {
-                                <$operator as $crate::Operator>::teardown(inner, phase, db, name, cfg)
+                                Box::pin(<$operator as $crate::Operator>::teardown(inner, phase, db, name, cfg))
                             }
                         )*
                         _ => ::std::unreachable!("operator instance/config variant mismatch"),

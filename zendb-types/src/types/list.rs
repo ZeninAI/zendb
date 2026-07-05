@@ -55,6 +55,13 @@ impl List {
         self.entries.get(&id).map(|entry| &entry.cell)
     }
 
+    /// Iterate over all visible cells in list order.
+    pub fn cells(&self) -> impl Iterator<Item = &Cell> {
+        self.visible_ids()
+            .into_iter()
+            .filter_map(move |id| self.entries.get(&id).map(|entry| &entry.cell))
+    }
+
     #[cfg(test)]
     fn insert(&mut self, id: ListId, entry: ListEntry) -> Option<ListEntry> {
         self.entries.insert(id, entry)

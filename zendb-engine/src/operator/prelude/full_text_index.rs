@@ -121,11 +121,7 @@ impl FullTextIndexFacet {
     }
 
     /// Return the set of tokens indexed for a particular entry.
-    pub fn tokens_for_entry(
-        &self,
-        table: &str,
-        key: &PrimaryKey,
-    ) -> io::Result<HashSet<String>> {
+    pub fn tokens_for_entry(&self, table: &str, key: &PrimaryKey) -> io::Result<HashSet<String>> {
         let state = self.state.get()?;
         let guard = state.read();
         let fwd_key = FtiStateKey::Forward {
@@ -212,10 +208,15 @@ impl Operator for FullTextIndexOperator {
     {
         Box::pin(async move {
             let state = db.state(&config.state, Some(StateConfig::default()))?;
-            Ok(Self {
+            let mut op = Self {
                 state,
                 min_token_len: config.min_token_len,
-            })
+            };
+            // Reconcile: purge index entries for tables that no longer exist
+            // in the catalog. This handles the case where a table was deleted
+            // while the operator was suspended.
+            op.reconcile_orphaned_tables(db)?;
+            Ok(op)
         })
     }
 
@@ -313,10 +314,7 @@ impl Operator for FullTextIndexOperator {
                 }
 
                 // Update forward index.
-                let fwd_key = FtiStateKey::Forward {
-                    table,
-                    key: pk,
-                };
+                let fwd_key = FtiStateKey::Forward { table, key: pk };
                 if new_tokens.is_empty() {
                     state.delete(&fwd_key)?;
                 } else {
@@ -396,11 +394,82 @@ impl FullTextIndexOperator {
 
         Ok(())
     }
+
+    /// Remove index entries for tables that no longer exist in the catalog.
+    /// Called once during `create()` to handle tables deleted while the
+    /// operator was suspended.
+    fn reconcile_orphaned_tables<D>(&mut self, db: &Arc<Database<D>>) -> io::Result<()>
+    where
+        D: DispatchOperator,
+    {
+        let state = self.state.get()?;
+        let guard = state.read();
+
+        // Collect all table names referenced in forward index entries.
+        let mut indexed_tables: HashSet<String> = HashSet::new();
+        for key in guard.keys() {
+            if let FtiStateKey::Forward { table, .. } = key.as_ref() {
+                indexed_tables.insert(table.clone());
+            }
+        }
+        drop(guard);
+
+        // Find tables that are no longer in the catalog.
+        let orphaned: Vec<String> = indexed_tables
+            .into_iter()
+            .filter(|table| !db.contains_table(table))
+            .collect();
+
+        if orphaned.is_empty() {
+            return Ok(());
+        }
+
+        let mut state = state.write();
+        for table in orphaned {
+            purge_table_state(&mut state, &table)?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Remove all index state (forward entries and posting list references) for a table.
+fn purge_table_state(
+    state: &mut crate::State<FtiStateKey, FtiStateValue>,
+    table: &str,
+) -> io::Result<()> {
+    // Collect forward keys for this table.
+    let fwd_keys: Vec<FtiStateKey> = state
+        .keys()
+        .filter_map(|k| match k.as_ref() {
+            FtiStateKey::Forward { table: t, .. } if t == table => Some(k.into_owned()),
+            _ => None,
+        })
+        .collect();
+
+    // For each forward entry, remove from posting lists and delete the forward entry.
+    for fwd_key in fwd_keys {
+        if let Some(value) = state.get(&fwd_key) {
+            if let FtiStateValue::TokenSet(tokens) = value.into_owned() {
+                let entry = match &fwd_key {
+                    FtiStateKey::Forward { table: t, key } => (t.clone(), key.clone()),
+                    _ => continue,
+                };
+                for token in tokens {
+                    let posting_key = FtiStateKey::Posting(token);
+                    update_posting_list(state, &posting_key, |set| {
+                        set.remove(&entry);
+                    })?;
+                }
+            }
+        }
+        state.delete(&fwd_key)?;
+    }
+    Ok(())
+}
 
 /// Tokenize text: lowercase, split on non-alphanumeric, filter by min length.
 fn tokenize(text: &str, min_len: usize) -> Vec<String> {
@@ -411,15 +480,56 @@ fn tokenize(text: &str, min_len: usize) -> Vec<String> {
         .collect()
 }
 
-/// Extract indexable tokens from a cell value.
-fn extract_tokens(cell: &Cell, min_token_len: usize) -> HashSet<String> {
-    let Some(value) = &cell.value else {
-        return HashSet::new();
-    };
+/// Recursively collect all text fragments from a value.
+fn collect_text(value: &Value, out: &mut Vec<String>) {
     match value {
-        Value::String(s) => tokenize(s, min_token_len).into_iter().collect(),
-        _ => HashSet::new(),
+        Value::String(s) => {
+            if !s.is_empty() {
+                out.push(s.clone());
+            }
+        }
+        Value::Text(t) => {
+            let s = t.string();
+            if !s.is_empty() {
+                out.push(s);
+            }
+        }
+        Value::Record(r) => {
+            for (_, cell) in r.fields() {
+                if let Some(v) = &cell.value {
+                    collect_text(v, out);
+                }
+            }
+        }
+        Value::List(l) => {
+            for cell in l.cells() {
+                if let Some(v) = &cell.value {
+                    collect_text(v, out);
+                }
+            }
+        }
+        Value::MvRegister(mv) => {
+            for v in mv.values() {
+                collect_text(v, out);
+            }
+        }
+        _ => {}
     }
+}
+
+/// Extract indexable tokens from a cell value by recursively walking containers.
+fn extract_tokens(cell: &Cell, min_token_len: usize) -> HashSet<String> {
+    let mut texts = Vec::new();
+    if let Some(value) = &cell.value {
+        collect_text(value, &mut texts);
+    }
+    let mut tokens = HashSet::new();
+    for text in texts {
+        for token in tokenize(&text, min_token_len) {
+            tokens.insert(token);
+        }
+    }
+    tokens
 }
 
 /// Read the forward token set for an entry from state.

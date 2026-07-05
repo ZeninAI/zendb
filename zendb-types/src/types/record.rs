@@ -30,6 +30,11 @@ impl Record {
         self.fields.is_empty()
     }
 
+    /// Iterate over all fields and their cells.
+    pub fn fields(&self) -> impl Iterator<Item = (&str, &Cell)> {
+        self.fields.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
     #[cfg(test)]
     pub(crate) fn insert(&mut self, field: String, cell: Cell) -> Option<Cell> {
         self.fields.insert(field, cell)

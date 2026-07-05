@@ -104,8 +104,10 @@ They implement the `Operator` trait:
 pub trait Operator: Send + 'static {
     type Config: Debug + Clone + PartialEq + Encode + Decode<()> + 'static;
     type Timer: Encode + Decode<()> + 'static;
+    type Facet: Send + Sync + 'static;
 
     fn create(db, name, config) -> BoxFuture<io::Result<Self>>;
+    fn facet(&self) -> Self::Facet;
     fn process(&mut self, changes, db, name, config) -> BoxFuture<io::Result<OperatorDirective>>;
     fn on_timer(&mut self, payload, fire_at_ms, db, name, config) -> BoxFuture<io::Result<OperatorDirective>>;
     fn on_input_opened(&mut self, table, db, name, config) -> BoxFuture<io::Result<OperatorDirective>>;
@@ -181,9 +183,28 @@ to `Failed` and retire it.
 ### Cancel and Delete
 
 ```rust
-db.cancel_operator("my-op")?;                    // shut down or mark cancelled
-db.delete_terminal_operator("my-op")?;           // remove from catalog (terminal only)
+db.cancel_operator("my-op")?;
+db.delete_terminal_operator("my-op")?;
 ```
+
+### Facets
+
+Operators expose a typed query interface via the `Facet` associated type.
+The facet is produced after `create()` and stored in the worker, retrievable
+with `db.facet::<F>(name)`. It typically wraps `StateHandle` clones so
+queries read directly from operator state without locking the processing loop:
+
+```rust
+impl Operator for IndexerOp {
+    type Facet = IndexerFacet;
+    fn facet(&self) -> IndexerFacet { IndexerFacet { index: self.index.clone() } }
+}
+
+let facet = db.facet::<IndexerFacet>("indexer")?;
+let results = facet.lookup("hello")?;
+```
+
+Use `type Facet = ()` for operators without a query interface.
 
 ---
 

@@ -4,10 +4,13 @@ mod full_text_index;
 mod merkle_tree;
 mod rhai;
 
-pub use full_text_index::{FullTextIndexConfig, FullTextIndexOperator};
+pub use full_text_index::{
+    FullTextIndexConfig, FullTextIndexFacet, FullTextIndexOperator, FtiStateKey, FtiStateValue,
+    SearchHit,
+};
 pub use merkle_tree::{
-    MerkleEntry, MerkleLeaf, MerkleNode, MerkleRoot, MerkleTreeConfig, MerkleTreeOperator,
-    MerkleTreeStateKey, MerkleTreeStateValue,
+    MerkleEntry, MerkleLeaf, MerkleNode, MerkleRoot, MerkleTreeConfig, MerkleTreeFacet,
+    MerkleTreeOperator, MerkleTreeStateKey, MerkleTreeStateValue,
 };
 pub use rhai::{RhaiOperator, RhaiOperatorConfig};
 

@@ -17,6 +17,7 @@ pub struct RhaiOperator;
 impl Operator for RhaiOperator {
     type Config = RhaiOperatorConfig;
     type Timer = ();
+    type Facet = ();
 
     fn create<'a, D>(
         _db: &'a Arc<Database<D>>,
@@ -29,4 +30,6 @@ impl Operator for RhaiOperator {
     {
         Box::pin(async { Ok(Self) })
     }
+
+    fn facet(&self) {}
 }

@@ -40,6 +40,7 @@ pub(crate) async fn run<D>(
     let mut operator = match D::create(&db, worker.name(), config).await {
         Ok(op) => {
             info!("operator {:?} created successfully", worker.name());
+            worker.publish_facet(op.facet());
             op
         }
         Err(error) => {
@@ -113,6 +114,7 @@ pub(crate) async fn run<D>(
                 LifecycleEvent::Teardown(phase) => {
                     debug!("operator {:?} teardown ({phase:?})", worker.name());
                     let _ = operator.teardown(&phase, &db, worker.name(), config).await;
+                    worker.clear_facet();
                     db.retire_operator(
                         worker.name(),
                         phase,
@@ -129,6 +131,7 @@ pub(crate) async fn run<D>(
             let _ = operator
                 .teardown(&OperatorPhase::Active, &db, worker.name(), config)
                 .await;
+            worker.clear_facet();
             if db.suspend_operator(worker.name()) {
                 return;
             }
@@ -137,6 +140,7 @@ pub(crate) async fn run<D>(
             match D::create(&db, worker.name(), config).await {
                 Ok(op) => {
                     info!("operator {:?} re-created after suspend race", worker.name());
+                    worker.publish_facet(op.facet());
                     operator = op;
                 }
                 Err(error) => {

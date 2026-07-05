@@ -120,9 +120,88 @@ pub struct MerkleTreeOperator {
     leaf_bits: u8,
 }
 
+/// Public query interface for the Merkle tree operator.
+///
+/// Obtained via [`Database::facet`] while the operator is running. Provides
+/// read-only access to the persisted Merkle summaries without locking the
+/// operator itself.
+#[derive(Clone)]
+pub struct MerkleTreeFacet {
+    state: StateHandle<MerkleTreeStateKey, MerkleTreeStateValue>,
+    leaf_bits: u8,
+}
+
+impl MerkleTreeFacet {
+    /// Return the persisted root for `table`, if the operator has seen it.
+    pub fn root(&self, table: &str) -> io::Result<Option<MerkleRoot>> {
+        let state = self.state.get()?;
+        let guard = state.read();
+        Ok(guard
+            .get(&MerkleTreeStateKey::Root {
+                table: table.to_owned(),
+            })
+            .and_then(|value| match value.into_owned() {
+                MerkleTreeStateValue::Root(root) => Some(root),
+                _ => None,
+            }))
+    }
+
+    /// Return the leaf bits configuration.
+    pub fn leaf_bits(&self) -> u8 {
+        self.leaf_bits
+    }
+
+    /// Return the persisted entry digest for a specific key in a table.
+    pub fn entry(&self, table: &str, key: &PrimaryKey) -> io::Result<Option<MerkleEntry>> {
+        let state = self.state.get()?;
+        let guard = state.read();
+        Ok(guard
+            .get(&MerkleTreeStateKey::Entry {
+                table: table.to_owned(),
+                key: key.clone(),
+            })
+            .and_then(|value| match value.into_owned() {
+                MerkleTreeStateValue::Entry(entry) => Some(entry),
+                _ => None,
+            }))
+    }
+
+    /// Return the persisted leaf bucket summary for a table.
+    pub fn leaf(&self, table: &str, index: u64) -> io::Result<Option<MerkleLeaf>> {
+        let state = self.state.get()?;
+        let guard = state.read();
+        Ok(guard
+            .get(&MerkleTreeStateKey::Leaf {
+                table: table.to_owned(),
+                index,
+            })
+            .and_then(|value| match value.into_owned() {
+                MerkleTreeStateValue::Leaf(leaf) => Some(leaf),
+                _ => None,
+            }))
+    }
+
+    /// Return the persisted internal node summary for a table.
+    pub fn node(&self, table: &str, level: u8, index: u64) -> io::Result<Option<MerkleNode>> {
+        let state = self.state.get()?;
+        let guard = state.read();
+        Ok(guard
+            .get(&MerkleTreeStateKey::Node {
+                table: table.to_owned(),
+                level,
+                index,
+            })
+            .and_then(|value| match value.into_owned() {
+                MerkleTreeStateValue::Node(node) => Some(node),
+                _ => None,
+            }))
+    }
+}
+
 impl Operator for MerkleTreeOperator {
     type Config = MerkleTreeConfig;
     type Timer = ();
+    type Facet = MerkleTreeFacet;
 
     fn create<'a, D>(
         db: &'a Arc<Database<D>>,
@@ -138,6 +217,13 @@ impl Operator for MerkleTreeOperator {
             let state = db.state(&config.state, Some(StateConfig::default()))?;
             Ok(Self { state, leaf_bits })
         })
+    }
+
+    fn facet(&self) -> MerkleTreeFacet {
+        MerkleTreeFacet {
+            state: self.state.clone(),
+            leaf_bits: self.leaf_bits,
+        }
     }
 
     fn on_input_opened<'a, D>(
@@ -216,29 +302,6 @@ impl Operator for MerkleTreeOperator {
 }
 
 impl MerkleTreeOperator {
-    /// Return the persisted root for `table`, if the operator has seen it.
-    pub fn root<D>(
-        db: &Arc<Database<D>>,
-        config: &MerkleTreeConfig,
-        table: &str,
-    ) -> io::Result<Option<MerkleRoot>>
-    where
-        D: DispatchOperator,
-    {
-        let state: StateHandle<MerkleTreeStateKey, MerkleTreeStateValue> =
-            db.state(&config.state, None)?;
-        Ok(state
-            .get()?
-            .read()
-            .get(&MerkleTreeStateKey::Root {
-                table: table.to_owned(),
-            })
-            .and_then(|value| match value.into_owned() {
-                MerkleTreeStateValue::Root(root) => Some(root),
-                _ => None,
-            }))
-    }
-
     fn rebuild_table<D>(&mut self, db: &Arc<Database<D>>, table: &str) -> io::Result<()>
     where
         D: DispatchOperator,

@@ -60,6 +60,29 @@ where
             .map(|entry| entry.as_ref().config.clone())
     }
 
+    /// Retrieve the typed facet published by a running operator.
+    ///
+    /// Returns an error if the operator is not currently running or has not
+    /// published a facet, or if the facet type `F` does not match.
+    pub fn facet<F: Send + Sync + 'static>(&self, name: &str) -> io::Result<Arc<F>> {
+        let workers = self.operators.read();
+        let worker = workers.get(name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("operator {name:?} is not running"),
+            )
+        })?;
+        worker.get_facet::<F>().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "operator {name:?} has no facet or type mismatch (expected {})",
+                    std::any::type_name::<F>()
+                ),
+            )
+        })
+    }
+
     /// Register a new operator. If matching tables are already open it is
     /// spawned immediately; otherwise it is persisted and will be spawned when
     /// a matching table opens. Returns an error if an operator with `name`

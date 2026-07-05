@@ -133,6 +133,19 @@ macro_rules! __zendb_define_operator_set {
                     }
                 }
 
+                fn facet(&self) -> Box<dyn ::std::any::Any + Send + Sync> {
+                    match self {
+                        OperatorInstance::$first_variant(inner) => {
+                            Box::new(<$first_operator as $crate::Operator>::facet(inner))
+                        }
+                        $(
+                            OperatorInstance::$variant(inner) => {
+                                Box::new(<$operator as $crate::Operator>::facet(inner))
+                            }
+                        )*
+                    }
+                }
+
                 fn process<'a>(
                     &'a mut self,
                     changes: Vec<$crate::Change>,

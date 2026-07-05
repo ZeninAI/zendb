@@ -1,40 +1,461 @@
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 
 use bincode::{Decode, Encode};
+use hashbrown::HashMap;
+use zendb_storage::core::traits::Backend;
+use zendb_types::{Cell, PrimaryKey, Value};
 
-use crate::{BoxFuture, Database, DispatchOperator, Operator};
+use crate::{
+    BoxFuture, Change, Database, DispatchOperator, Operator, OperatorDirective, StateConfig,
+    StateHandle,
+};
 
 /// Configuration for the full-text index operator.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct FullTextIndexConfig {
+    /// State namespace used to persist the inverted index.
     pub state: String,
+    /// Minimum token length to index (shorter tokens are ignored).
+    pub min_token_len: usize,
 }
 
 impl Default for FullTextIndexConfig {
     fn default() -> Self {
         Self {
             state: "operator/prelude/full-text-index".to_owned(),
+            min_token_len: 2,
         }
     }
 }
 
-/// Placeholder full-text index operator (no-op).
-pub struct FullTextIndexOperator;
+/// Key for the full-text index state.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub enum FtiStateKey {
+    /// Posting list for a token: maps token → set of (table, primary_key).
+    Posting(String),
+    /// Forward index: maps (table, primary_key) → set of tokens for that entry.
+    /// Used for efficient deletion/update without scanning all posting lists.
+    Forward { table: String, key: PrimaryKey },
+}
+
+/// Value for the full-text index state.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub enum FtiStateValue {
+    /// Set of (table, primary_key) pairs that contain this token.
+    PostingList(HashSet<(String, PrimaryKey)>),
+    /// Set of tokens extracted from a particular entry.
+    TokenSet(HashSet<String>),
+}
+
+/// A single search hit with its score.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub table: String,
+    pub key: PrimaryKey,
+    /// Number of query tokens matched by this entry.
+    pub matched_tokens: usize,
+    /// TF score: sum of (occurrences of matched token in this entry's token set / total tokens).
+    pub score: f64,
+}
+
+/// Full-text index operator.
+///
+/// Maintains a token-level inverted index (posting lists) and a forward index
+/// (per-entry token set) for all subscribed tables. Text is extracted from
+/// `Value::String` cells; other value types are ignored.
+pub struct FullTextIndexOperator {
+    state: StateHandle<FtiStateKey, FtiStateValue>,
+    min_token_len: usize,
+}
+
+/// Public query interface for the full-text index operator.
+///
+/// Obtained via [`Database::facet`] while the operator is running.
+#[derive(Clone)]
+pub struct FullTextIndexFacet {
+    state: StateHandle<FtiStateKey, FtiStateValue>,
+}
+
+impl FullTextIndexFacet {
+    /// Search for entries matching the query string across all indexed tables.
+    ///
+    /// Tokenizes the query, intersects posting lists, and returns hits ranked
+    /// by number of matched tokens (descending), limited to `limit` results.
+    pub fn search(&self, query: &str, limit: usize) -> io::Result<Vec<SearchHit>> {
+        let tokens = tokenize(query, 1); // use min_len=1 for queries
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.search_tokens(&tokens, None, limit)
+    }
+
+    /// Search for entries matching the query within a specific table only.
+    pub fn search_table(
+        &self,
+        query: &str,
+        table: &str,
+        limit: usize,
+    ) -> io::Result<Vec<SearchHit>> {
+        let tokens = tokenize(query, 1);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.search_tokens(&tokens, Some(table), limit)
+    }
+
+    /// Return all entries containing the exact token.
+    pub fn lookup_token(&self, token: &str) -> io::Result<HashSet<(String, PrimaryKey)>> {
+        let state = self.state.get()?;
+        let guard = state.read();
+        let key = FtiStateKey::Posting(token.to_lowercase());
+        Ok(match guard.get(&key) {
+            Some(value) => match value.into_owned() {
+                FtiStateValue::PostingList(set) => set,
+                _ => HashSet::new(),
+            },
+            None => HashSet::new(),
+        })
+    }
+
+    /// Return the set of tokens indexed for a particular entry.
+    pub fn tokens_for_entry(
+        &self,
+        table: &str,
+        key: &PrimaryKey,
+    ) -> io::Result<HashSet<String>> {
+        let state = self.state.get()?;
+        let guard = state.read();
+        let fwd_key = FtiStateKey::Forward {
+            table: table.to_owned(),
+            key: key.clone(),
+        };
+        Ok(match guard.get(&fwd_key) {
+            Some(value) => match value.into_owned() {
+                FtiStateValue::TokenSet(set) => set,
+                _ => HashSet::new(),
+            },
+            None => HashSet::new(),
+        })
+    }
+
+    fn search_tokens(
+        &self,
+        tokens: &[String],
+        table_filter: Option<&str>,
+        limit: usize,
+    ) -> io::Result<Vec<SearchHit>> {
+        let state = self.state.get()?;
+        let guard = state.read();
+
+        // Collect posting lists for each query token.
+        let mut hit_counts: HashMap<(String, PrimaryKey), usize> = HashMap::new();
+        let num_query_tokens = tokens.len();
+
+        for token in tokens {
+            let key = FtiStateKey::Posting(token.clone());
+            if let Some(value) = guard.get(&key) {
+                if let FtiStateValue::PostingList(postings) = value.into_owned() {
+                    for (tbl, pk) in postings {
+                        if let Some(filter) = table_filter {
+                            if tbl != filter {
+                                continue;
+                            }
+                        }
+                        *hit_counts.entry((tbl, pk)).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        // Score and rank.
+        let mut hits: Vec<SearchHit> = hit_counts
+            .into_iter()
+            .map(|((table, key), matched)| {
+                let score = matched as f64 / num_query_tokens as f64;
+                SearchHit {
+                    table,
+                    key,
+                    matched_tokens: matched,
+                    score,
+                }
+            })
+            .collect();
+
+        // Sort by score descending, then by matched_tokens descending.
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.matched_tokens.cmp(&a.matched_tokens))
+        });
+        hits.truncate(limit);
+        Ok(hits)
+    }
+}
 
 impl Operator for FullTextIndexOperator {
     type Config = FullTextIndexConfig;
     type Timer = ();
+    type Facet = FullTextIndexFacet;
 
     fn create<'a, D>(
-        _db: &'a Arc<Database<D>>,
+        db: &'a Arc<Database<D>>,
         _name: &'a str,
-        _config: &'a Self::Config,
+        config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<Self>>
     where
         D: DispatchOperator,
         Self: Sized,
     {
-        Box::pin(async { Ok(Self) })
+        Box::pin(async move {
+            let state = db.state(&config.state, Some(StateConfig::default()))?;
+            Ok(Self {
+                state,
+                min_token_len: config.min_token_len,
+            })
+        })
     }
+
+    fn facet(&self) -> FullTextIndexFacet {
+        FullTextIndexFacet {
+            state: self.state.clone(),
+        }
+    }
+
+    fn on_input_opened<'a, D>(
+        &'a mut self,
+        table: String,
+        db: &'a Arc<Database<D>>,
+        _name: &'a str,
+        _config: &'a Self::Config,
+    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    where
+        D: DispatchOperator,
+    {
+        Box::pin(async move {
+            self.rebuild_table(db, &table)?;
+            Ok(OperatorDirective::Continue)
+        })
+    }
+
+    fn on_input_closed<'a, D>(
+        &'a mut self,
+        table: String,
+        _db: &'a Arc<Database<D>>,
+        _name: &'a str,
+        _config: &'a Self::Config,
+    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    where
+        D: DispatchOperator,
+    {
+        Box::pin(async move {
+            // If the table was deleted (not just closed), clean up its index entries.
+            // The table is already removed from the catalog by this point.
+            // For now, we keep the index entries alive — they can be cleaned up
+            // on the next rebuild if the table reappears, or removed explicitly.
+            let _ = table;
+            Ok(OperatorDirective::Continue)
+        })
+    }
+
+    fn process<'a, D>(
+        &'a mut self,
+        changes: Vec<Change>,
+        _db: &'a Arc<Database<D>>,
+        _name: &'a str,
+        _config: &'a Self::Config,
+    ) -> BoxFuture<'a, io::Result<OperatorDirective>>
+    where
+        D: DispatchOperator,
+    {
+        Box::pin(async move {
+            let state = self.state.get()?;
+            let mut state = state.write();
+
+            for change in changes {
+                let table = change.event.table_id.clone();
+                let pk = change.event.primary_key.clone();
+
+                let old_tokens = get_forward_tokens(&state, &table, &pk);
+                let new_tokens = change
+                    .current
+                    .as_ref()
+                    .map(|cell| extract_tokens(cell, self.min_token_len))
+                    .unwrap_or_default();
+
+                // Compute tokens to remove and add.
+                let to_remove: Vec<String> = old_tokens.difference(&new_tokens).cloned().collect();
+                let to_add: Vec<String> = new_tokens.difference(&old_tokens).cloned().collect();
+
+                if to_remove.is_empty() && to_add.is_empty() {
+                    continue;
+                }
+
+                let entry = (table.clone(), pk.clone());
+
+                // Remove from old posting lists.
+                for token in &to_remove {
+                    let posting_key = FtiStateKey::Posting(token.clone());
+                    update_posting_list(&mut state, &posting_key, |set| {
+                        set.remove(&entry);
+                    })?;
+                }
+
+                // Add to new posting lists.
+                for token in &to_add {
+                    let posting_key = FtiStateKey::Posting(token.clone());
+                    update_posting_list(&mut state, &posting_key, |set| {
+                        set.insert(entry.clone());
+                    })?;
+                }
+
+                // Update forward index.
+                let fwd_key = FtiStateKey::Forward {
+                    table,
+                    key: pk,
+                };
+                if new_tokens.is_empty() {
+                    state.delete(&fwd_key)?;
+                } else {
+                    state.put(fwd_key, FtiStateValue::TokenSet(new_tokens))?;
+                }
+            }
+
+            Ok(OperatorDirective::Continue)
+        })
+    }
+}
+
+impl FullTextIndexOperator {
+    /// Full rebuild: scan all entries in the table and reindex from scratch.
+    fn rebuild_table<D>(&mut self, db: &Arc<Database<D>>, table: &str) -> io::Result<()>
+    where
+        D: DispatchOperator,
+    {
+        let table_handle = db.table(table, None)?;
+        let table_guard = table_handle.get()?;
+        let table_read = table_guard.read();
+
+        let state = self.state.get()?;
+        let mut state = state.write();
+
+        // Clear existing entries for this table from forward index.
+        let fwd_keys: Vec<FtiStateKey> = state
+            .keys()
+            .filter_map(|k| match k.as_ref() {
+                FtiStateKey::Forward { table: t, .. } if t == table => Some(k.into_owned()),
+                _ => None,
+            })
+            .collect();
+
+        for fwd_key in &fwd_keys {
+            if let Some(value) = state.get(fwd_key) {
+                if let FtiStateValue::TokenSet(tokens) = value.into_owned() {
+                    let entry = match fwd_key {
+                        FtiStateKey::Forward { table: t, key } => (t.clone(), key.clone()),
+                        _ => continue,
+                    };
+                    for token in &tokens {
+                        let posting_key = FtiStateKey::Posting(token.clone());
+                        update_posting_list(&mut state, &posting_key, |set| {
+                            set.remove(&entry);
+                        })?;
+                    }
+                }
+            }
+            state.delete(fwd_key)?;
+        }
+
+        // Rebuild from table contents.
+        for (pk, cell) in table_read.entries() {
+            let pk = pk.into_owned();
+            let tokens = extract_tokens(cell.as_ref(), self.min_token_len);
+            if tokens.is_empty() {
+                continue;
+            }
+
+            let entry = (table.to_owned(), pk.clone());
+            for token in &tokens {
+                let posting_key = FtiStateKey::Posting(token.clone());
+                update_posting_list(&mut state, &posting_key, |set| {
+                    set.insert(entry.clone());
+                })?;
+            }
+
+            state.put(
+                FtiStateKey::Forward {
+                    table: table.to_owned(),
+                    key: pk,
+                },
+                FtiStateValue::TokenSet(tokens),
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Tokenize text: lowercase, split on non-alphanumeric, filter by min length.
+fn tokenize(text: &str, min_len: usize) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= min_len)
+        .map(|t| t.to_owned())
+        .collect()
+}
+
+/// Extract indexable tokens from a cell value.
+fn extract_tokens(cell: &Cell, min_token_len: usize) -> HashSet<String> {
+    let Some(value) = &cell.value else {
+        return HashSet::new();
+    };
+    match value {
+        Value::String(s) => tokenize(s, min_token_len).into_iter().collect(),
+        _ => HashSet::new(),
+    }
+}
+
+/// Read the forward token set for an entry from state.
+fn get_forward_tokens(
+    state: &crate::State<FtiStateKey, FtiStateValue>,
+    table: &str,
+    key: &PrimaryKey,
+) -> HashSet<String> {
+    let fwd_key = FtiStateKey::Forward {
+        table: table.to_owned(),
+        key: key.clone(),
+    };
+    match state.get(&fwd_key) {
+        Some(value) => match value.into_owned() {
+            FtiStateValue::TokenSet(set) => set,
+            _ => HashSet::new(),
+        },
+        None => HashSet::new(),
+    }
+}
+
+/// Update a posting list in-place: read, apply mutation, write back (or delete if empty).
+fn update_posting_list(
+    state: &mut crate::State<FtiStateKey, FtiStateValue>,
+    key: &FtiStateKey,
+    f: impl FnOnce(&mut HashSet<(String, PrimaryKey)>),
+) -> io::Result<()> {
+    let mut set = match state.get(key).map(Cow::into_owned) {
+        Some(FtiStateValue::PostingList(s)) => s,
+        _ => HashSet::new(),
+    };
+    f(&mut set);
+    if set.is_empty() {
+        state.delete(key)?;
+    } else {
+        state.put(key.clone(), FtiStateValue::PostingList(set))?;
+    }
+    Ok(())
 }

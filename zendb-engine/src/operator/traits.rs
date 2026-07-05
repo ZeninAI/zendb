@@ -1,4 +1,4 @@
-use std::{fmt::Debug, io, sync::Arc};
+use std::{any::Any, fmt::Debug, io, sync::Arc};
 
 use bincode::{Decode, Encode};
 
@@ -57,6 +57,17 @@ pub trait Operator: Send + 'static {
     /// Typed timer payload. Use `()` if the operator does not use timers.
     type Timer: Encode + Decode<()> + 'static;
 
+    /// Public query interface exposed to users while the operator is running.
+    ///
+    /// The facet is produced once after [`Operator::create`] succeeds and is
+    /// available via [`Database::facet`] for the lifetime of the operator.
+    /// Typically wraps [`StateHandle`](crate::StateHandle) instances so that
+    /// queries read directly from the operator's persisted state without
+    /// requiring a lock on the operator itself.
+    ///
+    /// Use `()` if the operator does not expose a query interface.
+    type Facet: Send + Sync + 'static;
+
     /// Construct the operator with full database access.
     ///
     /// Called once when the operator is first spawned. Use this to open state
@@ -69,6 +80,16 @@ pub trait Operator: Send + 'static {
     where
         D: DispatchOperator,
         Self: Sized;
+
+    /// Produce the public query facet for this operator.
+    ///
+    /// Called once after [`Operator::create`] succeeds (and again after
+    /// re-creation on a suspend race). The returned facet is stored in the
+    /// operator worker and made available via [`Database::facet`].
+    ///
+    /// The default implementation returns `()` for operators that do not
+    /// expose a query interface.
+    fn facet(&self) -> Self::Facet;
 
     /// Process a batch of changes from subscribed tables.
     fn process<'a, D>(
@@ -179,6 +200,9 @@ pub trait DispatchOperator: Send + 'static {
     ) -> BoxFuture<'a, io::Result<Self>>
     where
         Self: Sized;
+
+    /// Produce a type-erased facet for external queries.
+    fn facet(&self) -> Box<dyn Any + Send + Sync>;
 
     fn process<'a>(
         &'a mut self,

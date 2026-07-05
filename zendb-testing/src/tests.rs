@@ -7,6 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use zendb_engine::{Database, DatabaseConfig, OperatorPhase};
+use zendb_engine::operator::prelude::{
+    FullTextIndexConfig, FullTextIndexFacet, FullTextIndexOperator, MerkleTreeConfig,
+    MerkleTreeFacet, MerkleTreeOperator,
+};
 use zendb_storage::core::traits::Backend;
 use zendb_types::{Event, Op, Path as ValuePath, PrimaryKey};
 
@@ -472,4 +476,292 @@ fn timers_are_evicted_on_retirement() {
     drop(archiver_consumer);
     drop(docs_read);
     drop(docs_h);
+}
+
+// -----------------------------------------------------------------------
+// Merkle tree facet test
+// -----------------------------------------------------------------------
+
+#[test]
+fn merkle_tree_facet_provides_root() {
+    let path = tmp("merkle_facet");
+
+    let db =
+        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+
+    let documents = db
+        .table("documents", Some(zendb_engine::TableConfig::default()))
+        .unwrap();
+
+    // Insert documents BEFORE registering the operator so that rebuild_table
+    // sees them and the consumer starts after these offsets (no double-process).
+    documents
+        .get()
+        .unwrap()
+        .write()
+        .insert_event(doc_event("d1", "hello world", 100))
+        .unwrap();
+    documents
+        .get()
+        .unwrap()
+        .write()
+        .insert_event(doc_event("d2", "foo bar", 110))
+        .unwrap();
+
+    // Register the MerkleTree operator on the "documents" table.
+    let merkle_config = MerkleTreeConfig {
+        state: "merkle-state".to_owned(),
+        leaf_bits: 4, // small for test
+    };
+    let merkle_runtime = zendb_engine::OperatorRuntimeConfig {
+        subscriptions: vec![zendb_engine::Subscription::pattern("documents")],
+        poll_size: 128,
+    };
+    db.dispatch_operator::<MerkleTreeOperator>("merkle", merkle_config, merkle_runtime)
+        .unwrap();
+
+    // Wait until the merkle operator has processed the initial rebuild.
+    wait_until(
+        || {
+            db.facet::<MerkleTreeFacet>("merkle")
+                .ok()
+                .and_then(|f| f.root("documents").ok().flatten())
+                .map(|root| root.entries == 2)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    );
+
+    // Query the facet and verify root.
+    let facet = db.facet::<MerkleTreeFacet>("merkle").unwrap();
+    let root = facet.root("documents").unwrap().expect("root should exist");
+    assert_eq!(root.entries, 2);
+    assert_eq!(root.leaf_bits, 4);
+    assert_ne!(root.hash, [0u8; 32], "root hash should be non-zero");
+
+    // Verify individual entry lookup.
+    let entry = facet
+        .entry("documents", &PrimaryKey::String("d1".into()))
+        .unwrap()
+        .expect("entry d1 should exist");
+    assert_ne!(entry.hash, [0u8; 32]);
+
+    // Insert another document and verify the root updates via process().
+    documents
+        .get()
+        .unwrap()
+        .write()
+        .insert_event(doc_event("d3", "baz qux", 120))
+        .unwrap();
+
+    wait_until(
+        || {
+            facet
+                .root("documents")
+                .ok()
+                .flatten()
+                .map(|r| r.entries == 3)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    );
+
+    let updated_root = facet.root("documents").unwrap().unwrap();
+    assert_eq!(updated_root.entries, 3);
+    assert_ne!(updated_root.hash, root.hash, "hash should change after insert");
+}
+
+// -----------------------------------------------------------------------
+// Facet unavailable when operator is not running
+// -----------------------------------------------------------------------
+
+#[test]
+fn facet_unavailable_after_operator_cancellation() {
+    let path = tmp("facet_cancel");
+
+    let db =
+        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+
+    let _documents = db
+        .table("documents", Some(zendb_engine::TableConfig::default()))
+        .unwrap();
+
+    let merkle_config = MerkleTreeConfig {
+        state: "merkle-state".to_owned(),
+        leaf_bits: 4,
+    };
+    let merkle_runtime = zendb_engine::OperatorRuntimeConfig {
+        subscriptions: vec![zendb_engine::Subscription::pattern("documents")],
+        poll_size: 128,
+    };
+    db.dispatch_operator::<MerkleTreeOperator>("merkle", merkle_config, merkle_runtime)
+        .unwrap();
+
+    // Wait for the operator to start and publish the facet.
+    wait_until(
+        || db.facet::<MerkleTreeFacet>("merkle").is_ok(),
+        Duration::from_secs(5),
+    );
+
+    // Facet should be available.
+    assert!(db.facet::<MerkleTreeFacet>("merkle").is_ok());
+
+    // Cancel the operator.
+    db.cancel_operator("merkle").unwrap();
+
+    // Wait for cancellation to complete.
+    wait_until(
+        || db.operator_phase("merkle") == Some(OperatorPhase::Cancelled),
+        Duration::from_secs(5),
+    );
+
+    // Facet should no longer be available.
+    assert!(
+        db.facet::<MerkleTreeFacet>("merkle").is_err(),
+        "facet should not be available after operator cancellation"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Full-text index facet test
+// -----------------------------------------------------------------------
+
+#[test]
+fn full_text_index_search() {
+    let path = tmp("fti_search");
+
+    let db =
+        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+
+    let documents = db
+        .table("documents", Some(zendb_engine::TableConfig::default()))
+        .unwrap();
+
+    // Insert documents before operator so rebuild picks them up cleanly.
+    documents
+        .get()
+        .unwrap()
+        .write()
+        .insert_event(doc_event("d1", "The quick brown fox jumps over the lazy dog", 100))
+        .unwrap();
+    documents
+        .get()
+        .unwrap()
+        .write()
+        .insert_event(doc_event("d2", "A quick brown cat sleeps on the mat", 110))
+        .unwrap();
+    documents
+        .get()
+        .unwrap()
+        .write()
+        .insert_event(doc_event("d3", "The lazy fox does nothing", 120))
+        .unwrap();
+
+    // Register FTI operator.
+    let fti_config = FullTextIndexConfig {
+        state: "fti-state".to_owned(),
+        min_token_len: 2,
+    };
+    let fti_runtime = zendb_engine::OperatorRuntimeConfig {
+        subscriptions: vec![zendb_engine::Subscription::pattern("documents")],
+        poll_size: 128,
+    };
+    db.dispatch_operator::<FullTextIndexOperator>("fti", fti_config, fti_runtime)
+        .unwrap();
+
+    // Wait for the facet to become available and index to be built.
+    wait_until(
+        || {
+            db.facet::<FullTextIndexFacet>("fti")
+                .ok()
+                .and_then(|f| f.tokens_for_entry("documents", &PrimaryKey::String("d1".into())).ok())
+                .map(|tokens| !tokens.is_empty())
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    );
+
+    let facet = db.facet::<FullTextIndexFacet>("fti").unwrap();
+
+    // Search for "quick brown" — should match d1 and d2.
+    let results = facet.search("quick brown", 10).unwrap();
+    assert!(results.len() >= 2);
+    let keys: Vec<&PrimaryKey> = results.iter().map(|h| &h.key).collect();
+    assert!(keys.contains(&&PrimaryKey::String("d1".into())));
+    assert!(keys.contains(&&PrimaryKey::String("d2".into())));
+
+    // Search for "lazy fox" — should match d1 and d3.
+    let results = facet.search("lazy fox", 10).unwrap();
+    assert!(results.len() >= 2);
+    let keys: Vec<&PrimaryKey> = results.iter().map(|h| &h.key).collect();
+    assert!(keys.contains(&&PrimaryKey::String("d1".into())));
+    assert!(keys.contains(&&PrimaryKey::String("d3".into())));
+
+    // Search for "cat" — should only match d2.
+    let results = facet.search("cat", 10).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].key, PrimaryKey::String("d2".into()));
+
+    // Verify top-k limiting works.
+    let results = facet.search("the", 1).unwrap();
+    assert_eq!(results.len(), 1);
+
+    // Table-scoped search.
+    let results = facet.search_table("quick", "documents", 10).unwrap();
+    assert!(results.len() >= 2);
+
+    // Verify incremental update: insert a new document.
+    documents
+        .get()
+        .unwrap()
+        .write()
+        .insert_event(doc_event("d4", "quick silver fox", 130))
+        .unwrap();
+
+    wait_until(
+        || {
+            facet
+                .search("quick fox", 10)
+                .ok()
+                .map(|r| r.iter().any(|h| h.key == PrimaryKey::String("d4".into())))
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    );
+
+    // d4 should now appear in "quick fox" results with score 1.0 (both tokens match).
+    let results = facet.search("quick fox", 10).unwrap();
+    let d4_hit = results
+        .iter()
+        .find(|h| h.key == PrimaryKey::String("d4".into()));
+    assert!(d4_hit.is_some());
+    assert_eq!(d4_hit.unwrap().matched_tokens, 2);
+
+    // Verify update: change d1's content (removes "dog", adds "deer").
+    documents
+        .get()
+        .unwrap()
+        .write()
+        .insert_event(doc_event("d1", "The quick brown fox jumps over the lazy deer", 200))
+        .unwrap();
+
+    wait_until(
+        || {
+            facet
+                .search("dog", 10)
+                .ok()
+                .map(|r| r.is_empty())
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    );
+
+    // "dog" should no longer match anything.
+    let results = facet.search("dog", 10).unwrap();
+    assert!(results.is_empty());
+
+    // "deer" should match d1.
+    let results = facet.search("deer", 10).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].key, PrimaryKey::String("d1".into()));
 }

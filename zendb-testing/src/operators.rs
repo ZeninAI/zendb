@@ -91,6 +91,7 @@ pub(crate) struct IndexerOp {
 impl Operator for IndexerOp {
     type Config = IndexerConfig;
     type Timer = ();
+    type Facet = ();
 
     fn create<'a, D>(
         db: &'a Arc<Database<D>>, name: &'a str, config: &'a Self::Config,
@@ -105,6 +106,8 @@ impl Operator for IndexerOp {
             Ok(Self { index, stats })
         })
     }
+
+    fn facet(&self) {}
 
     fn process<'a, D>(
         &'a mut self,
@@ -206,6 +209,7 @@ pub(crate) struct ArchiverOp {
 impl Operator for ArchiverOp {
     type Config = ArchiverConfig;
     type Timer = ();
+    type Facet = ();
 
     fn create<'a, D>(
         db: &'a Arc<Database<D>>, name: &'a str, config: &'a Self::Config,
@@ -232,6 +236,8 @@ impl Operator for ArchiverOp {
             })
         })
     }
+
+    fn facet(&self) {}
 
     fn process<'a, D>(
         &'a mut self,

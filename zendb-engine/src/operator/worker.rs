@@ -4,7 +4,7 @@
 //! attaches/detaches inputs and enqueues timers) and the async run loop
 //! (which drives the operator through its lifecycle).
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{any::Any, collections::VecDeque, sync::Arc};
 
 use log::{debug, trace};
 use parking_lot::Mutex;
@@ -12,6 +12,9 @@ use zendb_storage::core::topic::TopicConsumer;
 
 use super::{run_loop::LifecycleEvent, Change, DispatchOperator, OperatorPhase};
 use crate::Database;
+
+/// Type-erased facet stored by the worker.
+pub(crate) type ErasedFacet = Arc<dyn Any + Send + Sync>;
 
 /// A single input source: a topic consumer bound to a table name.
 pub(crate) struct OperatorInput {
@@ -39,6 +42,7 @@ where
     timer_inbox: Mutex<VecDeque<(u64, Vec<u8>)>>,
     events: Mutex<VecDeque<LifecycleEvent>>,
     shutdown_phase: Mutex<Option<OperatorPhase>>,
+    facet: Mutex<Option<ErasedFacet>>,
 }
 
 impl<D> OperatorWorker<D>
@@ -58,6 +62,7 @@ where
             timer_inbox: Mutex::new(VecDeque::new()),
             events: Mutex::new(events),
             shutdown_phase: Mutex::new(None),
+            facet: Mutex::new(None),
         })
     }
 
@@ -77,6 +82,27 @@ where
 
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.shutdown_phase.lock().is_some()
+    }
+
+    // --- Facet management ---
+
+    /// Store the operator's type-erased facet for external queries.
+    pub(crate) fn publish_facet(&self, facet: Box<dyn Any + Send + Sync>) {
+        *self.facet.lock() = Some(Arc::from(facet));
+    }
+
+    /// Remove the facet (called on teardown/suspend).
+    pub(crate) fn clear_facet(&self) {
+        *self.facet.lock() = None;
+    }
+
+    /// Retrieve the facet, downcasting to `F`. Returns `None` if no facet is
+    /// published or the type does not match.
+    pub(crate) fn get_facet<F: Send + Sync + 'static>(&self) -> Option<Arc<F>> {
+        self.facet
+            .lock()
+            .as_ref()
+            .and_then(|f| Arc::clone(f).downcast::<F>().ok())
     }
 
     // --- Input management ---

@@ -298,7 +298,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator::prelude::{MerkleTreeConfig, MerkleTreeOperator};
+    use crate::operator::prelude::{MerkleTreeConfig, MerkleTreeFacet, MerkleTreeOperator};
     use crate::{
         Change, Operator, OperatorDirective, OperatorRuntimeConfig, Subscription, TableConfig,
     };
@@ -354,6 +354,7 @@ mod tests {
     impl Operator for CountingOperator {
         type Config = CountingConfig;
         type Timer = ();
+        type Facet = ();
 
         fn create<'a, D>(
             db: &'a Arc<Database<D>>,
@@ -377,6 +378,8 @@ mod tests {
                 })
             })
         }
+
+        fn facet(&self) {}
 
         fn process<'a, D>(
             &'a mut self,
@@ -423,6 +426,7 @@ mod tests {
     impl Operator for FailingOperator {
         type Config = FailingOperatorConfig;
         type Timer = ();
+        type Facet = ();
 
         fn create<'a, D>(
             db: &'a Arc<Database<D>>,
@@ -439,6 +443,8 @@ mod tests {
                 })
             })
         }
+
+        fn facet(&self) {}
 
         fn process<'a, D>(
             &'a mut self,
@@ -470,6 +476,7 @@ mod tests {
     impl Operator for TimerOperator {
         type Config = TimerOperatorConfig;
         type Timer = ();
+        type Facet = ();
 
         fn create<'a, D>(
             db: &'a Arc<Database<D>>,
@@ -491,6 +498,8 @@ mod tests {
                 })
             })
         }
+
+        fn facet(&self) {}
 
         fn process<'a, D>(
             &'a mut self,
@@ -536,6 +545,7 @@ mod tests {
     impl Operator for InputLifecycleOperator {
         type Config = InputLifecycleConfig;
         type Timer = ();
+        type Facet = ();
 
         fn create<'a, D>(
             db: &'a Arc<Database<D>>,
@@ -551,6 +561,8 @@ mod tests {
                 Ok(Self { opened, closed })
             })
         }
+
+        fn facet(&self) {}
 
         fn process<'a, D>(
             &'a mut self,
@@ -610,6 +622,7 @@ mod tests {
     impl Operator for ShutdownLifecycleOperator {
         type Config = ShutdownLifecycleConfig;
         type Timer = ();
+        type Facet = ();
 
         fn create<'a, D>(
             db: &'a Arc<Database<D>>,
@@ -626,6 +639,8 @@ mod tests {
                 Ok(Self { log })
             })
         }
+
+        fn facet(&self) {}
 
         fn process<'a, D>(
             &'a mut self,
@@ -702,6 +717,7 @@ mod tests {
     impl Operator for SpawnerOperator {
         type Config = SpawnerConfig;
         type Timer = ();
+        type Facet = ();
 
         fn create<'a, D>(
             db: &'a Arc<Database<D>>,
@@ -737,6 +753,8 @@ mod tests {
                 Ok(Self)
             })
         }
+
+        fn facet(&self) {}
 
         fn process<'a, D>(
             &'a mut self,
@@ -999,14 +1017,11 @@ mod tests {
         )
         .unwrap();
 
-        wait_until(|| {
-            MerkleTreeOperator::root(&db, &config, "users")
-                .unwrap()
-                .is_some()
-        });
-        let empty = MerkleTreeOperator::root(&db, &config, "users")
-            .unwrap()
-            .unwrap();
+        wait_until(|| db.facet::<MerkleTreeFacet>("merkle").is_ok());
+        let facet = db.facet::<MerkleTreeFacet>("merkle").unwrap();
+
+        wait_until(|| facet.root("users").unwrap().is_some());
+        let empty = facet.root("users").unwrap().unwrap();
         assert_eq!(empty.entries, 0);
 
         table
@@ -1016,13 +1031,12 @@ mod tests {
             .insert_event(event("users", 1, 100))
             .unwrap();
         wait_until(|| {
-            MerkleTreeOperator::root(&db, &config, "users")
+            facet
+                .root("users")
                 .unwrap()
                 .is_some_and(|root| root.entries == 1 && root.hash != empty.hash)
         });
-        let inserted = MerkleTreeOperator::root(&db, &config, "users")
-            .unwrap()
-            .unwrap();
+        let inserted = facet.root("users").unwrap().unwrap();
 
         table
             .get()
@@ -1040,7 +1054,8 @@ mod tests {
             .unwrap();
 
         wait_until(|| {
-            MerkleTreeOperator::root(&db, &config, "users")
+            facet
+                .root("users")
                 .unwrap()
                 .is_some_and(|root| root.entries == 1 && root.hash != inserted.hash)
         });

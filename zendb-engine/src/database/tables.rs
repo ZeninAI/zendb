@@ -93,6 +93,7 @@ where
             }
         }
 
+        // 4. Delete on-disk files (includes all consumer offsets).
         let path = self.path.join(TABLES_DIR).join(name);
         if path.exists() {
             fs::remove_dir_all(&path)?;

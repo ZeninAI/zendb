@@ -6,11 +6,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use zendb_engine::{Database, DatabaseConfig, OperatorPhase};
 use zendb_engine::operator::prelude::{
     FullTextIndexConfig, FullTextIndexFacet, FullTextIndexOperator, MerkleTreeConfig,
     MerkleTreeFacet, MerkleTreeOperator,
 };
+use zendb_engine::{Database, DatabaseConfig, OperatorPhase};
 use zendb_storage::core::traits::Backend;
 use zendb_types::{Event, Op, Path as ValuePath, PrimaryKey};
 
@@ -568,7 +568,10 @@ fn merkle_tree_facet_provides_root() {
 
     let updated_root = facet.root("documents").unwrap().unwrap();
     assert_eq!(updated_root.entries, 3);
-    assert_ne!(updated_root.hash, root.hash, "hash should change after insert");
+    assert_ne!(
+        updated_root.hash, root.hash,
+        "hash should change after insert"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -642,7 +645,11 @@ fn full_text_index_search() {
         .get()
         .unwrap()
         .write()
-        .insert_event(doc_event("d1", "The quick brown fox jumps over the lazy dog", 100))
+        .insert_event(doc_event(
+            "d1",
+            "The quick brown fox jumps over the lazy dog",
+            100,
+        ))
         .unwrap();
     documents
         .get()
@@ -674,7 +681,10 @@ fn full_text_index_search() {
         || {
             db.facet::<FullTextIndexFacet>("fti")
                 .ok()
-                .and_then(|f| f.tokens_for_entry("documents", &PrimaryKey::String("d1".into())).ok())
+                .and_then(|f| {
+                    f.tokens_for_entry("documents", &PrimaryKey::String("d1".into()))
+                        .ok()
+                })
                 .map(|tokens| !tokens.is_empty())
                 .unwrap_or(false)
         },
@@ -684,30 +694,30 @@ fn full_text_index_search() {
     let facet = db.facet::<FullTextIndexFacet>("fti").unwrap();
 
     // Search for "quick brown" — should match d1 and d2.
-    let results = facet.search("quick brown", 10).unwrap();
+    let results = facet.search("documents", "quick brown", 10).unwrap();
     assert!(results.len() >= 2);
     let keys: Vec<&PrimaryKey> = results.iter().map(|h| &h.key).collect();
     assert!(keys.contains(&&PrimaryKey::String("d1".into())));
     assert!(keys.contains(&&PrimaryKey::String("d2".into())));
 
     // Search for "lazy fox" — should match d1 and d3.
-    let results = facet.search("lazy fox", 10).unwrap();
+    let results = facet.search("documents", "lazy fox", 10).unwrap();
     assert!(results.len() >= 2);
     let keys: Vec<&PrimaryKey> = results.iter().map(|h| &h.key).collect();
     assert!(keys.contains(&&PrimaryKey::String("d1".into())));
     assert!(keys.contains(&&PrimaryKey::String("d3".into())));
 
     // Search for "cat" — should only match d2.
-    let results = facet.search("cat", 10).unwrap();
+    let results = facet.search("documents", "cat", 10).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].key, PrimaryKey::String("d2".into()));
 
     // Verify top-k limiting works.
-    let results = facet.search("the", 1).unwrap();
+    let results = facet.search("documents", "the", 1).unwrap();
     assert_eq!(results.len(), 1);
 
-    // Table-scoped search.
-    let results = facet.search_table("quick", "documents", 10).unwrap();
+    // Search remains table-scoped.
+    let results = facet.search("documents", "quick", 10).unwrap();
     assert!(results.len() >= 2);
 
     // Verify incremental update: insert a new document.
@@ -721,7 +731,7 @@ fn full_text_index_search() {
     wait_until(
         || {
             facet
-                .search("quick fox", 10)
+                .search("documents", "quick fox", 10)
                 .ok()
                 .map(|r| r.iter().any(|h| h.key == PrimaryKey::String("d4".into())))
                 .unwrap_or(false)
@@ -730,7 +740,7 @@ fn full_text_index_search() {
     );
 
     // d4 should now appear in "quick fox" results with score 1.0 (both tokens match).
-    let results = facet.search("quick fox", 10).unwrap();
+    let results = facet.search("documents", "quick fox", 10).unwrap();
     let d4_hit = results
         .iter()
         .find(|h| h.key == PrimaryKey::String("d4".into()));
@@ -742,13 +752,17 @@ fn full_text_index_search() {
         .get()
         .unwrap()
         .write()
-        .insert_event(doc_event("d1", "The quick brown fox jumps over the lazy deer", 200))
+        .insert_event(doc_event(
+            "d1",
+            "The quick brown fox jumps over the lazy deer",
+            200,
+        ))
         .unwrap();
 
     wait_until(
         || {
             facet
-                .search("dog", 10)
+                .search("documents", "dog", 10)
                 .ok()
                 .map(|r| r.is_empty())
                 .unwrap_or(false)
@@ -757,11 +771,11 @@ fn full_text_index_search() {
     );
 
     // "dog" should no longer match anything.
-    let results = facet.search("dog", 10).unwrap();
+    let results = facet.search("documents", "dog", 10).unwrap();
     assert!(results.is_empty());
 
     // "deer" should match d1.
-    let results = facet.search("deer", 10).unwrap();
+    let results = facet.search("documents", "deer", 10).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].key, PrimaryKey::String("d1".into()));
 }

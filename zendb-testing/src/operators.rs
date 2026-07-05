@@ -1,8 +1,8 @@
 //! Document indexing pipeline operators and helpers.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bincode::{Decode, Encode};
@@ -94,7 +94,9 @@ impl Operator for IndexerOp {
     type Facet = ();
 
     fn create<'a, D>(
-        db: &'a Arc<Database<D>>, name: &'a str, config: &'a Self::Config,
+        db: &'a Arc<Database<D>>,
+        _name: &'a str,
+        _config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<Self>>
     where
         D: DispatchOperator,
@@ -112,7 +114,9 @@ impl Operator for IndexerOp {
     fn process<'a, D>(
         &'a mut self,
         changes: Vec<Change>,
-        _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
+        _db: &'a Arc<Database<D>>,
+        _name: &'a str,
+        _config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
     where
         D: DispatchOperator,
@@ -212,7 +216,9 @@ impl Operator for ArchiverOp {
     type Facet = ();
 
     fn create<'a, D>(
-        db: &'a Arc<Database<D>>, name: &'a str, config: &'a Self::Config,
+        db: &'a Arc<Database<D>>,
+        name: &'a str,
+        config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<Self>>
     where
         D: DispatchOperator,
@@ -242,7 +248,9 @@ impl Operator for ArchiverOp {
     fn process<'a, D>(
         &'a mut self,
         _changes: Vec<Change>,
-        _db: &'a Arc<Database<D>>, _name: &'a str, _config: &'a Self::Config,
+        _db: &'a Arc<Database<D>>,
+        _name: &'a str,
+        _config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
     where
         D: DispatchOperator,
@@ -254,7 +262,9 @@ impl Operator for ArchiverOp {
         &'a mut self,
         _payload: (),
         _fire_at_ms: u64,
-        db: &'a Arc<Database<D>>, name: &'a str, config: &'a Self::Config,
+        db: &'a Arc<Database<D>>,
+        name: &'a str,
+        _config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
     where
         D: DispatchOperator,

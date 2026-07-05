@@ -478,6 +478,13 @@ crate::define_operator_set! {
 }
 
 pub(super) type TestDatabase = Database<test_operators::OperatorInstance>;
+
+pub(super) fn database_config() -> DatabaseConfig {
+    DatabaseConfig {
+        graceful_shutdown_max_duration: Duration::from_millis(100),
+    }
+}
+
 pub(super) fn counter_trackers() -> &'static Mutex<HashMap<String, Arc<AtomicUsize>>> {
     static TRACKERS: OnceLock<Mutex<HashMap<String, Arc<AtomicUsize>>>> = OnceLock::new();
     TRACKERS.get_or_init(|| Mutex::new(HashMap::new()))

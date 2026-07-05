@@ -1,6 +1,6 @@
 use super::support::*;
 use crate::operator::prelude::{MerkleTreeConfig, MerkleTreeFacet, MerkleTreeOperator};
-use crate::{DatabaseConfig, OperatorPhase, Subscription, TableConfig};
+use crate::{OperatorPhase, Subscription, TableConfig};
 use std::io;
 use std::sync::{atomic::Ordering, Arc};
 use std::time::Duration;
@@ -11,8 +11,7 @@ use zendb_types::{device_id, Event, Hlc, Op, Path as ValuePath, PrimaryKey, Valu
 fn direct_table_writes_drive_operators() {
     let path = tmp("direct");
     let (tracker, count) = new_tracker("direct");
-    let db =
-        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
     let table = db.table("users", Some(TableConfig::default())).unwrap();
     db.dispatch_operator::<CountingOperator>(
         "counter",
@@ -43,8 +42,7 @@ fn direct_table_writes_drive_operators() {
 #[test]
 fn merkle_tree_operator_maintains_table_root() {
     let path = tmp("merkle");
-    let db =
-        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
     let table = db.table("users", Some(TableConfig::default())).unwrap();
     let config = MerkleTreeConfig {
         state: "operator/prelude/merkle-tree-test".to_owned(),
@@ -105,8 +103,7 @@ fn merkle_tree_operator_maintains_table_root() {
 fn failed_process_transitions_operator_to_failed() {
     let path = tmp("failed");
     let (attempts_key, attempts) = new_tracker("retry_attempts");
-    let db =
-        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
     let table = db.table("users", Some(TableConfig::default())).unwrap();
     db.dispatch_operator::<FailingOperator>(
         "retry",
@@ -143,8 +140,7 @@ fn active_operators_respawn_after_database_reopen() {
     let path = tmp("operator_reopen");
     let (tracker, count) = new_tracker("operator_reopen");
     {
-        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
-            .unwrap();
+        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
         let users = db.table("users", Some(TableConfig::default())).unwrap();
         db.dispatch_operator::<CountingOperator>(
             "counter",
@@ -163,8 +159,7 @@ fn active_operators_respawn_after_database_reopen() {
         assert_eq!(db.operator_phase("counter"), Some(OperatorPhase::Active));
     }
 
-    let db =
-        TestDatabase::open(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::open(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
     let users = db.table("users", None).unwrap();
     assert_eq!(db.operator_phase("counter"), Some(OperatorPhase::Active));
 
@@ -182,8 +177,7 @@ fn cancelled_operator_is_permanent_and_not_reopened() {
     let path = tmp("operator_cancel");
     let (tracker, log) = new_lifecycle_log("operator_cancel");
     {
-        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
-            .unwrap();
+        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
         db.table("users", Some(TableConfig::default())).unwrap();
         db.dispatch_operator::<ShutdownLifecycleOperator>(
             "lifecycle",
@@ -204,8 +198,7 @@ fn cancelled_operator_is_permanent_and_not_reopened() {
         assert!(log.contains(&"teardown".to_owned()), "{log:?}");
     }
 
-    let db =
-        TestDatabase::open(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::open(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
     db.table("users", None).unwrap();
     std::thread::sleep(Duration::from_millis(20));
     assert_eq!(
@@ -226,8 +219,7 @@ fn cancelled_operator_is_permanent_and_not_reopened() {
 fn operators_can_spawn_user_and_prelude_operators_from_context() {
     let path = tmp("operator_spawn_from_context");
     let (tracker, child_count) = new_tracker("operator_spawn_from_context");
-    let db =
-        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
     let table = db.table("users", Some(TableConfig::default())).unwrap();
     db.dispatch_operator::<SpawnerOperator>(
         "spawner",
@@ -254,8 +246,7 @@ fn operators_can_spawn_user_and_prelude_operators_from_context() {
 fn operator_receives_opened_callbacks_for_initial_inputs() {
     let path = tmp("input_lifecycle_initial");
     let (tracker, opened, closed) = new_input_tracker("input_lifecycle_initial");
-    let db =
-        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
     db.table("users", Some(TableConfig::default())).unwrap();
     db.dispatch_operator::<InputLifecycleOperator>(
         "inputs",
@@ -272,8 +263,7 @@ fn operator_receives_opened_callbacks_for_initial_inputs() {
 fn operator_receives_opened_callbacks_for_later_inputs() {
     let path = tmp("input_lifecycle_later");
     let (tracker, opened, closed) = new_input_tracker("input_lifecycle_later");
-    let db =
-        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
     db.table("users", Some(TableConfig::default())).unwrap();
     db.dispatch_operator::<InputLifecycleOperator>(
         "inputs",
@@ -296,8 +286,7 @@ fn operator_receives_opened_callbacks_for_later_inputs() {
 fn close_table_evicts_cache_notifies_and_allows_reopen() {
     let path = tmp("close_table");
     let (tracker, opened, closed) = new_input_tracker("close_table");
-    let db =
-        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
     let users = db.table("users", Some(TableConfig::default())).unwrap();
     db.dispatch_operator::<InputLifecycleOperator>(
         "inputs",
@@ -337,8 +326,7 @@ fn close_table_evicts_cache_notifies_and_allows_reopen() {
 fn retired_operator_deletes_consumers_from_unopened_tables() {
     let path = tmp("retire_consumers");
     {
-        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default())
-            .unwrap();
+        let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
         let orders = db.table("orders", Some(TableConfig::default())).unwrap();
         let orders_table = orders.get().unwrap();
 
@@ -352,8 +340,7 @@ fn retired_operator_deletes_consumers_from_unopened_tables() {
     }
 
     let (tracker, _) = new_tracker("retire_consumers");
-    let db =
-        TestDatabase::open(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::open(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
     db.dispatch_operator::<CountingOperator>(
         "counter",
         counting_config(tracker, true),
@@ -386,8 +373,7 @@ fn retired_operator_deletes_consumers_from_unopened_tables() {
 fn shutdown_runs_input_closed_before_teardown() {
     let path = tmp("shutdown_lifecycle");
     let (tracker, log) = new_lifecycle_log("shutdown_lifecycle");
-    let db =
-        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
     let users = db.table("users", Some(TableConfig::default())).unwrap();
     db.dispatch_operator::<ShutdownLifecycleOperator>(
         "shutdown-lifecycle",

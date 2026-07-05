@@ -22,6 +22,12 @@ use crate::operators::{
 
 type TestDatabase = Database<OperatorInstance>;
 
+fn db_config() -> DatabaseConfig {
+    DatabaseConfig {
+        graceful_shutdown_max_duration: Duration::from_millis(100),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Temp dir helpers
 // ---------------------------------------------------------------------------
@@ -66,8 +72,7 @@ fn document_indexing_pipeline() {
     let path = tmp("doc_pipeline");
 
     // --- Phase 1: create, index, archive ---
-    let db =
-        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
 
     let documents = db
         .table("documents", Some(zendb_engine::TableConfig::default()))
@@ -184,8 +189,7 @@ fn document_indexing_pipeline() {
     drop(documents);
     drop(reports);
 
-    let db =
-        TestDatabase::open(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::open(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
 
     assert_eq!(db.operator_phase("indexer"), Some(OperatorPhase::Active));
     assert_eq!(db.operator_phase("archiver"), Some(OperatorPhase::Finished));
@@ -281,8 +285,7 @@ fn document_indexing_pipeline() {
 fn document_delete_removes_from_index() {
     let path = tmp("doc_delete");
 
-    let db =
-        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
 
     let documents = db
         .table("documents", Some(zendb_engine::TableConfig::default()))
@@ -367,8 +370,7 @@ fn document_delete_removes_from_index() {
 fn multiple_operators_share_table_cleanly() {
     let path = tmp("multi_ops");
 
-    let db =
-        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
 
     let documents = db
         .table("documents", Some(zendb_engine::TableConfig::default()))
@@ -428,8 +430,7 @@ fn multiple_operators_share_table_cleanly() {
 fn timers_are_evicted_on_retirement() {
     let path = tmp("timer_evict");
 
-    let db =
-        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
 
     db.table("documents", Some(zendb_engine::TableConfig::default()))
         .unwrap();
@@ -486,8 +487,7 @@ fn timers_are_evicted_on_retirement() {
 fn merkle_tree_facet_provides_root() {
     let path = tmp("merkle_facet");
 
-    let db =
-        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
 
     let documents = db
         .table("documents", Some(zendb_engine::TableConfig::default()))
@@ -582,8 +582,7 @@ fn merkle_tree_facet_provides_root() {
 fn facet_unavailable_after_operator_cancellation() {
     let path = tmp("facet_cancel");
 
-    let db =
-        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
 
     let _documents = db
         .table("documents", Some(zendb_engine::TableConfig::default()))
@@ -633,8 +632,7 @@ fn facet_unavailable_after_operator_cancellation() {
 fn full_text_index_search() {
     let path = tmp("fti_search");
 
-    let db =
-        TestDatabase::create(&path, Arc::new(ThreadExecutor), DatabaseConfig::default()).unwrap();
+    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
 
     let documents = db
         .table("documents", Some(zendb_engine::TableConfig::default()))

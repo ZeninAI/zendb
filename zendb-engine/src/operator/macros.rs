@@ -14,8 +14,17 @@
 ///     }
 /// }
 /// ```
+///
+/// You can also use it with no custom operators (only prelude operators):
+///
+/// ```ignore
+/// define_operator_set! {
+///     pub mod ops {}
+/// }
+/// ```
 #[macro_export]
 macro_rules! define_operator_set {
+    // Case with custom operators
     (
         $vis:vis mod $module:ident {
             $( $variant:ident ( $operator:ty ) ),+ $(,)?
@@ -26,6 +35,15 @@ macro_rules! define_operator_set {
             $vis mod $module {
                 $( $variant($operator), )+
             }
+        }
+    };
+    // Case with no custom operators (only prelude)
+    (
+        $vis:vis mod $module:ident {}
+    ) => {
+        $crate::__zendb_with_prelude_operators! {
+            $crate::__zendb_define_operator_set,
+            $vis mod $module {}
         }
     };
 }

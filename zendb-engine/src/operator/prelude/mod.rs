@@ -1,8 +1,8 @@
-//! Ready-made operator implementations (currently placeholders).
+//! Ready-made operator implementations.
 
 mod full_text_index;
 mod merkle_tree;
-mod rhai;
+pub mod rhai;
 
 pub use full_text_index::{
     FullTextIndexConfig, FullTextIndexFacet, FullTextIndexOperator, SearchHit,
@@ -11,7 +11,7 @@ pub use merkle_tree::{
     MerkleEntry, MerkleLeaf, MerkleNode, MerkleRoot, MerkleTreeConfig, MerkleTreeFacet,
     MerkleTreeOperator, MerkleTreeStateKey, MerkleTreeStateValue,
 };
-pub use rhai::{RhaiOperator, RhaiOperatorConfig};
+pub use rhai::{RhaiFacet, RhaiOperator, RhaiOperatorConfig};
 
 #[doc(hidden)]
 #[macro_export]

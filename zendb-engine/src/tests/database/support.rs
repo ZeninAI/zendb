@@ -1,5 +1,12 @@
-use super::super::*;
+use std::collections::HashMap;
+use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use bincode::{Decode, Encode};
+use crate::database::*;
 use crate::operator::prelude::{MerkleTreeConfig, MerkleTreeOperator};
+use crate::runtime::Executor;
 use crate::{Change, Operator, OperatorDirective, OperatorRuntimeConfig, Subscription};
 use parking_lot::Mutex;
 use std::future::Future;
@@ -9,11 +16,16 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use zendb_storage::core::traits::Backend;
+use zendb_storage::frontend::state::StateConfig;
 use zendb_types::{
     device_id, init_device_id, Event, Hlc, Op, Path as ValuePath, PrimaryKey, Value,
 };
 
-pub(super) struct ThreadExecutor;
+// ---------------------------------------------------------------------------
+// Shared test infrastructure (pub(crate) for reuse across test modules)
+// ---------------------------------------------------------------------------
+
+pub(crate) struct ThreadExecutor;
 
 impl Executor for ThreadExecutor {
     fn spawn(&self, future: crate::RuntimeFuture) {
@@ -29,13 +41,73 @@ impl Executor for ThreadExecutor {
     }
 }
 
-pub(super) fn wait_until(condition: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(1);
+/// Wait until a condition is true, with a 1 second timeout.
+pub(crate) fn wait_until(condition: impl Fn() -> bool) {
+    wait_until_timeout(condition, Duration::from_secs(1));
+}
+
+/// Wait until a condition is true, with a custom timeout.
+pub(crate) fn wait_until_timeout(condition: impl Fn() -> bool, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
     while !condition() {
-        assert!(Instant::now() < deadline, "condition was not reached");
+        assert!(Instant::now() < deadline, "condition was not reached within {:?}", timeout);
         std::thread::yield_now();
     }
 }
+
+pub(crate) fn database_config() -> DatabaseConfig {
+    DatabaseConfig {
+        graceful_shutdown_max_duration: Duration::from_millis(100),
+    }
+}
+
+pub(crate) fn hlc(ms: u64) -> Hlc {
+    init_device_id();
+    Hlc::with_device_id(ms, 0, device_id()).unwrap()
+}
+
+pub(crate) fn string_event(table: &str, key: &str, value: &str, ms: u64) -> Event {
+    Event {
+        table_id: table.into(),
+        primary_key: PrimaryKey::String(key.into()),
+        path: ValuePath::new(),
+        op: Op::Replace {
+            value: Value::String(value.into()),
+        },
+        hlc: hlc(ms),
+        sync: false,
+        signature: Vec::new(),
+    }
+}
+
+/// RAII guard that removes the test directory when dropped.
+pub(crate) struct TmpDir(PathBuf);
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for TmpDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+pub(crate) fn tmp(prefix: &str) -> TmpDir {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    TmpDir(std::env::temp_dir().join(format!(
+        "zendb_test_{prefix}_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// Database-specific test operators
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub(super) struct CountingConfig {
@@ -480,12 +552,6 @@ crate::define_operator_set! {
 
 pub(super) type TestDatabase = Database<test_operators::OperatorInstance>;
 
-pub(super) fn database_config() -> DatabaseConfig {
-    DatabaseConfig {
-        graceful_shutdown_max_duration: Duration::from_millis(100),
-    }
-}
-
 pub(super) fn counter_trackers() -> &'static Mutex<HashMap<String, Arc<AtomicUsize>>> {
     static TRACKERS: OnceLock<Mutex<HashMap<String, Arc<AtomicUsize>>>> = OnceLock::new();
     TRACKERS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -631,7 +697,6 @@ pub(super) fn shutdown_lifecycle_runtime_config() -> OperatorRuntimeConfig {
 }
 
 pub(super) fn event(table: &str, value: i64, ms: u64) -> Event {
-    init_device_id();
     Event {
         table_id: table.into(),
         primary_key: PrimaryKey::String("u1".into()),
@@ -639,33 +704,8 @@ pub(super) fn event(table: &str, value: i64, ms: u64) -> Event {
         op: Op::Replace {
             value: Value::Int(value),
         },
-        hlc: Hlc::with_device_id(ms, 0, device_id()).unwrap(),
+        hlc: hlc(ms),
         sync: false,
         signature: Vec::new(),
     }
-}
-
-/// RAII guard that removes the test directory when dropped.
-pub(super) struct TmpDir(PathBuf);
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-impl std::ops::Deref for TmpDir {
-    type Target = std::path::Path;
-    fn deref(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-pub(super) fn tmp(name: &str) -> TmpDir {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    TmpDir(std::env::temp_dir().join(format!(
-        "zendb_database_{name}_{}_{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    )))
 }

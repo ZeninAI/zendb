@@ -4,6 +4,9 @@ pub mod database;
 pub mod operator;
 pub mod runtime;
 
+#[cfg(test)]
+mod tests;
+
 pub use database::{
     ConcurrentState, ConcurrentTable, Database, DatabaseConfig, StateHandle, TableHandle,
 };

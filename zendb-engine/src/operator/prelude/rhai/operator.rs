@@ -9,7 +9,7 @@ use rhai::{Array, CallFnOptions, Dynamic, Scope, AST};
 use zendb_types::{Event, Hlc, Op, Path};
 
 use crate::{
-    Change, Database, DispatchOperator, Operator, OperatorDirective, OperatorPhase, TableConfig,
+    Change, DispatchOperator, Operator, OperatorDirective, OperatorPhase, TableConfig, Workspace,
 };
 
 use super::api::ScriptContext;
@@ -21,7 +21,7 @@ use super::types::ScriptChange;
 ///
 /// Executes user-provided Rhai scripts in response to operator lifecycle events.
 /// Scripts can define handlers for various events and use the `db` module to
-/// interact with the database.
+/// interact with the local workspace.
 pub struct RhaiOperator {
     /// The Rhai engine instance.
     engine: rhai::Engine,
@@ -29,7 +29,7 @@ pub struct RhaiOperator {
     ast: AST,
     /// Script execution scope (maintains state between calls).
     scope: Scope<'static>,
-    /// Script context for database operations.
+    /// Script context for workspace operations.
     context: ScriptContext,
 }
 
@@ -111,8 +111,8 @@ impl RhaiOperator {
         }
     }
 
-    /// Apply pending writes to the database.
-    fn apply_pending<D>(&mut self, db: &Arc<Database<D>>, name: &str) -> io::Result<()>
+    /// Apply pending writes to the workspace.
+    fn apply_pending<D>(&mut self, db: &Arc<Workspace<D>>, name: &str) -> io::Result<()>
     where
         D: DispatchOperator,
     {
@@ -123,6 +123,16 @@ impl RhaiOperator {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+
+        // Reject the whole batch before applying any local event. Otherwise a
+        // denied shared request later in the queue could leave earlier local
+        // requests partially committed.
+        if pending.events.iter().any(|event| event.sync) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "shared Rhai writes require a policy-aware effect gate",
+            ));
+        }
 
         // Apply pending events
         for event in pending.events {
@@ -145,7 +155,7 @@ impl RhaiOperator {
                 path: Path::new(),
                 op,
                 hlc,
-                sync: true,
+                sync: event.sync,
                 signature: Vec::new(),
             };
 
@@ -175,7 +185,7 @@ impl Operator for RhaiOperator {
     type Facet = RhaiFacet;
 
     fn create<'a, D>(
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         name: &'a str,
         config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<Self>> + Send + 'a
@@ -185,7 +195,7 @@ impl Operator for RhaiOperator {
     {
         async move {
             // Create the engine
-            let engine = create_engine();
+            let engine = create_engine(&config.policy);
 
             // Compile the script
             let ast = engine.compile(&config.script).map_err(|e| {
@@ -202,7 +212,7 @@ impl Operator for RhaiOperator {
             scope.push_constant("OPERATOR_NAME", name.to_owned());
 
             // Create script context
-            let context = ScriptContext::new(name.to_owned());
+            let context = ScriptContext::new(name.to_owned(), config.policy.write_mode);
 
             let mut op = Self {
                 engine,
@@ -228,7 +238,7 @@ impl Operator for RhaiOperator {
     fn process<'a, D>(
         &'a mut self,
         changes: Vec<Change>,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -259,7 +269,7 @@ impl Operator for RhaiOperator {
     fn on_input_opened<'a, D>(
         &'a mut self,
         table: String,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -276,7 +286,7 @@ impl Operator for RhaiOperator {
     fn on_input_closed<'a, D>(
         &'a mut self,
         table: String,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -294,7 +304,7 @@ impl Operator for RhaiOperator {
         &'a mut self,
         payload: Self::Timer,
         _fire_at_ms: u64,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -318,7 +328,7 @@ impl Operator for RhaiOperator {
     fn teardown<'a, D>(
         &'a mut self,
         phase: &'a OperatorPhase,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<()>> + Send + 'a

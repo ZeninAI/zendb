@@ -2,17 +2,26 @@ use std::{any::Any, fmt::Debug, future::Future, io, sync::Arc};
 
 use bincode::{Decode, Encode};
 
-use crate::Database;
+use crate::Workspace;
 
 use super::{BoxFuture, Change, OperatorDirective, OperatorPhase, OperatorRuntimeConfig};
 
-/// Core operator trait implemented by every concrete operator.
+/// Native operator execution ABI implemented by every concrete operator.
+///
+/// This trait is not the operator control plane. `OperatorSpec` is the durable
+/// desired object; the Workspace worker and reconciler decide whether this ABI
+/// is instantiated on the current device. The `Workspace` argument is the
+/// engine's current low-level integration surface, and every effect it
+/// performs must still pass the active operator permission/output policy. New
+/// sandboxed runtimes should use a scoped context rather than exposing this
+/// ABI directly to user-authored code. Compiled native operators are trusted
+/// application extensions; Rhai and other untrusted sources are not.
 ///
 /// # Lifecycle
 ///
 /// ```text
 /// ┌─────────┐
-/// │ create  │  ← Database + config available; set up state/tables
+/// │ create  │  ← Workspace + config available; set up state/tables
 /// └────┬────┘
 ///      │  (for each matching table already open)
 ///      ▼
@@ -38,7 +47,8 @@ use super::{BoxFuture, Change, OperatorDirective, OperatorPhase, OperatorRuntime
 /// ```
 ///
 /// Each lifecycle method receives:
-/// - `&Arc<Database<D>>` — full database access (tables, states, timers)
+/// - `&Arc<Workspace<D>>` — the native engine integration surface (tables,
+///   states, timers); it is not a grant to bypass policy
 /// - `&str` name — this operator's registration name
 /// - `&Self::Config` — operator-specific typed configuration
 ///
@@ -47,7 +57,7 @@ use super::{BoxFuture, Change, OperatorDirective, OperatorPhase, OperatorRuntime
 /// | Layer | Owns | Does NOT own |
 /// |-------|------|-------------|
 /// | `Operator` (user code) | Business logic, state handles, timer payloads | Polling, commit offsets, event ordering |
-/// | `Database` | Tables, states, timer store, operator catalog | Lifecycle transitions |
+/// | `Workspace` | Tables, states, timer store, operator catalog | Lifecycle transitions |
 /// | `OperatorWorker` | Input attachment/detachment, timer inbox, spawn | Run loop details |
 /// | `RunLoop` | Event queue, shutdown state machine, poll+commit, idle/wake | What the operator does with changes |
 pub trait Operator: Send + 'static {
@@ -60,7 +70,7 @@ pub trait Operator: Send + 'static {
     /// Public query interface exposed to users while the operator is running.
     ///
     /// The facet is produced once after [`Operator::create`] succeeds and is
-    /// available via [`Database::facet`] for the lifetime of the operator.
+    /// available via [`Workspace::facet`] for the lifetime of the operator.
     /// Typically wraps [`StateHandle`](crate::StateHandle) instances so that
     /// queries read directly from the operator's persisted state without
     /// requiring a lock on the operator itself.
@@ -68,12 +78,12 @@ pub trait Operator: Send + 'static {
     /// Use `()` if the operator does not expose a query interface.
     type Facet: Send + Sync + 'static;
 
-    /// Construct the operator with full database access.
+    /// Construct the operator with full workspace access.
     ///
     /// Called once when the operator is first spawned. Use this to open state
     /// handles, create output tables, register initial timers, etc.
     fn create<'a, D>(
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         name: &'a str,
         config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<Self>> + Send + 'a
@@ -85,7 +95,7 @@ pub trait Operator: Send + 'static {
     ///
     /// Called once after [`Operator::create`] succeeds (and again after
     /// re-creation on a suspend race). The returned facet is stored in the
-    /// operator worker and made available via [`Database::facet`].
+    /// operator worker and made available via [`Workspace::facet`].
     ///
     /// The default implementation returns `()` for operators that do not
     /// expose a query interface.
@@ -95,7 +105,7 @@ pub trait Operator: Send + 'static {
     fn process<'a, D>(
         &'a mut self,
         changes: Vec<Change>,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         name: &'a str,
         config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -110,7 +120,7 @@ pub trait Operator: Send + 'static {
     fn on_input_opened<'a, D>(
         &'a mut self,
         table: String,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         name: &'a str,
         config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -125,7 +135,7 @@ pub trait Operator: Send + 'static {
     fn on_input_closed<'a, D>(
         &'a mut self,
         table: String,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         name: &'a str,
         config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -141,7 +151,7 @@ pub trait Operator: Send + 'static {
         &'a mut self,
         payload: Self::Timer,
         fire_at_ms: u64,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         name: &'a str,
         config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -158,11 +168,11 @@ pub trait Operator: Send + 'static {
     /// - `Active` — suspending (no inputs remain, may be respawned later)
     /// - `Finished` — operator returned [`OperatorDirective::Finish`]
     /// - `Failed` — an unrecoverable error occurred
-    /// - `Cancelled` — permanently cancelled by the database owner
+    /// - `Cancelled` — permanently cancelled by the workspace owner
     fn teardown<'a, D>(
         &'a mut self,
         phase: &'a OperatorPhase,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         name: &'a str,
         config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<()>> + Send + 'a
@@ -174,7 +184,12 @@ pub trait Operator: Send + 'static {
     }
 }
 
-/// Config types that carry an [`OperatorRuntimeConfig`].
+/// Dispatch configuration that combines a registered operator's typed payload
+/// with a derived local [`OperatorRuntimeConfig`].
+///
+/// The generated enum is an implementation adapter. It must not be confused
+/// with the portable `zendb_types::OperatorSpec` stored in shared desired
+/// state.
 pub trait DispatchConfig:
     Debug + Clone + PartialEq + Encode + Decode<()> + Send + Sync + 'static
 {
@@ -194,7 +209,7 @@ pub trait DispatchOperator: Send + 'static {
 
     /// Create the operator instance.
     fn create<'a>(
-        db: &'a Arc<Database<Self>>,
+        db: &'a Arc<Workspace<Self>>,
         name: &'a str,
         config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<Self>>
@@ -207,7 +222,7 @@ pub trait DispatchOperator: Send + 'static {
     fn process<'a>(
         &'a mut self,
         changes: Vec<Change>,
-        db: &'a Arc<Database<Self>>,
+        db: &'a Arc<Workspace<Self>>,
         name: &'a str,
         config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
@@ -217,7 +232,7 @@ pub trait DispatchOperator: Send + 'static {
     fn on_input_opened<'a>(
         &'a mut self,
         table: String,
-        db: &'a Arc<Database<Self>>,
+        db: &'a Arc<Workspace<Self>>,
         name: &'a str,
         config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
@@ -227,7 +242,7 @@ pub trait DispatchOperator: Send + 'static {
     fn on_input_closed<'a>(
         &'a mut self,
         table: String,
-        db: &'a Arc<Database<Self>>,
+        db: &'a Arc<Workspace<Self>>,
         name: &'a str,
         config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
@@ -238,7 +253,7 @@ pub trait DispatchOperator: Send + 'static {
         &'a mut self,
         payload: Vec<u8>,
         fire_at_ms: u64,
-        db: &'a Arc<Database<Self>>,
+        db: &'a Arc<Workspace<Self>>,
         name: &'a str,
         config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<OperatorDirective>>
@@ -248,7 +263,7 @@ pub trait DispatchOperator: Send + 'static {
     fn teardown<'a>(
         &'a mut self,
         phase: &'a OperatorPhase,
-        db: &'a Arc<Database<Self>>,
+        db: &'a Arc<Workspace<Self>>,
         name: &'a str,
         config: &'a Self::Config,
     ) -> BoxFuture<'a, io::Result<()>>

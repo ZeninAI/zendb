@@ -129,7 +129,7 @@ macro_rules! __zendb_define_operator_set {
                 type Config = OperatorConfig;
 
                 fn create<'a>(
-                    db: &'a ::std::sync::Arc<$crate::Database<Self>>,
+                    db: &'a ::std::sync::Arc<$crate::Workspace<Self>>,
                     name: &'a str,
                     config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<Self>> {
@@ -167,7 +167,7 @@ macro_rules! __zendb_define_operator_set {
                 fn process<'a>(
                     &'a mut self,
                     changes: Vec<$crate::Change>,
-                    db: &'a ::std::sync::Arc<$crate::Database<Self>>,
+                    db: &'a ::std::sync::Arc<$crate::Workspace<Self>>,
                     name: &'a str,
                     config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
@@ -187,7 +187,7 @@ macro_rules! __zendb_define_operator_set {
                 fn on_input_opened<'a>(
                     &'a mut self,
                     table: String,
-                    db: &'a ::std::sync::Arc<$crate::Database<Self>>,
+                    db: &'a ::std::sync::Arc<$crate::Workspace<Self>>,
                     name: &'a str,
                     config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
@@ -207,7 +207,7 @@ macro_rules! __zendb_define_operator_set {
                 fn on_input_closed<'a>(
                     &'a mut self,
                     table: String,
-                    db: &'a ::std::sync::Arc<$crate::Database<Self>>,
+                    db: &'a ::std::sync::Arc<$crate::Workspace<Self>>,
                     name: &'a str,
                     config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
@@ -228,7 +228,7 @@ macro_rules! __zendb_define_operator_set {
                     &'a mut self,
                     payload: Vec<u8>,
                     fire_at_ms: u64,
-                    db: &'a ::std::sync::Arc<$crate::Database<Self>>,
+                    db: &'a ::std::sync::Arc<$crate::Workspace<Self>>,
                     name: &'a str,
                     config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<$crate::OperatorDirective>> {
@@ -260,7 +260,7 @@ macro_rules! __zendb_define_operator_set {
                 fn teardown<'a>(
                     &'a mut self,
                     phase: &'a $crate::OperatorPhase,
-                    db: &'a ::std::sync::Arc<$crate::Database<Self>>,
+                    db: &'a ::std::sync::Arc<$crate::Workspace<Self>>,
                     name: &'a str,
                     config: &'a Self::Config,
                 ) -> $crate::BoxFuture<'a, ::std::io::Result<()>> {

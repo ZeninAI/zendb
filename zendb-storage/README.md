@@ -5,6 +5,8 @@
 This crate provides general-purpose ordered and unordered data structures
 backed by memory-mapped files or in-memory state. It is independent of
 ZeninDB's CRDT types — backends operate on generic `K: Encode, V: Encode`.
+It also remains independent of identity, authorization, operator placement,
+leases, and networking; those concerns belong to higher crates.
 
 ---
 

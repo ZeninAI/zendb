@@ -9,8 +9,7 @@ use zendb_storage::core::traits::Backend;
 use zendb_types::{Cell, PrimaryKey};
 
 use crate::{
-    Change, Database, DispatchOperator, Operator, OperatorDirective, StateConfig,
-    StateHandle,
+    Change, DispatchOperator, Operator, OperatorDirective, StateConfig, StateHandle, Workspace,
 };
 
 const DEFAULT_LEAF_BITS: u8 = 16;
@@ -123,7 +122,7 @@ pub struct MerkleTreeOperator {
 
 /// Public query interface for the Merkle tree operator.
 ///
-/// Obtained via [`Database::facet`] while the operator is running. Provides
+/// Obtained via [`Workspace::facet`] while the operator is running. Provides
 /// read-only access to the persisted Merkle summaries without locking the
 /// operator itself.
 #[derive(Clone)]
@@ -205,7 +204,7 @@ impl Operator for MerkleTreeOperator {
     type Facet = MerkleTreeFacet;
 
     fn create<'a, D>(
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         _name: &'a str,
         config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<Self>> + Send + 'a
@@ -230,7 +229,7 @@ impl Operator for MerkleTreeOperator {
     fn on_input_opened<'a, D>(
         &'a mut self,
         table: String,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -246,7 +245,7 @@ impl Operator for MerkleTreeOperator {
     fn on_input_closed<'a, D>(
         &'a mut self,
         _table: String,
-        _db: &'a Arc<Database<D>>,
+        _db: &'a Arc<Workspace<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -259,7 +258,7 @@ impl Operator for MerkleTreeOperator {
     fn process<'a, D>(
         &'a mut self,
         changes: Vec<Change>,
-        _db: &'a Arc<Database<D>>,
+        _db: &'a Arc<Workspace<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -303,7 +302,7 @@ impl Operator for MerkleTreeOperator {
 }
 
 impl MerkleTreeOperator {
-    fn rebuild_table<D>(&mut self, db: &Arc<Database<D>>, table: &str) -> io::Result<()>
+    fn rebuild_table<D>(&mut self, db: &Arc<Workspace<D>>, table: &str) -> io::Result<()>
     where
         D: DispatchOperator,
     {

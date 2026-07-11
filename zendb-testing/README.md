@@ -4,7 +4,9 @@
 
 This crate is `#![cfg(test)]` — it is not compiled into release builds.
 It serves as both a test harness and an end-to-end usage example for the
-`zendb-engine` operator runtime.
+`zendb-engine` native operator runtime. The tests intentionally exercise the
+low-level immediate dispatch API; they do not stand in for declarative
+reconciliation, lease handoff, or hosted-service adapters.
 
 ---
 

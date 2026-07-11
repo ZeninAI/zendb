@@ -1,7 +1,7 @@
 //! Rhai scripting operator for ZenDB.
 //!
 //! This module provides a runtime-configurable operator powered by the Rhai
-//! scripting language. Users can write scripts that respond to database
+//! scripting language. Users can write scripts that respond to workspace
 //! changes without needing to compile Rust code.
 //!
 //! # Overview
@@ -10,9 +10,10 @@
 //! lifecycle events. Scripts can:
 //!
 //! - Process incoming changes from subscribed tables
-//! - Emit events to output tables
+//! - Queue events for host-side policy checking before output
 //! - Schedule timers for delayed processing
-//! - Maintain state between invocations
+//! - Maintain invocation-local scope state; durable state must use an explicit
+//!   engine state handle or a declared output
 //!
 //! # Script API
 //!
@@ -29,18 +30,18 @@
 //!
 //! All handlers are optional. If not defined, default behavior (continue) is used.
 //!
-//! ## Database Module (`db::`)
+//! ## Workspace Module (`db::`)
 //!
-//! The `db` module provides database operations:
+//! The `db` module provides workspace operations:
 //!
-//! - `db::emit(table, key, value)` - Emit an event to a table
-//! - `db::delete(table, key)` - Delete a key from a table
+//! - `db::emit(table, key, value)` - Queue a local/shared write request
+//! - `db::delete(table, key)` - Queue a local/shared delete request
 //! - `db::set_timer(delay_ms, payload)` - Schedule a timer
 //! - `db::log(message)` - Log a debug message
 //!
 //! ## Change Type
 //!
-//! The `Change` type represents a database change:
+//! The `Change` type represents a workspace change:
 //!
 //! - `change.table()` - Source table name
 //! - `change.key()` - Primary key
@@ -53,7 +54,7 @@
 //!
 //! ## Cell Type
 //!
-//! The `Cell` type wraps a database value:
+//! The `Cell` type wraps a workspace value:
 //!
 //! - `cell.value()` - Get the contained value
 //! - `cell.is_tombstone()` - Check if deleted
@@ -103,13 +104,17 @@
 //!
 //! # Safety
 //!
-//! The Rhai engine is configured with safety limits:
+//! The Rhai engine is configured with limits from `RhaiExecutionPolicy`:
 //!
-//! - Maximum expression depth: 64
-//! - Maximum string size: 1MB
-//! - Maximum array size: 10,000 elements
-//! - Maximum map size: 10,000 entries
-//! - Maximum operations: 1,000,000 per handler call
+//! - expression/call depth
+//! - string, array, and map sizes
+//! - operations per handler call
+//!
+//! Rhai has no ambient filesystem, process, browser, or network authority.
+//! External effects require a named host capability and a separate policy
+//! decision; the write mode in the script config is only a declaration.
+//! The current low-level native path accepts local writes and rejects shared
+//! writes until the Workspace authorization path explicitly permits them.
 
 mod api;
 mod config;
@@ -117,7 +122,7 @@ mod engine;
 mod operator;
 mod types;
 
-pub use config::RhaiOperatorConfig;
+pub use config::{RhaiExecutionPolicy, RhaiOperatorConfig, RhaiWriteMode};
 pub use operator::{RhaiFacet, RhaiOperator};
 
 // Re-export types for advanced usage

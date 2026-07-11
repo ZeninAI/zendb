@@ -1,6 +1,6 @@
 //! Operator worker: input management, timer inbox, lifecycle events, and spawn.
 //!
-//! The worker is the coordination layer between the database (which
+//! The worker is the coordination layer between the workspace (which
 //! attaches/detaches inputs and enqueues timers) and the async run loop
 //! (which drives the operator through its lifecycle).
 
@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use zendb_storage::core::topic::TopicConsumer;
 
 use super::{run_loop::LifecycleEvent, Change, DispatchOperator, OperatorPhase};
-use crate::Database;
+use crate::Workspace;
 
 /// Type-erased facet stored by the worker.
 pub(crate) type ErasedFacet = Arc<dyn Any + Send + Sync>;
@@ -250,12 +250,12 @@ where
     // --- Spawn ---
 
     /// Start the async run loop for this worker.
-    pub(crate) fn spawn(self: &Arc<Self>, database: &Arc<Database<D>>) {
-        let executor = database.executor();
-        let database = Arc::downgrade(database);
+    pub(crate) fn spawn(self: &Arc<Self>, workspace: &Arc<Workspace<D>>) {
+        let executor = workspace.executor();
+        let workspace = Arc::downgrade(workspace);
         let worker = Arc::clone(self);
         executor
             .clone()
-            .spawn(Box::pin(super::run_loop::run(worker, database, executor)));
+            .spawn(Box::pin(super::run_loop::run(worker, workspace, executor)));
     }
 }

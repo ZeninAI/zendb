@@ -3,7 +3,7 @@
 use std::{borrow::Cow, cmp::Ordering, fs, io, path::Path};
 
 use bincode::{Decode, Encode};
-use zendb_types::{Cell, Event, PrimaryKey};
+use zendb_types::{device_id, Cell, DeviceId, Event, PrimaryKey};
 
 use crate::core::{
     skiplist::{SkipList, SkipListCapacity, SkipListConfig, SkipListStats},
@@ -50,6 +50,7 @@ pub struct TableStats {
 /// durably appended to the table topic.
 pub struct Table {
     config: TableConfig,
+    local_device_id: DeviceId,
     state: State<PrimaryKey, Cell>,
     cache: SkipList<PrimaryKey, (Cell, bool)>,
     novel_pending: usize,
@@ -107,6 +108,7 @@ impl Table {
         let mut changed = false;
         let mut novel = false;
         let mut apply_error = None;
+        let local_device_id = self.local_device_id;
 
         self.cache.update(&event.primary_key, |cached| {
             let (mut cell, had_previous, visible) = match cached {
@@ -118,7 +120,7 @@ impl Table {
             };
 
             previous = visible.then(|| cell.clone());
-            match cell.apply_event(event, sync) {
+            match cell.apply_event_from(event, sync, local_device_id) {
                 Ok(true) => {
                     current = Some(cell.clone());
                     changed = true;
@@ -193,6 +195,34 @@ impl Storage for Table {
 
 impl DurableStorage for Table {
     fn create(path: &Path, config: TableConfig) -> io::Result<Self> {
+        Self::create_with_device(path, config, device_id())
+    }
+
+    fn open(path: &Path, config: TableConfig) -> io::Result<Self> {
+        Self::open_with_device(path, config, device_id())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Table::flush(self)
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        Table::sync(self)
+    }
+
+    fn compact(&mut self) -> io::Result<()> {
+        Table::compact(self)
+    }
+}
+
+impl Table {
+    /// Create a table with the database replica identity used for local-only
+    /// subtree checks.
+    pub fn create_with_device(
+        path: &Path,
+        config: TableConfig,
+        local_device_id: DeviceId,
+    ) -> io::Result<Self> {
         fs::create_dir_all(path)?;
 
         let state = State::create(&path.join("state"), config.state.clone())?;
@@ -206,6 +236,7 @@ impl DurableStorage for Table {
 
         Ok(Self {
             config,
+            local_device_id,
             state,
             cache,
             novel_pending: 0,
@@ -214,7 +245,13 @@ impl DurableStorage for Table {
         })
     }
 
-    fn open(path: &Path, config: TableConfig) -> io::Result<Self> {
+    /// Open a table with the database replica identity used for local-only
+    /// subtree checks.
+    pub fn open_with_device(
+        path: &Path,
+        config: TableConfig,
+        local_device_id: DeviceId,
+    ) -> io::Result<Self> {
         let state: State<PrimaryKey, Cell> =
             State::open(&path.join("state"), config.state.clone())?;
         let cache = SkipList::new(SkipListConfig {
@@ -227,6 +264,7 @@ impl DurableStorage for Table {
 
         let mut table = Self {
             config,
+            local_device_id,
             state,
             cache,
             novel_pending: 0,

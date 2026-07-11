@@ -10,9 +10,11 @@ use zendb_engine::operator::prelude::{
     FullTextIndexConfig, FullTextIndexFacet, FullTextIndexOperator, MerkleTreeConfig,
     MerkleTreeFacet, MerkleTreeOperator,
 };
-use zendb_engine::{Database, DatabaseConfig, OperatorPhase};
+use zendb_engine::{OperatorPhase, Workspace, WorkspaceConfig};
 use zendb_storage::core::traits::Backend;
-use zendb_types::{Event, Op, Path as ValuePath, PrimaryKey};
+use zendb_types::{
+    device_id, init_device_id, Event, Op, Path as ValuePath, PrimaryKey, WorkspaceId,
+};
 
 use crate::executor::ThreadExecutor;
 use crate::operators::{
@@ -20,10 +22,13 @@ use crate::operators::{
     indexer_config, indexer_runtime_config, wait_until, ArchiverOp, IndexerOp,
 };
 
-type TestDatabase = Database<OperatorInstance>;
+type TestWorkspace = Workspace<OperatorInstance>;
 
-fn db_config() -> DatabaseConfig {
-    DatabaseConfig {
+fn workspace_config() -> WorkspaceConfig {
+    init_device_id();
+    WorkspaceConfig {
+        workspace_id: WorkspaceId::from("test-workspace"),
+        device_id: device_id(),
         graceful_shutdown_max_duration: Duration::from_millis(100),
     }
 }
@@ -72,7 +77,7 @@ fn document_indexing_pipeline() {
     let path = tmp("doc_pipeline");
 
     // --- Phase 1: create, index, archive ---
-    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
+    let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     let documents = db
         .table("documents", Some(zendb_engine::TableConfig::default()))
@@ -189,7 +194,7 @@ fn document_indexing_pipeline() {
     drop(documents);
     drop(reports);
 
-    let db = TestDatabase::open(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
+    let db = TestWorkspace::open(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     assert_eq!(db.operator_phase("indexer"), Some(OperatorPhase::Active));
     assert_eq!(db.operator_phase("archiver"), Some(OperatorPhase::Finished));
@@ -285,7 +290,7 @@ fn document_indexing_pipeline() {
 fn document_delete_removes_from_index() {
     let path = tmp("doc_delete");
 
-    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
+    let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     let documents = db
         .table("documents", Some(zendb_engine::TableConfig::default()))
@@ -370,7 +375,7 @@ fn document_delete_removes_from_index() {
 fn multiple_operators_share_table_cleanly() {
     let path = tmp("multi_ops");
 
-    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
+    let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     let documents = db
         .table("documents", Some(zendb_engine::TableConfig::default()))
@@ -430,7 +435,7 @@ fn multiple_operators_share_table_cleanly() {
 fn timers_are_evicted_on_retirement() {
     let path = tmp("timer_evict");
 
-    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
+    let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     db.table("documents", Some(zendb_engine::TableConfig::default()))
         .unwrap();
@@ -487,7 +492,7 @@ fn timers_are_evicted_on_retirement() {
 fn merkle_tree_facet_provides_root() {
     let path = tmp("merkle_facet");
 
-    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
+    let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     let documents = db
         .table("documents", Some(zendb_engine::TableConfig::default()))
@@ -582,7 +587,7 @@ fn merkle_tree_facet_provides_root() {
 fn facet_unavailable_after_operator_cancellation() {
     let path = tmp("facet_cancel");
 
-    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
+    let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     let _documents = db
         .table("documents", Some(zendb_engine::TableConfig::default()))
@@ -632,7 +637,7 @@ fn facet_unavailable_after_operator_cancellation() {
 fn full_text_index_search() {
     let path = tmp("fti_search");
 
-    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), db_config()).unwrap();
+    let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     let documents = db
         .table("documents", Some(zendb_engine::TableConfig::default()))

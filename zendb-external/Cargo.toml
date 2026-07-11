@@ -1,0 +1,13 @@
+[package]
+name = "zendb-external"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Optional outbound client adapters for hosted ZeninDB services"
+
+[dependencies]
+zendb-types = { path = "../zendb-types" }
+zendb-identity = { path = "../zendb-identity" }
+zendb-transport = { path = "../zendb-transport" }

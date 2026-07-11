@@ -3,11 +3,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::database::Database;
 use crate::operator::prelude::{RhaiOperator, RhaiOperatorConfig};
-use crate::tests::database::support::{
-    database_config, string_event, tmp, wait_until_timeout, ThreadExecutor,
+use crate::tests::workspace::support::{
+    string_event, tmp, wait_until_timeout, workspace_config, ThreadExecutor,
 };
+use crate::workspace::Workspace;
 use crate::{OperatorRuntimeConfig, Subscription, TableConfig};
 use zendb_storage::core::traits::Backend;
 use zendb_types::PrimaryKey;
@@ -17,7 +17,7 @@ crate::define_operator_set! {
     mod rhai_test_operators {}
 }
 
-type TestDatabase = Database<rhai_test_operators::OperatorInstance>;
+type TestWorkspace = Workspace<rhai_test_operators::OperatorInstance>;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -27,7 +27,7 @@ type TestDatabase = Database<rhai_test_operators::OperatorInstance>;
 #[test]
 fn rhai_operator_creates_successfully() {
     let path = tmp("rhai_create");
-    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
+    let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     let script = r#"
         fn on_create() {
@@ -55,7 +55,7 @@ fn rhai_operator_creates_successfully() {
 #[test]
 fn rhai_operator_processes_changes() {
     let path = tmp("rhai_process");
-    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
+    let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     // Create input table
     let input_table = db.table("input", Some(TableConfig::default())).unwrap();
@@ -88,9 +88,15 @@ fn rhai_operator_processes_changes() {
     {
         let table = input_table.get().unwrap();
         let mut guard = table.write();
-        guard.insert_event(string_event("input", "key1", "value1", 1)).unwrap();
-        guard.insert_event(string_event("input", "key2", "value2", 2)).unwrap();
-        guard.insert_event(string_event("input", "key3", "value3", 3)).unwrap();
+        guard
+            .insert_event(string_event("input", "key1", "value1", 1))
+            .unwrap();
+        guard
+            .insert_event(string_event("input", "key2", "value2", 2))
+            .unwrap();
+        guard
+            .insert_event(string_event("input", "key3", "value3", 3))
+            .unwrap();
     }
 
     // Give operator time to process
@@ -101,7 +107,7 @@ fn rhai_operator_processes_changes() {
 #[test]
 fn rhai_operator_emits_to_output_table() {
     let path = tmp("rhai_emit");
-    let db = TestDatabase::create(&path, Arc::new(ThreadExecutor), database_config()).unwrap();
+    let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     // Create input and output tables
     let input_table = db.table("input", Some(TableConfig::default())).unwrap();
@@ -133,7 +139,9 @@ fn rhai_operator_emits_to_output_table() {
     {
         let table = input_table.get().unwrap();
         let mut guard = table.write();
-        guard.insert_event(string_event("input", "item1", "hello", 1)).unwrap();
+        guard
+            .insert_event(string_event("input", "item1", "hello", 1))
+            .unwrap();
     }
 
     // Wait for output to appear
@@ -141,7 +149,9 @@ fn rhai_operator_emits_to_output_table() {
         || {
             let table = output_table.get().unwrap();
             let guard = table.read();
-            guard.get(&PrimaryKey::String("processed_item1".into())).is_some()
+            guard
+                .get(&PrimaryKey::String("processed_item1".into()))
+                .is_some()
         },
         Duration::from_secs(2),
     );
@@ -149,6 +159,8 @@ fn rhai_operator_emits_to_output_table() {
     // Verify output
     let table = output_table.get().unwrap();
     let guard = table.read();
-    let cell = guard.get(&PrimaryKey::String("processed_item1".into())).unwrap();
+    let cell = guard
+        .get(&PrimaryKey::String("processed_item1".into()))
+        .unwrap();
     assert!(!cell.is_tombstone());
 }

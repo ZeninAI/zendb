@@ -1,31 +1,31 @@
 # zendb-engine
 
-**Table engine with a streaming operator runtime, processing-time timers,
-and a database-rooted ownership model.**
+**Workspace engine with tables, a streaming operator runtime, processing-time
+timers, and workspace-rooted ownership.**
 
 ---
 
 ## Overview
 
 `zendb-engine` composes the generic storage backends from `zendb-storage` into
-a database that owns tables, states, operators, and timers. Operators are
+a workspace that owns tables, states, operators, and timers. Operators are
 streaming computations that subscribe to tables, process changes incrementally,
 maintain private state, and publish derived results.
 
 ---
 
-## Database
+## Workspace
 
-`Database<D>` is the **single lifecycle root**. It holds strong references to
+`Workspace<D>` is the **single lifecycle root**. It holds strong references to
 every table, state, operator worker, and the shared timer store. When the last
-`Arc<Database>` is dropped, everything is torn down deterministically.
+`Arc<Workspace>` is dropped, everything is torn down deterministically.
 
 ### Lifecycle
 
 ```rust
-let db = Database::<MyOps>::create("/path/to/db", executor, DatabaseConfig::default())?;
+let workspace = Workspace::<MyOps>::create("/path/to/workspace", executor, WorkspaceConfig::default())?;
 // or
-let db = Database::<MyOps>::open("/path/to/db", executor, DatabaseConfig::default())?;
+let workspace = Workspace::<MyOps>::open("/path/to/workspace", executor, WorkspaceConfig::default())?;
 ```
 
 ### Catalog
@@ -36,12 +36,12 @@ Durable catalogs (each backed by a `KeyDir`):
 |---|---|---|
 | Tables | `_tables` | `String → TableConfig` |
 | States | `_states` | `String → StateConfig` |
-| Operators | `_operators` | `String → OperatorEntry<Config>` |
+| Operators | `_operators` | Local native execution adapter entries |
 
 Disk layout:
 
 ```text
-<database>/
+<workspace>/
 ├── _tables           # table catalog
 ├── _states           # state catalog
 ├── _operators        # operator catalog
@@ -57,19 +57,19 @@ Disk layout:
 ## Tables
 
 ```rust
-let handle = db.table("users", Some(TableConfig::default()))?;   // TableHandle (weak)
+let handle = workspace.table("users", Some(TableConfig::default()))?; // TableHandle (weak)
 let table = handle.get()?;                                       // upgrade for one operation
 table.write().insert_event(event)?;
 ```
 
-- `db.table(name, config)` — open or create; returns a weak `TableHandle`
-- `db.close_table(name)` — evict from memory (durable catalog entry remains)
-- `db.delete_table(name)` — evict + remove from catalog + delete files
-- `db.contains_table(name)` / `db.is_table_open(name)` / `db.list_tables()`
+- `workspace.table(name, config)` — open or create; returns a weak `TableHandle`
+- `workspace.close_table(name)` — evict from memory (durable catalog entry remains)
+- `workspace.delete_table(name)` — evict + remove from catalog + delete files
+- `workspace.contains_table(name)` / `workspace.is_table_open(name)` / `workspace.list_tables()`
 
-**`TableHandle`** is a `Weak<RwLock<Table>>`. It never keeps a table or database
+**`TableHandle`** is a `Weak<RwLock<Table>>`. It never keeps a table or workspace
 alive. `get()` upgrades for one operation and fails with `NotConnected` if the
-database was dropped.
+workspace was dropped.
 
 A `Table` owns:
 - **Materialized state** — `State<PrimaryKey, Cell>` (ordered or unordered backend)
@@ -81,14 +81,14 @@ A `Table` owns:
 ## States
 
 ```rust
-let handle = db.state::<String, u64>("totals", Some(StateConfig::default()))?;
+let handle = workspace.state::<String, u64>("totals", Some(StateConfig::default()))?;
 let state = handle.get()?;
 state.write().put("count".into(), 42)?;
 ```
 
-- `db.state::<K, V>(name, config)` — open or create typed state
-- `db.close_state(name)` — evict from memory
-- `db.delete_state(name)` — evict + remove from catalog + delete files
+- `workspace.state::<K, V>(name, config)` — open or create typed state
+- `workspace.close_state(name)` — evict from memory
+- `workspace.delete_state(name)` — evict + remove from catalog + delete files
 
 States are **typed** (`State<K, V>`), not forced through `Vec<u8>`.
 Type safety is runtime-only — there is no persisted schema registry.
@@ -97,8 +97,30 @@ Type safety is runtime-only — there is no persisted schema registry.
 
 ## Operators
 
-Operators are streaming computations that subscribe to table changes.
-They implement the `Operator` trait:
+Operators are streaming computations that subscribe to table changes. The
+client-side control model separates the durable desired object from its local
+worker:
+
+- `zendb_types::OperatorSpec` is desired state: class, source, inputs,
+  placement, permissions, approvals, retries, and outputs.
+- `OperatorObservation` is status: generation, condition, worker, lease, and
+  error information.
+- `Workspace` owns the local operator catalog, worker lifecycle, observations,
+  jobs, checkpoints, and lease records. These are workspace-owned state, not
+  interchangeable public service traits.
+- `LeaseConsistency` records whether a lease is advisory or authoritative;
+  the reconciler still validates fencing epochs before shared writes.
+- `plan_reconciliation` computes actions; it does not silently mutate desired
+  state or assume a central scheduler.
+- `AuthorizationEvaluator` and the Workspace effect path authorize exact
+  writes, capability invocations, jobs, and shared publication.
+- `CapabilityHost` combines local capability descriptors and execution.
+
+The current `Operator` trait is the native execution ABI used by the local
+runner. It is not itself the control-plane object. It implements:
+Compiled Rust operators are trusted application extensions. Scripted or
+externally supplied operators use the `CapabilityHost` and Workspace
+authorization boundary instead of receiving this native Workspace reference.
 
 ```rust
 pub trait Operator: Send + 'static {
@@ -116,9 +138,10 @@ pub trait Operator: Send + 'static {
 }
 ```
 
-Each method receives `&Arc<Database<D>>` directly — there is no separate context
-object. Operators open tables/states, register timers, and read/write data
-through the database reference.
+Each method receives `&Arc<Workspace<D>>` directly because this is the current
+native engine ABI. It is not a permission bypass: table writes, shared event
+publication, jobs, and capabilities must be checked against the active
+operator policy. User-authored Rhai code does not receive this Rust object.
 
 ### Dispatching
 
@@ -136,13 +159,13 @@ define_operator_set! {
 }
 
 // Type alias for convenience
-type MyDb = Database<ops::OperatorInstance>;
+type MyWorkspace = Workspace<ops::OperatorInstance>;
 ```
 
-Then dispatch at runtime:
+Then dispatch locally for embedded/test use:
 
 ```rust
-db.dispatch_operator::<MyCustom>(
+workspace.dispatch_operator::<MyCustom>(
     "my-op",
     MyCustomConfig { /* ... */ },
     OperatorRuntimeConfig {
@@ -151,6 +174,11 @@ db.dispatch_operator::<MyCustom>(
     },
 )?;
 ```
+
+`workspace.dispatch_operator` is a low-level immediate realization API. A
+cluster-aware application should persist a `zendb_types::OperatorSpec` and let
+the local reconciler decide whether to start a worker, acquire a lease, or
+remain stopped on this device.
 
 ### Subscriptions
 
@@ -175,7 +203,7 @@ create  →  on_input_opened (for each matching table)
 - **`Active`** — operator suspended (no open inputs); may be respawned later
 - **`Finished`** — operator returned `OperatorDirective::Finish`
 - **`Failed { error }`** — unrecoverable error
-- **`Cancelled`** — permanently cancelled by `db.cancel_operator(name)`
+- **`Cancelled`** — permanently cancelled by `workspace.cancel_operator(name)`
 
 Errors in `process`, `on_timer`, or lifecycle callbacks transition the operator
 to `Failed` and retire it.
@@ -183,15 +211,15 @@ to `Failed` and retire it.
 ### Cancel and Delete
 
 ```rust
-db.cancel_operator("my-op")?;
-db.delete_terminal_operator("my-op")?;
+workspace.cancel_operator("my-op")?;
+workspace.delete_terminal_operator("my-op")?;
 ```
 
 ### Facets
 
 Operators expose a typed query interface via the `Facet` associated type.
 The facet is produced after `create()` and stored in the worker, retrievable
-with `db.facet::<F>(name)`. It typically wraps `StateHandle` clones so
+with `workspace.facet::<F>(name)`. It typically wraps `StateHandle` clones so
 queries read directly from operator state without locking the processing loop:
 
 ```rust
@@ -200,7 +228,7 @@ impl Operator for IndexerOp {
     fn facet(&self) -> IndexerFacet { IndexerFacet { index: self.index.clone() } }
 }
 
-let facet = db.facet::<IndexerFacet>("indexer")?;
+let facet = workspace.facet::<IndexerFacet>("indexer")?;
 let results = facet.lookup("hello")?;
 ```
 
@@ -214,8 +242,8 @@ All operators share one ordered `BPlusTree` timer store keyed by
 `(fire_at_ms, operator)`. Operators register timers through the database:
 
 ```rust
-db.register_timer("my-op", fire_at_ms, &payload)?;
-db.cancel_timer("my-op", fire_at_ms)?;
+workspace.register_timer("my-op", fire_at_ms, &payload)?;
+workspace.cancel_timer("my-op", fire_at_ms)?;
 ```
 
 A background scheduler loop sleeps until the next due time (via condvar),
@@ -230,7 +258,7 @@ a timer removed from the store but not yet fired is lost across a crash.
 ## Concurrency Model
 
 - Storage backends are single-threaded values behind `RwLock`
-- The database holds strong `Arc<RwLock<Table>>` / `Arc<RwLock<State<K, V>>>`
+- The workspace holds strong `Arc<RwLock<Table>>` / `Arc<RwLock<State<K, V>>>`
 - Application and operator code hold weak `TableHandle` / `StateHandle`
 - Topic writing is single-writer; reading supports multiple concurrent consumers
 - Each operator worker owns its inputs, timer inbox, and event queue
@@ -258,8 +286,8 @@ pub trait Executor: Send + Sync + 'static {
 src/
 ├── lib.rs                # Crate root, re-exports
 ├── runtime.rs            # Executor trait
-├── database/
-│   ├── mod.rs            # Database struct, DatabaseConfig, handles, catalogs
+├── workspace/
+│   ├── mod.rs            # Workspace implementation, config, handles, catalogs
 │   ├── tables.rs         # table(), close_table(), delete_table()
 │   ├── states.rs         # state(), close_state(), delete_state()
 │   ├── operators.rs      # dispatch_operator(), cancel_operator(), retire_operator()
@@ -267,6 +295,7 @@ src/
 └── operator/
     ├── mod.rs            # Architecture docs, re-exports
     ├── config.rs         # Subscription, OperatorRuntimeConfig
+    ├── control.rs        # Workspace operator control and effect interfaces
     ├── lifecycle.rs      # OperatorPhase, OperatorDirective
     ├── traits.rs         # Operator, DispatchOperator, DispatchConfig traits
     ├── macros.rs         # define_operator_set! macro

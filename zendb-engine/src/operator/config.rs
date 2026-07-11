@@ -86,11 +86,20 @@ impl Subscription {
     }
 }
 
-/// Runtime configuration for an operator: subscriptions and poll batch size.
+/// Local execution binding for an operator worker.
+///
+/// This is deliberately not the declarative control object. A replicated
+/// [`zendb_types::OperatorSpec`] owns desired inputs, placement, permissions,
+/// outputs, and lifecycle. The reconciler compiles that desired state into
+/// this local topic-consumer binding and polling tuning before a worker starts.
+/// Keeping this distinction prevents a local poll-size change from becoming a
+/// cluster policy mutation.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct OperatorRuntimeConfig {
+    /// Derived table subscriptions used by the current native worker ABI.
+    /// They must be compiled from the active operator specification.
     pub subscriptions: Vec<Subscription>,
-    /// Max number of changes to collect per poll cycle.
+    /// Max number of changes to collect per local poll cycle.
     pub poll_size: usize,
 }
 

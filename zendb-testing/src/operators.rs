@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use bincode::{Decode, Encode};
 use zendb_engine::{
-    define_operator_set, Change, Database, DispatchOperator, Operator,
-    OperatorDirective, OperatorRuntimeConfig, StateHandle, Subscription, TableConfig, TableHandle,
+    define_operator_set, Change, DispatchOperator, Operator, OperatorDirective,
+    OperatorRuntimeConfig, StateHandle, Subscription, TableConfig, TableHandle, Workspace,
 };
 use zendb_storage::{core::traits::Backend, frontend::state::StateConfig};
 use zendb_types::{
@@ -95,7 +95,7 @@ impl Operator for IndexerOp {
     type Facet = ();
 
     fn create<'a, D>(
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<Self>> + Send + 'a
@@ -115,7 +115,7 @@ impl Operator for IndexerOp {
     fn process<'a, D>(
         &'a mut self,
         changes: Vec<Change>,
-        _db: &'a Arc<Database<D>>,
+        _db: &'a Arc<Workspace<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -217,7 +217,7 @@ impl Operator for ArchiverOp {
     type Facet = ();
 
     fn create<'a, D>(
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         name: &'a str,
         config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<Self>> + Send + 'a
@@ -249,7 +249,7 @@ impl Operator for ArchiverOp {
     fn process<'a, D>(
         &'a mut self,
         _changes: Vec<Change>,
-        _db: &'a Arc<Database<D>>,
+        _db: &'a Arc<Workspace<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -263,7 +263,7 @@ impl Operator for ArchiverOp {
         &'a mut self,
         _payload: (),
         _fire_at_ms: u64,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a

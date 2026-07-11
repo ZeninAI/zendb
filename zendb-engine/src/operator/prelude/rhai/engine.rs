@@ -3,18 +3,23 @@
 use rhai::Engine;
 
 use super::api::{create_db_module, register_table_type, ScriptContext};
+use super::config::RhaiExecutionPolicy;
 use super::types::{ScriptCell, ScriptChange, ScriptValue};
 
 /// Create a new Rhai engine configured for zendb operator scripts.
-pub fn create_engine() -> Engine {
+pub fn create_engine(policy: &RhaiExecutionPolicy) -> Engine {
     let mut engine = Engine::new();
 
-    // Disable potentially dangerous features for sandboxed execution
-    engine.set_max_expr_depths(64, 32);
-    engine.set_max_string_size(1024 * 1024); // 1MB max string
-    engine.set_max_array_size(10000);
-    engine.set_max_map_size(10000);
-    engine.set_max_operations(1_000_000);
+    // Limits are part of the persisted operator config, not process-global
+    // constants. Capabilities are still separately authorized by the host.
+    engine.set_max_expr_depths(
+        policy.max_expr_depth as usize,
+        policy.max_call_depth as usize,
+    );
+    engine.set_max_string_size(policy.max_string_bytes as usize);
+    engine.set_max_array_size(policy.max_array_len as usize);
+    engine.set_max_map_size(policy.max_map_len as usize);
+    engine.set_max_operations(policy.max_operations);
 
     // Register custom types
     register_types(&mut engine);
@@ -103,9 +108,7 @@ fn register_helpers(engine: &mut Engine) {
     });
 
     // Debug function
-    engine.register_fn("debug", |x: rhai::Dynamic| -> String {
-        format!("{:?}", x)
-    });
+    engine.register_fn("debug", |x: rhai::Dynamic| -> String { format!("{:?}", x) });
 }
 
 /// Names of lifecycle handler functions that scripts can define.

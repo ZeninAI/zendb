@@ -1,7 +1,7 @@
-//! Database API module for Rhai scripts.
+//! Workspace API module for Rhai scripts.
 //!
 //! This module provides the `db` namespace with functions to interact with
-//! the database from within Rhai scripts.
+//! the local workspace from within Rhai scripts.
 
 use std::sync::Arc;
 
@@ -9,10 +9,14 @@ use parking_lot::RwLock;
 use rhai::{Array, Dynamic, EvalAltResult, FuncRegistration, Module, Position};
 use zendb_types::PrimaryKey;
 
-use super::types::{dynamic_to_primary_key, dynamic_to_value, primary_key_to_dynamic, value_to_dynamic};
+use super::config::RhaiWriteMode;
+use super::types::{
+    dynamic_to_primary_key, dynamic_to_value, primary_key_to_dynamic, value_to_dynamic,
+};
 use zendb_types::{Cell, Value};
 
-/// Pending writes collected during script execution.
+/// Pending effect requests collected during script execution. A host-side
+/// effect gate must authorize them before durable application.
 #[derive(Debug, Clone, Default)]
 pub struct PendingWrites {
     /// Events to emit after script completes.
@@ -27,6 +31,9 @@ pub struct PendingEvent {
     pub table: String,
     pub key: PrimaryKey,
     pub value: Option<Value>,
+    /// Whether the script requested a shared event. The host still applies
+    /// the operator's effective output policy before accepting it.
+    pub sync: bool,
 }
 
 /// A pending timer to be scheduled.
@@ -36,20 +43,22 @@ pub struct PendingTimer {
     pub payload: Vec<u8>,
 }
 
-/// Shared context for database operations during script execution.
+/// Shared context for workspace operations during script execution.
 #[derive(Clone)]
 pub struct ScriptContext {
     /// Pending writes to apply after script execution.
     pub pending: Arc<RwLock<PendingWrites>>,
     /// The operator name for generating HLCs.
     pub operator_name: String,
+    pub write_mode: RhaiWriteMode,
 }
 
 impl ScriptContext {
-    pub fn new(operator_name: String) -> Self {
+    pub fn new(operator_name: String, write_mode: RhaiWriteMode) -> Self {
         Self {
             pending: Arc::new(RwLock::new(PendingWrites::default())),
             operator_name,
+            write_mode,
         }
     }
 
@@ -64,6 +73,7 @@ impl ScriptContext {
             table,
             key,
             value: Some(value),
+            sync: matches!(self.write_mode, RhaiWriteMode::SharedAllowed),
         });
     }
 
@@ -73,6 +83,7 @@ impl ScriptContext {
             table,
             key,
             value: None,
+            sync: matches!(self.write_mode, RhaiWriteMode::SharedAllowed),
         });
     }
 
@@ -85,7 +96,7 @@ impl ScriptContext {
     }
 }
 
-/// Create the `db` module with database access functions.
+/// Create the `db` module with workspace access functions.
 ///
 /// NOTE: These functions need access to a ScriptContext stored in the scope
 /// as `__db_ctx`. The operator must set this before calling any handlers.
@@ -259,7 +270,10 @@ impl ScriptTable {
     /// Get the number of entries.
     pub fn len(&mut self) -> i64 {
         let entries = self.entries.read();
-        entries.iter().filter(|(_, cell)| !cell.is_tombstone()).count() as i64
+        entries
+            .iter()
+            .filter(|(_, cell)| !cell.is_tombstone())
+            .count() as i64
     }
 }
 

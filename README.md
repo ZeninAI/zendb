@@ -12,7 +12,7 @@ offline mutation, streaming operators, and typed query facets.**
 3. [Crate Map](#crate-map)
 4. [Quick Start](#quick-start)
 5. [Core Concepts](#core-concepts)
-   - [The Database Facet](#the-database-facet)
+   - [The Workspace Facet](#the-workspace-facet)
    - [Tables and Events](#tables-and-events)
    - [Operators](#operators)
    - [States](#states)
@@ -41,11 +41,14 @@ ZeninDB is an embedded Rust database designed for applications that need:
   its processing loop
 - **File-backed durability** with ordered (B+tree) and unordered (Bitcask)
   backends, plus a segmented append-only topic log
-- **No external service** — link it into your application binary
+- **No required external service** — link it into your application binary;
+  optional hosted adapters live in `zendb-external`
 
 ZeninDB is *not* a SQL database, a distributed consensus system, or a
-cloud control plane. It is a local engine that you embed, configure with
-your own operator types, and query through typed handles.
+mandatory cloud control plane. It is a local engine that you embed, configure
+with your own operator types, and query through typed handles. A replicated
+workspace may carry declarative operator objects and reconcile them locally,
+but no hosted scheduler is required.
 
 ---
 
@@ -56,7 +59,7 @@ your own operator types, and query through typed handles.
 │                    Your Application                       │
 │                                                          │
 │  • Define operator types (define_operator_set!)           │
-│  • Create/open Database<YourOps>                          │
+│  • Create/open Workspace<YourOps>                         │
 │  • Insert events into tables                              │
 │  • Query facets from running operators                    │
 │  • Cancel / retire operators at runtime                   │
@@ -72,7 +75,7 @@ your own operator types, and query through typed handles.
 │                     zendb-engine                          │
 │                                                          │
 │  ┌──────────┐  ┌───────────────┐  ┌───────────────────┐  │
-│  │ Database │  │ OperatorWorker│  │     RunLoop       │  │
+│  │ Workspace│  │ OperatorWorker│  │     RunLoop       │  │
 │  │          │  │               │  │                   │  │
 │  │ • tables │──│ • inputs      │──│ • event queue     │  │
 │  │ • states │  │ • timer inbox │  │ • shutdown FSM    │  │
@@ -103,9 +106,11 @@ your own operator types, and query through typed handles.
 └──────────────────────────────────────────────────────────┘
 ```
 
-The dependency direction is strict: `zendb-types` → `zendb-storage` → `zendb-engine`.
-Types know nothing about storage; storage knows nothing about ZeninDB semantics;
-the engine composes them together.
+The core dependency direction is strict: `zendb-types` → `zendb-storage` →
+`zendb-engine`. Identity, transport, and sync are separate protocol layers;
+`zendb-engine` is the top-level local integrator. `zendb-external` is optional
+and contains outbound client adapters only. Types know nothing about storage;
+storage knows nothing about ZeninDB semantics; the engine composes them.
 
 ---
 
@@ -115,7 +120,11 @@ the engine composes them together.
 |---|---|---|
 | [`zendb-types`](zendb-types/) | Pure data model — CRDTs, HLCs, cells, events | `Cell`, `Event`, `Hlc`, `Value`, `Op`, `Path`, `Type` trait, `register_types!` |
 | [`zendb-storage`](zendb-storage/) | Generic KV backends and topic log | `BPlusTree`, `KeyDir`, `SkipList`, `Topic`, `State`, `Table`, `Backend` trait |
-| [`zendb-engine`](zendb-engine/) | Tables, database catalog, streaming operators, timers, facets | `Database`, `Operator` trait, `define_operator_set!`, `Subscription`, `Executor` |
+| [`zendb-engine`](zendb-engine/) | Workspace catalog, tables, operators, timers, facets | `Workspace`, `Operator`, `define_operator_set!`, `Subscription`, `Executor` |
+| [`zendb-identity`](zendb-identity/) | Device credentials, membership, invites, bootstrap evidence | `DeviceSigner`, `WorkspaceCredential`, `WorkspaceCredentialVerifier` |
+| [`zendb-transport`](zendb-transport/) | Client-side discovery, rendezvous, authenticated bearer sessions | `RawTransport`, `TransportSession`, `BearerAdapter`, `PathSelector` |
+| [`zendb-sync`](zendb-sync/) | Engine-independent replication messages and snapshot metadata | `ReplicatedEvent`, `SyncEnvelope`, `RangeRequest`, `SnapshotManifest` |
+| [`zendb-external`](zendb-external/) | Optional outbound adapters for hosted services | `HostedCredentialClient`, `HostedRendezvousClient`, `HostedJobClient` |
 | [`zendb-testing`](zendb-testing/) | Integration test harness (document pipeline) | Test operators: `IndexerOp`, `ArchiverOp` |
 
 ---
@@ -131,10 +140,10 @@ zendb-types = { path = "zendb-types" }
 zendb-storage = { path = "zendb-storage" }
 ```
 
-Define your operator set — this is your **database facet**:
+Define your operator set — this is your **workspace operator set**:
 
 ```rust
-use zendb_engine::define_operator_set;
+use zendb_engine::{define_operator_set, Workspace};
 
 define_operator_set! {
     pub mod my_ops {
@@ -143,23 +152,23 @@ define_operator_set! {
     }
 }
 
-// Your database type is parameterized by this set:
-type MyDb = Database<my_ops::OperatorInstance>;
+// Your workspace type is parameterized by this set:
+type MyWorkspace = Workspace<my_ops::OperatorInstance>;
 ```
 
-Create or open a database:
+Create or open a workspace:
 
 ```rust
-use zendb_engine::{Database, DatabaseConfig, Executor};
+use zendb_engine::{Executor, Workspace, WorkspaceConfig};
 use std::sync::Arc;
 
 let executor: Arc<dyn Executor> = /* your executor */;
 
-// Create a fresh database
-let db = MyDb::create("./my_db", executor.clone(), DatabaseConfig::default())?;
+// Create a fresh workspace
+let db = MyWorkspace::create("./my_workspace", executor.clone(), WorkspaceConfig::default())?;
 
 // Or open an existing one
-let db = MyDb::open("./my_db", executor, DatabaseConfig::default())?;
+let db = MyWorkspace::open("./my_workspace", executor, WorkspaceConfig::default())?;
 ```
 
 Create a table and insert an event:
@@ -211,9 +220,9 @@ println!("Documents containing 'hello': {:?}", index);
 
 ## Core Concepts
 
-### The Database Facet
+### The Workspace Facet
 
-The `Database<D>` type is parameterized by `D`, which is the **operator set**
+The `Workspace<D>` type is parameterized by `D`, which is the **operator set**
 generated by `define_operator_set!`. This means:
 
 - At compile time, the database knows exactly which operator types exist.
@@ -308,9 +317,15 @@ with five lifecycle hooks and one query hook:
 | `on_timer(payload, fire_at_ms, db, name, config)` | A registered timer fired |
 | `teardown(phase, db, name, config)` | Operator is stopping |
 
-Each method receives `&Arc<Database<D>>` directly — no separate context
-object. Operators open tables, create states, register timers, and read/write
-data through the database reference.
+Each method receives `&Arc<Workspace<D>>` directly because this is the current
+native Rust ABI. It is not a permission bypass: production runners must route
+mutations, shared publication, jobs, and capabilities through the operator
+effect gate. User-authored Rhai code receives a bounded script context, not
+the Rust database object.
+
+For cluster behavior, persist `zendb_types::OperatorSpec` and let the local
+reconciler decide whether a worker should run. `dispatch_operator` is the
+low-level embedded/test convenience path.
 
 **Return directives:**
 
@@ -432,7 +447,7 @@ define_operator_set! {
     }
 }
 
-type DocDb = Database<doc_ops::OperatorInstance>;
+type DocWorkspace = Workspace<doc_ops::OperatorInstance>;
 ```
 
 ### Step 2: The Indexer operator
@@ -440,7 +455,7 @@ type DocDb = Database<doc_ops::OperatorInstance>;
 ```rust
 use std::{collections::HashSet, future::Future, io, sync::Arc};
 use zendb_engine::{
-    Change, Database, DispatchOperator, Operator,
+    Change, Workspace, DispatchOperator, Operator,
     OperatorDirective, StateHandle, Subscription,
 };
 use zendb_storage::frontend::state::StateConfig;
@@ -476,7 +491,7 @@ impl Operator for IndexerOp {
     type Facet = IndexerFacet;
 
     fn create<'a, D>(
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<Self>> + Send + 'a
@@ -496,7 +511,7 @@ impl Operator for IndexerOp {
     fn process<'a, D>(
         &'a mut self,
         changes: Vec<Change>,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -541,7 +556,7 @@ impl Operator for IndexerOp {
 ```rust
 fn main() -> io::Result<()> {
     let executor = Arc::new(ThreadExecutor);
-    let db = DocDb::create("./my_db", executor, DatabaseConfig::default())?;
+    let db = DocWorkspace::create("./my_workspace", executor, WorkspaceConfig::default())?;
 
     // Create the documents table
     let docs = db.table("documents", Some(TableConfig::default()))?;

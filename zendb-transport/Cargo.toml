@@ -1,0 +1,13 @@
+[package]
+name = "zendb-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Networking and transport abstractions for ZeninDB"
+
+[dependencies]
+bincode.workspace = true
+zendb-identity = { path = "../zendb-identity" }
+

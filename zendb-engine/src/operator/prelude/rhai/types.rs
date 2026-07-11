@@ -239,7 +239,11 @@ pub fn primary_key_to_dynamic(pk: &PrimaryKey) -> Dynamic {
         PrimaryKey::Bool(b) => Dynamic::from(*b),
         PrimaryKey::Timestamp(t) => Dynamic::from(*t as i64),
         PrimaryKey::Blob(b) => {
-            let bytes: Vec<Dynamic> = b.as_slice().iter().map(|&byte| Dynamic::from(byte as i64)).collect();
+            let bytes: Vec<Dynamic> = b
+                .as_slice()
+                .iter()
+                .map(|&byte| Dynamic::from(byte as i64))
+                .collect();
             Dynamic::from(bytes)
         }
     }
@@ -269,7 +273,11 @@ pub fn value_to_dynamic(value: &Value) -> Dynamic {
         Value::Counter(c) => Dynamic::from(c.value() as i64),
         Value::Timestamp(t) => Dynamic::from(*t as i64),
         Value::Blob(b) => {
-            let bytes: Vec<Dynamic> = b.as_slice().iter().map(|&byte| Dynamic::from(byte as i64)).collect();
+            let bytes: Vec<Dynamic> = b
+                .as_slice()
+                .iter()
+                .map(|&byte| Dynamic::from(byte as i64))
+                .collect();
             Dynamic::from(bytes)
         }
         Value::Record(r) => {

@@ -8,7 +8,7 @@ use std::sync::{Arc, Weak};
 
 use log::{debug, info, trace};
 
-use crate::{runtime::Executor, Database};
+use crate::{runtime::Executor, Workspace};
 
 use super::{
     worker::OperatorWorker, DispatchConfig, DispatchOperator, OperatorDirective, OperatorPhase,
@@ -25,7 +25,7 @@ pub(crate) enum LifecycleEvent {
 /// Main async run loop.
 pub(crate) async fn run<D>(
     worker: Arc<OperatorWorker<D>>,
-    database: Weak<Database<D>>,
+    database: Weak<Workspace<D>>,
     executor: Arc<dyn Executor>,
 ) where
     D: DispatchOperator,

@@ -11,7 +11,7 @@ pub use merkle_tree::{
     MerkleEntry, MerkleLeaf, MerkleNode, MerkleRoot, MerkleTreeConfig, MerkleTreeFacet,
     MerkleTreeOperator, MerkleTreeStateKey, MerkleTreeStateValue,
 };
-pub use rhai::{RhaiFacet, RhaiOperator, RhaiOperatorConfig};
+pub use rhai::{RhaiExecutionPolicy, RhaiFacet, RhaiOperator, RhaiOperatorConfig, RhaiWriteMode};
 
 #[doc(hidden)]
 #[macro_export]

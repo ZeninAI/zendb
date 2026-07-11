@@ -1,6 +1,43 @@
 //! Configuration for the Rhai scripting operator.
 
 use bincode::{Decode, Encode};
+use zendb_types::CapabilityId;
+
+/// Whether a script may request shared writes. The operator spec and policy
+/// evaluator remain authoritative; this is only the script's declared mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub enum RhaiWriteMode {
+    LocalOnly,
+    SharedAllowed,
+}
+
+/// Resource limits applied to one script invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct RhaiExecutionPolicy {
+    pub max_expr_depth: u32,
+    pub max_call_depth: u32,
+    pub max_string_bytes: u32,
+    pub max_array_len: u32,
+    pub max_map_len: u32,
+    pub max_operations: u64,
+    pub requested_capabilities: Vec<CapabilityId>,
+    pub write_mode: RhaiWriteMode,
+}
+
+impl Default for RhaiExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            max_expr_depth: 64,
+            max_call_depth: 32,
+            max_string_bytes: 1024 * 1024,
+            max_array_len: 10_000,
+            max_map_len: 10_000,
+            max_operations: 1_000_000,
+            requested_capabilities: Vec::new(),
+            write_mode: RhaiWriteMode::LocalOnly,
+        }
+    }
+}
 
 /// Configuration for the Rhai scripting operator.
 ///
@@ -39,17 +76,15 @@ use bincode::{Decode, Encode};
 pub struct RhaiOperatorConfig {
     /// The Rhai script source code.
     pub script: String,
-
-    /// Optional state path for persisting operator state between restarts.
-    /// If not set, state is kept in memory only.
-    pub state_path: Option<String>,
+    /// Execution limits and declared host capability/write requirements.
+    pub policy: RhaiExecutionPolicy,
 }
 
 impl Default for RhaiOperatorConfig {
     fn default() -> Self {
         Self {
             script: String::new(),
-            state_path: None,
+            policy: RhaiExecutionPolicy::default(),
         }
     }
 }
@@ -59,13 +94,13 @@ impl RhaiOperatorConfig {
     pub fn new(script: impl Into<String>) -> Self {
         Self {
             script: script.into(),
-            state_path: None,
+            policy: RhaiExecutionPolicy::default(),
         }
     }
 
-    /// Set the state persistence path.
-    pub fn with_state_path(mut self, path: impl Into<String>) -> Self {
-        self.state_path = Some(path.into());
+    /// Set the execution policy declared by this script.
+    pub fn with_policy(mut self, policy: RhaiExecutionPolicy) -> Self {
+        self.policy = policy;
         self
     }
 }

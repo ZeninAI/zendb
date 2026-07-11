@@ -9,7 +9,7 @@ pub enum OperatorPhase {
     Finished,
     /// Terminated by an unrecoverable error.
     Failed { error: String },
-    /// Permanently cancelled by the database owner.
+    /// Permanently cancelled by the workspace owner.
     Cancelled,
 }
 

@@ -11,7 +11,7 @@ use zendb_storage::core::traits::Backend;
 use zendb_types::{Cell, PrimaryKey, Value};
 
 use crate::{
-    Change, Database, DispatchOperator, Operator, OperatorDirective, StateConfig, StateHandle,
+    Change, DispatchOperator, Operator, OperatorDirective, StateConfig, StateHandle, Workspace,
 };
 
 /// Configuration for the full-text index operator.
@@ -73,7 +73,7 @@ pub struct FullTextIndexOperator {
 
 /// Public query interface for the full-text index operator.
 ///
-/// Obtained via [`Database::facet`] while the operator is running.
+/// Obtained via [`Workspace::facet`] while the operator is running.
 #[derive(Clone)]
 pub struct FullTextIndexFacet {
     indexes: Arc<RwLock<HashMap<String, TableIndex>>>,
@@ -100,10 +100,7 @@ impl FullTextIndexFacet {
         let state = index.posting.get()?;
         let guard = state.read();
         let key = token.to_lowercase();
-        Ok(guard
-            .get(&key)
-            .map(|v| v.into_owned())
-            .unwrap_or_default())
+        Ok(guard.get(&key).map(|v| v.into_owned()).unwrap_or_default())
     }
 
     /// Return the set of tokens indexed for a particular entry.
@@ -113,10 +110,7 @@ impl FullTextIndexFacet {
         };
         let state = index.forward.get()?;
         let guard = state.read();
-        Ok(guard
-            .get(key)
-            .map(|v| v.into_owned())
-            .unwrap_or_default())
+        Ok(guard.get(key).map(|v| v.into_owned()).unwrap_or_default())
     }
 
     fn table_index(&self, table: &str) -> Option<TableIndex> {
@@ -181,7 +175,7 @@ impl Operator for FullTextIndexOperator {
     type Facet = FullTextIndexFacet;
 
     fn create<'a, D>(
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         _name: &'a str,
         config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<Self>> + Send + 'a
@@ -209,7 +203,7 @@ impl Operator for FullTextIndexOperator {
     fn on_input_opened<'a, D>(
         &'a mut self,
         table: String,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -235,7 +229,7 @@ impl Operator for FullTextIndexOperator {
     fn on_input_closed<'a, D>(
         &'a mut self,
         table: String,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -256,7 +250,7 @@ impl Operator for FullTextIndexOperator {
     fn process<'a, D>(
         &'a mut self,
         changes: Vec<Change>,
-        db: &'a Arc<Database<D>>,
+        db: &'a Arc<Workspace<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -357,11 +351,7 @@ impl Operator for FullTextIndexOperator {
 }
 
 impl FullTextIndexOperator {
-    fn table_index<D>(
-        &mut self,
-        db: &Arc<Database<D>>,
-        table: &str,
-    ) -> io::Result<TableIndex>
+    fn table_index<D>(&mut self, db: &Arc<Workspace<D>>, table: &str) -> io::Result<TableIndex>
     where
         D: DispatchOperator,
     {
@@ -369,15 +359,21 @@ impl FullTextIndexOperator {
             return Ok(index);
         }
 
-        let posting = db.state(&posting_state_name(&self.base_state, table), Some(state_config()))?;
-        let forward = db.state(&forward_state_name(&self.base_state, table), Some(state_config()))?;
+        let posting = db.state(
+            &posting_state_name(&self.base_state, table),
+            Some(state_config()),
+        )?;
+        let forward = db.state(
+            &forward_state_name(&self.base_state, table),
+            Some(state_config()),
+        )?;
         let index = TableIndex { posting, forward };
         self.indexes.write().insert(table.to_owned(), index.clone());
         Ok(index)
     }
 
     /// Full rebuild: scan all entries in the table and reindex from scratch.
-    fn rebuild_table<D>(&mut self, db: &Arc<Database<D>>, table: &str) -> io::Result<()>
+    fn rebuild_table<D>(&mut self, db: &Arc<Workspace<D>>, table: &str) -> io::Result<()>
     where
         D: DispatchOperator,
     {
@@ -437,7 +433,7 @@ impl FullTextIndexOperator {
     }
 
     /// Remove index entries for tables that no longer exist in the catalog.
-    fn reconcile_orphaned_tables<D>(&mut self, db: &Arc<Database<D>>) -> io::Result<()>
+    fn reconcile_orphaned_tables<D>(&mut self, db: &Arc<Workspace<D>>) -> io::Result<()>
     where
         D: DispatchOperator,
     {
@@ -455,9 +451,17 @@ impl FullTextIndexOperator {
 
             if db.contains_table(table) {
                 // Load existing index handles.
-                let posting = db.state(&posting_state_name(&self.base_state, table), Some(state_config()))?;
-                let forward = db.state(&forward_state_name(&self.base_state, table), Some(state_config()))?;
-                self.indexes.write().insert(table.to_owned(), TableIndex { posting, forward });
+                let posting = db.state(
+                    &posting_state_name(&self.base_state, table),
+                    Some(state_config()),
+                )?;
+                let forward = db.state(
+                    &forward_state_name(&self.base_state, table),
+                    Some(state_config()),
+                )?;
+                self.indexes
+                    .write()
+                    .insert(table.to_owned(), TableIndex { posting, forward });
             } else {
                 // Orphaned — delete.
                 let _ = db.delete_state(&posting_state_name(&self.base_state, table));

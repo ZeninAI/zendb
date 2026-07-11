@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-//! │   Database       │────►│  OperatorWorker   │────►│    RunLoop       │
+//! │   Workspace      │────►│  OperatorWorker   │────►│    RunLoop       │
 //! │                  │     │                   │     │                  │
 //! │ • registers ops  │     │ • holds inputs    │     │ • event queue    │
 //! │ • manages catalog│     │ • timer inbox     │     │ • shutdown FSM   │
@@ -28,7 +28,7 @@
 //!
 //! ```text
 //! ┌─────────┐
-//! │ create  │  ← Database available; set up state handles and tables
+//! │ create  │  ← Workspace available; set up state handles and tables
 //! └────┬────┘
 //!      │  (for each matching table already open)
 //!      ▼
@@ -58,11 +58,17 @@
 //! | Layer | Owns | Does NOT own |
 //! |-------|------|-------------|
 //! | `Operator` (user code) | Business logic, state handles, timer payloads | Polling, commit offsets, event ordering |
-//! | `Database` | DB access, timer registration, table/state creation | Lifecycle transitions |
+//! | `Workspace` | DB access, timer registration, table/state creation | Lifecycle transitions |
 //! | `OperatorWorker` | Input attachment/detachment, timer inbox, spawn | Run loop details |
 //! | `RunLoop` | Event queue, shutdown state machine, poll+commit, idle/wake | What the operator does with changes |
+//!
+//! The declarative control layer sits above this runtime table: specs and
+//! observations describe desired/current state, the reconciler decides local
+//! actions, leases fence shared ownership, and this worker stack realizes one
+//! approved local action. The worker is not a scheduler or a server.
 
 mod config;
+pub mod control;
 mod lifecycle;
 mod macros;
 pub mod prelude;
@@ -73,6 +79,10 @@ pub(crate) mod worker;
 use std::{future::Future, pin::Pin};
 
 pub use config::{OperatorRuntimeConfig, Subscription};
+pub use control::{
+    plan_reconciliation, CapabilityHost, LeaseConsistency, OperatorAdmission, OperatorControlError,
+    OperatorControlResult, ReconcileAction, ReconcileSnapshot,
+};
 pub use lifecycle::{OperatorDirective, OperatorPhase};
 pub use traits::{DispatchConfig, DispatchOperator, Operator};
 pub use zendb_storage::frontend::state::State;

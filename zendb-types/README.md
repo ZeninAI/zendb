@@ -1,16 +1,17 @@
 # zendb-types
 
-**Pure data model for ZeninDB — CRDT types, HLC clocks, cells, events,
-and generated type dispatch. No I/O, no storage, no networking.**
+**Pure shared data model for ZeninDB — CRDT types, HLC clocks, identity,
+authorization vocabulary, and declarative operator objects. No storage,
+network sessions, or hosted-service implementations.**
 
 ---
 
 ## Crate Role
 
 `zendb-types` is the foundation. It defines every data structure needed for
-collaborative conflict resolution and sits at the bottom of the dependency
-graph. Everything else depends on it; it depends on nothing except `bincode`
-for serialization.
+collaborative conflict resolution and shared control state and sits at the
+bottom of the dependency graph. It contains no policy lookup, storage, network
+session, OIDC, or operator execution implementation.
 
 ---
 
@@ -18,16 +19,19 @@ for serialization.
 
 ### `Hlc` — Hybrid Logical Clock
 
-16-byte lexicographically ordered timestamp:
+24-byte lexicographically ordered timestamp:
 
 ```text
 Bytes 0–5:  physical_ms  (48-bit big-endian, ms since epoch)
 Bytes 6–7:  logical      (16-bit big-endian, monotonic counter)
-Bytes 8–15: device_id    (64-bit, machine-derived)
+Bytes 8–23: device_id    (128-bit, persisted installation identity)
 ```
 
 `Hlc::ZERO` is the all-zero sentinel — any real clock beats it. Clock ordering
 is: physical → logical → device ID.
+
+`DeviceId` is generated from the operating system CSPRNG, persisted by the
+replica, and bound to its public key. It is not derived from a machine UID.
 
 ### `Cell`
 
@@ -64,6 +68,19 @@ pub struct Event {
     pub signature: Signature,
 }
 ```
+
+### Shared control objects
+
+The `control` module contains pure, serializable vocabulary used by the
+client-side database control plane:
+
+- authorization contexts, decisions, rules, resources, and obligations;
+- operator desired state (`OperatorSpec`) and local observations;
+- placement, capability requests, output policy, retry policy, and approvals;
+- fenced leases, checkpoints, jobs, and job results.
+
+These objects are database truth when replicated. They do not imply that a
+server scheduler exists; the embedded engine reconciles them on each device.
 
 ### `Path` / `PathStep`
 
@@ -139,19 +156,19 @@ A `macro_rules!` invocation that generates the type dispatch layer:
 
 ```rust
 register_types! {
-    leaf Bool => crate::types::bool::Bool,
-    leaf Int => crate::types::int::Int,
-    leaf String => crate::types::string::String,
-    leaf Timestamp => crate::types::timestamp::Timestamp,
-    leaf Blob => crate::types::blob::Blob,
-    leaf Counter => crate::types::counter::Counter,
-    leaf MvRegister => crate::types::mv_register::MvRegister,
-    leaf OrSet => crate::types::or_set::OrSet,
-    leaf Set => crate::types::set::Set,
-    leaf PriorityQueue => crate::types::priority_queue::PriorityQueue,
-    leaf Text => crate::types::text::Text,
-    container Record(RecordSegment) => crate::types::record::Record,
-    container List(ListSegment) => crate::types::list::List,
+    leaf Bool => crate::crdt::values::bool::Bool,
+    leaf Int => crate::crdt::values::int::Int,
+    leaf String => crate::crdt::values::string::String,
+    leaf Timestamp => crate::crdt::values::timestamp::Timestamp,
+    leaf Blob => crate::crdt::values::blob::Blob,
+    leaf Counter => crate::crdt::values::counter::Counter,
+    leaf MvRegister => crate::crdt::values::mv_register::MvRegister,
+    leaf OrSet => crate::crdt::values::or_set::OrSet,
+    leaf Set => crate::crdt::values::set::Set,
+    leaf PriorityQueue => crate::crdt::values::priority_queue::PriorityQueue,
+    leaf Text => crate::crdt::values::text::Text,
+    container Record(RecordSegment) => crate::crdt::values::record::Record,
+    container List(ListSegment) => crate::crdt::values::list::List,
 }
 ```
 
@@ -189,15 +206,15 @@ pub enum Op {
 ```
 src/
 ├── lib.rs              # register_types! macro, invocation, re-exports
-├── core/
+├── crdt/
 │   ├── cell.rs         # Cell struct + Type/ContainerType impls
 │   ├── change.rs       # Change struct
 │   ├── event.rs        # Event, TableId, Signature
-│   ├── hlc.rs          # Hlc, DeviceId, init_device_id()
+│   ├── hlc.rs          # Hlc and canonical DeviceId integration
 │   ├── op.rs           # Op enum (cell-level operations)
 │   ├── path.rs         # PathStep, Path
-│   └── traits.rs       # Type, ContainerType, MergeClocks
-└── types/
+│   ├── replication.rs  # Event identity, envelopes, version vectors
+│   └── values/
     ├── mod.rs
     ├── blob.rs         # Blob (scalar)
     ├── bool.rs         # Bool (scalar)
@@ -212,4 +229,12 @@ src/
     ├── string.rs       # String (scalar)
     ├── text.rs         # Text (RGA collaborative text)
     └── timestamp.rs    # Timestamp (scalar)
+├── identity/
+│   ├── ids.rs          # DeviceId and other shared identifiers
+│   ├── principal.rs    # User/device/guest/service/operator principals
+│   └── membership.rs   # Workspace and device membership records
+└── control/
+    ├── authorization.rs # Policy vocabulary and evaluator interface
+    ├── capability.rs    # Capability invocation/result records
+    └── operator.rs      # Desired operators, leases, jobs, checkpoints
 ```

@@ -1,0 +1,13 @@
+[package]
+name = "zendb-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Replication and bootstrap protocol abstractions for ZeninDB"
+
+[dependencies]
+bincode.workspace = true
+zendb-types = { path = "../zendb-types" }
+zendb-identity = { path = "../zendb-identity" }

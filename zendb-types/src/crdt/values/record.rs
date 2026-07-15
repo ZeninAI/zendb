@@ -14,8 +14,18 @@ pub struct Record {
 }
 
 impl Record {
+    pub fn from_fields(fields: impl IntoIterator<Item = (String, Cell)>) -> Self {
+        Self {
+            fields: fields.into_iter().collect(),
+        }
+    }
+
     pub fn get(&self, field: &str) -> Option<&Cell> {
         self.fields.get(field)
+    }
+
+    pub(crate) fn get_mut(&mut self, field: &str) -> Option<&mut Cell> {
+        self.fields.get_mut(field)
     }
 
     pub fn contains(&self, field: &str) -> bool {

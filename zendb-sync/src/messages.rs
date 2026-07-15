@@ -1,5 +1,5 @@
 use bincode::{Decode, Encode};
-use zendb_identity::{DeviceId, WorkspaceId};
+use zendb_types::{DeviceId, WorkspaceId};
 
 use crate::{journal::ReplicatedEvent, summary::WorkspaceSyncSummary};
 
@@ -42,7 +42,6 @@ pub struct SyncSnapshotMeta {
     pub total_bytes: u64,
     pub summary: WorkspaceSyncSummary,
     pub snapshot_hash: [u8; 32],
-    pub resource_scope_hash: [u8; 32],
 }
 
 /// One chunk of a snapshot stream.
@@ -52,13 +51,4 @@ pub struct SyncSnapshotChunk {
     pub chunk_index: u32,
     pub chunk_hash: [u8; 32],
     pub bytes: Vec<u8>,
-}
-
-/// Request or acknowledge a live tail subscription.
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub struct TailSubscription {
-    pub workspace_id: WorkspaceId,
-    pub policy_epoch: u64,
-    pub resource_scope_hash: [u8; 32],
-    pub accepted: bool,
 }

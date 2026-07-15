@@ -1,12 +1,13 @@
 //! # zendb-transport
 //!
-//! Transport and discovery abstractions for ZeninDB.
+//! Concrete client-side transport mechanics for ZeninDB.
 //!
 //! This crate intentionally owns:
 //! - peer discovery
 //! - rendezvous and pairing entrypoints
-//! - authenticated transport sessions
-//! - framed protocol channels
+//! - a durable device signing profile
+//! - mutually authenticated encrypted TCP sessions
+//! - enrollment proof helpers and local presence tracking
 //!
 //! It does not own:
 //! - replication semantics
@@ -14,26 +15,26 @@
 //! - operator placement
 //! - product-domain data models
 
-pub mod bearer;
 pub mod bootstrap;
 pub mod discovery;
 pub mod endpoint;
-pub mod frame;
-pub mod handshake;
-pub mod path;
-pub mod protocol;
+pub mod enrollment;
+pub mod identity;
+pub mod presence;
 pub mod rendezvous;
-pub mod session;
+pub mod secure_tcp;
 
-pub use bearer::{BearerAdapter, BearerCapabilities, BearerKind};
-pub use bootstrap::{BootstrapApproval, BootstrapRequest};
-pub use discovery::{DiscoveredPeer, DiscoveryProvider};
+pub use bootstrap::{BootstrapApproval, BootstrapRequest, BootstrapTicketProof};
+pub use discovery::DiscoveredPeer;
 pub use endpoint::{NetworkEndpoint, RelayAddress};
-pub use frame::{StreamId, TransportFrame};
-pub use handshake::{
-    HandshakeAuthenticate, HandshakeChallenge, HandshakeHello, SessionEstablished,
+pub use enrollment::{
+    build_direct_request, evidence_from_request, ticket_admission_signing_bytes,
+    verify_candidate_request, EnrollmentPresentation,
 };
-pub use path::PathSelector;
-pub use protocol::{ProtocolChannel, RequestId, SessionHealth, SessionId};
-pub use rendezvous::{RendezvousProvider, RendezvousPurpose, RendezvousRequest, RendezvousTicket};
-pub use session::{RawTransport, SessionMetadata, TransportSession};
+pub use identity::DeviceProfile;
+pub use presence::{PresenceStatus, PresenceTracker};
+pub use rendezvous::{RendezvousPurpose, RendezvousRequest, RendezvousTicket};
+pub use secure_tcp::{
+    HandshakePeer, SecureTcpSession, SessionPurpose, DEFAULT_MAX_SECURE_FRAME_BYTES,
+    SECURE_SESSION_VERSION,
+};

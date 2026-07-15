@@ -1,240 +1,127 @@
 # zendb-types
 
-**Pure shared data model for ZeninDB — CRDT types, HLC clocks, identity,
-authorization vocabulary, and declarative operator objects. No storage,
-network sessions, or hosted-service implementations.**
+Pure portable data for ZenDB: CRDT values, clocks, events, device membership,
+fixed roles, enrollment records, presence messages, replication frontiers, and
+future operator desired-state records. This crate has no filesystem, sockets,
+policy lookup, hosted service, or execution runtime.
 
----
+## CRDT Foundation
 
-## Crate Role
+`Hlc` is a 24-byte hybrid logical clock ordered by physical milliseconds,
+logical counter, and stable DeviceId. DeviceId is random and persisted; it is
+not derived from a machine identifier or public key.
 
-`zendb-types` is the foundation. It defines every data structure needed for
-collaborative conflict resolution and shared control state and sits at the
-bottom of the dependency graph. It contains no policy lookup, storage, network
-session, OIDC, or operator execution implementation.
-
----
-
-## Core Types
-
-### `Hlc` — Hybrid Logical Clock
-
-24-byte lexicographically ordered timestamp:
-
-```text
-Bytes 0–5:  physical_ms  (48-bit big-endian, ms since epoch)
-Bytes 6–7:  logical      (16-bit big-endian, monotonic counter)
-Bytes 8–23: device_id    (128-bit, persisted installation identity)
-```
-
-`Hlc::ZERO` is the all-zero sentinel — any real clock beats it. Clock ordering
-is: physical → logical → device ID.
-
-`DeviceId` is generated from the operating system CSPRNG, persisted by the
-replica, and bound to its public key. It is not derived from a machine UID.
-
-### `Cell`
-
-The universal addressable state unit:
+`Cell` is the universal recursive state unit:
 
 ```rust
 pub struct Cell {
-    pub value: Option<Value>,   // None = tombstone
-    pub hlc: Hlc,               // structural clock
-    pub sync: Option<bool>,     // per-cell sync policy override
-}
-```
-
-- `value = Some(v)` — cell is live
-- `value = None` — cell is a tombstone (preserved for CRDT correctness)
-- `sync = None` — inherit from ancestor or database default
-- `sync = Some(true/false)` — explicit sync policy for this subtree
-
-Key methods: `apply_event`, `merge`, `compact`, `max_hlc`, `ensure_type`,
-`is_dummy`, `is_tombstone`.
-
-### `Event`
-
-The unit of mutation — self-contained and replication-ready:
-
-```rust
-pub struct Event {
-    pub table_id: TableId,
-    pub primary_key: PrimaryKey,
-    pub path: Path,
-    pub op: Op,
+    pub value: Option<Value>,
     pub hlc: Hlc,
-    pub sync: bool,
-    pub signature: Signature,
+    pub sync: Option<bool>,
 }
 ```
 
-### Shared control objects
+`None` value is a CRDT tombstone. `sync` is local routing metadata, not
+replicated authorization. On a shared table, `Some(false)` starts a private
+overlay boundary. `Some(true)` cannot escape a private ancestor. Overlay
+storage and routing are implemented by `zendb-engine::Workspace`.
 
-The `control` module contains pure, serializable vocabulary used by the
-client-side database control plane:
+`Event` addresses a table, primary key, recursive Path, operation, and HLC.
+Its `sync` field is transitional input to the local router; a remote sender
+cannot use it to choose the replication plane. Shared identity and signatures
+are carried by `ReplicatedEvent` and `SyncEnvelope`.
 
-- authorization contexts, decisions, rules, resources, and obligations;
-- operator desired state (`OperatorSpec`) and local observations;
-- placement, capability requests, output policy, retry policy, and approvals;
-- fenced leases, checkpoints, jobs, and job results.
+Built-in values include scalar Bool, Int, String, Timestamp, and Blob plus
+Record, Set, OrSet, Counter, MvRegister, List, Text, and PriorityQueue CRDTs.
+`Record` and `List` recursively contain Cells. The `register_types!` macro
+generates `TypeTag`, `PrimaryKey`, `Value`, `TypeOp`, `Segment`, and dispatch
+implementations.
 
-These objects are database truth when replicated. They do not imply that a
-server scheduler exists; the embedded engine reconciles them on each device.
+`Type::compact(Hlc)` accepts an already proven watermark. Values do not infer
+distributed safety from a wall clock. The engine derives a shared watermark
+from durable frontiers before invoking recursive compaction.
 
-### `Path` / `PathStep`
+## Device Membership
 
-```rust
-pub struct PathStep {
-    pub container_tag: TypeTag,  // expected container type at this depth
-    pub segment: Segment,        // how to descend (field name, list id, etc.)
-}
+`DeviceRecord` is the complete database membership and authorization subject:
 
-pub type Path = Vec<PathStep>;
+```text
+DeviceRecord
+  name
+  key_ring
+  roles: Set<WorkspaceRole>
+  capabilities: Set<CapabilityId>
+  replication_frontier: ContiguousFrontier
 ```
 
-An empty path addresses the row root. Each step carries type information so
-the apply walk can self-heal: if an intermediate container is missing, it can
-be created from the expected type.
+The Workspace stores each DeviceRecord in a nested Device Cell. A live Cell is
+membership; a tombstone is removal. There is no UserId, PrincipalId,
+DeviceMembership, WorkspaceMembership, OAuth record, status field, or shared
+workspace private secret.
 
-### `Change`
+`DeviceKeyRing` is an atomically replaced two-key state machine:
 
-Before/after snapshot produced by applying an event:
-
-```rust
-pub struct Change {
-    pub event: Event,
-    pub previous: Option<Cell>,
-    pub current: Option<Cell>,
-}
+```text
+primary_key
+secondary_key: optional
+primary_from_seq
+phase: Stable | Staged
 ```
 
----
+The secondary is either a staged candidate or a historic verifier, depending
+on phase. There is no key ID or expiry interval. DeviceId remains stable while
+keys rotate.
 
-## CRDT Type System
+Every admitted device is an implicit Reader. The only explicit role values are
+Contributor, Dispatcher, and Manager. `WorkspaceAction` is the fixed action
+vocabulary used by engine validation. Roles and actions are not customizable
+policy records.
 
-### The `Type` Trait
+Capabilities are device-advertised string labels for future operator
+placement. They are not requests, permissions, subscriptions, or callable
+host functions.
 
-```rust
-pub trait Type: Sized + Encode + Decode<()> {
-    type Op: Encode + Decode<()>;
-    type Error: std::error::Error;
+## Enrollment And Presence
 
-    fn apply(&mut self, op: &Self::Op, op_hlc: Hlc) -> Result<bool, Self::Error>;
-    fn merge(&mut self, remote: &Self, clocks: MergeClocks) -> Result<bool, Self::Error>;
-    fn is_synced(&self, inherited: bool, path: &[PathStep]) -> bool;
-    fn compact(&mut self, watermark: Hlc) -> Result<bool, Self::Error>;
-    fn max_hlc(&self) -> Hlc;
-}
-```
+`EnrollmentTicket` stores only the public ticket verifier and expiry HLC. Its
+private credential belongs in an `EnrollmentPresentation` from
+`zendb-transport`, not replicated data.
 
-`ContainerType` extends `Type` with `apply_walk` for recursive path traversal.
+`PresenceHeartbeat` and `DepartureNotice` are signed ephemeral protocol
+messages. They are not DeviceRecord fields and do not affect membership or
+roles. The heartbeat carries the sender's advertised idle period so receivers
+can derive local liveness using an explicit grace policy.
 
-### Built-in Types
+## Replication Progress
 
-| Type | Kind | Semantics |
-|---|---|---|
-| `Bool` | Scalar | LWW merge |
-| `Int` | Scalar | LWW merge (`i64`) |
-| `String` | Scalar | LWW merge |
-| `Timestamp` | Scalar | LWW merge (`u64`) |
-| `Blob` | Scalar | LWW merge (`Vec<u8>`) |
-| `Record` | Container | Named-field map, recursive field-wise merge |
-| `Set` | CRDT | LWW per-element add/remove clocks |
-| `OrSet` | CRDT | Observed-remove set (additive-wins) |
-| `Counter` | CRDT | PN-Counter with per-device accumulators |
-| `MvRegister` | CRDT | Multi-value register |
-| `List` | Container CRDT | RGA ordered list with stable element IDs |
-| `Text` | CRDT | RGA collaborative text with per-character formatting |
-| `PriorityQueue` | CRDT | Replicated min-heap |
+`EventIdentity { origin_device_id, origin_seq }` identifies one shared-journal
+event. `ContiguousFrontier` records the durable, gap-free applied prefix for
+each origin. `VersionVector` only records maximum observed values and is not
+safe for compaction.
 
----
+`TicketAdmissionEvidence` is optional envelope evidence for the exceptional
+ticket-created Device event. Keeping it outside DeviceRecord lets every replica
+validate admission without expanding materialized membership state.
 
-## `register_types!` Macro
+## Operator Records
 
-A `macro_rules!` invocation that generates the type dispatch layer:
+The `control::operator` module contains portable desired-state and lease
+vocabulary reserved for ADR 008. Their existence does not imply that
+distributed reconciliation, scheduling, Rhai isolation, or fenced execution is
+implemented. The existing native operator runtime is in `zendb-engine`.
 
-```rust
-register_types! {
-    leaf Bool => crate::crdt::values::bool::Bool,
-    leaf Int => crate::crdt::values::int::Int,
-    leaf String => crate::crdt::values::string::String,
-    leaf Timestamp => crate::crdt::values::timestamp::Timestamp,
-    leaf Blob => crate::crdt::values::blob::Blob,
-    leaf Counter => crate::crdt::values::counter::Counter,
-    leaf MvRegister => crate::crdt::values::mv_register::MvRegister,
-    leaf OrSet => crate::crdt::values::or_set::OrSet,
-    leaf Set => crate::crdt::values::set::Set,
-    leaf PriorityQueue => crate::crdt::values::priority_queue::PriorityQueue,
-    leaf Text => crate::crdt::values::text::Text,
-    container Record(RecordSegment) => crate::crdt::values::record::Record,
-    container List(ListSegment) => crate::crdt::values::list::List,
-}
-```
+## Module Map
 
-This generates: `TypeTag`, `PrimaryKey`, `Value`, `TypeOp`, `Segment`,
-`TypeError`, and all dispatch implementations. Adding a new type requires
-one module, 2–3 trait impls, and one line in the macro invocation.
-
----
-
-## Cell-Level Operations (`Op`)
-
-```rust
-pub enum Op {
-    Type(TypeOp),                     // type-specific operation
-    SetSync { sync: Option<bool> },   // set/clear sync override
-    Delete,                           // tombstone the cell
-    Replace { value: Value },         // replace entire cell value
-    Merge { cell: Cell },             // merge remote cell state
-}
-```
-
----
-
-## Merge Semantics
-
-- **Same type:** delegate to `Type::merge` (type-specific CRDT logic)
-- **Different type:** LWW by Cell HLC (newer clock wins)
-- **Live vs tombstone:** LWW by Cell HLC
-- **Sync metadata:** local `sync` is preserved; `SetSync` is always local-only
-
----
-
-## Module Structure
-
-```
+```text
 src/
-├── lib.rs              # register_types! macro, invocation, re-exports
-├── crdt/
-│   ├── cell.rs         # Cell struct + Type/ContainerType impls
-│   ├── change.rs       # Change struct
-│   ├── event.rs        # Event, TableId, Signature
-│   ├── hlc.rs          # Hlc and canonical DeviceId integration
-│   ├── op.rs           # Op enum (cell-level operations)
-│   ├── path.rs         # PathStep, Path
-│   ├── replication.rs  # Event identity, envelopes, version vectors
-│   └── values/
-    ├── mod.rs
-    ├── blob.rs         # Blob (scalar)
-    ├── bool.rs         # Bool (scalar)
-    ├── counter.rs      # Counter (PN-Counter)
-    ├── int.rs          # Int (scalar)
-    ├── list.rs         # List (RGA container)
-    ├── mv_register.rs  # MvRegister (multi-value register)
-    ├── or_set.rs       # OrSet (observed-remove set)
-    ├── priority_queue.rs # PriorityQueue (replicated min-heap)
-    ├── record.rs       # Record (named-field container)
-    ├── set.rs          # Set (LWW set)
-    ├── string.rs       # String (scalar)
-    ├── text.rs         # Text (RGA collaborative text)
-    └── timestamp.rs    # Timestamp (scalar)
-├── identity/
-│   ├── ids.rs          # DeviceId and other shared identifiers
-│   ├── principal.rs    # User/device/guest/service/operator principals
-│   └── membership.rs   # Workspace and device membership records
-└── control/
-    ├── authorization.rs # Policy vocabulary and evaluator interface
-    ├── capability.rs    # Capability invocation/result records
-    └── operator.rs      # Desired operators, leases, jobs, checkpoints
+|-- crdt/
+|   |-- cell.rs, event.rs, hlc.rs, path.rs, replication.rs
+|   `-- values/       built-in scalar and recursive CRDT values
+|-- identity/
+|   |-- ids.rs        DeviceId, WorkspaceId, ticket/operator IDs
+|   |-- membership.rs DeviceRecord, key ring, ticket, signatures
+|   `-- role.rs       fixed WorkspaceRole and WorkspaceAction
+`-- control/
+    |-- presence.rs   heartbeat and departure messages
+    `-- operator.rs   future distributed operator records
 ```

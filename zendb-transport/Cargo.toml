@@ -5,9 +5,16 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Networking and transport abstractions for ZeninDB"
+description = "Concrete device profile and authenticated transport for ZeninDB"
 
 [dependencies]
 bincode.workspace = true
-zendb-identity = { path = "../zendb-identity" }
-
+zendb-types = { path = "../zendb-types" }
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+zeroize.workspace = true
+x25519-dalek.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+blake3.workspace = true

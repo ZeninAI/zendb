@@ -55,6 +55,14 @@ impl List {
         self.entries.get(&id).map(|entry| &entry.cell)
     }
 
+    pub fn cell_by_id(&self, id: ListId) -> Option<&Cell> {
+        self.entries.get(&id).map(|entry| &entry.cell)
+    }
+
+    pub fn cell_by_id_mut(&mut self, id: ListId) -> Option<&mut Cell> {
+        self.entries.get_mut(&id).map(|entry| &mut entry.cell)
+    }
+
     /// Iterate over all visible cells in list order.
     pub fn cells(&self) -> impl Iterator<Item = &Cell> {
         self.visible_ids()

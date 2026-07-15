@@ -8,16 +8,14 @@ pub mod workspace;
 mod tests;
 
 pub use operator::{
-    plan_reconciliation, BoxFuture, CapabilityHost, Change, DispatchConfig, DispatchOperator,
-    LeaseConsistency, Operator, OperatorAdmission, OperatorControlError, OperatorControlResult,
+    plan_reconciliation, BoxFuture, Change, DispatchConfig, DispatchOperator, Operator,
     OperatorDirective, OperatorPhase, OperatorRuntimeConfig, ReconcileAction, ReconcileSnapshot,
-    State, Subscription,
+    State, StopReason, Subscription,
 };
 pub use runtime::{Executor, RuntimeFuture};
 pub use workspace::{
-    ConcurrentState, ConcurrentTable, StateHandle, TableHandle, Workspace, WorkspaceConfig,
-    WorkspaceError, WorkspaceJoinPlan, WorkspaceJoinRequest, WorkspaceReconcileRequest,
-    WorkspaceSyncRequest,
+    ClusterConfig, ClusterRuntime, ConcurrentState, ConcurrentTable, OnboardingResult, StateHandle,
+    SyncReport, TableHandle, Workspace, WorkspaceConfig,
 };
 pub use zendb_storage::frontend::{
     state::{StateConfig, StateStats},

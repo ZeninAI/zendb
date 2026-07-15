@@ -1,305 +1,213 @@
 # zendb-engine
 
-**Workspace engine with tables, a streaming operator runtime, processing-time
-timers, and workspace-rooted ownership.**
+Client-side workspace engine with local tables, authenticated CRDT
+replication, device onboarding, and an existing local operator runtime.
 
----
+## Responsibility
 
-## Overview
+`zendb-engine` is the product integration boundary. `Workspace<D>` owns local
+storage, replicated control state, the signed shared journal, snapshots,
+anti-entropy sessions, presence observations, and the optional cluster loop.
+There is no server process or central authority in this crate.
 
-`zendb-engine` composes the generic storage backends from `zendb-storage` into
-a workspace that owns tables, states, operators, and timers. Operators are
-streaming computations that subscribe to tables, process changes incrementally,
-maintain private state, and publish derived results.
+Generic CRDT values live in `zendb-types`, durable byte structures live in
+`zendb-storage`, wire records live in `zendb-sync`, and authenticated framing
+lives in `zendb-transport`. This crate enforces the invariants between them.
 
----
+## Workspace Lifecycle
 
-## Workspace
-
-`Workspace<D>` is the **single lifecycle root**. It holds strong references to
-every table, state, operator worker, and the shared timer store. When the last
-`Arc<Workspace>` is dropped, everything is torn down deterministically.
-
-### Lifecycle
+`Workspace<D>` is the lifecycle and authorization root. It serializes shared
+sequence allocation, journal append, authorization, application, snapshot
+capture, and snapshot installation.
 
 ```rust
-let workspace = Workspace::<MyOps>::create("/path/to/workspace", executor, WorkspaceConfig::default())?;
-// or
-let workspace = Workspace::<MyOps>::open("/path/to/workspace", executor, WorkspaceConfig::default())?;
-```
+let workspace = Workspace::<MyOps>::create(
+    path,
+    executor,
+    WorkspaceConfig::default(),
+)?;
 
-### Catalog
-
-Durable catalogs (each backed by a `KeyDir`):
-
-| Catalog | File | Stores |
-|---|---|---|
-| Tables | `_tables` | `String → TableConfig` |
-| States | `_states` | `String → StateConfig` |
-| Operators | `_operators` | Local native execution adapter entries |
-
-Disk layout:
-
-```text
-<workspace>/
-├── _tables           # table catalog
-├── _states           # state catalog
-├── _operators        # operator catalog
-├── _timers           # shared timer store (B+tree)
-├── tables/
-│   └── <name>/       # per-table directory
-└── states/
-    └── <name>/       # per-state directory
-```
-
----
-
-## Tables
-
-```rust
-let handle = workspace.table("users", Some(TableConfig::default()))?; // TableHandle (weak)
-let table = handle.get()?;                                       // upgrade for one operation
-table.write().insert_event(event)?;
-```
-
-- `workspace.table(name, config)` — open or create; returns a weak `TableHandle`
-- `workspace.close_table(name)` — evict from memory (durable catalog entry remains)
-- `workspace.delete_table(name)` — evict + remove from catalog + delete files
-- `workspace.contains_table(name)` / `workspace.is_table_open(name)` / `workspace.list_tables()`
-
-**`TableHandle`** is a `Weak<RwLock<Table>>`. It never keeps a table or workspace
-alive. `get()` upgrades for one operation and fails with `NotConnected` if the
-workspace was dropped.
-
-A `Table` owns:
-- **Materialized state** — `State<PrimaryKey, Cell>` (ordered or unordered backend)
-- **Resolved cache** — `SkipList<PrimaryKey, Cell>` shadowing pending rows
-- **Change topic** — `Topic<Change>` with a single writer, multiple consumer readers
-
----
-
-## States
-
-```rust
-let handle = workspace.state::<String, u64>("totals", Some(StateConfig::default()))?;
-let state = handle.get()?;
-state.write().put("count".into(), 42)?;
-```
-
-- `workspace.state::<K, V>(name, config)` — open or create typed state
-- `workspace.close_state(name)` — evict from memory
-- `workspace.delete_state(name)` — evict + remove from catalog + delete files
-
-States are **typed** (`State<K, V>`), not forced through `Vec<u8>`.
-Type safety is runtime-only — there is no persisted schema registry.
-
----
-
-## Operators
-
-Operators are streaming computations that subscribe to table changes. The
-client-side control model separates the durable desired object from its local
-worker:
-
-- `zendb_types::OperatorSpec` is desired state: class, source, inputs,
-  placement, permissions, approvals, retries, and outputs.
-- `OperatorObservation` is status: generation, condition, worker, lease, and
-  error information.
-- `Workspace` owns the local operator catalog, worker lifecycle, observations,
-  jobs, checkpoints, and lease records. These are workspace-owned state, not
-  interchangeable public service traits.
-- `LeaseConsistency` records whether a lease is advisory or authoritative;
-  the reconciler still validates fencing epochs before shared writes.
-- `plan_reconciliation` computes actions; it does not silently mutate desired
-  state or assume a central scheduler.
-- `AuthorizationEvaluator` and the Workspace effect path authorize exact
-  writes, capability invocations, jobs, and shared publication.
-- `CapabilityHost` combines local capability descriptors and execution.
-
-The current `Operator` trait is the native execution ABI used by the local
-runner. It is not itself the control-plane object. It implements:
-Compiled Rust operators are trusted application extensions. Scripted or
-externally supplied operators use the `CapabilityHost` and Workspace
-authorization boundary instead of receiving this native Workspace reference.
-
-```rust
-pub trait Operator: Send + 'static {
-    type Config: Debug + Clone + PartialEq + Encode + Decode<()> + 'static;
-    type Timer: Encode + Decode<()> + 'static;
-    type Facet: Send + Sync + 'static;
-
-    fn create(db, name, config) -> impl Future<Output = io::Result<Self>> + Send;
-    fn facet(&self) -> Self::Facet;
-    fn process(&mut self, changes, db, name, config) -> impl Future<Output = io::Result<OperatorDirective>> + Send;
-    fn on_timer(&mut self, payload, fire_at_ms, db, name, config) -> impl Future<Output = io::Result<OperatorDirective>> + Send;
-    fn on_input_opened(&mut self, table, db, name, config) -> impl Future<Output = io::Result<OperatorDirective>> + Send;
-    fn on_input_closed(&mut self, table, db, name, config) -> impl Future<Output = io::Result<OperatorDirective>> + Send;
-    fn teardown(&mut self, phase, db, name, config) -> impl Future<Output = io::Result<()>> + Send;
-}
-```
-
-Each method receives `&Arc<Workspace<D>>` directly because this is the current
-native engine ABI. It is not a permission bypass: table writes, shared event
-publication, jobs, and capabilities must be checked against the active
-operator policy. User-authored Rhai code does not receive this Rust object.
-
-### Dispatching
-
-Operators are registered through the `define_operator_set!` macro, which
-generates a dispatch enum:
-
-```rust
-define_operator_set! {
-    pub mod ops {
-        FullTextIndex(FullTextIndexOperator),
-        MerkleTree(MerkleTreeOperator),
-        Rhai(RhaiOperator),
-        MyCustom(MyCustomOperator),
-    }
-}
-
-// Type alias for convenience
-type MyWorkspace = Workspace<ops::OperatorInstance>;
-```
-
-Then dispatch locally for embedded/test use:
-
-```rust
-workspace.dispatch_operator::<MyCustom>(
-    "my-op",
-    MyCustomConfig { /* ... */ },
-    OperatorRuntimeConfig {
-        subscriptions: vec![Subscription::pattern("users")],
-        poll_size: 128,
-    },
+let reopened = Workspace::<MyOps>::open(
+    path,
+    executor,
+    WorkspaceConfig::default(),
 )?;
 ```
 
-`workspace.dispatch_operator` is a low-level immediate realization API. A
-cluster-aware application should persist a `zendb_types::OperatorSpec` and let
-the local reconciler decide whether to start a worker, acquire a lease, or
-remain stopped on this device.
+The durable profile overrides caller-supplied device identity on reopen. The
+workspace ID and random DeviceId are stable; a DeviceId is not derived from a
+rotatable signing key.
 
-### Subscriptions
-
-Operators declare which tables they read using glob patterns:
-
-```rust
-Subscription::pattern("users")     // exact match
-Subscription::pattern("wiki-*")    // prefix
-Subscription::pattern("*-log")     // suffix
-Subscription::pattern("*")         // all tables
-```
-
-### Lifecycle
+Important files under a workspace root are:
 
 ```text
-create  →  on_input_opened (for each matching table)
-         →  ACTIVE LOOP:
-              process(changes)  |  on_timer(payload)  |  on_input_opened / _closed
-         →  teardown(phase)     ← reason: Active/Finished/Failed/Cancelled
+|-- _workspace_id
+|-- _device_profile.a / _device_profile.b
+|-- _control
+|-- _shared_events
+|-- _replication_frontier
+|-- _snapshot
+|-- _tables / _states / _operators / _timers
+|-- tables/<name>/
+`-- states/<name>/
 ```
 
-- **`Active`** — operator suspended (no open inputs); may be respawned later
-- **`Finished`** — operator returned `OperatorDirective::Finish`
-- **`Failed { error }`** — unrecoverable error
-- **`Cancelled`** — permanently cancelled by `workspace.cancel_operator(name)`
+The alternating device-profile slots preserve signing keys, HLC state,
+presence sequence, and shared-origin sequence across crashes.
 
-Errors in `process`, `on_timer`, or lifecycle callbacks transition the operator
-to `Failed` and retire it.
+## Local And Shared Data
 
-### Cancel and Delete
+Local tables use `TableConfig::sync == false`. Their events have no
+distributed identity, require no workspace role, and are never exported by a
+snapshot or sync session.
 
 ```rust
-workspace.cancel_operator("my-op")?;
-workspace.delete_terminal_operator("my-op")?;
+let handle = workspace.table("drafts", Some(local_config))?;
+handle.get()?.write().insert_event(event)?;
 ```
 
-### Facets
-
-Operators expose a typed query interface via the `Facet` associated type.
-The facet is produced after `create()` and stored in the worker, retrievable
-with `workspace.facet::<F>(name)`. It typically wraps `StateHandle` clones so
-queries read directly from operator state without locking the processing loop:
+Shared-table existence is replicated control state. A Contributor creates and
+deletes shared tables through the workspace and submits data mutations through
+`mutate()`:
 
 ```rust
-impl Operator for IndexerOp {
-    type Facet = IndexerFacet;
-    fn facet(&self) -> IndexerFacet { IndexerFacet { index: self.index.clone() } }
-}
-
-let facet = workspace.facet::<IndexerFacet>("indexer")?;
-let results = facet.lookup("hello")?;
+let handle = workspace.create_shared_table("users", TableConfig::default())?;
+workspace.mutate("users", user_id, event)?;
 ```
 
-Use `type Facet = ()` for operators without a query interface.
+Direct `Table::insert_event()` on a shared table is rejected because it would
+bypass signing, authorization, and journal ordering. `list_shared_tables()` is
+the canonical replicated list; the physical table catalog may retain deleted
+shared-table files for recovery and local overlays.
 
----
+Every admitted device receives all shared data. `Cell.sync == false` routes a
+local table or nested subtree into a device-private overlay. The overlay
+survives shared ancestor replacement and restart, is absent from snapshots,
+and is discarded rather than published when sync is re-enabled.
 
-## Processing-Time Timers
+Typed `state::<K, V>()` resources are local engine state. They are not part of
+workspace replication and have no persisted schema registry.
 
-All operators share one ordered `BPlusTree` timer store keyed by
-`(fire_at_ms, operator)`. Operators register timers through the database:
+## Devices And Roles
 
-```rust
-workspace.register_timer("my-op", fire_at_ms, &payload)?;
-workspace.cancel_timer("my-op", fire_at_ms)?;
-```
+The replicated `DeviceRecord` is both membership record and authorization
+subject. A live Device Cell is admitted; tombstoning it revokes the device.
+Presence, application accounts, and OAuth identities are not database
+authorities.
 
-A background scheduler loop sleeps until the next due time (via condvar),
-delivers payloads to operator worker inboxes, and the worker fires
-`on_timer` from its run loop.
+All admitted devices are implicit Readers. The only explicit workspace roles
+are fixed and non-overlapping:
 
-Timers are **persistent** — they survive restart. Durability is at-most-once:
-a timer removed from the store but not yet fired is lost across a crash.
+- `Contributor`: create/delete shared tables and mutate shared data.
+- `Dispatcher`: manage operator specifications. Distributed operator execution
+  is not implemented in this pass.
+- `Manager`: admit/remove/rename devices, assign roles, and manage enrollment
+  tickets.
 
----
+A device may rename itself and update its capabilities, key ring, heartbeat,
+and frontier under field-specific validation rules. Capabilities are
+scheduler labels, not permissions or executable host functions.
 
-## Concurrency Model
+## Onboarding
 
-- Storage backends are single-threaded values behind `RwLock`
-- The workspace holds strong `Arc<RwLock<Table>>` / `Arc<RwLock<State<K, V>>>`
-- Application and operator code hold weak `TableHandle` / `StateHandle`
-- Topic writing is single-writer; reading supports multiple concurrent consumers
-- Each operator worker owns its inputs, timer inbox, and event queue
-- **Rule:** never hold a lock guard across `.await`
+`create_joining()` creates a durable candidate identity with no roles. ZenDB
+supports exactly two admission paths:
 
----
+1. A Manager creates an enrollment presentation. A QR/link carries its private
+   ticket credential. Any admitted peer can verify and relay the candidate's
+   bound ticket proof.
+2. A Manager calls `admit_device()` with an out-of-band DeviceId and public
+   key. The candidate later bootstraps from any peer while pinning an expected
+   peer public key.
 
-## Executor Abstraction
+The corresponding APIs are `create_enrollment_ticket()`,
+`bootstrap_with_ticket()`, and `bootstrap_direct()`. Both paths prove
+candidate-key possession, transfer a verified chunked snapshot, install
+control/data state, and then use ordinary anti-entropy. Discovery and network
+connectivity never grant membership.
 
-The engine does not depend on Tokio. The application provides an executor:
+## Replication
 
-```rust
-pub trait Executor: Send + Sync + 'static {
-    fn spawn(&self, future: RuntimeFuture);
-    fn idle(&self) -> RuntimeFuture;
-    fn sleep(&self, duration: Duration) -> RuntimeFuture;
-}
-```
+`sync_tcp()` performs one bilateral anti-entropy cycle over a mutually
+authenticated encrypted `SecureTcpSession`. Peers exchange durable contiguous
+frontiers, request exact missing origin ranges, transfer bounded event batches,
+and fall back to a chunked snapshot when retained history cannot satisfy a
+request.
 
----
+Each shared event has `(origin_device_id, origin_seq)`, a strictly increasing
+origin HLC, a signature, and optional ticket-admission evidence. A receiver
+independently validates membership, key transition, role/field ownership, and
+event signature before applying it. Out-of-order events are retained and only
+advance the frontier once every gap is durably present and applicable.
 
-## Module Structure
+`export_snapshot()` produces shared control and live shared-table state only.
+Installation validates the workspace, manifest hash, local membership, and
+retained journal tail before rebuilding resolved state with local overlays.
 
-```
-src/
-├── lib.rs                # Crate root, re-exports
-├── runtime.rs            # Executor trait
-├── workspace/
-│   ├── mod.rs            # Workspace implementation, config, handles, catalogs
-│   ├── tables.rs         # table(), close_table(), delete_table()
-│   ├── states.rs         # state(), close_state(), delete_state()
-│   ├── operators.rs      # dispatch_operator(), cancel_operator(), retire_operator()
-│   └── timers.rs         # register_timer(), cancel_timer(), scheduler loop
-└── operator/
-    ├── mod.rs            # Architecture docs, re-exports
-    ├── config.rs         # Subscription, OperatorRuntimeConfig
-    ├── control.rs        # Workspace operator control and effect interfaces
-    ├── lifecycle.rs      # OperatorPhase, OperatorDirective
-    ├── traits.rs         # Operator, DispatchOperator, DispatchConfig traits
-    ├── macros.rs         # define_operator_set! macro
-    ├── worker.rs         # OperatorWorker: inputs, timers, events, spawn
-    ├── run_loop.rs       # Async run loop driving the operator lifecycle
-    └── prelude/          # Built-in operators (FullTextIndex, MerkleTree, Rhai)
+`checkpoint_local_frontier()` publishes durable progress. The stable frontier
+is the minimum checkpoint across every admitted device. `compact_shared()`
+requires a retained snapshot and compacts recursive tombstones only through the
+HLC proven stable by that frontier. Shared journal pruning is intentionally
+conservative and is not performed yet.
+
+## Cluster Runtime
+
+`start_cluster(ClusterConfig)` starts a concrete client-side runtime containing:
+
+- a TCP listener for replication and bootstrap sessions;
+- periodic synchronization and reconnect across multiple peers;
+- signed UDP LAN announcements and dynamically learned endpoints;
+- frontier checkpoints, signed heartbeats, and signed departure notices; and
+- bounded diagnostics available through `ClusterRuntime::errors()`.
+
+Presence is a local estimate based on the sender-advertised heartbeat interval
+and a configured grace multiplier. It is a ranking signal only and never
+changes membership or authorization.
+
+## Key Rotation
+
+`stage_local_key_rotation()` publishes a secondary key signed by the current
+primary. `promote_local_key_rotation()` waits until the stable frontier proves
+every admitted device has received the staged key, then publishes a promotion
+signed by that staged key. The keys swap order; the old key remains secondary
+for delayed in-flight events. A later rotation replaces it.
+
+## Existing Local Operators
+
+The repository already contains a native streaming operator runtime with
+`Operator`, `DispatchOperator`, subscriptions, local state, facets, timers, and
+worker lifecycle APIs. It remains usable as local functionality.
+
+Distributed declarative reconciliation, placement, leases, fencing, Rhai
+isolation, and Dispatcher enforcement are deliberately excluded from this
+implementation pass. ADR 008 remains the design boundary for that work; the
+current native `Operator` trait must not be mistaken for the future distributed
+control-plane API.
+
+## Concurrency
+
+- Storage backends are single-threaded values protected by locks.
+- The workspace owns strong table/state handles; application handles are weak.
+- Shared mutation and snapshot operations are serialized under one workspace
+  lock to preserve durable allocation and apply ordering.
+- The engine does not require Tokio. Applications provide the `Executor` trait.
+- Operator code must not hold a lock guard across `.await`.
+
+## Modules
+
+```text
+src/workspace/
+|-- mod.rs          lifecycle, handles, public control APIs
+|-- control.rs      replicated schema and authorization validation
+|-- journal.rs      durable signed shared journal and gap tracking
+|-- replication.rs local/shared routing and event application
+|-- snapshot.rs     snapshot, stable frontier, compaction
+|-- network.rs      secure anti-entropy protocol
+|-- onboarding.rs   ticket and direct bootstrap flows
+|-- cluster.rs      listener, reconnect, LAN discovery, presence
+|-- rotation.rs     staged signing-key rotation
+|-- tables.rs       physical table catalog and handles
+|-- states.rs       typed local state
+|-- operators.rs    existing local operator workers
+`-- timers.rs       existing processing-time timer store
 ```

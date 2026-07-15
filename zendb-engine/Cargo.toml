@@ -3,7 +3,7 @@ name = "zendb-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ZeninDB table engine"
+description = "Embedded ZeninDB workspace, replication, and local operator engine"
 
 [dependencies]
 zendb-types = { path = "../zendb-types" }
@@ -13,6 +13,9 @@ blake3.workspace = true
 hashbrown.workspace = true
 parking_lot.workspace = true
 log.workspace = true
+getrandom.workspace = true
+zendb-transport = { path = "../zendb-transport" }
+zendb-sync = { path = "../zendb-sync" }
 rhai = { version = "1", features = ["sync"] }
 
 [dev-dependencies]

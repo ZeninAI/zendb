@@ -13,6 +13,9 @@ pub struct Cell {
     /// or a direct operation against this cell. Descendant-only updates do not
     /// bump ancestor HLCs.
     pub hlc: Hlc,
+    /// Local sync-boundary override. `None` inherits; a full local-overlay
+    /// router is specified by ADR 006. The current apply path only performs
+    /// target-path filtering and is not sufficient for ancestor replacements.
     pub sync: Option<bool>,
 }
 
@@ -37,6 +40,50 @@ impl Cell {
         self.value.as_ref().map(Value::type_tag)
     }
 
+    /// Resolve a nested Cell without creating missing containers.
+    pub fn at_path(&self, path: &[PathStep]) -> Option<&Cell> {
+        let Some((step, remaining)) = path.split_first() else {
+            return Some(self);
+        };
+        match (&self.value, &step.segment) {
+            (Some(Value::Record(record)), crate::Segment::Record(field)) => {
+                record.get(field)?.at_path(remaining)
+            }
+            (Some(Value::List(list)), crate::Segment::List(id)) => {
+                list.cell_by_id(*id)?.at_path(remaining)
+            }
+            _ => None,
+        }
+    }
+
+    /// Mutable counterpart of [`Cell::at_path`] used after a path has already
+    /// been structurally validated.
+    pub fn at_path_mut(&mut self, path: &[PathStep]) -> Option<&mut Cell> {
+        let Some((step, remaining)) = path.split_first() else {
+            return Some(self);
+        };
+        match (&mut self.value, &step.segment) {
+            (Some(Value::Record(record)), crate::Segment::Record(field)) => {
+                record.get_mut(field)?.at_path_mut(remaining)
+            }
+            (Some(Value::List(list)), crate::Segment::List(id)) => {
+                list.cell_by_id_mut(*id)?.at_path_mut(remaining)
+            }
+            _ => None,
+        }
+    }
+
+    /// Apply an already-routed operation. This bypasses sync classification and
+    /// is used by the local-overlay and verified-replication layers.
+    pub fn apply_routed(
+        &mut self,
+        op: &Op,
+        op_hlc: Hlc,
+        path: &[PathStep],
+    ) -> Result<bool, TypeError> {
+        ContainerType::apply_walk(self, op, op_hlc, path)
+    }
+
     /// Ensure this cell contains `expected`, replacing stale state when the
     /// incoming operation is newer than all state currently below this cell.
     pub(crate) fn ensure_type(&mut self, expected: TypeTag, op_hlc: Hlc) -> bool {
@@ -55,10 +102,13 @@ impl Cell {
 
     /// Apply an event to this cell. Returns true if state was modified.
     ///
-    /// `sync` is the mandatory sync policy inherited from the owning table.
-    /// The nearest explicit cell sync flag on the target path overrides it.
-    /// Remote-device events cannot mutate local-only values, except that
-    /// `SetSync` is always allowed to update the policy itself.
+    /// `sync` is the inherited local routing policy from the owning table.
+    /// The nearest explicit Cell flag on the target path overrides it.
+    ///
+    /// This legacy direct-apply path filters remote writes to local targets.
+    /// It does not implement ADR 006's separate local overlay, so callers must
+    /// not use it as proof that an ancestor shared replacement preserves local
+    /// descendants.
     pub fn apply_event(&mut self, event: &crate::Event, sync: bool) -> Result<bool, TypeError> {
         self.apply_event_from(event, sync, crate::device_id())
     }
@@ -109,6 +159,10 @@ impl Type for Cell {
                 }
             }
             Op::SetSync { sync } => {
+                // The direct Cell API has no routing context and therefore
+                // cannot enforce ADR 006's local-only SetSync rule. The
+                // Workspace router must reject a replicated SetSync before it
+                // reaches this method.
                 if !op_hlc.beats(self.hlc) {
                     return Ok(false);
                 }

@@ -1,16 +1,27 @@
 //! Eager workspace lifecycle and resource ownership.
 
+mod cluster;
+mod control;
+mod journal;
+mod network;
+mod onboarding;
 mod operators;
+mod replication;
+mod rotation;
+mod snapshot;
 mod states;
 mod tables;
 mod timers;
 
 use std::{
     any::Any,
-    fmt, fs, io,
+    fs, io,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Weak},
+    sync::{
+        atomic::{AtomicU32, AtomicU64},
+        Arc, Weak,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -26,7 +37,8 @@ use zendb_storage::frontend::{
     state::{State, StateConfig},
     table::Table,
 };
-use zendb_types::{DeviceId, PrincipalId, WorkspaceId};
+use zendb_transport::DeviceProfile;
+use zendb_types::{DeviceId, WorkspaceId};
 
 use log::{debug, info};
 
@@ -35,6 +47,9 @@ use crate::{
     TableConfig,
 };
 
+pub use cluster::{ClusterConfig, ClusterRuntime};
+pub use network::SyncReport;
+pub use onboarding::OnboardingResult;
 use timers::run_scheduler;
 
 /// Ordering key: earliest `fire_at_ms` first; within the same millisecond,
@@ -76,8 +91,12 @@ const OPERATOR_CATALOG_FILE: &str = "_operators";
 pub(crate) const TABLES_DIR: &str = "tables";
 pub(crate) const STATES_DIR: &str = "states";
 const TIMERS_FILE: &str = "_timers";
-const DEVICE_ID_FILE: &str = "_device_id";
 const WORKSPACE_ID_FILE: &str = "_workspace_id";
+const DEVICE_PROFILE_FILE: &str = "_device_profile";
+const CONTROL_FILE: &str = "_control";
+const SHARED_EVENTS_FILE: &str = "_shared_events";
+const FRONTIER_FILE: &str = "_replication_frontier";
+const SNAPSHOT_FILE: &str = "_snapshot";
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct WorkspaceConfig {
@@ -204,6 +223,15 @@ where
     states: RwLock<HashMap<String, ErasedStateHandle>>,
     operators: RwLock<HashMap<String, Arc<OperatorWorker<D>>>>,
     timers: Arc<RwLock<TimerStore>>,
+    device_profile: Arc<DeviceProfile>,
+    control: Mutex<control::WorkspaceControl>,
+    shared_journal: Mutex<journal::SharedJournal>,
+    /// Serializes shared sequence allocation, journal append, application,
+    /// snapshot capture, and snapshot installation.
+    shared_mutation: Mutex<()>,
+    presence: Mutex<HashMap<DeviceId, zendb_transport::PresenceTracker>>,
+    presence_idle_ms: AtomicU64,
+    presence_grace_multiplier: AtomicU32,
     /// Notified by `register_timer` to wake the scheduler early.
     timer_notify: Arc<(Mutex<()>, Condvar)>,
 }
@@ -219,8 +247,52 @@ where
         executor: Arc<dyn Executor>,
         config: WorkspaceConfig,
     ) -> io::Result<Arc<Self>> {
+        Self::create_with_initial_device(
+            path,
+            executor,
+            config,
+            None,
+            std::collections::BTreeSet::new(),
+            std::collections::BTreeSet::from([
+                zendb_types::WorkspaceRole::Contributor,
+                zendb_types::WorkspaceRole::Dispatcher,
+                zendb_types::WorkspaceRole::Manager,
+            ]),
+        )
+    }
+
+    /// Create a local bootstrap candidate. Its provisional control state grants
+    /// no roles and is replaced by a verified peer snapshot during onboarding.
+    pub fn create_joining(
+        path: &Path,
+        executor: Arc<dyn Executor>,
+        config: WorkspaceConfig,
+        requested_name: String,
+        capabilities: std::collections::BTreeSet<zendb_types::CapabilityId>,
+    ) -> io::Result<Arc<Self>> {
+        Self::create_with_initial_device(
+            path,
+            executor,
+            config,
+            Some(requested_name),
+            capabilities,
+            std::collections::BTreeSet::new(),
+        )
+    }
+
+    fn create_with_initial_device(
+        path: &Path,
+        executor: Arc<dyn Executor>,
+        config: WorkspaceConfig,
+        requested_name: Option<String>,
+        capabilities: std::collections::BTreeSet<zendb_types::CapabilityId>,
+        roles: std::collections::BTreeSet<zendb_types::WorkspaceRole>,
+    ) -> io::Result<Arc<Self>> {
         fs::create_dir_all(path)?;
-        persist_device_id(&path.join(DEVICE_ID_FILE), config.device_id)?;
+        let device_profile = Arc::new(DeviceProfile::create_with_device_id(
+            &path.join(DEVICE_PROFILE_FILE),
+            config.device_id,
+        )?);
         persist_workspace_id(&path.join(WORKSPACE_ID_FILE), &config.workspace_id)?;
         let table_catalog =
             TableCatalog::create(&path.join(TABLE_CATALOG_FILE), KeyDirConfig::default())?;
@@ -231,8 +303,26 @@ where
             KeyDirConfig::default(),
         )?;
         let timers = TimerStore::create(&path.join(TIMERS_FILE), BPlusTreeConfig::default())?;
+        let initial_hlc = device_profile.next_hlc(now_ms())?;
+        let initial_device = zendb_types::DeviceRecord {
+            name: requested_name.unwrap_or_else(|| format!("device-{}", config.device_id)),
+            key_ring: device_profile.initial_key_ring(),
+            roles,
+            capabilities,
+            replication_frontier: zendb_types::ContiguousFrontier::default(),
+        };
+        let control = control::WorkspaceControl::create(
+            &path.join(CONTROL_FILE),
+            config.device_id,
+            initial_device,
+            initial_hlc,
+        )?;
+        let shared_journal = journal::SharedJournal::create(
+            &path.join(SHARED_EVENTS_FILE),
+            &path.join(FRONTIER_FILE),
+        )?;
         info!("creating workspace at {:?}", path);
-        Self::from_parts(
+        let workspace = Self::from_parts(
             path,
             table_catalog,
             state_catalog,
@@ -240,7 +330,12 @@ where
             timers,
             executor,
             config,
-        )
+            device_profile,
+            control,
+            shared_journal,
+        )?;
+        workspace.recover_shared_journal()?;
+        Ok(workspace)
     }
 
     /// Open an existing workspace at `path`. Fails if the directory does not
@@ -251,7 +346,8 @@ where
         config: WorkspaceConfig,
     ) -> io::Result<Arc<Self>> {
         let mut config = config;
-        config.device_id = load_or_persist_device_id(&path.join(DEVICE_ID_FILE), config.device_id)?;
+        let device_profile = Arc::new(DeviceProfile::open(&path.join(DEVICE_PROFILE_FILE))?);
+        config.device_id = device_profile.device_id();
         config.workspace_id =
             load_or_persist_workspace_id(&path.join(WORKSPACE_ID_FILE), config.workspace_id)?;
         let table_catalog =
@@ -263,8 +359,13 @@ where
             KeyDirConfig::default(),
         )?;
         let timers = TimerStore::open(&path.join(TIMERS_FILE), BPlusTreeConfig::default())?;
+        let control = control::WorkspaceControl::open(&path.join(CONTROL_FILE))?;
+        let shared_journal = journal::SharedJournal::open(
+            &path.join(SHARED_EVENTS_FILE),
+            &path.join(FRONTIER_FILE),
+        )?;
         info!("opening workspace at {:?}", path);
-        Self::from_parts(
+        let workspace = Self::from_parts(
             path,
             table_catalog,
             state_catalog,
@@ -272,7 +373,12 @@ where
             timers,
             executor,
             config,
-        )
+            device_profile,
+            control,
+            shared_journal,
+        )?;
+        workspace.recover_shared_journal()?;
+        Ok(workspace)
     }
 
     /// Assemble a `Workspace` from its constituent parts and spawn the background timer scheduler.
@@ -284,6 +390,9 @@ where
         timers: TimerStore,
         executor: Arc<dyn Executor>,
         config: WorkspaceConfig,
+        device_profile: Arc<DeviceProfile>,
+        control: control::WorkspaceControl,
+        shared_journal: journal::SharedJournal,
     ) -> io::Result<Arc<Self>> {
         let timer_notify = Arc::new((Mutex::new(()), Condvar::new()));
         let workspace = Arc::new(Self {
@@ -297,8 +406,27 @@ where
             states: RwLock::new(HashMap::new()),
             operators: RwLock::new(HashMap::new()),
             timers: Arc::new(RwLock::new(timers)),
+            device_profile,
+            control: Mutex::new(control),
+            shared_journal: Mutex::new(shared_journal),
+            shared_mutation: Mutex::new(()),
+            presence: Mutex::new(HashMap::new()),
+            presence_idle_ms: AtomicU64::new(30_000),
+            presence_grace_multiplier: AtomicU32::new(3),
             timer_notify: Arc::clone(&timer_notify),
         });
+        let highest_local_sequence = workspace
+            .shared_journal
+            .lock()
+            .highest_sequence(workspace.device_id());
+        workspace
+            .device_profile
+            .advance_origin_seq_past(highest_local_sequence)?;
+        if let Some(local_device) = workspace.device(workspace.device_id())? {
+            workspace
+                .device_profile
+                .reconcile_key_ring(&local_device.key_ring)?;
+        }
         let workspace_weak = Arc::downgrade(&workspace);
         debug!("spawning background timer scheduler");
         workspace
@@ -325,35 +453,154 @@ where
     pub fn device_id(&self) -> DeviceId {
         self.config.device_id
     }
-}
 
-fn persist_device_id(path: &Path, device_id: DeviceId) -> io::Result<()> {
-    let bytes = bincode::encode_to_vec(device_id, bincode::config::standard())
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    let mut file = fs::File::create(path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()
-}
+    /// Access the durable local signing and sequence profile.
+    pub fn device_profile(&self) -> &DeviceProfile {
+        &self.device_profile
+    }
 
-fn load_or_persist_device_id(path: &Path, configured: DeviceId) -> io::Result<DeviceId> {
-    match fs::read(path) {
-        Ok(bytes) => {
-            let (device_id, consumed): (DeviceId, usize) =
-                bincode::decode_from_slice(&bytes, bincode::config::standard())
-                    .map_err(|error| io::Error::other(error.to_string()))?;
-            if consumed != bytes.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "workspace device identity contains trailing bytes",
-                ));
-            }
-            Ok(device_id)
+    /// Read one live replicated Device record.
+    pub fn device(&self, device_id: DeviceId) -> io::Result<Option<zendb_types::DeviceRecord>> {
+        self.control.lock().device(device_id)
+    }
+
+    /// List every currently admitted Device record.
+    pub fn devices(&self) -> io::Result<Vec<(DeviceId, zendb_types::DeviceRecord)>> {
+        self.control.lock().devices()
+    }
+
+    /// List the live shared-table declarations from replicated control state.
+    pub fn list_shared_tables(&self) -> io::Result<Vec<String>> {
+        self.control.lock().shared_tables()
+    }
+
+    /// Return whether replicated control currently declares this table live.
+    pub fn is_shared_table(&self, name: &str) -> io::Result<bool> {
+        Ok(self
+            .control
+            .lock()
+            .shared_table_state(name)?
+            .is_some_and(|(live, _)| live))
+    }
+
+    /// Idempotently create a Contributor-authorized shared-table declaration
+    /// and open its local physical storage.
+    pub fn create_shared_table(
+        self: &Arc<Self>,
+        name: &str,
+        mut config: TableConfig,
+    ) -> io::Result<TableHandle> {
+        if self.is_shared_table(name)? {
+            return self.table(name, None);
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            persist_device_id(path, configured)?;
-            Ok(configured)
+        if self
+            .table_config(name)
+            .is_some_and(|existing| !existing.sync)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a local-only table already uses this name",
+            ));
         }
-        Err(error) => Err(error),
+        config.sync = true;
+        let at = self.device_profile.next_hlc(now_ms())?;
+        self.commit_shared_event(control::shared_table_event(at, name, true))?;
+        self.table(name, Some(config))
+    }
+
+    /// Tombstone a live shared-table declaration. Physical files are retained
+    /// for recovery, overlays, and later compaction.
+    pub fn delete_shared_table(self: &Arc<Self>, name: &str) -> io::Result<bool> {
+        if !self.is_shared_table(name)? {
+            return Ok(false);
+        }
+        let at = self.device_profile.next_hlc(now_ms())?;
+        self.commit_shared_event(control::shared_table_event(at, name, false))?;
+        self.close_table(name);
+        Ok(true)
+    }
+
+    /// Directly pre-admit a Device as an implicit Reader. Non-empty roles,
+    /// staged keys, and pre-populated frontiers are rejected; a Manager grants
+    /// roles in separate visible events.
+    pub fn admit_device(
+        self: &Arc<Self>,
+        device_id: DeviceId,
+        record: zendb_types::DeviceRecord,
+    ) -> io::Result<bool> {
+        control::validate_initial_device(&record)?;
+        let at = self.device_profile.next_hlc(now_ms())?;
+        self.commit_shared_event(control::admit_event(at, device_id, record))?;
+        Ok(true)
+    }
+
+    /// Tombstone a Device membership Cell. Requires the Manager role.
+    pub fn remove_device(self: &Arc<Self>, device_id: DeviceId) -> io::Result<bool> {
+        let at = self.device_profile.next_hlc(now_ms())?;
+        self.commit_shared_event(control::remove_device_event(at, device_id))?;
+        Ok(true)
+    }
+
+    /// Change a Device alias. A Device may rename itself; changing another
+    /// Device requires Manager.
+    pub fn rename_device(self: &Arc<Self>, device_id: DeviceId, name: String) -> io::Result<bool> {
+        let at = self.device_profile.next_hlc(now_ms())?;
+        self.commit_shared_event(control::replace_field_event(
+            at,
+            device_id,
+            "name",
+            zendb_types::Value::String(name),
+        ))?;
+        Ok(true)
+    }
+
+    /// Add or remove one fixed workspace role. Requires Manager.
+    pub fn set_device_role(
+        self: &Arc<Self>,
+        device_id: DeviceId,
+        role: zendb_types::WorkspaceRole,
+        enabled: bool,
+    ) -> io::Result<bool> {
+        let at = self.device_profile.next_hlc(now_ms())?;
+        self.commit_shared_event(control::role_event(at, device_id, role, enabled))?;
+        Ok(true)
+    }
+
+    /// Advertise or withdraw one scheduler capability for the local Device.
+    pub fn set_local_capability(
+        self: &Arc<Self>,
+        capability: zendb_types::CapabilityId,
+        enabled: bool,
+    ) -> io::Result<bool> {
+        let at = self.device_profile.next_hlc(now_ms())?;
+        let control = self.control.lock();
+        let event = control.capability_event(at, self.device_id(), capability, enabled)?;
+        drop(control);
+        self.commit_shared_event(event)?;
+        Ok(true)
+    }
+
+    pub(crate) fn publish_local_frontier(
+        self: &Arc<Self>,
+        frontier: &zendb_types::ContiguousFrontier,
+    ) -> io::Result<bool> {
+        self.commit_frontier_checkpoint(frontier.clone())?;
+        Ok(true)
+    }
+
+    /// Publish progress only when the replicated Device checkpoint is behind.
+    pub fn checkpoint_local_frontier(self: &Arc<Self>) -> io::Result<bool> {
+        let frontier = self.shared_frontier();
+        let device = self.device(self.device_id())?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "local Device is not admitted",
+            )
+        })?;
+        if device.replication_frontier == frontier {
+            return Ok(false);
+        }
+        self.publish_local_frontier(&frontier)
     }
 }
 
@@ -422,100 +669,5 @@ where
 
             std::thread::sleep(Duration::from_millis(10));
         }
-    }
-}
-
-/// Request to join or authorize this local replica for a workspace.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceJoinRequest {
-    pub workspace_id: WorkspaceId,
-    pub principal: PrincipalId,
-    pub device_id: DeviceId,
-}
-
-/// Result placeholder for the future join state machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceJoinPlan {
-    pub workspace_id: WorkspaceId,
-    pub device_id: DeviceId,
-    pub principal: PrincipalId,
-}
-
-/// Request to synchronize with one authenticated peer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceSyncRequest {
-    pub workspace_id: WorkspaceId,
-    pub peer_device_id: DeviceId,
-}
-
-/// Input to the local declarative operator reconciler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WorkspaceReconcileRequest {
-    pub now_ms: u64,
-}
-
-/// Workspace operations are part of the concrete root. They return explicit
-/// errors until their coordinators are implemented; no separate Workspace
-/// trait is needed because this type is the sole lifecycle owner.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkspaceError {
-    InvalidWorkspace,
-    InvalidDevice,
-    Unsupported(&'static str),
-}
-
-impl fmt::Display for WorkspaceError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidWorkspace => formatter.write_str("workspace identity does not match"),
-            Self::InvalidDevice => formatter.write_str("device identity does not match"),
-            Self::Unsupported(operation) => write!(formatter, "{operation} is not implemented"),
-        }
-    }
-}
-
-impl std::error::Error for WorkspaceError {}
-
-impl<D> Workspace<D>
-where
-    D: DispatchOperator,
-{
-    /// Begin the workspace join state machine for this local replica.
-    pub fn join_workspace(
-        &self,
-        request: WorkspaceJoinRequest,
-    ) -> Result<WorkspaceJoinPlan, WorkspaceError> {
-        if request.workspace_id != *self.workspace_id() {
-            return Err(WorkspaceError::InvalidWorkspace);
-        }
-        if request.device_id != self.device_id() {
-            return Err(WorkspaceError::InvalidDevice);
-        }
-        Err(WorkspaceError::Unsupported("workspace join"))
-    }
-
-    /// Leave the current workspace after revocation and local cleanup are
-    /// implemented by the workspace coordinator.
-    pub fn leave_workspace(&self) -> Result<(), WorkspaceError> {
-        Err(WorkspaceError::Unsupported("workspace leave"))
-    }
-
-    /// Run one authenticated anti-entropy cycle with a peer.
-    pub fn synchronize_workspace(
-        &self,
-        request: WorkspaceSyncRequest,
-    ) -> Result<(), WorkspaceError> {
-        if request.workspace_id != *self.workspace_id() {
-            return Err(WorkspaceError::InvalidWorkspace);
-        }
-        Err(WorkspaceError::Unsupported("workspace synchronization"))
-    }
-
-    /// Run one local desired-versus-observed operator reconciliation cycle.
-    pub fn reconcile_workspace(
-        &self,
-        _request: WorkspaceReconcileRequest,
-    ) -> Result<(), WorkspaceError> {
-        Err(WorkspaceError::Unsupported("workspace reconciliation"))
     }
 }

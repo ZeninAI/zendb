@@ -9,5 +9,4 @@ description = "Optional outbound client adapters for hosted ZeninDB services"
 
 [dependencies]
 zendb-types = { path = "../zendb-types" }
-zendb-identity = { path = "../zendb-identity" }
 zendb-transport = { path = "../zendb-transport" }

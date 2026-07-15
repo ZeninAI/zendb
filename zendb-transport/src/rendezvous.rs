@@ -1,16 +1,11 @@
-use std::io;
-
 use bincode::{Decode, Encode};
-use zendb_identity::{DeviceId, KeyId, WorkspaceId};
-
-use crate::NetworkEndpoint;
+use zendb_types::{DeviceId, WorkspaceId};
 
 /// The operation for which a rendezvous ticket may be used. Reachability
 /// tickets are not interchangeable with device-enrollment tickets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
 pub enum RendezvousPurpose {
     PairDevice,
-    JoinGuest,
     ConnectPeer,
 }
 
@@ -36,16 +31,5 @@ pub struct RendezvousTicket {
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
     pub one_time: bool,
-    pub issuer_key_id: Option<KeyId>,
     pub signature: Vec<u8>,
-}
-
-/// Client-side provider for creating and resolving rendezvous tickets.
-///
-/// A local implementation may use a trusted peer or local QR exchange. A
-/// hosted implementation belongs in `zendb-external` and is still only an
-/// outbound client adapter from this database's perspective.
-pub trait RendezvousProvider: Send + Sync + 'static {
-    fn create_ticket(&self, request: &RendezvousRequest) -> io::Result<RendezvousTicket>;
-    fn resolve_ticket(&self, ticket: &RendezvousTicket) -> io::Result<Vec<NetworkEndpoint>>;
 }

@@ -36,7 +36,10 @@ pub use event::{Event, Signature, TableId};
 pub use hlc::{device_id, init_device_id, Hlc, HlcDeviceId};
 pub use op::Op;
 pub use path::{Path, PathStep};
-pub use replication::{EventIdentity, ReplicatedEvent, SyncEnvelope, VersionVector};
+pub use replication::{
+    compaction_watermark, stable_frontier, ContiguousFrontier, EventIdentity, ReplicatedEvent,
+    SyncEnvelope, TicketAdmissionEvidence, VersionVector,
+};
 
 // Re-export all CRDT values
 pub use values::*;

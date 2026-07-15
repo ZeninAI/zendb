@@ -1,16 +1,14 @@
 use bincode::{Decode, Encode};
-use zendb_identity::WorkspaceId;
 pub use zendb_types::VersionVector;
+use zendb_types::{ContiguousFrontier, WorkspaceId};
 
 /// Summary exchanged before requesting snapshots or event ranges.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct WorkspaceSyncSummary {
     pub workspace_id: WorkspaceId,
-    pub version_vector: VersionVector,
+    /// Contiguous shared-history receipt proof used for exact range requests.
+    pub frontier: ContiguousFrontier,
     pub snapshot_generation: Option<u64>,
-    /// The policy snapshot used to determine what this replica is allowed to
-    /// know. A version vector without this scope is ambiguous for partial
-    /// replicas.
-    pub policy_epoch: u64,
-    pub resource_scope_hash: [u8; 32],
+    /// Latest shared watermark represented by the offered snapshot.
+    pub compacted_through: Option<zendb_types::Hlc>,
 }

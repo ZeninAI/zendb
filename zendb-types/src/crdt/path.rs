@@ -12,7 +12,7 @@ use bincode::{Decode, Encode};
 use crate::{Segment, TypeTag};
 
 /// One step in a Path: the expected container type and how to descend.
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct PathStep {
     pub container_tag: TypeTag,
     pub segment: Segment,

@@ -1,5 +1,10 @@
 # In-Depth Operator Stack Redesign
 
+> **Status: historical exploration.** The accepted records in
+> [decisions/](decisions/) are normative. Implemented ADRs 001 through 007 and
+> 009 supersede this document. ADR 008 remains proposed. Principal/OAuth models,
+> broad transport traits, and similarly named deleted APIs below are not current.
+
 This document explains how I would implement the new operator stack described in [ideas.md](C:\Users\cngru\Documents\Zenin\zendb\ideas.md).
 
 This is not exact Rust code. It is implementation-oriented pseudo-code plus explanations, written against the current `zendb` codebase so that the changes are understandable and incremental.

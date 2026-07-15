@@ -1,5 +1,10 @@
 # Ground-Up Workspace Design
 
+> **Status: historical exploration.** The accepted records in
+> [decisions/](decisions/) are normative. Implemented ADRs 001 through 007 and
+> 009 supersede this document. ADR 008 remains proposed. Principal/OAuth models,
+> broad transport traits, and similarly named deleted APIs below are not current.
+
 This is the current implementation-oriented view of ZeninDB. The word
 Workspace means the one concrete local durable root. It is not a trait and it
 is not a second object layered over another database object.

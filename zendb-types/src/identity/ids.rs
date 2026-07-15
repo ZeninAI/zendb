@@ -45,19 +45,9 @@ impl fmt::Display for DeviceId {
     }
 }
 
-// Other IDs are opaque textual labels for now. DeviceId is intentionally
-// binary because it is part of signatures, HLCs, and replication ranges.
-define_id!(UserId);
+// Other IDs are opaque labels. DeviceId is intentionally binary because it is
+// part of signatures, HLCs, and replication ranges.
 define_id!(WorkspaceId);
-define_id!(InviteId);
-define_id!(GuestId);
-define_id!(ServiceId);
 define_id!(OperatorId);
-define_id!(ReplicaId);
-define_id!(GrantId);
-define_id!(CredentialId);
 define_id!(CapabilityId);
-define_id!(KeyId);
-define_id!(JobId);
-define_id!(LeaseId);
-define_id!(CheckpointId);
+define_id!(EnrollmentTicketId);

@@ -7,11 +7,13 @@ handlers, server storage, scheduler, credential authority, or relay
 implementation. Its traits describe calls an application may make from a
 local database to an external service:
 
-- `HostedCredentialClient` requests a workspace credential;
 - `HostedRendezvousClient` obtains reachability tickets and endpoints;
 - `HostedDiscoveryClient` publishes presence and retrieves untrusted peers;
-- `HostedJobClient` transports job records and results.
 
-All returned identity, reachability, job, and authorization data remains
-subject to the normal local verification, policy, handshake, and durable
-replication boundaries.
+An application may also use its own hosted OAuth or account service before it
+creates a database ticket or directly admits a device. That service does not
+issue a ZenDB workspace credential and is not an authorization authority inside
+the Workspace.
+
+All returned reachability data remains subject to normal local handshake and
+durable replication validation.

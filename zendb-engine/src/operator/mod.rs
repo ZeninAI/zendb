@@ -79,10 +79,7 @@ pub(crate) mod worker;
 use std::{future::Future, pin::Pin};
 
 pub use config::{OperatorRuntimeConfig, Subscription};
-pub use control::{
-    plan_reconciliation, CapabilityHost, LeaseConsistency, OperatorAdmission, OperatorControlError,
-    OperatorControlResult, ReconcileAction, ReconcileSnapshot,
-};
+pub use control::{plan_reconciliation, ReconcileAction, ReconcileSnapshot, StopReason};
 pub use lifecycle::{OperatorDirective, OperatorPhase};
 pub use traits::{DispatchConfig, DispatchOperator, Operator};
 pub use zendb_storage::frontend::state::State;

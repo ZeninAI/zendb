@@ -1,5 +1,10 @@
 # Zenin V2 Architecture Proposals
 
+> **Status: historical exploration.** The accepted records in
+> [decisions/](decisions/) are normative. Implemented ADRs 001 through 007 and
+> 009 supersede this document. ADR 008 remains proposed. Principal/OAuth models,
+> broad transport traits, and similarly named deleted APIs below are not current.
+
 This document distills the architecture decisions we discussed after reviewing the current `zendb` repository. The goal is to make the direction concrete, technically coherent, and implementable in small steps.
 
 The central conclusions are:

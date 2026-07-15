@@ -1,15 +1,29 @@
 # zendb-sync
 
-Engine-independent replication contracts.
+Portable records used by ZenDB anti-entropy and snapshot transfer.
 
-This crate contains replication messages, event envelopes, peer identities,
-version-vector summaries, range requests, and snapshot metadata. It does not
-define a broad storage backend trait. The concrete `Workspace` owns journal
-reads, verified appends, policy checks, cursors, and staged snapshot
-installation; the sync crate only defines the protocol data those operations
-exchange.
+This crate contains no sockets, storage implementation, policy evaluator, or
+broad synchronization trait. The concrete `zendb-engine::Workspace` owns
+journal reads, verified append, range orchestration, snapshot installation, and
+retry of control dependencies.
 
-The shared journal uses event identities and version vectors. Local table-topic
-offsets remain local operator runtime state and are not portable distributed
-checkpoints. This crate contains no database implementation, transport bearer,
-hosted scheduler, or server-side coordination API.
+Important records are:
+
+- `ReplicatedEvent` and `SyncEnvelope`: signed shared event plus optional
+  ticket-admission evidence;
+- `WorkspaceSyncSummary`: workspace identity, durable contiguous frontier, and
+  offered snapshot boundary;
+- `RangeRequest` and `EventBatch`: exact origin ranges and bounded transfers;
+- `SyncSnapshotMeta` and `SyncSnapshotChunk`: manifest-bound, independently
+  hashed chunk transfer; and
+- `SnapshotManifest` and `SnapshotExport`: validated shared-state snapshot.
+
+Only shared-plane events receive an EventIdentity. Local tables and private
+Cell overlays consume no origin sequence and cannot create intentional holes.
+
+`VersionVector` remains a maximum-observed utility and is not a compaction
+proof. `ContiguousFrontier` proves a durable gap-free prefix. The minimum
+published frontier across all admitted devices provides the conservative
+boundary used to derive a tombstone-compaction HLC.
+
+See ADRs 003, 006, and 007 under [`.plan/decisions`](../.plan/decisions/README.md).

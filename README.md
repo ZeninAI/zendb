@@ -1,645 +1,228 @@
-# ZeninDB
+# ZenDB
 
-**An embedded, local-first, eventually consistent database with CRDT types,
-offline mutation, streaming operators, and typed query facets.**
+An embedded, local-first CRDT database for applications that need durable local
+state and optional peer-to-peer workspace replication without a central
+authority.
 
----
+ZenDB provides:
 
-## Table of Contents
+- recursively nested CRDT values and deterministic merge;
+- local tables and device-private nested overlays;
+- signed shared journals with durable per-origin contiguous frontiers;
+- device-only workspace membership and fixed workspace roles;
+- QR/link ticket onboarding and direct Manager pre-admission;
+- mutually authenticated encrypted TCP anti-entropy;
+- signed LAN discovery, heartbeat presence, departure notices, and reconnect;
+- snapshot bootstrap, stable-frontier derivation, and tombstone compaction; and
+- an existing native local streaming operator runtime.
 
-1. [What Is ZeninDB?](#what-is-zenindb)
-2. [Architecture](#architecture)
-3. [Crate Map](#crate-map)
-4. [Quick Start](#quick-start)
-5. [Core Concepts](#core-concepts)
-   - [The Workspace Facet](#the-workspace-facet)
-   - [Tables and Events](#tables-and-events)
-   - [Operators](#operators)
-   - [States](#states)
-   - [Timers](#timers)
-6. [Operator Lifecycle](#operator-lifecycle)
-7. [Walkthrough: A Document Indexer](#walkthrough-a-document-indexer)
-8. [Storage Backends](#storage-backends)
-9. [Building and Testing](#building-and-testing)
-
----
-
-## What Is ZeninDB?
-
-ZeninDB is an embedded Rust database designed for applications that need:
-
-- **Conflict-free collaborative data structures** — counters, sets, lists,
-  registers, priority queues, and collaborative text, all nested inside
-  typed records
-- **Offline-first writes** with deterministic CRDT merge when devices
-  reconnect
-- **Streaming operators** — attach long-running computations to tables that
-  process changes incrementally, maintain private durable state, and
-  publish derived results back into tables
-- **Typed query facets** — operators expose a public read-only query API
-  that applications use directly, without locking the operator or blocking
-  its processing loop
-- **File-backed durability** with ordered (B+tree) and unordered (Bitcask)
-  backends, plus a segmented append-only topic log
-- **No required external service** — link it into your application binary;
-  optional hosted adapters live in `zendb-external`
-
-ZeninDB is *not* a SQL database, a distributed consensus system, or a
-mandatory cloud control plane. It is a local engine that you embed, configure
-with your own operator types, and query through typed handles. A replicated
-workspace may carry declarative operator objects and reconcile them locally,
-but no hosted scheduler is required.
-
----
+ZenDB is not SQL, distributed consensus, or a cloud control plane. Every
+workspace replica runs inside the client application. Optional hosted adapters
+can help peers find each other, but they do not become database authorities.
 
 ## Architecture
 
 ```text
-┌──────────────────────────────────────────────────────────┐
-│                    Your Application                       │
-│                                                          │
-│  • Define operator types (define_operator_set!)           │
-│  • Create/open Workspace<YourOps>                         │
-│  • Insert events into tables                              │
-│  • Query facets from running operators                    │
-│  • Cancel / retire operators at runtime                   │
-└────────────┬──────────────────────────────┬──────────────┘
-             │                              │
-    ┌────────▼────────┐            ┌────────▼────────┐
-    │   Table Handles  │            │   Facet Queries  │
-    │  (weak, upgrade  │            │  (typed, direct  │
-    │   per operation) │            │   state reads)   │
-    └────────┬────────┘            └────────┬────────┘
-             │                              │
-┌────────────▼──────────────────────────────▼──────────────┐
-│                     zendb-engine                          │
-│                                                          │
-│  ┌──────────┐  ┌───────────────┐  ┌───────────────────┐  │
-│  │ Workspace│  │ OperatorWorker│  │     RunLoop       │  │
-│  │          │  │               │  │                   │  │
-│  │ • tables │──│ • inputs      │──│ • event queue     │  │
-│  │ • states │  │ • timer inbox │  │ • shutdown FSM    │  │
-│  │ • ops    │  │ • facet       │  │ • poll + commit   │  │
-│  │ • timers │  │ • spawn       │  │ • idle / wake     │  │
-│  └──────────┘  └───────────────┘  └────────┬──────────┘  │
-│                                            │              │
-│                                     ┌──────▼──────┐      │
-│                                     │  Operator   │      │
-│                                     │ (your code) │      │
-│                                     └─────────────┘      │
-└──────────────────────────┬───────────────────────────────┘
-                           │
-┌──────────────────────────▼───────────────────────────────┐
-│                    zendb-storage                          │
-│                                                          │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐ │
-│  │ BPlusTree│  │  KeyDir  │  │ SkipList │  │  Topic   │ │
-│  │ (ordered)│  │(unordered)│  │(in-memory)│  │(app-log) │ │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘ │
-└──────────────────────────┬───────────────────────────────┘
-                           │
-┌──────────────────────────▼───────────────────────────────┐
-│                    zendb-types                            │
-│                                                          │
-│  Cell, Event, HLC, Path, Op, Value, CRDT types,          │
-│  register_types! macro, generated dispatch                │
-└──────────────────────────────────────────────────────────┘
+Application
+    |
+    v
+zendb-engine::Workspace<D>
+    |-- local/shared mutation routing and authorization
+    |-- device control state and signed shared journal
+    |-- onboarding, anti-entropy, snapshots, compaction
+    |-- TCP cluster runtime and LAN peer discovery
+    `-- existing local operator workers and timers
+         |
+         +--> zendb-transport  authenticated encrypted sessions, profile
+         +--> zendb-sync       portable replication wire records
+         +--> zendb-storage    durable tables, states, logs, indexes
+         `--> zendb-types      CRDTs, IDs, devices, roles, frontiers
+
+zendb-external                optional outbound hosted discovery/rendezvous
 ```
 
-The core dependency direction is strict: `zendb-types` → `zendb-storage` →
-`zendb-engine`. Identity, transport, and sync are separate protocol layers;
-`zendb-engine` is the top-level local integrator. `zendb-external` is optional
-and contains outbound client adapters only. Types know nothing about storage;
-storage knows nothing about ZeninDB semantics; the engine composes them.
+The dependency direction keeps values portable and the product policy in one
+concrete owner. `zendb-types` has no filesystem or socket behavior.
+`zendb-storage` does not decide authorization. `zendb-transport` authenticates
+and encrypts a byte session but does not admit devices. `Workspace` composes
+those pieces and enforces the complete operation.
 
----
+## Crates
 
-## Crate Map
-
-| Crate | Purpose | Key Exports |
+| Crate | Responsibility | Important exports |
 |---|---|---|
-| [`zendb-types`](zendb-types/) | Pure data model — CRDTs, HLCs, cells, events | `Cell`, `Event`, `Hlc`, `Value`, `Op`, `Path`, `Type` trait, `register_types!` |
-| [`zendb-storage`](zendb-storage/) | Generic KV backends and topic log | `BPlusTree`, `KeyDir`, `SkipList`, `Topic`, `State`, `Table`, `Backend` trait |
-| [`zendb-engine`](zendb-engine/) | Workspace catalog, tables, operators, timers, facets | `Workspace`, `Operator`, `define_operator_set!`, `Subscription`, `Executor` |
-| [`zendb-identity`](zendb-identity/) | Device credentials, membership, invites, bootstrap evidence | `DeviceSigner`, `WorkspaceCredential`, `WorkspaceCredentialVerifier` |
-| [`zendb-transport`](zendb-transport/) | Client-side discovery, rendezvous, authenticated bearer sessions | `RawTransport`, `TransportSession`, `BearerAdapter`, `PathSelector` |
-| [`zendb-sync`](zendb-sync/) | Engine-independent replication messages and snapshot metadata | `ReplicatedEvent`, `SyncEnvelope`, `RangeRequest`, `SnapshotManifest` |
-| [`zendb-external`](zendb-external/) | Optional outbound adapters for hosted services | `HostedCredentialClient`, `HostedRendezvousClient`, `HostedJobClient` |
-| [`zendb-testing`](zendb-testing/) | Integration test harness (document pipeline) | Test operators: `IndexerOp`, `ArchiverOp` |
+| [`zendb-types`](zendb-types/) | CRDT data and portable control records | `Cell`, `Event`, `Hlc`, `Value`, `DeviceRecord`, `WorkspaceRole`, `ContiguousFrontier` |
+| [`zendb-storage`](zendb-storage/) | Generic durable data structures | `BPlusTree`, `KeyDir`, `SkipList`, `Topic`, `State`, `Table` |
+| [`zendb-transport`](zendb-transport/) | Concrete client transport mechanics | `DeviceProfile`, `SecureTcpSession`, `EnrollmentPresentation`, `PresenceTracker` |
+| [`zendb-sync`](zendb-sync/) | Engine-independent sync records | `SyncEnvelope`, `RangeRequest`, `WorkspaceSyncSummary`, `SnapshotManifest`, `SyncSnapshotChunk` |
+| [`zendb-engine`](zendb-engine/) | Concrete workspace product runtime | `Workspace`, `ClusterConfig`, `ClusterRuntime`, `SyncReport`, `OnboardingResult` |
+| [`zendb-external`](zendb-external/) | Optional outbound hosted adapters | `HostedRendezvousClient`, `HostedDiscoveryClient` |
+| [`zendb-testing`](zendb-testing/) | Integration fixtures and local operators | document pipeline test types |
 
----
+The former `zendb-identity` crate was removed. The database does not model
+OAuth users or principals. Application identity may inform whether an app asks
+a Manager to admit a device, but the replicated authority is always DeviceId.
 
-## Quick Start
+## Workspace Model
 
-Add to your `Cargo.toml`:
+A workspace is one distributed CRDT ledger with one stable `WorkspaceId`.
+Every installation has a random, stable `DeviceId` and a durable signing
+profile. DeviceId is independent of the signing key so keys can rotate.
 
-```toml
-[dependencies]
-zendb-engine = { path = "zendb-engine" }
-zendb-types = { path = "zendb-types" }
-zendb-storage = { path = "zendb-storage" }
-```
+Membership is represented by a live `devices.<device_id>` Cell in replicated
+control state. Deleting that Cell revokes the device. There is no separate
+membership table, status row, workspace secret, owner key, or principal-device
+binding.
 
-Define your operator set — this is your **workspace operator set**:
+Every admitted device receives all shared data and is an implicit Reader. The
+only explicit workspace-wide roles are:
 
-```rust
-use zendb_engine::{define_operator_set, Workspace};
+- `Contributor`: create/delete shared tables and mutate shared data.
+- `Dispatcher`: manage operator specifications.
+- `Manager`: manage devices, role sets, and enrollment tickets.
 
-define_operator_set! {
-    pub mod my_ops {
-        MyIndexer(MyIndexerOperator),
-        MyArchiver(MyArchiverOperator),
-    }
-}
+The creator starts with all three roles. Newly onboarded devices start with no
+explicit role and therefore read only. The roles are fixed protocol values,
+not user-defined policy programs. Capabilities such as `vpn` or `gpu` are
+self-advertised device labels for future placement, not permissions.
 
-// Your workspace type is parameterized by this set:
-type MyWorkspace = Workspace<my_ops::OperatorInstance>;
-```
+## Local And Shared Data
 
-Create or open a workspace:
-
-```rust
-use zendb_engine::{Executor, Workspace, WorkspaceConfig};
-use std::sync::Arc;
-
-let executor: Arc<dyn Executor> = /* your executor */;
-
-// Create a fresh workspace
-let db = MyWorkspace::create("./my_workspace", executor.clone(), WorkspaceConfig::default())?;
-
-// Or open an existing one
-let db = MyWorkspace::open("./my_workspace", executor, WorkspaceConfig::default())?;
-```
-
-Create a table and insert an event:
+A local table is present only in the local catalog. It requires no workspace
+role and consumes no shared origin sequence:
 
 ```rust
-use zendb_engine::TableConfig;
-use zendb_types::{Event, Hlc, Op, PrimaryKey, Value, Path};
-
-let table = db.table("documents", Some(TableConfig::default()))?;
-let guard = table.get()?;
-
-let event = Event {
-    table_id: "documents".into(),
-    primary_key: PrimaryKey::String("doc-1".into()),
-    path: Path::new(),
-    op: Op::Replace { value: Value::String("hello world".into()) },
-    hlc: Hlc::with_device_id(1000, 0, device_id()).unwrap(),
-    sync: false,
-    signature: vec![],
-};
-guard.write().insert_event(event)?;
+let table = workspace.table("drafts", Some(local_config))?;
+table.get()?.write().insert_event(local_event)?;
 ```
 
-Dispatch an operator:
+A shared table is a replicated control declaration. Contributors create it and
+route all data mutations through `Workspace`:
 
 ```rust
-use zendb_engine::{OperatorRuntimeConfig, Subscription};
-
-db.dispatch_operator::<MyIndexer>(
-    "indexer",
-    MyIndexerConfig::default(),
-    OperatorRuntimeConfig {
-        subscriptions: vec![Subscription::pattern("documents")],
-        poll_size: 128,
-    },
-)?;
+let table = workspace.create_shared_table("documents", TableConfig::default())?;
+workspace.mutate("documents", document_id, shared_event)?;
 ```
 
-Query the operator's facet:
+Direct insertion on a physical shared table is rejected. The workspace path is
+responsible for role validation, durable origin-sequence allocation, signing,
+journal append, and application.
 
-```rust
-// Operators can expose a typed query interface while they run
-let facet = db.facet::<MyIndexerFacet>("indexer")?;
-let index = facet.lookup("hello")?;
-println!("Documents containing 'hello': {:?}", index);
+Within shared data, `Cell.sync = Some(false)` creates a device-private overlay
+at that recursive path. Local writes under it never enter the shared journal.
+Remote ancestor changes cannot erase the overlay. Re-enabling sync discards
+the private overlay and reveals current shared state; it never silently
+publishes local data.
+
+## Onboarding
+
+A joining installation first persists its DeviceId and signing key. Discovery
+or a successful socket connection is not admission. ZenDB has two protocols:
+
+1. **Enrollment presentation.** A Manager publishes a ticket verifier and puts
+   the private ticket credential in a QR code or link. The candidate signs an
+   exact admission proof. Any admitted reader can validate and relay it.
+2. **Direct admission.** A Manager receives the candidate DeviceId and public
+   key out of band and adds the Device record. The candidate may then bootstrap
+   from any peer while pinning an expected peer public key.
+
+Both flows prove possession of the candidate private key and transfer a
+manifest-verified, independently hashed chunked snapshot. The resulting device
+has no explicit roles. Ticket admission evidence accompanies the admission
+event so every replica can validate the exceptional Manager-free write.
+
+Relevant APIs are `Workspace::create_joining()`,
+`create_enrollment_ticket()`, `bootstrap_with_ticket()`, `admit_device()`,
+and `bootstrap_direct()`.
+
+## Networking And Synchronization
+
+`Workspace::sync_tcp()` performs a single bilateral anti-entropy session. The
+transport uses signed ephemeral X25519 handshakes authenticated by accepted
+Ed25519 device keys and ChaCha20-Poly1305 encrypted framing. Peers then:
+
+1. exchange signed heartbeat presence and contiguous frontier summaries;
+2. request exact missing `(origin, sequence range)` history;
+3. send bounded batches of signed events;
+4. retain out-of-order events until gaps and control dependencies arrive; and
+5. use a chunked snapshot fallback when retained history is unavailable.
+
+`Workspace::start_cluster(ClusterConfig)` runs a TCP listener plus periodic
+multi-peer sync and reconnect. Optional signed UDP announcements discover LAN
+peers. The runtime publishes frontier checkpoints and sends a signed departure
+after stopping heartbeat producers.
+
+Presence is deliberately local. A signed heartbeat advertises its intended
+idle interval; each receiver derives `Direct`, `Indirect`, `Suspect`,
+`Unreachable`, `Departed`, or `Unknown` using bounded arrival samples and a
+local grace multiplier. A continuous suspicion score is available to consumers.
+None of these observations revoke membership or grant authorization.
+
+## Frontiers, Snapshots, And Compaction
+
+Only shared events receive `EventIdentity { origin_device_id, origin_seq }`.
+Each replica durably tracks the largest gap-free prefix per origin and
+checkpoints it in its own Device record.
+
+The stable frontier is the point observed by every admitted device. Offline
+members continue to hold it back until a Manager removes them. This is a
+membership and storage-retention consequence, not a liveness timeout.
+
+Snapshots contain shared control and live shared tables only. They exclude
+local tables and private overlays. `compact_shared()` first requires a
+retained snapshot, derives a stable HLC from the stable frontier, and recursively
+removes CRDT tombstones no newer than that proof. Shared journal pruning is not
+implemented yet; retaining history is the conservative recovery behavior.
+
+## Signing-Key Rotation
+
+A device calls `stage_local_key_rotation()` to stage a secondary key in its
+replicated key ring. It continues using
+the primary until the stable frontier proves that every admitted device has
+received the stage event. Promotion is signed by the staged key and swaps the
+two keys. The prior primary remains as the secondary verifier for delayed old
+events and is replaced by a later rotation. `promote_local_key_rotation()`
+performs the stable-frontier-gated swap. DeviceId never changes.
+
+## Operators
+
+The existing native operator runtime supports compiled Rust operators,
+subscriptions, local state, facets, timers, and worker lifecycle. Distributed
+declarative operator reconciliation, capability placement, leases, fencing,
+Rhai isolation, and Dispatcher enforcement are intentionally not implemented
+in this pass. They are specified separately in ADR 008 and must not be inferred
+from similarly named legacy operator types.
+
+## Decisions
+
+The normative distributed design is split into narrow records under
+[`.plan/decisions`](.plan/decisions/README.md):
+
+1. devices and roles;
+2. device liveness;
+3. shared journal and replication frontiers;
+4. device onboarding;
+5. device signing-key rotation;
+6. local/shared sync boundaries;
+7. tombstone compaction watermarks;
+8. proposed distributed operator reconciliation and leases; and
+9. shared-table lifecycle.
+
+Older large documents under `.plan` are retained as historical exploration.
+Their principal/OAuth abstractions and broad transport traits are not current
+APIs.
+
+## Building And Testing
+
+```bash
+cargo build --workspace
+cargo test --workspace
 ```
 
----
-
-## Core Concepts
-
-### The Workspace Facet
-
-The `Workspace<D>` type is parameterized by `D`, which is the **operator set**
-generated by `define_operator_set!`. This means:
-
-- At compile time, the database knows exactly which operator types exist.
-- Operator configs are type-safe — `dispatch_operator::<MyOp>` ensures the
-  config type matches.
-- The generated `OperatorInstance` enum implements `DispatchOperator`,
-  providing the type-erased dispatch layer that the run loop calls.
-
-Each operator can also expose a **query facet** — a typed, read-only struct
-that applications use to query the operator's accumulated state:
-
-```rust
-// In your operator impl:
-impl Operator for MyIndexer {
-    type Config = MyIndexerConfig;
-    type Timer = ();
-    type Facet = MyIndexerFacet;  // <-- the facet type
-
-    fn create(db, name, config) -> impl Future<Output = io::Result<Self>> + Send {
-        // open state handles, store them on self
-    }
-
-    fn facet(&self) -> MyIndexerFacet {
-        // return a lightweight clone of the state handles
-        MyIndexerFacet { index: self.index.clone() }
-    }
-
-    fn process(&mut self, changes, db, name, config) -> impl Future<Output = io::Result<OperatorDirective>> + Send {
-        // update self.index as changes arrive
-    }
-}
-
-// The facet provides public query methods:
-impl MyIndexerFacet {
-    pub fn lookup(&self, word: &str) -> io::Result<HashSet<String>> {
-        let state = self.index.get()?;
-        Ok(state.read().get(&word.into())?.unwrap_or_default())
-    }
-}
-```
-
-The facet is stored in the operator worker and retrieved via
-`db.facet::<MyIndexerFacet>("indexer")`. It reads directly from the
-operator's persisted state — no lock contention with the processing loop.
-
-Use `type Facet = ()` and `fn facet(&self) {}` for operators that don't
-expose queries.
-
-### Tables and Events
-
-A table owns three things:
-
-| Component | Backend | Purpose |
-|---|---|---|
-| Materialized state | `State<PrimaryKey, Cell>` (B+tree or KeyDir) | Durable resolved row state |
-| Resolved cache | `SkipList<PrimaryKey, Cell>` | In-memory shadow of pending rows |
-| Change topic | `Topic<Change>` | Durable append-only change stream |
-
-The write path:
-
-1. `insert_event(event)` — apply the event to the resolved cache (or
-   materialized state if not cached)
-2. If the event changes the cell, update the cache
-3. Append a `Change` (before/after snapshot) to the topic
-4. When the cache exceeds `max_buffered_records`, drain to materialized state
-
-Reads merge cache over state — cache entries shadow materialized entries.
-This means reads see the latest state even before materialization.
-
-Table handles are **weak** (`Weak<RwLock<Table>>`). They never keep a table
-or database alive. Upgrade with `.get()` for one operation:
-
-```rust
-let handle = db.table("users", None)?;         // TableHandle (weak)
-let table = handle.get()?;                      // Arc<RwLock<Table>> for this op
-table.write().insert_event(event)?;
-// table dropped here — lock released
-```
-
-### Operators
-
-Operators are streaming computations. They implement the `Operator` trait
-with five lifecycle hooks and one query hook:
-
-| Method | When Called |
-|---|---|
-| `create(db, name, config)` | Once on spawn — open state handles, create output tables |
-| `facet(&self)` | Once after create — return the query facet |
-| `on_input_opened(table, db, name, config)` | A matching table was opened |
-| `on_input_closed(table, db, name, config)` | A matching table was closed |
-| `process(changes, db, name, config)` | A batch of changes is available |
-| `on_timer(payload, fire_at_ms, db, name, config)` | A registered timer fired |
-| `teardown(phase, db, name, config)` | Operator is stopping |
-
-Each method receives `&Arc<Workspace<D>>` directly because this is the current
-native Rust ABI. It is not a permission bypass: production runners must route
-mutations, shared publication, jobs, and capabilities through the operator
-effect gate. User-authored Rhai code receives a bounded script context, not
-the Rust database object.
-
-For cluster behavior, persist `zendb_types::OperatorSpec` and let the local
-reconciler decide whether a worker should run. `dispatch_operator` is the
-low-level embedded/test convenience path.
-
-**Return directives:**
-
-- `OperatorDirective::Continue` — keep processing (commit offsets)
-- `OperatorDirective::Finish` — clean shutdown, retire the operator
-
-**Subscriptions** use glob patterns:
-
-```rust
-Subscription::pattern("users")      // exact table name
-Subscription::pattern("wiki-*")     // all tables starting with "wiki-"
-Subscription::pattern("*-log")      // all tables ending with "-log"
-Subscription::pattern("*")          // every table
-```
-
-### States
-
-States are typed key-value stores owned by the database. Operators typically
-open states in `create()` and store weak `StateHandle<K, V>` references:
-
-```rust
-struct MyIndexer {
-    index: StateHandle<String, HashSet<String>>,  // weak handle
-}
-
-impl Operator for MyIndexer {
-    fn create(db, name, config) -> impl Future<Output = io::Result<Self>> + Send {
-        async move {
-            // Open (or create) a typed state
-            let index = db.state("my-index", Some(StateConfig::default()))?;
-            Ok(Self { index })
-        }
-    }
-
-    fn process(&mut self, changes, db, name, config) -> impl Future<Output = io::Result<OperatorDirective>> + Send {
-        async move {
-            let state = self.index.get()?;   // upgrade for this operation
-            state.write().put("hello".into(), doc_ids)?;
-            Ok(OperatorDirective::Continue)
-        }
-    }
-}
-```
-
-State backends are configurable: `Ordered` (B+tree), `Unordered` (KeyDir),
-or `InMemory` (SkipList). The first typed lookup on open establishes the
-`K, V` types — there is no persisted schema registry, so application code
-is responsible for type compatibility across restarts.
-
-### Timers
-
-All operators share one ordered B+tree timer store keyed by
-`(fire_at_ms, operator)`. Operators register timers through the database:
-
-```rust
-// Inside an operator method:
-db.register_timer("my-op", fire_at_ms, &payload)?;
-db.cancel_timer("my-op", fire_at_ms)?;
-```
-
-A background scheduler loop sleeps until the next timer is due (condvar),
-delivers payloads to operator worker inboxes, and the worker fires
-`on_timer` from its main loop.
-
-Timers persist across restarts. Durability is at-most-once: a timer removed
-from the store but not yet fired is lost if the process crashes.
-
----
-
-## Operator Lifecycle
-
-```text
-┌──────────┐
-│  create  │  ← open state handles, create output tables, register initial timers
-└────┬─────┘
-     │  facet() called — query interface becomes available
-     │  (for each matching table already open)
-     ▼
-┌────────────────┐
-│on_input_opened │  ← notified of each initial subscription match
-└───────┬────────┘
-        │
-        ▼
-┌──────────────────────────────────────────────────────────┐
-│                     ACTIVE LOOP                            │
-│                                                           │
-│  ┌──────────┐   ┌──────────┐   ┌──────────────────────┐  │
-│  │ process  │   │ on_timer │   │ on_input_opened /     │  │
-│  │ changes  │   │  fires   │   │ _closed               │  │
-│  └──────────┘   └──────────┘   └──────────────────────┘  │
-│                                                           │
-│  Return Finish from any method → teardown                 │
-│  Error from any method → Failed, then teardown            │
-│  No inputs remain → teardown(Active), suspend             │
-└──────────────────────────────┬────────────────────────────┘
-                               │
-                               ▼
-                      ┌────────────────┐
-                      │   teardown     │ ← Active (suspend) / Finished / Failed / Cancelled
-                      └────────────────┘
-```
-
----
-
-## Walkthrough: A Document Indexer
-
-Let's build a complete document indexing pipeline — the same one tested in
-`zendb-testing`.
-
-### Step 1: Define the operator set
-
-```rust
-use zendb_engine::define_operator_set;
-
-define_operator_set! {
-    pub mod doc_ops {
-        Indexer(IndexerOp),
-        Archiver(ArchiverOp),
-    }
-}
-
-type DocWorkspace = Workspace<doc_ops::OperatorInstance>;
-```
-
-### Step 2: The Indexer operator
-
-```rust
-use std::{collections::HashSet, future::Future, io, sync::Arc};
-use zendb_engine::{
-    Change, Workspace, DispatchOperator, Operator,
-    OperatorDirective, StateHandle, Subscription,
-};
-use zendb_storage::frontend::state::StateConfig;
-use bincode::{Decode, Encode};
-
-#[derive(Debug, Clone, PartialEq, Encode, Decode)]
-struct IndexerConfig;
-
-/// Query facet — allows the application to search the index.
-struct IndexerFacet {
-    index: StateHandle<String, HashSet<String>>,
-}
-
-impl IndexerFacet {
-    pub fn search(&self, word: &str) -> io::Result<HashSet<String>> {
-        let state = self.index.get()?;
-        Ok(state.read().get(&word.to_lowercase())?.unwrap_or_default())
-    }
-
-    pub fn doc_count(&self) -> io::Result<usize> {
-        Ok(self.index.get()?.read().size())
-    }
-}
-
-struct IndexerOp {
-    index: StateHandle<String, HashSet<String>>,  // word → set of doc IDs
-    docs:  StateHandle<String, u64>,              // doc ID → word count
-}
-
-impl Operator for IndexerOp {
-    type Config = IndexerConfig;
-    type Timer = ();
-    type Facet = IndexerFacet;
-
-    fn create<'a, D>(
-        db: &'a Arc<Workspace<D>>,
-        _name: &'a str,
-        _config: &'a Self::Config,
-    ) -> impl Future<Output = io::Result<Self>> + Send + 'a
-    where D: DispatchOperator
-    {
-        async move {
-            let index = db.state("indexer/index", Some(StateConfig::default()))?;
-            let docs  = db.state("indexer/docs", Some(StateConfig::default()))?;
-            Ok(Self { index, docs })
-        }
-    }
-
-    fn facet(&self) -> IndexerFacet {
-        IndexerFacet { index: self.index.clone() }
-    }
-
-    fn process<'a, D>(
-        &'a mut self,
-        changes: Vec<Change>,
-        db: &'a Arc<Workspace<D>>,
-        _name: &'a str,
-        _config: &'a Self::Config,
-    ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
-    where D: DispatchOperator
-    {
-        async move {
-            for change in changes {
-                match (&change.previous, &change.current) {
-                    // New or updated document
-                    (_, Some(cell)) if !cell.is_dummy() => {
-                        let doc_id = /* extract from primary key */;
-                        let text = /* extract text from cell */;
-                        let words = tokenize(&text);
-
-                        let index_state = self.index.get()?;
-                        let docs_state = self.docs.get()?;
-
-                        for word in &words {
-                            index_state.write().update(&word.into(), |entry| {
-                                let mut set = entry.unwrap_or_default();
-                                set.insert(doc_id.clone());
-                                Some(set)
-                            })?;
-                        }
-                        docs_state.write().put(doc_id.clone(), words.len() as u64)?;
-                    }
-                    // Deleted document
-                    (Some(_), None) => {
-                        // Remove from index...
-                    }
-                    _ => {}
-                }
-            }
-            Ok(OperatorDirective::Continue)
-        }
-    }
-}
-```
-
-### Step 3: Put it all together
-
-```rust
-fn main() -> io::Result<()> {
-    let executor = Arc::new(ThreadExecutor);
-    let db = DocWorkspace::create("./my_workspace", executor, WorkspaceConfig::default())?;
-
-    // Create the documents table
-    let docs = db.table("documents", Some(TableConfig::default()))?;
-
-    // Dispatch the indexer
-    db.dispatch_operator::<IndexerOp>(
-        "indexer",
-        IndexerConfig,
-        OperatorRuntimeConfig {
-            subscriptions: vec![Subscription::pattern("documents")],
-            poll_size: 128,
-        },
-    )?;
-
-    // Insert some documents
-    {
-        let table = docs.get()?;
-        table.write().insert_event(make_event("doc-1", "hello world"))?;
-        table.write().insert_event(make_event("doc-2", "hello rust"))?;
-    }
-
-    // Wait a moment for the operator to process...
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
-    // Query the index through the facet — no locking the operator!
-    let facet = db.facet::<IndexerFacet>("indexer")?;
-    let results = facet.search("hello")?;
-    assert_eq!(results.len(), 2);  // doc-1 and doc-2
-
-    println!("Documents containing 'hello': {:?}", results);
-    Ok(())
-}
-```
-
----
-
-## Storage Backends
-
-ZeninDB's storage layer provides three KV backends plus an append-only log:
-
-| Backend | Persistent | Ordered | Best For |
-|---|---|---|---|
-| `BPlusTree<K, V>` | ✅ mmap file | ✅ | Ordered state, range scans, large datasets |
-| `KeyDir<K, V>` | ✅ mmap file | ❌ | Unordered lookups, catalogs, metadata |
-| `SkipList<K, V>` | ❌ in-memory | ✅ | Caches, working sets, event buffers |
-| `Topic<T>` | ✅ segmented files | N/A | Event streaming, change logs, consumer offsets |
-
-All backends implement the `Backend<K, V>` trait (CRUD, bulk ops, iteration,
-flush, sync). Ordered backends add `range`, `first`, `last`, and reverse
-iteration. The `State<K, V>` enum provides runtime backend dispatch so you
-can switch between ordered and unordered storage by changing config.
-
-All serialization uses **bincode 2** (little-endian, fixed-int encoding).
-Hot-path encoding uses thread-local pooled `Vec<u8>` buffers — zero
-allocation after warm-up.
-
----
-
-## Building and Testing
-
-```sh
-# Build everything
-cargo build
-
-# Run all tests (unit + integration)
-cargo test
-
-# Run only engine tests
-cargo test -p zendb-engine
-
-# Run only storage tests
-cargo test -p zendb-storage
-
-# Run integration tests (document search pipeline)
-cargo test -p zendb-testing
-```
-
-The engine is executor-agnostic. Tests use a trivial `ThreadExecutor` that
-spawns each future onto a dedicated OS thread. For production use, implement
-the `Executor` trait with Tokio, smol, or your own runtime.
-
----
+The workspace uses Rust 2021. The engine has integration coverage for local and
+shared routing, authenticated sync, ticket/direct onboarding, key rotation,
+presence/departure, snapshots, and compaction.
 
 ## License
 
-MIT
+License terms have not yet been declared in this repository.

@@ -80,6 +80,17 @@ where
     /// Returns `Ok(true)` if the table existed, `Ok(false)` if it was not in
     /// the catalog.
     pub fn delete_table(&self, name: &str) -> io::Result<bool> {
+        if self
+            .control
+            .lock()
+            .shared_table_state(name)?
+            .is_some_and(|(live, _)| live)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "use delete_shared_table for replicated table membership",
+            ));
+        }
         let was_open = self.tables.write().remove(name).is_some();
 
         if !self.table_catalog.lock().delete(&name.to_owned())? {

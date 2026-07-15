@@ -1,5 +1,5 @@
 use bincode::{Decode, Encode};
-use zendb_identity::WorkspaceId;
+use zendb_types::{Hlc, WorkspaceId};
 
 use crate::summary::WorkspaceSyncSummary;
 
@@ -10,8 +10,7 @@ pub struct SnapshotManifest {
     pub summary: WorkspaceSyncSummary,
     pub total_bytes: u64,
     pub snapshot_hash: [u8; 32],
-    pub policy_epoch: u64,
-    pub resource_scope_hash: [u8; 32],
+    pub compacted_through: Option<Hlc>,
 }
 
 /// In-memory snapshot export placeholder. The concrete storage format can evolve later.

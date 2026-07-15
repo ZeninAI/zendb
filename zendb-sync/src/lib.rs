@@ -2,8 +2,8 @@
 //!
 //! Replication and bootstrap abstractions for ZeninDB.
 //!
-//! This crate sits above transport and identity and below product-domain logic.
-//! Its role is to define:
+//! This crate is independent of transport and below product-domain logic. Its
+//! role is to define:
 //! - replica summaries and version vectors
 //! - shared journal envelopes
 //! - sync request / response message types
@@ -14,15 +14,13 @@
 
 pub mod journal;
 pub mod messages;
-pub mod peer;
 pub mod snapshot;
 pub mod summary;
 
-pub use journal::{ReplicatedEvent, SharedJournalRecord, SyncEnvelope};
+pub use journal::{EventIdentity, ReplicatedEvent, SyncEnvelope};
 pub use messages::{
     EventBatch, RangeRequest, SyncCapabilities, SyncSnapshotChunk, SyncSnapshotMeta,
-    SyncSummaryMessage, TailSubscription,
+    SyncSummaryMessage,
 };
-pub use peer::{ReplicaId, ReplicationPeer};
 pub use snapshot::{SnapshotExport, SnapshotManifest};
 pub use summary::{VersionVector, WorkspaceSyncSummary};

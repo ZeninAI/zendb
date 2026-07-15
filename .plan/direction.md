@@ -1,5 +1,10 @@
 # Current Direction
 
+> **Status: historical exploration.** The accepted records in
+> [decisions/](decisions/) are normative. Implemented ADRs 001 through 007 and
+> 009 supersede this document. ADR 008 remains proposed. Principal/OAuth models,
+> broad transport traits, and similarly named deleted APIs below are not current.
+
 This document merges the current conclusions from [ideas.md](C:\Users\cngru\Documents\Zenin\zendb\ideas.md) and [in-depth-operator.md](C:\Users\cngru\Documents\Zenin\zendb\in-depth-operator.md) with the later crate, sync, identity, and networking decisions.
 
 It is intentionally narrower than `ideas.md`.

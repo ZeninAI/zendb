@@ -1,11 +1,12 @@
 //! Table abstraction over materialized state, a resolved cache, and a change topic.
 
-use std::{borrow::Cow, cmp::Ordering, fs, io, path::Path};
+use std::{borrow::Cow, cmp::Ordering, fs, io, path::Path as FsPath};
 
 use bincode::{Decode, Encode};
-use zendb_types::{device_id, Cell, DeviceId, Event, PrimaryKey};
+use zendb_types::{device_id, Cell, DeviceId, Event, Hlc, Op, Path, PrimaryKey, Type};
 
 use crate::core::{
+    keydir::KeyDirConfig,
     skiplist::{SkipList, SkipListCapacity, SkipListConfig, SkipListStats},
     topic::{Topic, TopicConfig, TopicConsumer, TopicStats},
     traits::{Backend, DurableStorage, OrderedBackend, Storage},
@@ -52,10 +53,108 @@ pub struct Table {
     config: TableConfig,
     local_device_id: DeviceId,
     state: State<PrimaryKey, Cell>,
+    shared_state: State<PrimaryKey, Cell>,
+    overlays: State<PrimaryKey, RowOverlay>,
     cache: SkipList<PrimaryKey, (Cell, bool)>,
     novel_pending: usize,
     topic: Topic<Change>,
     recovery: TopicConsumer<Change>,
+}
+
+#[derive(Debug, Clone, Default, Encode, Decode)]
+struct RowOverlay {
+    boundaries: Vec<OverlayBoundary>,
+}
+
+#[derive(Debug, Clone, Encode, Decode)]
+struct OverlayBoundary {
+    path: Path,
+    cell: Cell,
+}
+
+impl RowOverlay {
+    fn boundary_for(&self, path: &Path) -> Option<&OverlayBoundary> {
+        self.boundaries
+            .iter()
+            .filter(|boundary| path.starts_with(&boundary.path))
+            .max_by_key(|boundary| boundary.path.len())
+    }
+
+    fn is_local(&self, path: &Path) -> bool {
+        self.boundary_for(path).is_some()
+    }
+
+    fn set_boundary(&mut self, path: Path, shared: &Cell, enabled: bool) -> bool {
+        if enabled {
+            if self.boundaries.iter().any(|boundary| {
+                boundary.path.len() < path.len() && path.starts_with(&boundary.path)
+            }) {
+                return false;
+            }
+            let before = self.boundaries.len();
+            self.boundaries
+                .retain(|boundary| !boundary.path.starts_with(&path));
+            return self.boundaries.len() != before;
+        }
+        if self.is_local(&path) {
+            return false;
+        }
+        let mut cell = shared
+            .at_path(&path)
+            .cloned()
+            .unwrap_or_else(|| Cell::dummy(None));
+        cell.sync = Some(false);
+        self.boundaries.push(OverlayBoundary { path, cell });
+        true
+    }
+
+    fn apply(&mut self, event: &Event) -> Result<bool, zendb_types::TypeError> {
+        let Some(index) = self
+            .boundaries
+            .iter()
+            .enumerate()
+            .filter(|(_, boundary)| event.path.starts_with(&boundary.path))
+            .max_by_key(|(_, boundary)| boundary.path.len())
+            .map(|(index, _)| index)
+        else {
+            return Ok(false);
+        };
+        let relative = &event.path[self.boundaries[index].path.len()..];
+        self.boundaries[index]
+            .cell
+            .apply_routed(&event.op, event.hlc, relative)
+    }
+
+    fn resolve(&self, shared: &Cell) -> Cell {
+        let mut resolved = shared.clone();
+        let overlay_hlc = Hlc::from_bytes([0xff; 24]);
+        for boundary in &self.boundaries {
+            let Some(shared_target) = shared.at_path(&boundary.path) else {
+                continue;
+            };
+            if shared_target.is_tombstone()
+                || (!boundary.cell.is_tombstone()
+                    && shared_target.type_tag() != boundary.cell.type_tag())
+            {
+                continue;
+            }
+            if boundary.path.is_empty() {
+                resolved = boundary.cell.clone();
+                continue;
+            }
+            let op = match &boundary.cell.value {
+                Some(value) => Op::Replace {
+                    value: value.clone(),
+                },
+                None => Op::Delete,
+            };
+            let _ = resolved.apply_routed(&op, overlay_hlc, &boundary.path);
+            if let Some(target) = resolved.at_path_mut(&boundary.path) {
+                target.sync = Some(false);
+            }
+        }
+        resolved
+    }
 }
 
 fn cache_cell(entry: Cow<'_, (Cell, bool)>) -> Cow<'_, Cell> {
@@ -72,17 +171,138 @@ fn cache_entry<'a>(
 }
 
 impl Table {
+    /// Copy the canonical shared layer for snapshot export. Local tables and
+    /// local overlay values deliberately return no rows.
+    pub fn shared_rows(&self) -> Vec<(PrimaryKey, Cell)> {
+        if !self.config.sync {
+            return Vec::new();
+        }
+        self.shared_state
+            .entries()
+            .map(|(key, cell)| (key.into_owned(), cell.into_owned()))
+            .collect()
+    }
+
+    /// Replace the canonical shared layer from a verified snapshot, then
+    /// reconstruct this device's resolved view with its existing overlays.
+    pub fn install_shared_rows(&mut self, rows: Vec<(PrimaryKey, Cell)>) -> io::Result<()> {
+        if !self.config.sync {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot install shared rows into a local table",
+            ));
+        }
+        self.shared_state.clear()?;
+        self.shared_state.bulk_put(rows)?;
+        self.shared_state.sync()?;
+        self.rebuild_resolved_from_layers()
+    }
+
+    /// Compact only the shared CRDT layer through a proven stable watermark.
+    /// Device-private overlays are intentionally untouched.
+    pub fn compact_shared_through(&mut self, watermark: Hlc) -> io::Result<usize> {
+        if !self.config.sync {
+            return Ok(0);
+        }
+        let mut changed = 0;
+        let rows: Vec<_> = self
+            .shared_state
+            .entries()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        for (key, mut cell) in rows {
+            if cell.is_tombstone() && cell.hlc <= watermark {
+                self.shared_state.delete(&key)?;
+                changed += 1;
+            } else if cell.compact(watermark).map_err(io::Error::other)? {
+                self.shared_state.put(key, cell)?;
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.shared_state.sync()?;
+            self.rebuild_resolved_from_layers()?;
+        }
+        Ok(changed)
+    }
+
     /// Apply an event, cache the resolved row, and publish real changes.
     pub fn insert_event(&mut self, event: Event) -> io::Result<()> {
-        if self.cache.size() >= self.config.max_buffered_records
-            && !self.cache.contains(&event.primary_key)
-        {
-            self.drain_cache()?;
+        if !self.config.sync {
+            return self.insert_local_table_event(event);
         }
+        if matches!(event.op, Op::SetSync { .. })
+            || !self.is_path_shared(&event.primary_key, &event.path)
+        {
+            self.insert_local_overlay_event(event)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "shared-table writes must pass through Workspace::mutate",
+            ))
+        }
+    }
 
+    pub fn is_path_shared(&self, primary_key: &PrimaryKey, path: &Path) -> bool {
+        if !self.config.sync {
+            return false;
+        }
+        !self
+            .overlays
+            .get(primary_key)
+            .is_some_and(|overlay| overlay.is_local(path))
+    }
+
+    /// Apply an event already classified and verified as shared.
+    pub fn insert_shared_event(&mut self, event: Event) -> io::Result<()> {
+        if !self.config.sync || matches!(event.op, Op::SetSync { .. }) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "event is not valid for the shared plane",
+            ));
+        }
+        self.prepare_cache(&event.primary_key)?;
+        let Some((previous, current)) = self.apply_shared_layer(&event)? else {
+            return Ok(());
+        };
+        self.append_change(event, previous, current)
+    }
+
+    /// Apply a mutation to a device-private overlay of a shared table.
+    pub fn insert_local_overlay_event(&mut self, event: Event) -> io::Result<()> {
+        if !self.config.sync {
+            return self.insert_local_table_event(event);
+        }
+        self.prepare_cache(&event.primary_key)?;
+        let Some((previous, current)) = self.apply_overlay_layer(&event)? else {
+            return Ok(());
+        };
+        self.append_change(event, previous, current)
+    }
+
+    fn insert_local_table_event(&mut self, event: Event) -> io::Result<()> {
+        self.prepare_cache(&event.primary_key)?;
         let Some((previous, current)) = self.apply_event_to_cache(&event)? else {
             return Ok(());
         };
+        self.append_change(event, previous, current)
+    }
+
+    fn prepare_cache(&mut self, primary_key: &PrimaryKey) -> io::Result<()> {
+        if self.cache.size() >= self.config.max_buffered_records
+            && !self.cache.contains(primary_key)
+        {
+            self.drain_cache()?;
+        }
+        Ok(())
+    }
+
+    fn append_change(
+        &mut self,
+        event: Event,
+        previous: Option<Cell>,
+        current: Option<Cell>,
+    ) -> io::Result<()> {
         let change = Change {
             event,
             previous,
@@ -91,6 +311,130 @@ impl Table {
         let offset = self.topic.append(&change)?;
         self.recovery.seek(offset + 1);
         Ok(())
+    }
+
+    fn apply_shared_layer(
+        &mut self,
+        event: &Event,
+    ) -> io::Result<Option<(Option<Cell>, Option<Cell>)>> {
+        let previous = Backend::get(self, &event.primary_key).map(Cow::into_owned);
+        let mut shared = self
+            .shared_state
+            .get(&event.primary_key)
+            .map(Cow::into_owned)
+            .unwrap_or_else(|| Cell::dummy(None));
+        if !shared
+            .apply_routed(&event.op, event.hlc, &event.path)
+            .map_err(io::Error::other)?
+        {
+            return Ok(None);
+        }
+        self.shared_state
+            .put(event.primary_key.clone(), shared.clone())?;
+        // A shared journal frontier may advance as soon as this method returns.
+        // Persist the shared layer first so recovery never observes an applied
+        // journal entry whose materialized state was lost in a crash.
+        self.shared_state.sync()?;
+        let resolved = self
+            .overlays
+            .get(&event.primary_key)
+            .map_or_else(|| shared.clone(), |overlay| overlay.resolve(&shared));
+        if previous.as_ref() == Some(&resolved) {
+            return Ok(None);
+        }
+        self.cache_resolved(
+            event.primary_key.clone(),
+            resolved.clone(),
+            previous.is_some(),
+        )?;
+        Ok(Some((previous, Some(resolved))))
+    }
+
+    fn apply_overlay_layer(
+        &mut self,
+        event: &Event,
+    ) -> io::Result<Option<(Option<Cell>, Option<Cell>)>> {
+        let previous = Backend::get(self, &event.primary_key).map(Cow::into_owned);
+        let shared = self
+            .shared_state
+            .get(&event.primary_key)
+            .map(Cow::into_owned)
+            .unwrap_or_else(|| Cell::dummy(None));
+        let mut overlay = self
+            .overlays
+            .get(&event.primary_key)
+            .map(Cow::into_owned)
+            .unwrap_or_default();
+        let changed = match &event.op {
+            Op::SetSync { sync } => {
+                overlay.set_boundary(event.path.clone(), &shared, *sync != Some(false))
+            }
+            _ => {
+                if !overlay.is_local(&event.path) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "local mutation is outside a local overlay boundary",
+                    ));
+                }
+                overlay.apply(event).map_err(io::Error::other)?
+            }
+        };
+        if !changed {
+            return Ok(None);
+        }
+        self.overlays
+            .put(event.primary_key.clone(), overlay.clone())?;
+        // Overlay events are intentionally absent from the shared journal, so
+        // the overlay catalog itself is their durable source of truth.
+        self.overlays.sync()?;
+        let resolved = overlay.resolve(&shared);
+        if previous.as_ref() == Some(&resolved) {
+            return Ok(None);
+        }
+        self.cache_resolved(
+            event.primary_key.clone(),
+            resolved.clone(),
+            previous.is_some(),
+        )?;
+        Ok(Some((previous, Some(resolved))))
+    }
+
+    fn cache_resolved(
+        &mut self,
+        key: PrimaryKey,
+        cell: Cell,
+        had_previous: bool,
+    ) -> io::Result<()> {
+        self.cache.put(key, (cell, had_previous))?;
+        if !had_previous {
+            self.novel_pending += 1;
+        }
+        Ok(())
+    }
+
+    fn rebuild_resolved_from_layers(&mut self) -> io::Result<()> {
+        if !self.config.sync {
+            return Ok(());
+        }
+        self.cache.clear()?;
+        self.novel_pending = 0;
+        self.state.clear()?;
+
+        let mut keys = std::collections::BTreeSet::new();
+        keys.extend(self.shared_state.entries().map(|(key, _)| key.into_owned()));
+        keys.extend(self.overlays.entries().map(|(key, _)| key.into_owned()));
+        for key in keys {
+            let Some(shared) = self.shared_state.get(&key).map(Cow::into_owned) else {
+                // An overlay cannot resurrect a row absent from the shared layer.
+                continue;
+            };
+            let resolved = self
+                .overlays
+                .get(&key)
+                .map_or_else(|| shared.clone(), |overlay| overlay.resolve(&shared));
+            self.state.put(key, resolved)?;
+        }
+        self.state.sync()
     }
 
     pub fn consumer(&self, consumer: &str) -> io::Result<TopicConsumer<Change>> {
@@ -194,11 +538,11 @@ impl Storage for Table {
 }
 
 impl DurableStorage for Table {
-    fn create(path: &Path, config: TableConfig) -> io::Result<Self> {
+    fn create(path: &FsPath, config: TableConfig) -> io::Result<Self> {
         Self::create_with_device(path, config, device_id())
     }
 
-    fn open(path: &Path, config: TableConfig) -> io::Result<Self> {
+    fn open(path: &FsPath, config: TableConfig) -> io::Result<Self> {
         Self::open_with_device(path, config, device_id())
     }
 
@@ -219,13 +563,18 @@ impl Table {
     /// Create a table with the database replica identity used for local-only
     /// subtree checks.
     pub fn create_with_device(
-        path: &Path,
+        path: &FsPath,
         config: TableConfig,
         local_device_id: DeviceId,
     ) -> io::Result<Self> {
         fs::create_dir_all(path)?;
 
         let state = State::create(&path.join("state"), config.state.clone())?;
+        let shared_state = State::create(&path.join("shared-state"), config.state.clone())?;
+        let overlays = State::create(
+            &path.join("overlays"),
+            StateConfig::Unordered(KeyDirConfig::default()),
+        )?;
         let cache = SkipList::new(SkipListConfig {
             capacity: SkipListCapacity::Bounded {
                 max_entries: config.max_buffered_records,
@@ -238,6 +587,8 @@ impl Table {
             config,
             local_device_id,
             state,
+            shared_state,
+            overlays,
             cache,
             novel_pending: 0,
             topic,
@@ -248,12 +599,18 @@ impl Table {
     /// Open a table with the database replica identity used for local-only
     /// subtree checks.
     pub fn open_with_device(
-        path: &Path,
+        path: &FsPath,
         config: TableConfig,
         local_device_id: DeviceId,
     ) -> io::Result<Self> {
         let state: State<PrimaryKey, Cell> =
             State::open(&path.join("state"), config.state.clone())?;
+        let shared_state: State<PrimaryKey, Cell> =
+            State::open(&path.join("shared-state"), config.state.clone())?;
+        let overlays: State<PrimaryKey, RowOverlay> = State::open(
+            &path.join("overlays"),
+            StateConfig::Unordered(KeyDirConfig::default()),
+        )?;
         let cache = SkipList::new(SkipListConfig {
             capacity: SkipListCapacity::Bounded {
                 max_entries: config.max_buffered_records,
@@ -266,29 +623,38 @@ impl Table {
             config,
             local_device_id,
             state,
+            shared_state,
+            overlays,
             cache,
             novel_pending: 0,
             topic,
             recovery,
         };
         table.replay_recovery()?;
+        table.rebuild_resolved_from_layers()?;
         Ok(table)
     }
 
     fn compact(&mut self) -> io::Result<()> {
         self.state.compact()?;
+        self.shared_state.compact()?;
+        self.overlays.compact()?;
         self.topic.compact()
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.drain_cache()?;
         self.state.flush()?;
+        self.shared_state.flush()?;
+        self.overlays.flush()?;
         self.topic.flush()
     }
 
     fn sync(&mut self) -> io::Result<()> {
         self.drain_cache()?;
         self.state.sync()?;
+        self.shared_state.sync()?;
+        self.overlays.sync()?;
         self.topic.sync()
     }
 }
@@ -716,7 +1082,10 @@ mod tests {
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
-    use zendb_types::{device_id, init_device_id, Hlc, Op, Path, Value};
+    use zendb_types::{
+        crdt::values::record::Record, device_id, init_device_id, Hlc, Op, Path, PathStep, Segment,
+        TypeTag, Value,
+    };
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 
@@ -765,6 +1134,159 @@ mod tests {
     fn materialize(table: &mut Table) {
         table.drain_cache().unwrap();
         table.state.flush().unwrap();
+    }
+
+    fn record_value(private: i64, shared: i64, at: Hlc) -> Value {
+        Value::Record(Record::from_fields([
+            (
+                "private".into(),
+                Cell {
+                    value: Some(Value::Int(private)),
+                    hlc: at,
+                    sync: None,
+                },
+            ),
+            (
+                "shared".into(),
+                Cell {
+                    value: Some(Value::Int(shared)),
+                    hlc: at,
+                    sync: None,
+                },
+            ),
+        ]))
+    }
+
+    fn field_path(name: &str) -> Path {
+        vec![PathStep::new(TypeTag::Record, Segment::Record(name.into()))]
+    }
+
+    fn int_field(table: &Table, key: &PrimaryKey, name: &str) -> i64 {
+        let cell = Backend::get(table, key).unwrap();
+        let Some(Value::Record(record)) = cell.value.as_ref() else {
+            panic!("expected record row")
+        };
+        let Some(Value::Int(value)) = record.get(name).and_then(|cell| cell.value.as_ref()) else {
+            panic!("expected integer field")
+        };
+        *value
+    }
+
+    #[test]
+    fn local_overlay_survives_shared_ancestor_replacement_and_reopen() {
+        let path = tmp_path("overlay_ancestor");
+        let config = TableConfig {
+            sync: true,
+            ..TableConfig::default()
+        };
+        let key = PrimaryKey::String("row".into());
+        let mut table = Table::create(&path, config.clone()).unwrap();
+        table
+            .insert_shared_event(Event {
+                table_id: "shared".into(),
+                primary_key: key.clone(),
+                path: Path::new(),
+                op: Op::Replace {
+                    value: record_value(1, 2, hlc(1)),
+                },
+                hlc: hlc(1),
+                sync: true,
+                signature: Vec::new(),
+            })
+            .unwrap();
+        table
+            .insert_local_overlay_event(Event {
+                table_id: "shared".into(),
+                primary_key: key.clone(),
+                path: field_path("private"),
+                op: Op::SetSync { sync: Some(false) },
+                hlc: hlc(2),
+                sync: false,
+                signature: Vec::new(),
+            })
+            .unwrap();
+        table
+            .insert_local_overlay_event(Event {
+                table_id: "shared".into(),
+                primary_key: key.clone(),
+                path: field_path("private"),
+                op: Op::Replace {
+                    value: Value::Int(9),
+                },
+                hlc: hlc(3),
+                sync: false,
+                signature: Vec::new(),
+            })
+            .unwrap();
+        table
+            .insert_shared_event(Event {
+                table_id: "shared".into(),
+                primary_key: key.clone(),
+                path: Path::new(),
+                op: Op::Replace {
+                    value: record_value(7, 8, hlc(4)),
+                },
+                hlc: hlc(4),
+                sync: true,
+                signature: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(int_field(&table, &key, "private"), 9);
+        assert_eq!(int_field(&table, &key, "shared"), 8);
+        table.sync().unwrap();
+        drop(table);
+
+        let table = Table::open(&path, config).unwrap();
+        assert_eq!(int_field(&table, &key, "private"), 9);
+        assert_eq!(int_field(&table, &key, "shared"), 8);
+    }
+
+    #[test]
+    fn reenabling_sync_discards_overlay_without_publishing_it() {
+        let path = tmp_path("overlay_reenable");
+        let config = TableConfig {
+            sync: true,
+            ..TableConfig::default()
+        };
+        let key = PrimaryKey::String("row".into());
+        let mut table = Table::create(&path, config).unwrap();
+        table
+            .insert_shared_event(Event {
+                table_id: "shared".into(),
+                primary_key: key.clone(),
+                path: Path::new(),
+                op: Op::Replace {
+                    value: record_value(1, 2, hlc(1)),
+                },
+                hlc: hlc(1),
+                sync: true,
+                signature: Vec::new(),
+            })
+            .unwrap();
+        for (at, op) in [
+            (2, Op::SetSync { sync: Some(false) }),
+            (
+                3,
+                Op::Replace {
+                    value: Value::Int(9),
+                },
+            ),
+            (4, Op::SetSync { sync: Some(true) }),
+        ] {
+            table
+                .insert_local_overlay_event(Event {
+                    table_id: "shared".into(),
+                    primary_key: key.clone(),
+                    path: field_path("private"),
+                    op,
+                    hlc: hlc(at),
+                    sync: false,
+                    signature: Vec::new(),
+                })
+                .unwrap();
+        }
+        assert_eq!(int_field(&table, &key, "private"), 1);
+        assert!(table.is_path_shared(&key, &field_path("private")));
     }
 
     #[test]

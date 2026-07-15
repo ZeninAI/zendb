@@ -5,9 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Replication and bootstrap protocol abstractions for ZeninDB"
+description = "Portable replication and snapshot protocol records for ZeninDB"
 
 [dependencies]
 bincode.workspace = true
 zendb-types = { path = "../zendb-types" }
-zendb-identity = { path = "../zendb-identity" }

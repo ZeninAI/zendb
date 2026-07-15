@@ -15,7 +15,7 @@
 /// # Example
 ///
 /// ```ignore
-/// define_id!(UserId);
+/// define_id!(WorkspaceId);
 /// define_id!(WorkspaceId);
 /// ```
 #[macro_export]

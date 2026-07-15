@@ -1,5 +1,10 @@
 # ZeninDB Distributed Direction: Refined Expert Design
 
+> **Status: historical exploration.** The accepted records in
+> [decisions/](decisions/) are normative. Implemented ADRs 001 through 007 and
+> 009 supersede this document. ADR 008 remains proposed. Principal/OAuth models,
+> broad transport traits, and similarly named deleted APIs below are not current.
+
 This document refines the direction in `.plan/direction.md`, `.plan/ideas.md`,
 and `.plan/in-depth-operator.md` after reviewing the repository README files and
 the current identity, transport, and sync scaffolding.

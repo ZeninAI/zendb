@@ -269,7 +269,7 @@ macro_rules! register_types {
         // =================================================================
         // Segment
         // =================================================================
-        #[derive(Debug, Clone, ::bincode::Encode, ::bincode::Decode)]
+        #[derive(Debug, Clone, PartialEq, Eq, ::bincode::Encode, ::bincode::Decode)]
         pub enum Segment {
             $($cont_var($seg_ty),)*
         }

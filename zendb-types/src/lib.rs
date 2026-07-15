@@ -3,10 +3,10 @@
 //! Core type system for ZeninDB — an embedded, local-first, eventually
 //! consistent database with first-class collaborative editing.
 //!
-//! This crate contains all shared truth types that are replicated across devices:
+//! This crate contains portable data and protocol types shared by devices:
 //! - **CRDT primitives & values**: HLC, Event, Path, Cell, collaborative types
-//! - **Identity primitives**: user/device/workspace IDs, roles, memberships
-//! - **Control plane types**: policy vocabulary and authorization contracts
+//! - **Device control**: membership, fixed roles, keys, and admission
+//! - **Control plane types**: presence, operator specifications, and leases
 //!
 //! ## Module Organization
 //!
@@ -62,20 +62,13 @@ pub use crdt::*;
 
 // Identity types
 pub use control::{
-    Action, AuthorizationContext, AuthorizationDecision, AuthorizationEvaluator,
-    CapabilityDescriptor, CapabilityInvocation, CapabilityResult, DecisionCode, DecisionEffect,
-    DeviceCapabilitySummary, JobInputRef, JobStatus, Obligation, OperatorApprovalPolicy,
-    OperatorCheckpoint, OperatorClass, OperatorCondition, OperatorDesiredState, OperatorInput,
-    OperatorJob, OperatorJobResult, OperatorLease, OperatorLeaseKey, OperatorObservation,
-    OperatorOutputPolicy, OperatorPermissionRequest, OperatorSource, OperatorSpec, OperatorTrigger,
-    PlacementMode, PlacementPolicy, PolicyRule, ResourceId, ResourceSelector, RetryPolicy,
-    RuleEffect, Sensitivity,
+    DepartureNotice, DeviceCapabilitySummary, OperatorDesiredState, OperatorEffect, OperatorInput,
+    OperatorLease, OperatorOutputFence, OperatorSource, OperatorSpec, PresenceHeartbeat,
 };
 pub use identity::{
-    CapabilityId, CheckpointId, CredentialId, DeviceId, DeviceTrust, GrantId, GuestId, InviteId,
-    JobId, KeyId, LeaseId, OperatorId, PrincipalId, ReplicaId, Role, ServiceId, UserId,
-    WorkspaceId,
+    CapabilityId, DeviceId, DeviceKeyPhase, DeviceKeyRing, DevicePublicKey, DeviceRecord,
+    DeviceRecordError, EnrollmentTicket, EnrollmentTicketId, OperatorId, SignatureBytes,
+    WorkspaceAction, WorkspaceId, WorkspaceRole,
 };
-pub use identity::{DeviceMembership, WorkspaceMembership};
 
 // TypeTag, Value, TypeOp, Segment, TypeError are generated above by register_types!

@@ -234,7 +234,7 @@ impl Workspace {
         config.device_id = device_profile.device_id();
         config.workspace_id =
             load_or_persist_workspace_id(&path.join(WORKSPACE_ID_FILE), config.workspace_id)?;
-        let control = system::WorkspaceControl::open(&path.join(TABLES_DIR), config.device_id)?;
+        let control = system::WorkspaceControl::open(&path.join(TABLES_DIR))?;
         let shared_journal =
             SharedJournal::open(&path.join(SHARED_EVENTS_FILE), &path.join(FRONTIER_FILE))?;
         info!("opening workspace at {:?}", path);

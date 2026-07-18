@@ -8,8 +8,7 @@ use std::{borrow::Cow, collections::BTreeMap, fs, io, path::Path as FsPath};
 
 use bincode::{Decode, Encode};
 use zendb_types::{
-    device_id, Cell, ContainerType, DeviceId, Event, Hlc, MergeClocks, Path, PrimaryKey,
-    SyncPolicy, SyncScope,
+    Cell, ContainerType, Event, Hlc, MergeClocks, Path, PrimaryKey, SyncPolicy, SyncScope,
 };
 
 use zendb_storage::{
@@ -51,7 +50,6 @@ pub struct TableStats {
 pub struct Table {
     config: TableConfig,
     sync_policy: SyncPolicy,
-    local_device_id: DeviceId,
     state: State<PrimaryKey, Cell>,
     cache: SkipList<PrimaryKey, (Cell, bool)>,
     novel_pending: usize,
@@ -67,18 +65,9 @@ fn cache_cell(entry: Cow<'_, (Cell, bool)>) -> Cow<'_, Cell> {
 }
 
 impl Table {
-    pub fn create_with_device(
-        path: &FsPath,
-        config: TableConfig,
-        local_device_id: DeviceId,
-    ) -> io::Result<Self> {
-        Self::create_with_policy(path, config, local_device_id, SyncPolicy::Local)
-    }
-
     pub fn create_with_policy(
         path: &FsPath,
         config: TableConfig,
-        local_device_id: DeviceId,
         sync_policy: SyncPolicy,
     ) -> io::Result<Self> {
         fs::create_dir_all(path)?;
@@ -93,7 +82,6 @@ impl Table {
         let table = Self {
             config,
             sync_policy,
-            local_device_id,
             state,
             cache,
             novel_pending: 0,
@@ -104,18 +92,9 @@ impl Table {
         Ok(table)
     }
 
-    pub fn open_with_device(
-        path: &FsPath,
-        config: TableConfig,
-        local_device_id: DeviceId,
-    ) -> io::Result<Self> {
-        Self::open_with_policy(path, config, local_device_id, SyncPolicy::Local)
-    }
-
     pub fn open_with_policy(
         path: &FsPath,
         config: TableConfig,
-        local_device_id: DeviceId,
         sync_policy: SyncPolicy,
     ) -> io::Result<Self> {
         let persisted = Self::persisted_config(path)?.ok_or_else(|| {
@@ -141,7 +120,6 @@ impl Table {
         let mut table = Self {
             config,
             sync_policy,
-            local_device_id,
             state,
             cache,
             novel_pending: 0,
@@ -188,7 +166,7 @@ impl Table {
                 "shared-table writes must pass through Workspace::mutate",
             ));
         }
-        self.apply_and_publish(event, false)
+        self.apply_and_publish(event)
     }
 
     /// Create or update a root-local row in an otherwise replicated table.
@@ -205,7 +183,7 @@ impl Table {
         let mut cell = previous.clone().unwrap_or_else(|| Cell::dummy(None));
         cell.sync = SyncPolicy::Local;
         if !cell
-            .apply_routed(&event.op, event.hlc, &event.path)
+            .apply_walk(&event.op, event.hlc, &event.path)
             .map_err(io::Error::other)?
         {
             return Ok(());
@@ -235,7 +213,7 @@ impl Table {
         if !self.is_path_shared(&event.primary_key, &event.path) {
             return Ok(());
         }
-        self.apply_and_publish(event, true)
+        self.apply_and_publish(event)
     }
 
     pub fn is_path_shared(&self, primary_key: &PrimaryKey, path: &Path) -> bool {
@@ -308,22 +286,15 @@ impl Table {
             .collect()
     }
 
-    /// Canonical Merkle root of this table's wholly shared materialized state.
+    /// Canonical Merkle root of this table's shared-state projection.
     ///
     /// The root is derived from authoritative state on demand, so it cannot
-    /// lag commits. A table containing any local boundary returns `None`
-    /// because another replica cannot be expected to have identical bytes.
+    /// lag commits. Local boundaries are omitted from the projection.
     pub fn shared_merkle_root(&self) -> io::Result<Option<[u8; 32]>> {
         if !self.table_is_shared() {
             return Ok(None);
         }
-        let rows = self.resolved_entries();
-        if rows
-            .iter()
-            .any(|(_, cell)| cell.contains_local_boundary(SyncScope::Shared))
-        {
-            return Ok(None);
-        }
+        let rows = self.shared_rows();
         let mut level: Vec<[u8; 32]> = rows
             .into_iter()
             .map(|row| {
@@ -381,16 +352,13 @@ impl Table {
         Ok(0)
     }
 
-    fn apply_and_publish(&mut self, event: Event, shared: bool) -> io::Result<()> {
+    fn apply_and_publish(&mut self, event: Event) -> io::Result<()> {
         self.prepare_cache(&event.primary_key)?;
         let previous = self.get_resolved(&event.primary_key);
         let mut cell = previous.clone().unwrap_or_else(|| Cell::dummy(None));
-        let changed = if shared {
-            cell.apply_event_from(&event, SyncScope::Shared, self.local_device_id)
-        } else {
-            cell.apply_routed(&event.op, event.hlc, &event.path)
-        }
-        .map_err(io::Error::other)?;
+        let changed = cell
+            .apply_walk(&event.op, event.hlc, &event.path)
+            .map_err(io::Error::other)?;
         if !changed {
             return Ok(());
         }
@@ -516,11 +484,11 @@ impl Storage for Table {
 
 impl DurableStorage for Table {
     fn create(path: &FsPath, config: TableConfig) -> io::Result<Self> {
-        Self::create_with_device(path, config, device_id())
+        Self::create_with_policy(path, config, SyncPolicy::Local)
     }
 
     fn open(path: &FsPath, config: TableConfig) -> io::Result<Self> {
-        Self::open_with_device(path, config, device_id())
+        Self::open_with_policy(path, config, SyncPolicy::Local)
     }
 
     fn compact(&mut self) -> io::Result<()> {
@@ -657,7 +625,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use zendb_types::{init_device_id, Op, TypeTag, Value};
+    use zendb_types::{device_id, init_device_id, Op, TypeTag, Value};
 
     use super::*;
     use zendb_storage::backend::_traits::ReadBackend;
@@ -700,13 +668,7 @@ mod tests {
 
     fn shared_table(path: &FsPath) -> Table {
         init_device_id();
-        Table::create_with_policy(
-            path,
-            TableConfig::default(),
-            device_id(),
-            SyncPolicy::Inherit,
-        )
-        .unwrap()
+        Table::create_with_policy(path, TableConfig::default(), SyncPolicy::Inherit).unwrap()
     }
 
     #[test]
@@ -745,6 +707,8 @@ mod tests {
             .set_sync_policy(&key, Path::new(), SyncPolicy::Local)
             .unwrap());
         assert!(!table.is_path_shared(&key, &Path::new()));
+        table.insert_shared_event(event("a", 3, 150)).unwrap();
+        assert_eq!(table.get(&key).unwrap().value, Some(Value::Int(1)));
         table.insert_event(event("a", 2, 200)).unwrap();
         assert!(table
             .set_sync_policy(&key, Path::new(), SyncPolicy::Inherit)
@@ -802,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn merkle_root_tracks_shared_state_and_withholds_local_boundaries() {
+    fn merkle_root_hashes_the_shared_projection() {
         let path = tmp_path("merkle-root");
         let mut table = shared_table(&path);
         let empty = table.shared_merkle_root().unwrap().unwrap();
@@ -815,7 +779,7 @@ mod tests {
                 SyncPolicy::Local,
             )
             .unwrap();
-        assert!(table.shared_merkle_root().unwrap().is_none());
+        assert_eq!(table.shared_merkle_root().unwrap(), Some(empty));
     }
 
     #[test]

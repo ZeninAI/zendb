@@ -354,7 +354,6 @@ impl Workspace {
                         Arc::new(RwLock::new(Table::open_with_policy(
                             &path,
                             persisted,
-                            self.config.device_id,
                             sync_policy,
                         )?))
                     } else {
@@ -363,7 +362,6 @@ impl Workspace {
                         Arc::new(RwLock::new(Table::create_with_policy(
                             &path,
                             effective_config,
-                            self.config.device_id,
                             sync_policy,
                         )?))
                     }
@@ -375,8 +373,7 @@ impl Workspace {
                         fs::create_dir_all(parent)?;
                     }
                     info!("creating new table {name:?}");
-                    let raw =
-                        Table::create_with_device(&path, config.clone(), self.config.device_id)?;
+                    let raw = Table::create_with_policy(&path, config.clone(), SyncPolicy::Local)?;
                     table_catalog.put_local_table(
                         name,
                         config,

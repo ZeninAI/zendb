@@ -207,12 +207,9 @@ mod tests {
     fn newer_remote_replaces_with_an_independent_clone() {
         let remote = Blob::from(vec![1, 2, 3]);
         let mut local = Blob::from(vec![9]);
-        assert!(Type::merge(
-            &mut local,
-            &remote,
-            crate::MergeClocks::new(hlc(100, 1), hlc(200, 1)),
-        )
-        .unwrap());
+        assert!(local
+            .merge(&remote, crate::MergeClocks::new(hlc(100, 1), hlc(200, 1)),)
+            .unwrap());
         assert_eq!(local, remote);
         assert_ne!(local.as_ptr(), remote.as_ptr());
     }
@@ -220,12 +217,12 @@ mod tests {
     #[test]
     fn stale_remote_blob_is_ignored() {
         let mut local = Blob::from(vec![1, 2, 3]);
-        assert!(!Type::merge(
-            &mut local,
-            &Blob::from(vec![9]),
-            crate::MergeClocks::new(hlc(200, 1), hlc(100, 2)),
-        )
-        .unwrap());
+        assert!(!local
+            .merge(
+                &Blob::from(vec![9]),
+                crate::MergeClocks::new(hlc(200, 1), hlc(100, 2)),
+            )
+            .unwrap());
         assert_eq!(local.as_slice(), &[1, 2, 3]);
     }
 

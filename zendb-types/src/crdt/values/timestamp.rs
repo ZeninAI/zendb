@@ -76,24 +76,18 @@ mod tests {
     #[test]
     fn merge_uses_write_clock_not_timestamp_value() {
         let mut local = u64::MAX;
-        assert!(Type::merge(
-            &mut local,
-            &0,
-            crate::MergeClocks::new(hlc(100, 1), hlc(200, 1)),
-        )
-        .unwrap());
+        assert!(local
+            .merge(&0, crate::MergeClocks::new(hlc(100, 1), hlc(200, 1)),)
+            .unwrap());
         assert_eq!(local, 0);
     }
 
     #[test]
     fn stale_remote_timestamp_is_ignored() {
         let mut local = 1;
-        assert!(!Type::merge(
-            &mut local,
-            &u64::MAX,
-            crate::MergeClocks::new(hlc(200, 1), hlc(100, 2)),
-        )
-        .unwrap());
+        assert!(!local
+            .merge(&u64::MAX, crate::MergeClocks::new(hlc(200, 1), hlc(100, 2)),)
+            .unwrap());
         assert_eq!(local, 1);
     }
 

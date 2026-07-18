@@ -86,42 +86,30 @@ mod tests {
     #[test]
     fn newer_remote_value_wins() {
         let mut local = false;
-        assert!(Type::merge(
-            &mut local,
-            &true,
-            crate::MergeClocks::new(hlc(100, 1), hlc(200, 2)),
-        )
-        .unwrap());
+        assert!(local
+            .merge(&true, crate::MergeClocks::new(hlc(100, 1), hlc(200, 2)),)
+            .unwrap());
         assert!(local);
     }
 
     #[test]
     fn older_and_equal_clock_values_are_ignored() {
         let mut local = true;
-        assert!(!Type::merge(
-            &mut local,
-            &false,
-            crate::MergeClocks::new(hlc(200, 2), hlc(100, 1)),
-        )
-        .unwrap());
-        assert!(!Type::merge(
-            &mut local,
-            &false,
-            crate::MergeClocks::new(hlc(200, 2), hlc(200, 2)),
-        )
-        .unwrap());
+        assert!(!local
+            .merge(&false, crate::MergeClocks::new(hlc(200, 2), hlc(100, 1)),)
+            .unwrap());
+        assert!(!local
+            .merge(&false, crate::MergeClocks::new(hlc(200, 2), hlc(200, 2)),)
+            .unwrap());
         assert!(local);
     }
 
     #[test]
     fn device_id_breaks_same_time_ties() {
         let mut local = false;
-        assert!(Type::merge(
-            &mut local,
-            &true,
-            crate::MergeClocks::new(hlc(100, 1), hlc(100, 2)),
-        )
-        .unwrap());
+        assert!(local
+            .merge(&true, crate::MergeClocks::new(hlc(100, 1), hlc(100, 2)),)
+            .unwrap());
         assert!(local);
     }
 

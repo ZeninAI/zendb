@@ -232,7 +232,7 @@ mod tests {
     }
 
     fn apply(queue: &mut PriorityQueue, op: PqOp, at: Hlc) -> Result<bool, PqError> {
-        Type::apply(queue, &op, at)
+        queue.apply(&op, at)
     }
 
     #[test]
@@ -269,8 +269,8 @@ mod tests {
         let pop = queue.pop().unwrap();
         apply(&mut queue, pop, hlc(200, 1)).unwrap();
 
-        assert!(!Type::compact(&mut queue, hlc(150, 1)).unwrap());
-        assert!(Type::compact(&mut queue, hlc(200, 1)).unwrap());
+        assert!(!queue.compact(hlc(150, 1)).unwrap());
+        assert!(queue.compact(hlc(200, 1)).unwrap());
         assert!(queue.entries.is_empty());
     }
 
@@ -415,7 +415,7 @@ mod tests {
         )
         .unwrap();
 
-        Type::merge(&mut left, &right, crate::MergeClocks::ZERO).unwrap();
+        left.merge(&right, crate::MergeClocks::ZERO).unwrap();
         let live = left.live();
         assert_eq!(live.len(), 2);
         assert_eq!(live[0].0, 3);
@@ -446,7 +446,7 @@ mod tests {
         let pop = right.pop().unwrap();
         apply(&mut right, pop, hlc(200, 2)).unwrap();
 
-        Type::merge(&mut left, &right, crate::MergeClocks::ZERO).unwrap();
+        left.merge(&right, crate::MergeClocks::ZERO).unwrap();
         assert_eq!(left.live().len(), 0);
     }
 
@@ -479,7 +479,7 @@ mod tests {
         apply(&mut left, left_pop, hlc(200, 1)).unwrap();
         apply(&mut right, right_pop, hlc(150, 2)).unwrap();
 
-        Type::merge(&mut left, &right, crate::MergeClocks::ZERO).unwrap();
+        left.merge(&right, crate::MergeClocks::ZERO).unwrap();
         assert_eq!(left.live().len(), 0);
     }
 
@@ -537,8 +537,12 @@ mod tests {
 
         let merge_order = |order: [usize; 3]| -> PriorityQueue {
             let mut merged = queues[order[0]].clone();
-            Type::merge(&mut merged, &queues[order[1]], crate::MergeClocks::ZERO).unwrap();
-            Type::merge(&mut merged, &queues[order[2]], crate::MergeClocks::ZERO).unwrap();
+            merged
+                .merge(&queues[order[1]], crate::MergeClocks::ZERO)
+                .unwrap();
+            merged
+                .merge(&queues[order[2]], crate::MergeClocks::ZERO)
+                .unwrap();
             merged
         };
 

@@ -150,19 +150,16 @@ pub trait ContainerType: Type {
     /// Mutable immediate-child lookup. This never creates state.
     fn child_mut(&mut self, segment: &Segment) -> Option<&mut Cell>;
 
-    /// Visit children until `predicate` succeeds.
-    fn any_child(&self, predicate: &mut dyn FnMut(&Cell) -> bool) -> bool;
-
     /// Resolve an existing descendant Cell without creating state.
     fn cell_at_path(&self, path: &[PathStep]) -> Option<&Cell> {
         let (step, remaining) = path.split_first()?;
-        ContainerType::cell_at_path(self.child(&step.segment)?, remaining)
+        self.child(&step.segment)?.cell_at_path(remaining)
     }
 
     /// Mutable counterpart of [`Self::cell_at_path`].
     fn cell_at_path_mut(&mut self, path: &[PathStep]) -> Option<&mut Cell> {
         let (step, remaining) = path.split_first()?;
-        ContainerType::cell_at_path_mut(self.child_mut(&step.segment)?, remaining)
+        self.child_mut(&step.segment)?.cell_at_path_mut(remaining)
     }
 
     /// Resolve the effective replication scope at a descendant path.
@@ -171,13 +168,8 @@ pub trait ContainerType: Type {
             return parent_scope;
         };
         self.child(&step.segment)
-            .map(|child| ContainerType::effective_scope_at(child, parent_scope, remaining))
+            .map(|child| child.effective_scope_at(parent_scope, remaining))
             .unwrap_or(parent_scope)
-    }
-
-    /// Return whether any descendant Cell introduces a local boundary.
-    fn contains_local_boundary(&self, parent_scope: SyncScope) -> bool {
-        self.any_child(&mut |child| child.contains_local_boundary(parent_scope))
     }
 
     /// Apply a path-targeted operation recursively.

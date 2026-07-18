@@ -444,13 +444,17 @@ mod tests {
     }
 
     fn apply(text: &mut Text, op: TextOp, at: Hlc) -> bool {
-        Type::apply(text, &op, at).unwrap()
+        text.apply(&op, at).unwrap()
     }
 
     fn merge_order(texts: &[Text; 3], order: [usize; 3]) -> Text {
         let mut merged = texts[order[0]].clone();
-        Type::merge(&mut merged, &texts[order[1]], crate::MergeClocks::ZERO).unwrap();
-        Type::merge(&mut merged, &texts[order[2]], crate::MergeClocks::ZERO).unwrap();
+        merged
+            .merge(&texts[order[1]], crate::MergeClocks::ZERO)
+            .unwrap();
+        merged
+            .merge(&texts[order[2]], crate::MergeClocks::ZERO)
+            .unwrap();
         merged
     }
 
@@ -519,8 +523,8 @@ mod tests {
 
         let mut left_first = left.clone();
         let mut right_first = right.clone();
-        Type::merge(&mut left_first, &right, crate::MergeClocks::ZERO).unwrap();
-        Type::merge(&mut right_first, &left, crate::MergeClocks::ZERO).unwrap();
+        left_first.merge(&right, crate::MergeClocks::ZERO).unwrap();
+        right_first.merge(&left, crate::MergeClocks::ZERO).unwrap();
         assert_eq!(left_first, right_first);
         assert_eq!(left_first.string(), "rightleft");
     }
@@ -576,7 +580,7 @@ mod tests {
             hlc(300, 1),
         );
 
-        assert!(Type::compact(&mut text, hlc(300, 1)).unwrap());
+        assert!(text.compact(hlc(300, 1)).unwrap());
         assert!(text.entries.contains_key(&(anchor, 0)));
         assert!(!text.entries.contains_key(&(orphan, 0)));
         assert_eq!(text.string(), "b");
@@ -661,8 +665,7 @@ mod tests {
         let snapshot = text.clone();
 
         assert!(matches!(
-            Type::apply(
-                &mut text,
+            text.apply(
                 &TextOp::Insert {
                     after: None,
                     text: "ax".into(),
@@ -751,8 +754,7 @@ mod tests {
     fn zero_clocks_and_ids_are_rejected() {
         let mut text = Text::default();
         assert!(matches!(
-            Type::apply(
-                &mut text,
+            text.apply(
                 &TextOp::Insert {
                     after: None,
                     text: "a".into(),
@@ -762,8 +764,7 @@ mod tests {
             Err(TextError::ZeroClock)
         ));
         assert!(matches!(
-            Type::apply(
-                &mut text,
+            text.apply(
                 &TextOp::Delete {
                     ids: vec![(Hlc::ZERO, 0)],
                 },
@@ -772,8 +773,7 @@ mod tests {
             Err(TextError::ZeroId)
         ));
         assert!(matches!(
-            Type::apply(
-                &mut text,
+            text.apply(
                 &TextOp::Insert {
                     after: Some((Hlc::ZERO, 0)),
                     text: "a".into(),
@@ -789,8 +789,7 @@ mod tests {
         let at = hlc(100, 1);
         let mut text = Text::default();
         assert!(matches!(
-            Type::apply(
-                &mut text,
+            text.apply(
                 &TextOp::Insert {
                     after: Some((at, 0)),
                     text: "cycle".into(),
@@ -817,8 +816,7 @@ mod tests {
         let snapshot = text.clone();
 
         assert!(matches!(
-            Type::apply(
-                &mut text,
+            text.apply(
                 &TextOp::Delete {
                     ids: vec![(insert, 0), (Hlc::ZERO, 0)],
                 },
@@ -953,7 +951,7 @@ mod tests {
         let mut removed = old.clone();
         let remove = removed.format(Some(id), None, "bold".into(), None).unwrap();
         apply(&mut removed, remove, hlc(300, 1));
-        Type::merge(&mut removed, &old, crate::MergeClocks::ZERO).unwrap();
+        removed.merge(&old, crate::MergeClocks::ZERO).unwrap();
 
         assert!(!removed.format_at(0).unwrap().contains_key("bold"));
     }
@@ -1061,7 +1059,7 @@ mod tests {
             .unwrap();
         apply(&mut right, italic, hlc(200, 2));
 
-        Type::merge(&mut left, &right, crate::MergeClocks::ZERO).unwrap();
+        left.merge(&right, crate::MergeClocks::ZERO).unwrap();
         assert!(left.format_at(0).unwrap().contains_key("bold"));
         assert!(!left.format_at(0).unwrap().contains_key("italic"));
         assert!(!left.format_at(1).unwrap().contains_key("bold"));
@@ -1117,7 +1115,7 @@ mod tests {
             hlc(150, 2),
         );
 
-        Type::merge(&mut left, &right, crate::MergeClocks::ZERO).unwrap();
+        left.merge(&right, crate::MergeClocks::ZERO).unwrap();
         assert_eq!(left.string(), "abz");
         // 'a' and 'z' still bold; 'b' has no formatting (insert didn't carry it).
         assert!(left.format_at(0).unwrap().contains_key("bold"));

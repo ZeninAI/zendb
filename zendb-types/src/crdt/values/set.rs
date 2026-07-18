@@ -51,8 +51,7 @@ impl<T: CellCodecKey + Ord> CrdtCodec for SetCodec<T> {
     fn encode(values: &BTreeSet<T>, hlc: Hlc) -> Value {
         let mut set = Set::default();
         for value in values {
-            Type::apply(
-                &mut set,
+            set.apply(
                 &SetOp::Add {
                     key: value.to_primary_key(),
                 },
@@ -180,13 +179,17 @@ mod tests {
     }
 
     fn apply(set: &mut Set, op: SetOp, at: Hlc) -> bool {
-        Type::apply(set, &op, at).unwrap()
+        set.apply(&op, at).unwrap()
     }
 
     fn merge_order(sets: &[Set; 3], order: [usize; 3]) -> Set {
         let mut merged = sets[order[0]].clone();
-        Type::merge(&mut merged, &sets[order[1]], crate::MergeClocks::ZERO).unwrap();
-        Type::merge(&mut merged, &sets[order[2]], crate::MergeClocks::ZERO).unwrap();
+        merged
+            .merge(&sets[order[1]], crate::MergeClocks::ZERO)
+            .unwrap();
+        merged
+            .merge(&sets[order[2]], crate::MergeClocks::ZERO)
+            .unwrap();
         merged
     }
 
@@ -223,8 +226,8 @@ mod tests {
         apply(&mut set, SetOp::Add { key: key.clone() }, hlc(100, 1));
         apply(&mut set, SetOp::Remove { key: key.clone() }, hlc(200, 1));
 
-        assert!(!Type::compact(&mut set, hlc(150, 1)).unwrap());
-        assert!(Type::compact(&mut set, hlc(200, 1)).unwrap());
+        assert!(!set.compact(hlc(150, 1)).unwrap());
+        assert!(set.compact(hlc(200, 1)).unwrap());
         assert!(set.entries.is_empty());
     }
 

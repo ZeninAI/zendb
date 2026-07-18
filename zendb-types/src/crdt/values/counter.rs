@@ -137,7 +137,7 @@ mod tests {
     }
 
     fn apply(counter: &mut Counter, op: CounterOp, at: Hlc) -> bool {
-        Type::apply(counter, &op, at).unwrap()
+        counter.apply(&op, at).unwrap()
     }
 
     #[test]
@@ -156,7 +156,7 @@ mod tests {
         apply(&mut left, CounterOp::Increment(-5), hlc(100, 1));
         apply(&mut right, CounterOp::Decrement(-3), hlc(100, 2));
 
-        Type::merge(&mut left, &right, crate::MergeClocks::ZERO).unwrap();
+        left.merge(&right, crate::MergeClocks::ZERO).unwrap();
         assert_eq!(left.value(), -2);
     }
 
@@ -168,7 +168,7 @@ mod tests {
         apply(&mut a, CounterOp::Increment(10), hlc(100, 1));
         apply(&mut b, CounterOp::Increment(20), hlc(100, 2));
 
-        Type::merge(&mut a, &b, crate::MergeClocks::ZERO).unwrap();
+        a.merge(&b, crate::MergeClocks::ZERO).unwrap();
         assert_eq!(a.value(), 30);
     }
 
@@ -180,7 +180,7 @@ mod tests {
         apply(&mut a, CounterOp::Increment(100), hlc(100, 1));
         apply(&mut b, CounterOp::Decrement(30), hlc(100, 2));
 
-        Type::merge(&mut a, &b, crate::MergeClocks::ZERO).unwrap();
+        a.merge(&b, crate::MergeClocks::ZERO).unwrap();
         assert_eq!(a.value(), 70);
     }
 
@@ -191,7 +191,7 @@ mod tests {
         apply(&mut a, CounterOp::Decrement(2), hlc(101, 1));
 
         let snapshot = a.clone();
-        assert!(!Type::merge(&mut a, &snapshot, crate::MergeClocks::ZERO).unwrap());
+        assert!(!a.merge(&snapshot, crate::MergeClocks::ZERO).unwrap());
         assert_eq!(a, snapshot);
     }
 
@@ -204,10 +204,10 @@ mod tests {
         apply(&mut y, CounterOp::Increment(3), hlc(100, 2));
 
         let mut x_first = x.clone();
-        Type::merge(&mut x_first, &y, crate::MergeClocks::ZERO).unwrap();
+        x_first.merge(&y, crate::MergeClocks::ZERO).unwrap();
 
         let mut y_first = y.clone();
-        Type::merge(&mut y_first, &x, crate::MergeClocks::ZERO).unwrap();
+        y_first.merge(&x, crate::MergeClocks::ZERO).unwrap();
 
         assert_eq!(x_first, y_first);
         assert_eq!(x_first.value(), -1);
@@ -222,8 +222,12 @@ mod tests {
 
         let merge_order = |order: [usize; 3]| -> Counter {
             let mut merged = counters[order[0]].clone();
-            Type::merge(&mut merged, &counters[order[1]], crate::MergeClocks::ZERO).unwrap();
-            Type::merge(&mut merged, &counters[order[2]], crate::MergeClocks::ZERO).unwrap();
+            merged
+                .merge(&counters[order[1]], crate::MergeClocks::ZERO)
+                .unwrap();
+            merged
+                .merge(&counters[order[2]], crate::MergeClocks::ZERO)
+                .unwrap();
             merged
         };
 

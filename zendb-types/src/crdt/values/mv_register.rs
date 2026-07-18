@@ -174,7 +174,7 @@ mod tests {
 
     fn apply(reg: &mut MvRegister, value: Value, at: Hlc) -> bool {
         let op = reg.assign(value);
-        Type::apply(reg, &op, at).unwrap()
+        reg.apply(&op, at).unwrap()
     }
 
     #[test]
@@ -206,7 +206,7 @@ mod tests {
         let mut right = MvRegister::default();
         apply(&mut left, val(1), hlc(100, 1));
         apply(&mut right, val(2), hlc(200, 2));
-        Type::merge(&mut left, &right, crate::MergeClocks::ZERO).unwrap();
+        left.merge(&right, crate::MergeClocks::ZERO).unwrap();
 
         let values = left.values();
         assert_eq!(values.len(), 2);
@@ -221,7 +221,7 @@ mod tests {
         apply(&mut left, val(10), hlc(100, 1));
         apply(&mut right, val(20), hlc(100, 2));
 
-        Type::merge(&mut left, &right, crate::MergeClocks::ZERO).unwrap();
+        left.merge(&right, crate::MergeClocks::ZERO).unwrap();
         let values = left.values();
         assert_eq!(values.len(), 2);
     }
@@ -233,7 +233,7 @@ mod tests {
         let mut right = left.clone();
         apply(&mut right, val(2), hlc(200, 1));
 
-        Type::merge(&mut left, &right, crate::MergeClocks::ZERO).unwrap();
+        left.merge(&right, crate::MergeClocks::ZERO).unwrap();
         assert_eq!(left.values(), vec![&val(2)]);
     }
 
@@ -251,12 +251,14 @@ mod tests {
         };
 
         let mut original_first = MvRegister::default();
-        Type::apply(&mut original_first, &original, original_id).unwrap();
-        Type::apply(&mut original_first, &replacement, replacement_id).unwrap();
+        original_first.apply(&original, original_id).unwrap();
+        original_first.apply(&replacement, replacement_id).unwrap();
 
         let mut replacement_first = MvRegister::default();
-        Type::apply(&mut replacement_first, &replacement, replacement_id).unwrap();
-        Type::apply(&mut replacement_first, &original, original_id).unwrap();
+        replacement_first
+            .apply(&replacement, replacement_id)
+            .unwrap();
+        replacement_first.apply(&original, original_id).unwrap();
 
         assert_eq!(original_first, replacement_first);
         assert_eq!(original_first.values(), vec![&val(2)]);
@@ -275,8 +277,12 @@ mod tests {
 
         let merge_order = |order: [usize; 3]| -> MvRegister {
             let mut merged = regs[order[0]].clone();
-            Type::merge(&mut merged, &regs[order[1]], crate::MergeClocks::ZERO).unwrap();
-            Type::merge(&mut merged, &regs[order[2]], crate::MergeClocks::ZERO).unwrap();
+            merged
+                .merge(&regs[order[1]], crate::MergeClocks::ZERO)
+                .unwrap();
+            merged
+                .merge(&regs[order[2]], crate::MergeClocks::ZERO)
+                .unwrap();
             merged
         };
 
@@ -293,7 +299,7 @@ mod tests {
         let mut concurrent = MvRegister::default();
         apply(&mut reg, val(1), hlc(100, 1));
         apply(&mut concurrent, val(2), hlc(100, 2));
-        Type::merge(&mut reg, &concurrent, crate::MergeClocks::ZERO).unwrap();
+        reg.merge(&concurrent, crate::MergeClocks::ZERO).unwrap();
         apply(&mut reg, val(99), hlc(200, 1));
 
         assert_eq!(reg.values(), vec![&val(99)]);

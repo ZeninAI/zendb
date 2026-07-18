@@ -192,13 +192,13 @@ macro_rules! register_types {
                 match (self, remote) {
                     $(
                         (Value::$leaf_var(l), Value::$leaf_var(r)) => {
-                            $crate::Type::merge(l, r, clocks)
+                            l.merge(r, clocks)
                                 .map_err(TypeError::$leaf_var)
                         }
                     )*
                     $(
                         (Value::$cont_var(l), Value::$cont_var(r)) => {
-                            $crate::Type::merge(l, r, clocks)
+                            l.merge(r, clocks)
                                 .map_err(TypeError::$cont_var)
                         }
                     )*
@@ -230,9 +230,7 @@ macro_rules! register_types {
         impl $crate::ContainerType for Value {
             fn child(&self, segment: &$crate::Segment) -> Option<&$crate::Cell> {
                 match self {
-                    $(Value::$cont_var(value) => {
-                        $crate::ContainerType::child(value, segment)
-                    },)*
+                    $(Value::$cont_var(value) => value.child(segment),)*
                     _ => None,
                 }
             }
@@ -242,22 +240,41 @@ macro_rules! register_types {
                 segment: &$crate::Segment,
             ) -> Option<&mut $crate::Cell> {
                 match self {
-                    $(Value::$cont_var(value) => {
-                        $crate::ContainerType::child_mut(value, segment)
-                    },)*
+                    $(Value::$cont_var(value) => value.child_mut(segment),)*
                     _ => None,
                 }
             }
 
-            fn any_child(
+            fn cell_at_path(
                 &self,
-                predicate: &mut dyn FnMut(&$crate::Cell) -> bool,
-            ) -> bool {
+                path: &[$crate::PathStep],
+            ) -> Option<&$crate::Cell> {
+                match self {
+                    $(Value::$cont_var(value) => value.cell_at_path(path),)*
+                    _ => None,
+                }
+            }
+
+            fn cell_at_path_mut(
+                &mut self,
+                path: &[$crate::PathStep],
+            ) -> Option<&mut $crate::Cell> {
+                match self {
+                    $(Value::$cont_var(value) => value.cell_at_path_mut(path),)*
+                    _ => None,
+                }
+            }
+
+            fn effective_scope_at(
+                &self,
+                parent_scope: $crate::SyncScope,
+                path: &[$crate::PathStep],
+            ) -> $crate::SyncScope {
                 match self {
                     $(Value::$cont_var(value) => {
-                        $crate::ContainerType::any_child(value, predicate)
+                        value.effective_scope_at(parent_scope, path)
                     },)*
-                    _ => false,
+                    _ => parent_scope,
                 }
             }
 
@@ -269,7 +286,7 @@ macro_rules! register_types {
             ) -> Result<bool, TypeError> {
                 match self {
                     $(Value::$cont_var(v) => {
-                        $crate::ContainerType::apply_walk(v, op, op_hlc, path)
+                        v.apply_walk(op, op_hlc, path)
                             .map_err(TypeError::$cont_var)
                     },)*
                     _ => Ok(false),
@@ -285,18 +302,13 @@ macro_rules! register_types {
                 match (self, remote) {
                     $(
                         (Value::$leaf_var(local), Value::$leaf_var(remote)) => {
-                            $crate::Type::merge(local, remote, clocks)
+                            local.merge(remote, clocks)
                                 .map_err(TypeError::$leaf_var)
                         }
                     )*
                     $(
                         (Value::$cont_var(local), Value::$cont_var(remote)) => {
-                            $crate::ContainerType::merge_shared(
-                                local,
-                                remote,
-                                clocks,
-                                parent_scope,
-                            )
+                            local.merge_shared(remote, clocks, parent_scope)
                             .map_err(TypeError::$cont_var)
                         }
                     )*
@@ -314,7 +326,7 @@ macro_rules! register_types {
                 match self {
                     $(Value::$leaf_var(value) => Some(Value::$leaf_var(value.clone())),)*
                     $(Value::$cont_var(value) => {
-                        $crate::ContainerType::shared_clone(value, parent_scope)
+                        value.shared_clone(parent_scope)
                             .map(Value::$cont_var)
                     },)*
                 }

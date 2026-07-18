@@ -58,19 +58,16 @@ impl WorkspaceControl {
             catalog: Table::create_with_policy(
                 &tables_path.join(CATALOG_TABLE),
                 system_config.clone(),
-                local_device_id,
                 SyncPolicy::Inherit,
             )?,
             devices: Table::create_with_policy(
                 &tables_path.join(DEVICES_TABLE),
                 system_config.clone(),
-                local_device_id,
                 SyncPolicy::Inherit,
             )?,
             tickets: Table::create_with_policy(
                 &tables_path.join(TICKETS_TABLE),
                 system_config.clone(),
-                local_device_id,
                 SyncPolicy::Inherit,
             )?,
         };
@@ -91,25 +88,22 @@ impl WorkspaceControl {
         Ok(control)
     }
 
-    pub(crate) fn open(tables_path: &FsPath, local_device_id: DeviceId) -> io::Result<Self> {
+    pub(crate) fn open(tables_path: &FsPath) -> io::Result<Self> {
         let config = system_table_config();
         Ok(Self {
             catalog: Table::open_with_policy(
                 &tables_path.join(CATALOG_TABLE),
                 config.clone(),
-                local_device_id,
                 SyncPolicy::Inherit,
             )?,
             devices: Table::open_with_policy(
                 &tables_path.join(DEVICES_TABLE),
                 config.clone(),
-                local_device_id,
                 SyncPolicy::Inherit,
             )?,
             tickets: Table::open_with_policy(
                 &tables_path.join(TICKETS_TABLE),
                 config,
-                local_device_id,
                 SyncPolicy::Inherit,
             )?,
         })

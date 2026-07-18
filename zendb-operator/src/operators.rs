@@ -4,7 +4,7 @@ use std::{io, sync::Arc};
 
 use log::{debug, info, trace};
 use zendb_replication::{Table, TableConfig};
-use zendb_storage::backend::_traits::{ReadBackend, WriteBackend};
+use zendb_storage::backend::_traits::{DurableStorage, ReadBackend, WriteBackend};
 
 use crate::{
     operator::{
@@ -264,7 +264,7 @@ where
                     })
             } else {
                 let path = self.workspace.path().join(TABLES_DIR).join(&table_name);
-                Table::open_with_device(&path, config, self.workspace.device_id())
+                Table::open(&path, config)
                     .and_then(|table| table.consumer(name).and_then(|consumer| consumer.delete()))
             };
             if let Err(error) = result {

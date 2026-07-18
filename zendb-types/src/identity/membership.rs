@@ -186,7 +186,7 @@ mod tests {
             )]),
         };
 
-        let cell = crate::CellCodec::to_cell(&record, hlc);
+        let cell = record.to_cell(hlc);
         let Value::Record(encoded) = cell.value.as_ref().expect("encoded device is live") else {
             panic!("encoded device is a record");
         };

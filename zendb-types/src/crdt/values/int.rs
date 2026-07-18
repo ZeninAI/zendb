@@ -134,36 +134,27 @@ mod tests {
     #[test]
     fn newer_remote_replaces_regardless_of_numeric_order() {
         let mut local = i64::MAX;
-        assert!(Type::merge(
-            &mut local,
-            &i64::MIN,
-            crate::MergeClocks::new(hlc(100, 1), hlc(200, 1)),
-        )
-        .unwrap());
+        assert!(local
+            .merge(&i64::MIN, crate::MergeClocks::new(hlc(100, 1), hlc(200, 1)),)
+            .unwrap());
         assert_eq!(local, i64::MIN);
     }
 
     #[test]
     fn stale_remote_cannot_replace_local() {
         let mut local: Int = -10;
-        assert!(!Type::merge(
-            &mut local,
-            &100_i64,
-            crate::MergeClocks::new(hlc(200, 1), hlc(100, 2)),
-        )
-        .unwrap());
+        assert!(!local
+            .merge(&100_i64, crate::MergeClocks::new(hlc(200, 1), hlc(100, 2)),)
+            .unwrap());
         assert_eq!(local, -10);
     }
 
     #[test]
     fn merging_same_state_and_clock_is_idempotent() {
         let mut local: Int = 42;
-        assert!(!Type::merge(
-            &mut local,
-            &42_i64,
-            crate::MergeClocks::new(hlc(100, 1), hlc(100, 1)),
-        )
-        .unwrap());
+        assert!(!local
+            .merge(&42_i64, crate::MergeClocks::new(hlc(100, 1), hlc(100, 1)),)
+            .unwrap());
         assert_eq!(local, 42);
     }
 

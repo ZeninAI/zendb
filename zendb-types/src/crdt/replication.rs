@@ -190,7 +190,7 @@ pub fn stable_frontier<'a>(
     stable
 }
 
-/// Derive the scalar watermark consumed by `Type::compact` from a stable
+/// Derive the scalar watermark consumed by CRDT compaction from a stable
 /// frontier and journal lookup. Missing origin history yields no watermark.
 pub fn compaction_watermark(
     stable: &ContiguousFrontier,

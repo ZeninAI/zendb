@@ -85,7 +85,8 @@ impl Type for Record {
         for (field_name, remote_cell) in &remote.fields {
             match self.fields.get_mut(field_name) {
                 Some(local_cell) => {
-                    if Type::merge(local_cell, remote_cell, MergeClocks::ZERO)
+                    if local_cell
+                        .merge(remote_cell, MergeClocks::ZERO)
                         .map_err(|error| RecordError::Child(Box::new(error)))?
                     {
                         changed = true;
@@ -114,7 +115,8 @@ impl Type for Record {
             changed = true;
         }
         for child in self.fields.values_mut() {
-            if Type::compact(child, watermark)
+            if child
+                .compact(watermark)
                 .map_err(|error| RecordError::Child(Box::new(error)))?
             {
                 changed = true;
@@ -124,9 +126,9 @@ impl Type for Record {
     }
 
     fn max_hlc(&self) -> Hlc {
-        self.fields.values().fold(Hlc::ZERO, |max, cell| {
-            std::cmp::max(max, Type::max_hlc(cell))
-        })
+        self.fields
+            .values()
+            .fold(Hlc::ZERO, |max, cell| std::cmp::max(max, cell.max_hlc()))
     }
 }
 
@@ -143,10 +145,6 @@ impl ContainerType for Record {
             return None;
         };
         self.fields.get_mut(field)
-    }
-
-    fn any_child(&self, predicate: &mut dyn FnMut(&Cell) -> bool) -> bool {
-        self.fields.values().any(predicate)
     }
 
     fn apply_walk(&mut self, op: &Op, op_hlc: Hlc, path: &[PathStep]) -> Result<bool, RecordError> {
@@ -187,13 +185,9 @@ impl ContainerType for Record {
         for (name, remote_cell) in &remote.fields {
             match self.fields.get_mut(name) {
                 Some(local_cell) => {
-                    changed |= ContainerType::merge_shared(
-                        local_cell,
-                        remote_cell,
-                        MergeClocks::ZERO,
-                        parent_scope,
-                    )
-                    .map_err(|error| RecordError::Child(Box::new(error)))?;
+                    changed |= local_cell
+                        .merge_shared(remote_cell, MergeClocks::ZERO, parent_scope)
+                        .map_err(|error| RecordError::Child(Box::new(error)))?;
                 }
                 None => {
                     self.fields.insert(name.clone(), remote_cell.clone());
@@ -242,8 +236,12 @@ mod tests {
 
     fn merge_order(records: &[Record; 3], order: [usize; 3]) -> Record {
         let mut merged = records[order[0]].clone();
-        Type::merge(&mut merged, &records[order[1]], crate::MergeClocks::ZERO).unwrap();
-        Type::merge(&mut merged, &records[order[2]], crate::MergeClocks::ZERO).unwrap();
+        merged
+            .merge(&records[order[1]], crate::MergeClocks::ZERO)
+            .unwrap();
+        merged
+            .merge(&records[order[2]], crate::MergeClocks::ZERO)
+            .unwrap();
         merged
     }
 
@@ -259,8 +257,9 @@ mod tests {
             "x".into(),
             cell(Some(Value::Int(2)), hlc(200), crate::SyncPolicy::Inherit),
         );
-        let changed =
-            Type::merge(&mut local, &remote, MergeClocks::new(hlc(100), hlc(200))).unwrap();
+        let changed = local
+            .merge(&remote, MergeClocks::new(hlc(100), hlc(200)))
+            .unwrap();
         assert!(changed);
         assert!(local.get("x").is_some_and(|cell| !cell.is_tombstone()));
     }
@@ -280,15 +279,15 @@ mod tests {
             PathStep::new(TypeTag::Record, Segment::Record("leaf".into())),
         ];
 
-        assert!(ContainerType::apply_walk(
-            &mut state,
-            &Op::Replace {
-                value: Value::Int(1),
-            },
-            hlc(200),
-            &path,
-        )
-        .unwrap());
+        assert!(state
+            .apply_walk(
+                &Op::Replace {
+                    value: Value::Int(1),
+                },
+                hlc(200),
+                &path,
+            )
+            .unwrap());
 
         let Some(Value::Record(nested)) = &state.get("nested").unwrap().value else {
             panic!("expected healed record");
@@ -311,15 +310,15 @@ mod tests {
             PathStep::new(TypeTag::Record, Segment::Record("leaf".into())),
         ];
 
-        assert!(!ContainerType::apply_walk(
-            &mut state,
-            &Op::Replace {
-                value: Value::Int(1),
-            },
-            hlc(100),
-            &path,
-        )
-        .unwrap());
+        assert!(!state
+            .apply_walk(
+                &Op::Replace {
+                    value: Value::Int(1),
+                },
+                hlc(100),
+                &path,
+            )
+            .unwrap());
         assert_eq!(
             state.get("nested").unwrap().value,
             Some(Value::String("newer".into()))
@@ -335,8 +334,9 @@ mod tests {
         );
         let mut remote = Record::default();
         remote.insert("x".into(), cell(None, hlc(200), crate::SyncPolicy::Inherit));
-        let changed =
-            Type::merge(&mut local, &remote, MergeClocks::new(hlc(100), hlc(200))).unwrap();
+        let changed = local
+            .merge(&remote, MergeClocks::new(hlc(100), hlc(200)))
+            .unwrap();
         assert!(changed);
         assert!(local.get("x").is_none_or(Cell::is_tombstone));
     }
@@ -359,7 +359,7 @@ mod tests {
         ]);
         let snapshot = local.clone();
 
-        assert!(!Type::merge(&mut local, &snapshot, crate::MergeClocks::ZERO).unwrap());
+        assert!(!local.merge(&snapshot, crate::MergeClocks::ZERO).unwrap());
         assert_eq!(local, snapshot);
     }
 
@@ -403,9 +403,9 @@ mod tests {
         ]);
 
         let mut left_first = left.clone();
-        Type::merge(&mut left_first, &right, crate::MergeClocks::ZERO).unwrap();
+        left_first.merge(&right, crate::MergeClocks::ZERO).unwrap();
         let mut right_first = right;
-        Type::merge(&mut right_first, &left, crate::MergeClocks::ZERO).unwrap();
+        right_first.merge(&left, crate::MergeClocks::ZERO).unwrap();
 
         assert_eq!(left_first, right_first);
         assert_eq!(left_first.get("shared").unwrap().value, Some(Value::Int(2)));
@@ -495,7 +495,7 @@ mod tests {
             ),
         )]);
 
-        assert!(Type::merge(&mut left, &right, crate::MergeClocks::ZERO).unwrap());
+        assert!(left.merge(&right, crate::MergeClocks::ZERO).unwrap());
         let Some(Value::Record(nested)) = &left.get("nested").unwrap().value else {
             panic!("expected nested record");
         };
@@ -548,7 +548,7 @@ mod tests {
             ),
         ]);
 
-        assert!(Type::compact(&mut record, hlc(200)).unwrap());
+        assert!(record.compact(hlc(200)).unwrap());
         assert!(!record.contains("dead"));
         assert!(record.contains("future"));
         let Some(Value::Record(nested)) = &record.get("nested").unwrap().value else {

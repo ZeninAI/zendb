@@ -51,8 +51,7 @@ impl<T: CellCodecKey + Ord> CrdtCodec for OrSetCodec<T> {
     fn encode(values: &BTreeSet<T>, hlc: Hlc) -> Value {
         let mut set = OrSet::default();
         for value in values {
-            Type::apply(
-                &mut set,
+            set.apply(
                 &OrSetOp::Add {
                     key: value.to_primary_key(),
                 },
@@ -230,7 +229,7 @@ mod tests {
     }
 
     fn apply(set: &mut OrSet, op: OrSetOp, at: Hlc) -> bool {
-        Type::apply(set, &op, at).unwrap()
+        set.apply(&op, at).unwrap()
     }
 
     #[test]
@@ -259,7 +258,7 @@ mod tests {
         let remove = set.remove(key.clone());
         apply(&mut set, remove, hlc(200, 1));
 
-        assert!(Type::compact(&mut set, hlc(200, 1)).unwrap());
+        assert!(set.compact(hlc(200, 1)).unwrap());
         assert!(set.entries.is_empty());
     }
 
@@ -292,8 +291,8 @@ mod tests {
         let remove = set.remove(key.clone());
         apply(&mut set, remove, hlc(300, 2));
 
-        assert!(!Type::compact(&mut set, hlc(200, 1)).unwrap());
-        assert!(Type::compact(&mut set, hlc(300, 2)).unwrap());
+        assert!(!set.compact(hlc(200, 1)).unwrap());
+        assert!(set.compact(hlc(300, 2)).unwrap());
     }
 
     #[test]
@@ -306,7 +305,7 @@ mod tests {
         let remove = right.remove(key.clone());
         apply(&mut right, remove, hlc(100, 2));
 
-        Type::merge(&mut left, &right, crate::MergeClocks::ZERO).unwrap();
+        left.merge(&right, crate::MergeClocks::ZERO).unwrap();
         // The Add at hlc(100,1) was not observed by the Remove at hlc(100,2),
         // so the element survives.
         assert!(left.contains(&key));
@@ -383,8 +382,12 @@ mod tests {
 
         let merge_order = |order: [usize; 3]| -> OrSet {
             let mut merged = sets[order[0]].clone();
-            Type::merge(&mut merged, &sets[order[1]], crate::MergeClocks::ZERO).unwrap();
-            Type::merge(&mut merged, &sets[order[2]], crate::MergeClocks::ZERO).unwrap();
+            merged
+                .merge(&sets[order[1]], crate::MergeClocks::ZERO)
+                .unwrap();
+            merged
+                .merge(&sets[order[2]], crate::MergeClocks::ZERO)
+                .unwrap();
             merged
         };
 

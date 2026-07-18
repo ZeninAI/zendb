@@ -52,17 +52,6 @@ impl Cell {
         true
     }
 
-    /// Apply an already-routed operation. This bypasses sync classification and
-    /// is used after the owning table has classified a mutation as local.
-    pub fn apply_routed(
-        &mut self,
-        op: &Op,
-        op_hlc: Hlc,
-        path: &[PathStep],
-    ) -> Result<bool, TypeError> {
-        self.apply_walk(op, op_hlc, path)
-    }
-
     /// Ensure this cell contains `expected`, replacing stale state when the
     /// incoming operation is newer than all state currently below this cell.
     pub(crate) fn ensure_type(&mut self, expected: TypeTag, op_hlc: Hlc) -> bool {
@@ -77,56 +66,6 @@ impl Cell {
         }
 
         false
-    }
-
-    /// Apply an event to this cell. Returns true if state was modified.
-    ///
-    /// `parent_scope` is the effective routing scope inherited from the
-    /// owning table.
-    /// The nearest explicit Cell flag on the target path overrides it.
-    ///
-    /// This direct-apply path filters remote writes to local targets and
-    /// conservatively rejects an ancestor replacement that would erase local
-    /// descendants in the single physical Cell tree.
-    pub fn apply_event(
-        &mut self,
-        event: &crate::Event,
-        parent_scope: SyncScope,
-    ) -> Result<bool, TypeError> {
-        self.apply_event_from(event, parent_scope, crate::device_id())
-    }
-
-    /// Apply an event using the actual local replica identity. The two-argument
-    /// method above remains a convenience fallback for low-level callers, but
-    /// database-backed tables should always use this explicit form.
-    pub fn apply_event_from(
-        &mut self,
-        event: &crate::Event,
-        parent_scope: SyncScope,
-        local_device_id: crate::DeviceId,
-    ) -> Result<bool, TypeError> {
-        if event.hlc.device_id() != local_device_id {
-            if !self
-                .effective_scope_at(parent_scope, &event.path)
-                .is_shared()
-            {
-                return Ok(false);
-            }
-            if let Some(target) = self.cell_at_path(&event.path) {
-                let replaces_subtree = match &event.op {
-                    Op::Delete | Op::Replace { .. } | Op::Merge { .. } => true,
-                    Op::Type(op) => target.type_tag() != Some(op.type_tag()),
-                };
-                // With one physical tree, accepting an ancestor replacement
-                // would erase local descendants. Keep the replicated event in
-                // history and defer this branch to state reconciliation.
-                if replaces_subtree && target.contains_local_boundary(SyncScope::Shared) {
-                    return Ok(false);
-                }
-            }
-        }
-
-        self.apply_walk(&event.op, event.hlc, &event.path)
     }
 }
 
@@ -171,7 +110,7 @@ impl Type for Cell {
                 self.hlc = op_hlc;
                 true
             }
-            Op::Merge { cell } => Type::merge(self, cell, MergeClocks::ZERO)?,
+            Op::Merge { cell } => self.merge(cell, MergeClocks::ZERO)?,
         };
         Ok(changed)
     }
@@ -244,12 +183,6 @@ impl ContainerType for Cell {
             .and_then(|value| value.child_mut(segment))
     }
 
-    fn any_child(&self, predicate: &mut dyn FnMut(&Cell) -> bool) -> bool {
-        self.value
-            .as_ref()
-            .is_some_and(|value| value.any_child(predicate))
-    }
-
     fn cell_at_path(&self, path: &[PathStep]) -> Option<&Cell> {
         if path.is_empty() {
             return Some(self);
@@ -289,16 +222,6 @@ impl ContainerType for Cell {
             .unwrap_or(effective_scope)
     }
 
-    fn contains_local_boundary(&self, parent_scope: SyncScope) -> bool {
-        let effective_scope = self.sync.resolve(parent_scope);
-        if !effective_scope.is_shared() {
-            return true;
-        }
-        self.value
-            .as_ref()
-            .is_some_and(|value| value.contains_local_boundary(effective_scope))
-    }
-
     fn merge_shared(
         &mut self,
         remote: &Self,
@@ -324,10 +247,7 @@ impl ContainerType for Cell {
             }
         }
 
-        if self.contains_local_boundary(parent_scope) {
-            return Ok(false);
-        }
-        Type::merge(self, remote, MergeClocks::ZERO)
+        self.merge(remote, MergeClocks::ZERO)
     }
 
     fn shared_clone(&self, parent_scope: SyncScope) -> Option<Self> {
@@ -351,7 +271,7 @@ impl ContainerType for Cell {
 mod tests {
     use super::*;
     use crate::crdt::values::record::Record;
-    use crate::{Path, PathStep, PrimaryKey, Segment};
+    use crate::{PathStep, Segment};
     use bincode::{config, decode_from_slice, encode_to_vec};
 
     fn hlc(ms: u64) -> Hlc {
@@ -360,28 +280,6 @@ mod tests {
 
     fn cell(value: Option<Value>, hlc: Hlc, sync: SyncPolicy) -> Cell {
         Cell { value, hlc, sync }
-    }
-
-    fn local_hlc(ms: u64) -> Hlc {
-        crate::init_device_id();
-        Hlc::with_device_id(ms, 0, crate::device_id()).unwrap()
-    }
-
-    fn remote_hlc(ms: u64) -> Hlc {
-        crate::init_device_id();
-        let mut remote = crate::device_id();
-        remote.0[0] ^= u8::MAX;
-        Hlc::with_device_id(ms, 0, remote).unwrap()
-    }
-
-    fn event(path: Path, op: Op, hlc: Hlc) -> crate::Event {
-        crate::Event {
-            table_id: "test".into(),
-            primary_key: PrimaryKey::String("pk".into()),
-            path,
-            op,
-            hlc,
-        }
     }
 
     #[test]
@@ -398,6 +296,19 @@ mod tests {
         assert!(cell.is_dummy());
         assert!(cell.is_tombstone());
         assert_eq!(cell.sync, SyncPolicy::Inherit);
+    }
+
+    #[test]
+    fn value_container_methods_use_leaf_defaults() {
+        let mut value = Value::String("leaf".into());
+
+        assert!(value.cell_at_path(&[]).is_none());
+        assert!(value.cell_at_path_mut(&[]).is_none());
+        assert_eq!(
+            value.effective_scope_at(SyncScope::Local, &[]),
+            SyncScope::Local
+        );
+        assert!(!value.apply_walk(&Op::Delete, hlc(100), &[]).unwrap());
     }
 
     #[test]
@@ -418,15 +329,12 @@ mod tests {
     fn replace_scalar() {
         let mut cell = Cell::dummy(Some(Value::String(String::new())));
         assert!(cell
-            .apply_event(
-                &event(
-                    Path::new(),
-                    Op::Replace {
-                        value: Value::Int(42),
-                    },
-                    hlc(100),
-                ),
-                SyncScope::Shared
+            .apply_walk(
+                &Op::Replace {
+                    value: Value::Int(42),
+                },
+                hlc(100),
+                &[],
             )
             .unwrap());
         assert_eq!(cell.hlc, hlc(100));
@@ -436,15 +344,12 @@ mod tests {
     fn apply_lww_older_no_change() {
         let mut cell = cell(Some(Value::Int(1)), hlc(200), SyncPolicy::Inherit);
         let changed = cell
-            .apply_event(
-                &event(
-                    Path::new(),
-                    Op::Replace {
-                        value: Value::Int(2),
-                    },
-                    hlc(100),
-                ),
-                SyncScope::Shared,
+            .apply_walk(
+                &Op::Replace {
+                    value: Value::Int(2),
+                },
+                hlc(100),
+                &[],
             )
             .unwrap();
         assert!(!changed);
@@ -454,9 +359,7 @@ mod tests {
     #[test]
     fn delete_tombstones_cell() {
         let mut cell = cell(Some(Value::Int(1)), hlc(100), SyncPolicy::Inherit);
-        assert!(cell
-            .apply_event(&event(Path::new(), Op::Delete, hlc(200)), SyncScope::Shared,)
-            .unwrap());
+        assert!(cell.apply_walk(&Op::Delete, hlc(200), &[]).unwrap());
         assert!(cell.is_tombstone());
         assert_eq!(cell.hlc, hlc(200));
     }
@@ -465,15 +368,12 @@ mod tests {
     fn older_write_does_not_resurrect_tombstone() {
         let mut cell = cell(None, hlc(200), SyncPolicy::Inherit);
         let changed = cell
-            .apply_event(
-                &event(
-                    Path::new(),
-                    Op::Replace {
-                        value: Value::Int(2),
-                    },
-                    hlc(100),
-                ),
-                SyncScope::Shared,
+            .apply_walk(
+                &Op::Replace {
+                    value: Value::Int(2),
+                },
+                hlc(100),
+                &[],
             )
             .unwrap();
         assert!(!changed);
@@ -489,65 +389,14 @@ mod tests {
         );
         let path = vec![PathStep::new(TypeTag::Record, Segment::Record("x".into()))];
         assert!(root
-            .apply_event(
-                &event(
-                    path,
-                    Op::Replace {
-                        value: Value::String("hi".into()),
-                    },
-                    hlc(100),
-                ),
-                SyncScope::Shared
+            .apply_walk(
+                &Op::Replace {
+                    value: Value::String("hi".into()),
+                },
+                hlc(100),
+                &path,
             )
             .unwrap());
-    }
-
-    #[test]
-    fn remote_event_is_rejected_by_nearest_local_only_ancestor() {
-        let mut nested = Record::default();
-        nested.insert(
-            "field".into(),
-            cell(Some(Value::Int(1)), local_hlc(100), SyncPolicy::Inherit),
-        );
-        let mut root_record = Record::default();
-        root_record.insert(
-            "nested".into(),
-            cell(
-                Some(Value::Record(nested)),
-                local_hlc(100),
-                SyncPolicy::Local,
-            ),
-        );
-        let mut root = cell(
-            Some(Value::Record(root_record)),
-            local_hlc(100),
-            SyncPolicy::Inherit,
-        );
-        let path = vec![
-            PathStep::new(TypeTag::Record, Segment::Record("nested".into())),
-            PathStep::new(TypeTag::Record, Segment::Record("field".into())),
-        ];
-
-        assert!(!root
-            .apply_event(
-                &event(
-                    path,
-                    Op::Replace {
-                        value: Value::Int(2),
-                    },
-                    remote_hlc(200),
-                ),
-                SyncScope::Shared,
-            )
-            .unwrap());
-
-        let Some(Value::Record(root_record)) = &root.value else {
-            panic!("expected root record");
-        };
-        let Some(Value::Record(nested)) = &root_record.get("nested").unwrap().value else {
-            panic!("expected nested record");
-        };
-        assert_eq!(nested.get("field").unwrap().value, Some(Value::Int(1)));
     }
 
     #[test]
@@ -579,39 +428,8 @@ mod tests {
     }
 
     #[test]
-    fn rejected_remote_event_does_not_create_missing_children() {
-        let mut root = cell(
-            Some(Value::Record(Record::default())),
-            local_hlc(100),
-            SyncPolicy::Local,
-        );
-        let path = vec![PathStep::new(
-            TypeTag::Record,
-            Segment::Record("missing".into()),
-        )];
-
-        assert!(!root
-            .apply_event(
-                &event(
-                    path,
-                    Op::Replace {
-                        value: Value::Int(1),
-                    },
-                    remote_hlc(200),
-                ),
-                SyncScope::Shared,
-            )
-            .unwrap());
-
-        let Some(Value::Record(record)) = &root.value else {
-            panic!("expected record");
-        };
-        assert!(!record.contains("missing"));
-    }
-
-    #[test]
     fn sync_policy_is_local_and_hlc_neutral() {
-        let mut root = cell(Some(Value::Int(1)), local_hlc(100), SyncPolicy::Local);
+        let mut root = cell(Some(Value::Int(1)), hlc(100), SyncPolicy::Local);
         let original_hlc = root.hlc;
 
         assert!(root.set_sync_policy(&[], SyncPolicy::Inherit));
@@ -625,7 +443,7 @@ mod tests {
         assert!(local.set_sync_policy(&[], SyncPolicy::Local));
         let remote = cell(Some(Value::Int(2)), hlc(200), SyncPolicy::Inherit);
 
-        let changed = Type::merge(&mut local, &remote, MergeClocks::ZERO).unwrap();
+        let changed = local.merge(&remote, MergeClocks::ZERO).unwrap();
         assert!(changed);
         assert_eq!(local.value, Some(Value::Int(2)));
         assert_eq!(local.hlc, hlc(200));
@@ -679,13 +497,9 @@ mod tests {
             SyncPolicy::Inherit,
         );
 
-        assert!(ContainerType::merge_shared(
-            &mut local,
-            &remote,
-            MergeClocks::ZERO,
-            SyncScope::Shared,
-        )
-        .unwrap());
+        assert!(local
+            .merge_shared(&remote, MergeClocks::ZERO, SyncScope::Shared,)
+            .unwrap());
         let Some(Value::Record(record)) = local.value else {
             panic!("expected record");
         };
@@ -697,6 +511,32 @@ mod tests {
             record.get("private").unwrap().value,
             Some(Value::String("mine".into()))
         );
+    }
+
+    #[test]
+    fn shared_parent_replacement_overwrites_nested_local_child() {
+        let mut local = cell(
+            Some(Value::Record(Record::from_fields([(
+                "private".into(),
+                cell(
+                    Some(Value::String("mine".into())),
+                    hlc(10),
+                    SyncPolicy::Local,
+                ),
+            )]))),
+            hlc(10),
+            SyncPolicy::Inherit,
+        );
+        let remote = cell(
+            Some(Value::String("replacement".into())),
+            hlc(20),
+            SyncPolicy::Inherit,
+        );
+
+        assert!(local
+            .merge_shared(&remote, MergeClocks::ZERO, SyncScope::Shared)
+            .unwrap());
+        assert_eq!(local.value, Some(Value::String("replacement".into())));
     }
 
     #[test]
@@ -764,15 +604,12 @@ mod tests {
         );
         let path = vec![PathStep::new(TypeTag::Record, Segment::Record("x".into()))];
         assert!(root
-            .apply_event(
-                &event(
-                    path,
-                    Op::Replace {
-                        value: Value::Int(1),
-                    },
-                    hlc(100),
-                ),
-                SyncScope::Shared
+            .apply_walk(
+                &Op::Replace {
+                    value: Value::Int(1),
+                },
+                hlc(100),
+                &path,
             )
             .unwrap());
         assert_eq!(root.hlc, hlc(50));
@@ -783,15 +620,12 @@ mod tests {
         let mut root = cell(None, hlc(50), SyncPolicy::Inherit);
         let path = vec![PathStep::new(TypeTag::Record, Segment::Record("x".into()))];
         assert!(root
-            .apply_event(
-                &event(
-                    path,
-                    Op::Replace {
-                        value: Value::Int(1),
-                    },
-                    hlc(100),
-                ),
-                SyncScope::Shared
+            .apply_walk(
+                &Op::Replace {
+                    value: Value::Int(1),
+                },
+                hlc(100),
+                &path,
             )
             .unwrap());
         assert_eq!(root.hlc, hlc(100));
@@ -813,30 +647,24 @@ mod tests {
         let local_path = vec![PathStep::new(TypeTag::Record, Segment::Record("a".into()))];
         let remote_path = vec![PathStep::new(TypeTag::Record, Segment::Record("b".into()))];
         local
-            .apply_event(
-                &event(
-                    local_path,
-                    Op::Replace {
-                        value: Value::Int(1),
-                    },
-                    hlc(100),
-                ),
-                SyncScope::Shared,
+            .apply_walk(
+                &Op::Replace {
+                    value: Value::Int(1),
+                },
+                hlc(100),
+                &local_path,
             )
             .unwrap();
         remote
-            .apply_event(
-                &event(
-                    remote_path,
-                    Op::Replace {
-                        value: Value::Int(2),
-                    },
-                    hlc(110),
-                ),
-                SyncScope::Shared,
+            .apply_walk(
+                &Op::Replace {
+                    value: Value::Int(2),
+                },
+                hlc(110),
+                &remote_path,
             )
             .unwrap();
-        assert!(Type::merge(&mut local, &remote, MergeClocks::ZERO).unwrap());
+        assert!(local.merge(&remote, MergeClocks::ZERO).unwrap());
         let Some(Value::Record(record)) = &local.value else {
             panic!("expected record");
         };
@@ -848,7 +676,7 @@ mod tests {
     fn merge_scalar_uses_original_local_hlc() {
         let mut local = cell(Some(Value::Int(1)), hlc(100), SyncPolicy::Inherit);
         let remote = cell(Some(Value::Int(2)), hlc(200), SyncPolicy::Inherit);
-        assert!(Type::merge(&mut local, &remote, MergeClocks::ZERO).unwrap());
+        assert!(local.merge(&remote, MergeClocks::ZERO).unwrap());
         assert_eq!(local.value, Some(Value::Int(2)));
         assert_eq!(local.hlc, hlc(200));
     }
@@ -861,7 +689,7 @@ mod tests {
             hlc(200),
             SyncPolicy::Inherit,
         );
-        assert!(Type::merge(&mut local, &remote, MergeClocks::ZERO).unwrap());
+        assert!(local.merge(&remote, MergeClocks::ZERO).unwrap());
         assert_eq!(local.type_tag(), Some(TypeTag::Record));
         assert_eq!(local.sync, SyncPolicy::Local);
     }

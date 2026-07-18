@@ -11,6 +11,8 @@
 //! This allows adding new CRDT types with minimal boilerplate - just implement
 //! the `Type` trait and add one line to the macro invocation.
 
+pub use zendb_type_converter::CellCodec;
+
 /// Generate the complete CRDT type dispatch layer.
 ///
 /// # Syntax
@@ -150,6 +152,7 @@ macro_rules! register_types {
                     $(Value::$cont_var(_) => TypeTag::$cont_var,)*
                 }
             }
+
         }
 
         impl $crate::Type for Value {
@@ -206,13 +209,6 @@ macro_rules! register_types {
                 }
             }
 
-            fn is_synced(&self, inherited: bool, path: &[$crate::PathStep]) -> bool {
-                match self {
-                    $(Value::$leaf_var(v) => v.is_synced(inherited, path),)*
-                    $(Value::$cont_var(v) => v.is_synced(inherited, path),)*
-                }
-            }
-
             fn compact(
                 &mut self,
                 watermark: $crate::Hlc,
@@ -232,6 +228,39 @@ macro_rules! register_types {
         }
 
         impl $crate::ContainerType for Value {
+            fn child(&self, segment: &$crate::Segment) -> Option<&$crate::Cell> {
+                match self {
+                    $(Value::$cont_var(value) => {
+                        $crate::ContainerType::child(value, segment)
+                    },)*
+                    _ => None,
+                }
+            }
+
+            fn child_mut(
+                &mut self,
+                segment: &$crate::Segment,
+            ) -> Option<&mut $crate::Cell> {
+                match self {
+                    $(Value::$cont_var(value) => {
+                        $crate::ContainerType::child_mut(value, segment)
+                    },)*
+                    _ => None,
+                }
+            }
+
+            fn any_child(
+                &self,
+                predicate: &mut dyn FnMut(&$crate::Cell) -> bool,
+            ) -> bool {
+                match self {
+                    $(Value::$cont_var(value) => {
+                        $crate::ContainerType::any_child(value, predicate)
+                    },)*
+                    _ => false,
+                }
+            }
+
             fn apply_walk(
                 &mut self,
                 op: &$crate::Op,
@@ -244,6 +273,50 @@ macro_rules! register_types {
                             .map_err(TypeError::$cont_var)
                     },)*
                     _ => Ok(false),
+                }
+            }
+
+            fn merge_shared(
+                &mut self,
+                remote: &Self,
+                clocks: $crate::MergeClocks,
+                parent_scope: $crate::SyncScope,
+            ) -> Result<bool, TypeError> {
+                match (self, remote) {
+                    $(
+                        (Value::$leaf_var(local), Value::$leaf_var(remote)) => {
+                            $crate::Type::merge(local, remote, clocks)
+                                .map_err(TypeError::$leaf_var)
+                        }
+                    )*
+                    $(
+                        (Value::$cont_var(local), Value::$cont_var(remote)) => {
+                            $crate::ContainerType::merge_shared(
+                                local,
+                                remote,
+                                clocks,
+                                parent_scope,
+                            )
+                            .map_err(TypeError::$cont_var)
+                        }
+                    )*
+                    (local, remote) => Err(TypeError::MergeConflict {
+                        local: local.type_tag(),
+                        remote: remote.type_tag(),
+                    }),
+                }
+            }
+
+            fn shared_clone(
+                &self,
+                parent_scope: $crate::SyncScope,
+            ) -> Option<Self> {
+                match self {
+                    $(Value::$leaf_var(value) => Some(Value::$leaf_var(value.clone())),)*
+                    $(Value::$cont_var(value) => {
+                        $crate::ContainerType::shared_clone(value, parent_scope)
+                            .map(Value::$cont_var)
+                    },)*
                 }
             }
         }

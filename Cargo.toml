@@ -2,13 +2,14 @@
 resolver = "2"
 
 members = [
+    "zendb-type-converter",
     "zendb-types",
     "zendb-storage",
+    "zendb-replication",
     "zendb-engine",
+    "zendb-operator",
     "zendb-testing",
     "zendb-transport",
-    "zendb-sync",
-    "zendb-external",
 ]
 
 [workspace.package]
@@ -26,6 +27,9 @@ hashbrown = "0.15"
 # serialization
 bincode = { version = "2", features = ["derive"] }
 rkyv = "0.8"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
 
 # zendb-types
 getrandom = "0.3"

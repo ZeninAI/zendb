@@ -1,98 +1,37 @@
-# 003: Shared Journal and Replication Frontiers
+# 003: Shared Events And Frontiers
 
-Status: Accepted
+Status: Implemented
 
-## Scope
+## Event Identity
 
-This decision defines identities and progress for the shared journal only. The
-local-versus-shared routing decision is ADR 006. Tombstone compaction is ADR
-007.
-
-## Shared Event Identity
-
-Only a mutation routed to the shared journal receives a distributed event
-identity:
+Only inherited mutations receive:
 
 ```text
-EventIdentity
-  origin_device_id
-  origin_seq
+EventIdentity { origin_device_id, origin_seq }
 ```
 
-`origin_seq` is allocated when, and only when, a mutation enters the shared
-journal. Local tables and local-only subtrees have local journal records but no
-shared EventIdentity. This is required: if local mutations consumed the same
-sequence, every peer would see intentional gaps and could never prove a
-contiguous shared prefix.
+The sequence is per device across the Workspace shared journal. Local table
+and local path mutations consume no sequence, so they create no remote gaps.
+The Event HLC remains the CRDT conflict clock; origin sequence is durable
+transport identity, not a causal or total order.
 
-The origin's shared sequence is strictly increasing, and the HLC assigned to
-its shared events is strictly increasing in sequence order.
+## Contiguous Receipt
 
-## Contiguous Frontier
+`ContiguousFrontier[origin] = n` proves that every event `1..=n` was durably
+received and classified. Out-of-order events wait behind gaps. Classification
+may apply state, wait on catalog/device dependencies, or deliberately skip
+materialization below a local boundary.
 
-`VersionVector::max_seen` means only that a replica has seen some event at the
-largest recorded sequence. It is not safe progress: sequence 10 may arrive
-before sequence 9.
-
-Each device maintains a `ContiguousFrontier` for the shared journal:
-
-```text
-ContiguousFrontier
-  applied_through: map<DeviceId, u64>
-```
-
-`applied_through[origin] = n` means the device has applied every shared event
-from that origin with sequence `1..=n`. Out-of-order shared events remain
-pending until the next missing sequence arrives, then the prefix advances.
-
-Each device checkpoints its frontier in its own nested Device record:
-
-```text
-devices.<device_id>.replication_frontier
-```
-
-The checkpoint is monotonic, durable shared control state. A device may write
-only its own checkpoint. Checkpoint cadence is an implementation choice;
-delaying it is conservative because it can only hold the derived frontier back.
-
-Publishing a checkpoint is itself a shared event from that device. To avoid a
-permanent one-event lag, the checkpoint value may include the sequence reserved
-for that checkpoint event. This is valid only when allocation, durable append,
-and profile commit are one serialized operation: after the event is appended,
-its own origin prefix is durably contiguous through that sequence.
-
-## Anti-Entropy
-
-Peers exchange their current frontiers during synchronization and request exact
-shared-journal ranges:
-
-```text
-peer requests origin O, sequences local_frontier[O] + 1 .. remote_frontier[O]
-```
-
-If a requester already holds later out-of-order events, it still asks for the
-gap beginning at its contiguous prefix plus one.
+Peers request exact missing ranges. Each device checkpoints its frontier in
+its own `_devices` row. A maximum-seen VersionVector is only a hint.
 
 ## Stable Frontier
 
-For every currently admitted Device Cell, read its latest frontier checkpoint.
-The Workspace-wide stable frontier is derived, never declared by a special
-device:
+Stable receipt is the element-wise minimum checkpoint across every admitted
+device. Offline devices hold it back until Manager removal. It gates signing
+key rotation and informs retention.
 
-```text
-stable[origin] =
-  min(device.replication_frontier.applied_through[origin]
-      for every live Device cell)
-```
-
-This says that every admitted device has applied every shared event from
-`origin` through `stable[origin]`. A long-unreachable member remains in this
-minimum until a Manager tombstones membership. That deliberately holds shared
-compaction back rather than silently forgetting a member that may return.
-
-## Non-Goals
-
-A frontier is not a causal context, a total-order claim, a liveness signal, or
-an authorization fact. It does not describe local-only mutations. ADR 007
-uses the stable frontier to derive the scalar watermark consumed by CRDT
-compaction.
+Stable receipt does not prove identical materialized state because local
+boundaries may skip events. Merkle roots and explicit state reconciliation
+cover that distinction. It also does not by itself authorize tombstone pruning;
+ADR 007 explains why.

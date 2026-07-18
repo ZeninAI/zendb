@@ -3,7 +3,7 @@
 use bincode::{Decode, Encode};
 
 use crate::crdt::_traits::{ContainerType, MergeClocks, Type};
-use crate::{Hlc, Op, PathStep, TypeError, TypeTag, Value};
+use crate::{Hlc, Op, PathStep, SyncPolicy, SyncScope, TypeError, TypeTag, Value};
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct Cell {
@@ -13,10 +13,8 @@ pub struct Cell {
     /// or a direct operation against this cell. Descendant-only updates do not
     /// bump ancestor HLCs.
     pub hlc: Hlc,
-    /// Local sync-boundary override. `None` inherits; a full local-overlay
-    /// router is specified by ADR 006. The current apply path only performs
-    /// target-path filtering and is not sufficient for ancestor replacements.
-    pub sync: Option<bool>,
+    /// Replica-local sync boundary. It is never changed by a CRDT operation.
+    pub sync: SyncPolicy,
 }
 
 impl Cell {
@@ -24,7 +22,7 @@ impl Cell {
         Cell {
             value,
             hlc: Hlc::ZERO,
-            sync: None,
+            sync: SyncPolicy::Inherit,
         }
     }
 
@@ -40,48 +38,29 @@ impl Cell {
         self.value.as_ref().map(Value::type_tag)
     }
 
-    /// Resolve a nested Cell without creating missing containers.
-    pub fn at_path(&self, path: &[PathStep]) -> Option<&Cell> {
-        let Some((step, remaining)) = path.split_first() else {
-            return Some(self);
+    /// Change local replication policy without changing CRDT state or clocks.
+    ///
+    /// Returns `false` when the path does not exist or already has `policy`.
+    pub fn set_sync_policy(&mut self, path: &[PathStep], policy: SyncPolicy) -> bool {
+        let Some(target) = self.cell_at_path_mut(path) else {
+            return false;
         };
-        match (&self.value, &step.segment) {
-            (Some(Value::Record(record)), crate::Segment::Record(field)) => {
-                record.get(field)?.at_path(remaining)
-            }
-            (Some(Value::List(list)), crate::Segment::List(id)) => {
-                list.cell_by_id(*id)?.at_path(remaining)
-            }
-            _ => None,
+        if target.sync == policy {
+            return false;
         }
-    }
-
-    /// Mutable counterpart of [`Cell::at_path`] used after a path has already
-    /// been structurally validated.
-    pub fn at_path_mut(&mut self, path: &[PathStep]) -> Option<&mut Cell> {
-        let Some((step, remaining)) = path.split_first() else {
-            return Some(self);
-        };
-        match (&mut self.value, &step.segment) {
-            (Some(Value::Record(record)), crate::Segment::Record(field)) => {
-                record.get_mut(field)?.at_path_mut(remaining)
-            }
-            (Some(Value::List(list)), crate::Segment::List(id)) => {
-                list.cell_by_id_mut(*id)?.at_path_mut(remaining)
-            }
-            _ => None,
-        }
+        target.sync = policy;
+        true
     }
 
     /// Apply an already-routed operation. This bypasses sync classification and
-    /// is used by the local-overlay and verified-replication layers.
+    /// is used after the owning table has classified a mutation as local.
     pub fn apply_routed(
         &mut self,
         op: &Op,
         op_hlc: Hlc,
         path: &[PathStep],
     ) -> Result<bool, TypeError> {
-        ContainerType::apply_walk(self, op, op_hlc, path)
+        self.apply_walk(op, op_hlc, path)
     }
 
     /// Ensure this cell contains `expected`, replacing stale state when the
@@ -102,15 +81,19 @@ impl Cell {
 
     /// Apply an event to this cell. Returns true if state was modified.
     ///
-    /// `sync` is the inherited local routing policy from the owning table.
+    /// `parent_scope` is the effective routing scope inherited from the
+    /// owning table.
     /// The nearest explicit Cell flag on the target path overrides it.
     ///
-    /// This legacy direct-apply path filters remote writes to local targets.
-    /// It does not implement ADR 006's separate local overlay, so callers must
-    /// not use it as proof that an ancestor shared replacement preserves local
-    /// descendants.
-    pub fn apply_event(&mut self, event: &crate::Event, sync: bool) -> Result<bool, TypeError> {
-        self.apply_event_from(event, sync, crate::device_id())
+    /// This direct-apply path filters remote writes to local targets and
+    /// conservatively rejects an ancestor replacement that would erase local
+    /// descendants in the single physical Cell tree.
+    pub fn apply_event(
+        &mut self,
+        event: &crate::Event,
+        parent_scope: SyncScope,
+    ) -> Result<bool, TypeError> {
+        self.apply_event_from(event, parent_scope, crate::device_id())
     }
 
     /// Apply an event using the actual local replica identity. The two-argument
@@ -119,17 +102,31 @@ impl Cell {
     pub fn apply_event_from(
         &mut self,
         event: &crate::Event,
-        sync: bool,
+        parent_scope: SyncScope,
         local_device_id: crate::DeviceId,
     ) -> Result<bool, TypeError> {
-        if !matches!(&event.op, Op::SetSync { .. })
-            && !self.is_synced(sync, &event.path)
-            && event.hlc.device_id() != local_device_id
-        {
-            return Ok(false);
+        if event.hlc.device_id() != local_device_id {
+            if !self
+                .effective_scope_at(parent_scope, &event.path)
+                .is_shared()
+            {
+                return Ok(false);
+            }
+            if let Some(target) = self.cell_at_path(&event.path) {
+                let replaces_subtree = match &event.op {
+                    Op::Delete | Op::Replace { .. } | Op::Merge { .. } => true,
+                    Op::Type(op) => target.type_tag() != Some(op.type_tag()),
+                };
+                // With one physical tree, accepting an ancestor replacement
+                // would erase local descendants. Keep the replicated event in
+                // history and defer this branch to state reconciliation.
+                if replaces_subtree && target.contains_local_boundary(SyncScope::Shared) {
+                    return Ok(false);
+                }
+            }
         }
 
-        ContainerType::apply_walk(self, &event.op, event.hlc, &event.path)
+        self.apply_walk(&event.op, event.hlc, &event.path)
     }
 }
 
@@ -157,18 +154,6 @@ impl Type for Cell {
                     }
                     false => false,
                 }
-            }
-            Op::SetSync { sync } => {
-                // The direct Cell API has no routing context and therefore
-                // cannot enforce ADR 006's local-only SetSync rule. The
-                // Workspace router must reject a replicated SetSync before it
-                // reaches this method.
-                if !op_hlc.beats(self.hlc) {
-                    return Ok(false);
-                }
-                self.sync = *sync;
-                self.hlc = op_hlc;
-                true
             }
             Op::Delete => {
                 if !op_hlc.beats(self.hlc) {
@@ -233,20 +218,6 @@ impl Type for Cell {
         Ok(changed)
     }
 
-    fn is_synced(&self, inherited: bool, path: &[PathStep]) -> bool {
-        let effective = self.sync.unwrap_or(inherited);
-        if path.is_empty() {
-            return effective;
-        }
-        if self.type_tag() != Some(path[0].container_tag) {
-            return effective;
-        }
-        self.value
-            .as_ref()
-            .map(|value| value.is_synced(effective, path))
-            .unwrap_or(effective)
-    }
-
     fn compact(&mut self, watermark: Hlc) -> Result<bool, TypeError> {
         let Some(value) = self.value.as_mut() else {
             return Ok(false);
@@ -263,6 +234,36 @@ impl Type for Cell {
 }
 
 impl ContainerType for Cell {
+    fn child(&self, segment: &crate::Segment) -> Option<&Cell> {
+        self.value.as_ref().and_then(|value| value.child(segment))
+    }
+
+    fn child_mut(&mut self, segment: &crate::Segment) -> Option<&mut Cell> {
+        self.value
+            .as_mut()
+            .and_then(|value| value.child_mut(segment))
+    }
+
+    fn any_child(&self, predicate: &mut dyn FnMut(&Cell) -> bool) -> bool {
+        self.value
+            .as_ref()
+            .is_some_and(|value| value.any_child(predicate))
+    }
+
+    fn cell_at_path(&self, path: &[PathStep]) -> Option<&Cell> {
+        if path.is_empty() {
+            return Some(self);
+        }
+        self.value.as_ref()?.cell_at_path(path)
+    }
+
+    fn cell_at_path_mut(&mut self, path: &[PathStep]) -> Option<&mut Cell> {
+        if path.is_empty() {
+            return Some(self);
+        }
+        self.value.as_mut()?.cell_at_path_mut(path)
+    }
+
     fn apply_walk(&mut self, op: &Op, op_hlc: Hlc, path: &[PathStep]) -> Result<bool, TypeError> {
         let Some((step, _)) = path.split_first() else {
             return self.apply(op, op_hlc);
@@ -275,6 +276,74 @@ impl ContainerType for Cell {
             .as_mut()
             .expect("ensure_type must leave the cell live")
             .apply_walk(op, op_hlc, path)
+    }
+
+    fn effective_scope_at(&self, parent_scope: SyncScope, path: &[PathStep]) -> SyncScope {
+        let effective_scope = self.sync.resolve(parent_scope);
+        if path.is_empty() || self.type_tag() != Some(path[0].container_tag) {
+            return effective_scope;
+        }
+        self.value
+            .as_ref()
+            .map(|value| value.effective_scope_at(effective_scope, path))
+            .unwrap_or(effective_scope)
+    }
+
+    fn contains_local_boundary(&self, parent_scope: SyncScope) -> bool {
+        let effective_scope = self.sync.resolve(parent_scope);
+        if !effective_scope.is_shared() {
+            return true;
+        }
+        self.value
+            .as_ref()
+            .is_some_and(|value| value.contains_local_boundary(effective_scope))
+    }
+
+    fn merge_shared(
+        &mut self,
+        remote: &Self,
+        _clocks: MergeClocks,
+        parent_scope: SyncScope,
+    ) -> Result<bool, TypeError> {
+        if !self.sync.resolve(parent_scope).is_shared() {
+            return Ok(false);
+        }
+
+        if let (Some(local), Some(remote_value)) = (&mut self.value, &remote.value) {
+            if local.type_tag() == remote_value.type_tag() {
+                let mut changed = local.merge_shared(
+                    remote_value,
+                    MergeClocks::new(self.hlc, remote.hlc),
+                    parent_scope,
+                )?;
+                if remote.hlc.beats(self.hlc) {
+                    self.hlc = remote.hlc;
+                    changed = true;
+                }
+                return Ok(changed);
+            }
+        }
+
+        if self.contains_local_boundary(parent_scope) {
+            return Ok(false);
+        }
+        Type::merge(self, remote, MergeClocks::ZERO)
+    }
+
+    fn shared_clone(&self, parent_scope: SyncScope) -> Option<Self> {
+        let effective_scope = self.sync.resolve(parent_scope);
+        if !effective_scope.is_shared() {
+            return None;
+        }
+        let value = match self.value.as_ref() {
+            Some(value) => Some(value.shared_clone(effective_scope)?),
+            None => None,
+        };
+        Some(Self {
+            value,
+            hlc: self.hlc,
+            sync: SyncPolicy::Inherit,
+        })
     }
 }
 
@@ -289,7 +358,7 @@ mod tests {
         Hlc::with_device_id(ms, 0, crate::DeviceId::from_bytes([1u8; 16])).unwrap()
     }
 
-    fn cell(value: Option<Value>, hlc: Hlc, sync: Option<bool>) -> Cell {
+    fn cell(value: Option<Value>, hlc: Hlc, sync: SyncPolicy) -> Cell {
         Cell { value, hlc, sync }
     }
 
@@ -312,8 +381,6 @@ mod tests {
             path,
             op,
             hlc,
-            sync: false,
-            signature: Vec::new(),
         }
     }
 
@@ -322,7 +389,7 @@ mod tests {
         let cell = Cell::dummy(Some(Value::String(String::new())));
         assert!(cell.is_dummy());
         assert!(!cell.is_tombstone());
-        assert_eq!(cell.sync, None);
+        assert_eq!(cell.sync, SyncPolicy::Inherit);
     }
 
     #[test]
@@ -330,12 +397,16 @@ mod tests {
         let cell = Cell::dummy(None);
         assert!(cell.is_dummy());
         assert!(cell.is_tombstone());
-        assert_eq!(cell.sync, None);
+        assert_eq!(cell.sync, SyncPolicy::Inherit);
     }
 
     #[test]
     fn bincode_roundtrip() {
-        let cell = cell(Some(Value::String("hi".into())), hlc(100), Some(true));
+        let cell = cell(
+            Some(Value::String("hi".into())),
+            hlc(100),
+            SyncPolicy::Inherit,
+        );
         let buf = encode_to_vec(&cell, config::standard()).unwrap();
         let (decoded, n): (Cell, usize) = decode_from_slice(&buf, config::standard()).unwrap();
         assert_eq!(n, buf.len());
@@ -355,7 +426,7 @@ mod tests {
                     },
                     hlc(100),
                 ),
-                true
+                SyncScope::Shared
             )
             .unwrap());
         assert_eq!(cell.hlc, hlc(100));
@@ -363,7 +434,7 @@ mod tests {
 
     #[test]
     fn apply_lww_older_no_change() {
-        let mut cell = cell(Some(Value::Int(1)), hlc(200), None);
+        let mut cell = cell(Some(Value::Int(1)), hlc(200), SyncPolicy::Inherit);
         let changed = cell
             .apply_event(
                 &event(
@@ -373,7 +444,7 @@ mod tests {
                     },
                     hlc(100),
                 ),
-                true,
+                SyncScope::Shared,
             )
             .unwrap();
         assert!(!changed);
@@ -382,9 +453,9 @@ mod tests {
 
     #[test]
     fn delete_tombstones_cell() {
-        let mut cell = cell(Some(Value::Int(1)), hlc(100), None);
+        let mut cell = cell(Some(Value::Int(1)), hlc(100), SyncPolicy::Inherit);
         assert!(cell
-            .apply_event(&event(Path::new(), Op::Delete, hlc(200)), true)
+            .apply_event(&event(Path::new(), Op::Delete, hlc(200)), SyncScope::Shared,)
             .unwrap());
         assert!(cell.is_tombstone());
         assert_eq!(cell.hlc, hlc(200));
@@ -392,7 +463,7 @@ mod tests {
 
     #[test]
     fn older_write_does_not_resurrect_tombstone() {
-        let mut cell = cell(None, hlc(200), None);
+        let mut cell = cell(None, hlc(200), SyncPolicy::Inherit);
         let changed = cell
             .apply_event(
                 &event(
@@ -402,7 +473,7 @@ mod tests {
                     },
                     hlc(100),
                 ),
-                true,
+                SyncScope::Shared,
             )
             .unwrap();
         assert!(!changed);
@@ -411,7 +482,11 @@ mod tests {
 
     #[test]
     fn apply_set_field() {
-        let mut root = cell(Some(Value::Record(Record::default())), hlc(50), None);
+        let mut root = cell(
+            Some(Value::Record(Record::default())),
+            hlc(50),
+            SyncPolicy::Inherit,
+        );
         let path = vec![PathStep::new(TypeTag::Record, Segment::Record("x".into()))];
         assert!(root
             .apply_event(
@@ -422,7 +497,7 @@ mod tests {
                     },
                     hlc(100),
                 ),
-                true
+                SyncScope::Shared
             )
             .unwrap());
     }
@@ -432,14 +507,22 @@ mod tests {
         let mut nested = Record::default();
         nested.insert(
             "field".into(),
-            cell(Some(Value::Int(1)), local_hlc(100), None),
+            cell(Some(Value::Int(1)), local_hlc(100), SyncPolicy::Inherit),
         );
         let mut root_record = Record::default();
         root_record.insert(
             "nested".into(),
-            cell(Some(Value::Record(nested)), local_hlc(100), Some(false)),
+            cell(
+                Some(Value::Record(nested)),
+                local_hlc(100),
+                SyncPolicy::Local,
+            ),
         );
-        let mut root = cell(Some(Value::Record(root_record)), local_hlc(100), Some(true));
+        let mut root = cell(
+            Some(Value::Record(root_record)),
+            local_hlc(100),
+            SyncPolicy::Inherit,
+        );
         let path = vec![
             PathStep::new(TypeTag::Record, Segment::Record("nested".into())),
             PathStep::new(TypeTag::Record, Segment::Record("field".into())),
@@ -454,7 +537,7 @@ mod tests {
                     },
                     remote_hlc(200),
                 ),
-                true,
+                SyncScope::Shared,
             )
             .unwrap());
 
@@ -468,11 +551,39 @@ mod tests {
     }
 
     #[test]
+    fn effective_scope_stays_local_below_a_local_ancestor() {
+        let mut nested = Record::default();
+        nested.insert(
+            "child".into(),
+            cell(Some(Value::Int(1)), hlc(100), SyncPolicy::Inherit),
+        );
+        let mut root_record = Record::default();
+        root_record.insert(
+            "local".into(),
+            cell(Some(Value::Record(nested)), hlc(100), SyncPolicy::Local),
+        );
+        let root = cell(
+            Some(Value::Record(root_record)),
+            hlc(100),
+            SyncPolicy::Inherit,
+        );
+        let path = vec![
+            PathStep::new(TypeTag::Record, Segment::Record("local".into())),
+            PathStep::new(TypeTag::Record, Segment::Record("child".into())),
+        ];
+
+        assert_eq!(
+            root.effective_scope_at(SyncScope::Shared, &path),
+            SyncScope::Local
+        );
+    }
+
+    #[test]
     fn rejected_remote_event_does_not_create_missing_children() {
         let mut root = cell(
             Some(Value::Record(Record::default())),
             local_hlc(100),
-            Some(false),
+            SyncPolicy::Local,
         );
         let path = vec![PathStep::new(
             TypeTag::Record,
@@ -488,7 +599,7 @@ mod tests {
                     },
                     remote_hlc(200),
                 ),
-                true,
+                SyncScope::Shared,
             )
             .unwrap());
 
@@ -499,40 +610,158 @@ mod tests {
     }
 
     #[test]
-    fn remote_set_sync_is_allowed_on_local_only_target() {
-        let mut root = cell(Some(Value::Int(1)), local_hlc(100), Some(false));
+    fn sync_policy_is_local_and_hlc_neutral() {
+        let mut root = cell(Some(Value::Int(1)), local_hlc(100), SyncPolicy::Local);
+        let original_hlc = root.hlc;
 
-        assert!(root
-            .apply_event(
-                &event(
-                    Path::new(),
-                    Op::SetSync { sync: Some(true) },
-                    remote_hlc(200),
-                ),
-                false,
-            )
-            .unwrap());
-        assert_eq!(root.sync, Some(true));
+        assert!(root.set_sync_policy(&[], SyncPolicy::Inherit));
+        assert_eq!(root.sync, SyncPolicy::Inherit);
+        assert_eq!(root.hlc, original_hlc);
     }
 
     #[test]
-    fn set_sync_uses_hlc_for_clock_check() {
-        let mut local = cell(Some(Value::Int(1)), hlc(100), None);
-        // SetSync at 300 bumps hlc; older remote value is rejected.
-        Type::apply(&mut local, &Op::SetSync { sync: Some(false) }, hlc(300)).unwrap();
-        let remote = cell(Some(Value::Int(2)), hlc(200), None);
+    fn sync_policy_does_not_affect_merge_order() {
+        let mut local = cell(Some(Value::Int(1)), hlc(100), SyncPolicy::Inherit);
+        assert!(local.set_sync_policy(&[], SyncPolicy::Local));
+        let remote = cell(Some(Value::Int(2)), hlc(200), SyncPolicy::Inherit);
 
         let changed = Type::merge(&mut local, &remote, MergeClocks::ZERO).unwrap();
-        // Remote at 200 doesn't beat the SetSync-bumped hlc of 300.
-        assert!(!changed);
-        assert_eq!(local.value, Some(Value::Int(1)));
-        assert_eq!(local.hlc, hlc(300));
-        assert_eq!(local.sync, Some(false));
+        assert!(changed);
+        assert_eq!(local.value, Some(Value::Int(2)));
+        assert_eq!(local.hlc, hlc(200));
+        assert_eq!(local.sync, SyncPolicy::Local);
+    }
+
+    #[test]
+    fn shared_merge_updates_shared_siblings_and_preserves_local_children() {
+        let mut local = cell(
+            Some(Value::Record(Record::from_fields([
+                (
+                    "shared".into(),
+                    cell(
+                        Some(Value::String("old".into())),
+                        hlc(10),
+                        SyncPolicy::Inherit,
+                    ),
+                ),
+                (
+                    "private".into(),
+                    cell(
+                        Some(Value::String("mine".into())),
+                        hlc(30),
+                        SyncPolicy::Local,
+                    ),
+                ),
+            ]))),
+            hlc(10),
+            SyncPolicy::Inherit,
+        );
+        let remote = cell(
+            Some(Value::Record(Record::from_fields([
+                (
+                    "shared".into(),
+                    cell(
+                        Some(Value::String("new".into())),
+                        hlc(20),
+                        SyncPolicy::Inherit,
+                    ),
+                ),
+                (
+                    "private".into(),
+                    cell(
+                        Some(Value::String("theirs".into())),
+                        hlc(40),
+                        SyncPolicy::Inherit,
+                    ),
+                ),
+            ]))),
+            hlc(20),
+            SyncPolicy::Inherit,
+        );
+
+        assert!(ContainerType::merge_shared(
+            &mut local,
+            &remote,
+            MergeClocks::ZERO,
+            SyncScope::Shared,
+        )
+        .unwrap());
+        let Some(Value::Record(record)) = local.value else {
+            panic!("expected record");
+        };
+        assert_eq!(
+            record.get("shared").unwrap().value,
+            Some(Value::String("new".into()))
+        );
+        assert_eq!(
+            record.get("private").unwrap().value,
+            Some(Value::String("mine".into()))
+        );
+    }
+
+    #[test]
+    fn shared_clone_omits_local_policy() {
+        let local = cell(
+            Some(Value::String("private".into())),
+            hlc(10),
+            SyncPolicy::Local,
+        );
+        assert!(local.shared_clone(SyncScope::Shared).is_none());
+
+        let shared = cell(
+            Some(Value::String("shared".into())),
+            hlc(10),
+            SyncPolicy::Inherit,
+        );
+        let projected = shared.shared_clone(SyncScope::Shared).unwrap();
+        assert_eq!(projected.sync, SyncPolicy::Inherit);
+        let bytes = encode_to_vec(&projected, config::standard()).unwrap();
+        let (decoded, consumed): (Cell, usize) =
+            decode_from_slice(&bytes, config::standard()).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, projected);
+    }
+
+    #[test]
+    fn shared_clone_omits_nested_local_cells() {
+        let root = cell(
+            Some(Value::Record(Record::from_fields([
+                (
+                    "shared".into(),
+                    cell(
+                        Some(Value::String("visible".into())),
+                        hlc(10),
+                        SyncPolicy::Inherit,
+                    ),
+                ),
+                (
+                    "local".into(),
+                    cell(
+                        Some(Value::String("private".into())),
+                        hlc(10),
+                        SyncPolicy::Local,
+                    ),
+                ),
+            ]))),
+            hlc(10),
+            SyncPolicy::Inherit,
+        );
+
+        let projected = root.shared_clone(SyncScope::Shared).unwrap();
+        let Value::Record(record) = projected.value.unwrap() else {
+            panic!("the projected root must remain a Record");
+        };
+        assert!(record.contains("shared"));
+        assert!(!record.contains("local"));
     }
 
     #[test]
     fn nested_update_does_not_bump_existing_parent_hlc() {
-        let mut root = cell(Some(Value::Record(Record::default())), hlc(50), None);
+        let mut root = cell(
+            Some(Value::Record(Record::default())),
+            hlc(50),
+            SyncPolicy::Inherit,
+        );
         let path = vec![PathStep::new(TypeTag::Record, Segment::Record("x".into()))];
         assert!(root
             .apply_event(
@@ -543,7 +772,7 @@ mod tests {
                     },
                     hlc(100),
                 ),
-                true
+                SyncScope::Shared
             )
             .unwrap());
         assert_eq!(root.hlc, hlc(50));
@@ -551,7 +780,7 @@ mod tests {
 
     #[test]
     fn recreated_parent_gets_event_hlc() {
-        let mut root = cell(None, hlc(50), None);
+        let mut root = cell(None, hlc(50), SyncPolicy::Inherit);
         let path = vec![PathStep::new(TypeTag::Record, Segment::Record("x".into()))];
         assert!(root
             .apply_event(
@@ -562,7 +791,7 @@ mod tests {
                     },
                     hlc(100),
                 ),
-                true
+                SyncScope::Shared
             )
             .unwrap());
         assert_eq!(root.hlc, hlc(100));
@@ -571,8 +800,16 @@ mod tests {
 
     #[test]
     fn merge_same_record_recurses() {
-        let mut local = cell(Some(Value::Record(Record::default())), hlc(50), None);
-        let mut remote = cell(Some(Value::Record(Record::default())), hlc(50), None);
+        let mut local = cell(
+            Some(Value::Record(Record::default())),
+            hlc(50),
+            SyncPolicy::Inherit,
+        );
+        let mut remote = cell(
+            Some(Value::Record(Record::default())),
+            hlc(50),
+            SyncPolicy::Inherit,
+        );
         let local_path = vec![PathStep::new(TypeTag::Record, Segment::Record("a".into()))];
         let remote_path = vec![PathStep::new(TypeTag::Record, Segment::Record("b".into()))];
         local
@@ -584,7 +821,7 @@ mod tests {
                     },
                     hlc(100),
                 ),
-                true,
+                SyncScope::Shared,
             )
             .unwrap();
         remote
@@ -596,7 +833,7 @@ mod tests {
                     },
                     hlc(110),
                 ),
-                true,
+                SyncScope::Shared,
             )
             .unwrap();
         assert!(Type::merge(&mut local, &remote, MergeClocks::ZERO).unwrap());
@@ -609,8 +846,8 @@ mod tests {
 
     #[test]
     fn merge_scalar_uses_original_local_hlc() {
-        let mut local = cell(Some(Value::Int(1)), hlc(100), None);
-        let remote = cell(Some(Value::Int(2)), hlc(200), None);
+        let mut local = cell(Some(Value::Int(1)), hlc(100), SyncPolicy::Inherit);
+        let remote = cell(Some(Value::Int(2)), hlc(200), SyncPolicy::Inherit);
         assert!(Type::merge(&mut local, &remote, MergeClocks::ZERO).unwrap());
         assert_eq!(local.value, Some(Value::Int(2)));
         assert_eq!(local.hlc, hlc(200));
@@ -618,10 +855,14 @@ mod tests {
 
     #[test]
     fn merge_keeps_sync_local() {
-        let mut local = cell(Some(Value::Int(1)), hlc(100), Some(false));
-        let remote = cell(Some(Value::Record(Record::default())), hlc(200), Some(true));
+        let mut local = cell(Some(Value::Int(1)), hlc(100), SyncPolicy::Local);
+        let remote = cell(
+            Some(Value::Record(Record::default())),
+            hlc(200),
+            SyncPolicy::Inherit,
+        );
         assert!(Type::merge(&mut local, &remote, MergeClocks::ZERO).unwrap());
         assert_eq!(local.type_tag(), Some(TypeTag::Record));
-        assert_eq!(local.sync, Some(false));
+        assert_eq!(local.sync, SyncPolicy::Local);
     }
 }

@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use bincode::{Decode, Encode};
 
-use crate::{Cell, ContainerType, Hlc, MergeClocks, Op, PathStep, Segment, Type, TypeError};
+use crate::{
+    Cell, ContainerType, Hlc, MergeClocks, Op, PathStep, Segment, SyncScope, Type, TypeError,
+};
 
 pub type RecordSegment = String;
 
@@ -24,6 +26,7 @@ impl Record {
         self.fields.get(field)
     }
 
+    #[cfg(test)]
     pub(crate) fn get_mut(&mut self, field: &str) -> Option<&mut Cell> {
         self.fields.get_mut(field)
     }
@@ -98,19 +101,6 @@ impl Type for Record {
         Ok(changed)
     }
 
-    fn is_synced(&self, inherited: bool, path: &[PathStep]) -> bool {
-        let Some((step, remaining)) = path.split_first() else {
-            return inherited;
-        };
-        let Segment::Record(field) = &step.segment else {
-            return inherited;
-        };
-        self.fields
-            .get(field)
-            .map(|child| child.is_synced(inherited, remaining))
-            .unwrap_or(inherited)
-    }
-
     fn compact(&mut self, watermark: Hlc) -> Result<bool, RecordError> {
         let mut changed = false;
         let stable_tombstones: Vec<String> = self
@@ -141,6 +131,24 @@ impl Type for Record {
 }
 
 impl ContainerType for Record {
+    fn child(&self, segment: &Segment) -> Option<&Cell> {
+        let Segment::Record(field) = segment else {
+            return None;
+        };
+        self.fields.get(field)
+    }
+
+    fn child_mut(&mut self, segment: &Segment) -> Option<&mut Cell> {
+        let Segment::Record(field) = segment else {
+            return None;
+        };
+        self.fields.get_mut(field)
+    }
+
+    fn any_child(&self, predicate: &mut dyn FnMut(&Cell) -> bool) -> bool {
+        self.fields.values().any(predicate)
+    }
+
     fn apply_walk(&mut self, op: &Op, op_hlc: Hlc, path: &[PathStep]) -> Result<bool, RecordError> {
         let Some((step, remaining)) = path.split_first() else {
             return Ok(false);
@@ -151,21 +159,58 @@ impl ContainerType for Record {
         let child_tag = remaining
             .first()
             .map(|step| step.container_tag)
-            .or_else(|| op.target_type());
+            .or_else(|| op.type_tag());
         let child = self.fields.entry(field.clone()).or_insert_with(|| {
             child_tag
                 .map(|tag| Cell::dummy(Some(tag.empty_value())))
                 .unwrap_or(Cell {
                     value: None,
                     hlc: Hlc::ZERO,
-                    sync: None,
+                    sync: crate::SyncPolicy::Inherit,
                 })
         });
         if child_tag.is_some_and(|tag| !child.ensure_type(tag, op_hlc)) {
             return Ok(false);
         }
-        ContainerType::apply_walk(child, op, op_hlc, remaining)
+        child
+            .apply_walk(op, op_hlc, remaining)
             .map_err(|error| RecordError::Child(Box::new(error)))
+    }
+
+    fn merge_shared(
+        &mut self,
+        remote: &Self,
+        _clocks: MergeClocks,
+        parent_scope: SyncScope,
+    ) -> Result<bool, RecordError> {
+        let mut changed = false;
+        for (name, remote_cell) in &remote.fields {
+            match self.fields.get_mut(name) {
+                Some(local_cell) => {
+                    changed |= ContainerType::merge_shared(
+                        local_cell,
+                        remote_cell,
+                        MergeClocks::ZERO,
+                        parent_scope,
+                    )
+                    .map_err(|error| RecordError::Child(Box::new(error)))?;
+                }
+                None => {
+                    self.fields.insert(name.clone(), remote_cell.clone());
+                    changed = true;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    fn shared_clone(&self, parent_scope: SyncScope) -> Option<Self> {
+        Some(Self::from_fields(self.fields.iter().filter_map(
+            |(name, cell)| {
+                cell.shared_clone(parent_scope)
+                    .map(|cell| (name.clone(), cell))
+            },
+        )))
     }
 }
 
@@ -179,7 +224,7 @@ mod tests {
         Hlc::with_device_id(ms, 0, crate::DeviceId::from_bytes([1u8; 16])).unwrap()
     }
 
-    fn cell(value: Option<Value>, hlc: Hlc, sync: Option<bool>) -> Cell {
+    fn cell(value: Option<Value>, hlc: Hlc, sync: crate::SyncPolicy) -> Cell {
         Cell { value, hlc, sync }
     }
 
@@ -205,9 +250,15 @@ mod tests {
     #[test]
     fn record_merge_both_visible() {
         let mut local = Record::default();
-        local.insert("x".into(), cell(Some(Value::Int(1)), hlc(100), None));
+        local.insert(
+            "x".into(),
+            cell(Some(Value::Int(1)), hlc(100), crate::SyncPolicy::Inherit),
+        );
         let mut remote = Record::default();
-        remote.insert("x".into(), cell(Some(Value::Int(2)), hlc(200), None));
+        remote.insert(
+            "x".into(),
+            cell(Some(Value::Int(2)), hlc(200), crate::SyncPolicy::Inherit),
+        );
         let changed =
             Type::merge(&mut local, &remote, MergeClocks::new(hlc(100), hlc(200))).unwrap();
         assert!(changed);
@@ -218,7 +269,11 @@ mod tests {
     fn record_apply_heals_stale_child_type_before_descending() {
         let mut state = record([(
             "nested",
-            cell(Some(Value::String("stale".into())), hlc(100), None),
+            cell(
+                Some(Value::String("stale".into())),
+                hlc(100),
+                crate::SyncPolicy::Inherit,
+            ),
         )]);
         let path = vec![
             PathStep::new(TypeTag::Record, Segment::Record("nested".into())),
@@ -245,7 +300,11 @@ mod tests {
     fn record_apply_does_not_heal_newer_child_type() {
         let mut state = record([(
             "nested",
-            cell(Some(Value::String("newer".into())), hlc(200), None),
+            cell(
+                Some(Value::String("newer".into())),
+                hlc(200),
+                crate::SyncPolicy::Inherit,
+            ),
         )]);
         let path = vec![
             PathStep::new(TypeTag::Record, Segment::Record("nested".into())),
@@ -270,9 +329,12 @@ mod tests {
     #[test]
     fn record_merge_tombstone_wins() {
         let mut local = Record::default();
-        local.insert("x".into(), cell(Some(Value::Int(1)), hlc(100), None));
+        local.insert(
+            "x".into(),
+            cell(Some(Value::Int(1)), hlc(100), crate::SyncPolicy::Inherit),
+        );
         let mut remote = Record::default();
-        remote.insert("x".into(), cell(None, hlc(200), None));
+        remote.insert("x".into(), cell(None, hlc(200), crate::SyncPolicy::Inherit));
         let changed =
             Type::merge(&mut local, &remote, MergeClocks::new(hlc(100), hlc(200))).unwrap();
         assert!(changed);
@@ -282,8 +344,18 @@ mod tests {
     #[test]
     fn record_merge_is_idempotent() {
         let mut local = record([
-            ("live", cell(Some(Value::Int(1)), clock(100, 1), None)),
-            ("deleted", cell(None, clock(200, 1), None)),
+            (
+                "live",
+                cell(
+                    Some(Value::Int(1)),
+                    clock(100, 1),
+                    crate::SyncPolicy::Inherit,
+                ),
+            ),
+            (
+                "deleted",
+                cell(None, clock(200, 1), crate::SyncPolicy::Inherit),
+            ),
         ]);
         let snapshot = local.clone();
 
@@ -294,15 +366,40 @@ mod tests {
     #[test]
     fn record_merge_is_commutative_for_independent_and_conflicting_fields() {
         let left = record([
-            ("left", cell(Some(Value::Bool(true)), clock(100, 1), None)),
-            ("shared", cell(Some(Value::Int(1)), clock(100, 1), None)),
+            (
+                "left",
+                cell(
+                    Some(Value::Bool(true)),
+                    clock(100, 1),
+                    crate::SyncPolicy::Inherit,
+                ),
+            ),
+            (
+                "shared",
+                cell(
+                    Some(Value::Int(1)),
+                    clock(100, 1),
+                    crate::SyncPolicy::Inherit,
+                ),
+            ),
         ]);
         let right = record([
             (
                 "right",
-                cell(Some(Value::String("right".into())), clock(100, 2), None),
+                cell(
+                    Some(Value::String("right".into())),
+                    clock(100, 2),
+                    crate::SyncPolicy::Inherit,
+                ),
             ),
-            ("shared", cell(Some(Value::Int(2)), clock(100, 2), None)),
+            (
+                "shared",
+                cell(
+                    Some(Value::Int(2)),
+                    clock(100, 2),
+                    crate::SyncPolicy::Inherit,
+                ),
+            ),
         ]);
 
         let mut left_first = left.clone();
@@ -317,11 +414,35 @@ mod tests {
     #[test]
     fn record_merge_converges_for_every_replica_order() {
         let records = [
-            record([("field", cell(Some(Value::Int(1)), clock(100, 1), None))]),
-            record([("field", cell(None, clock(200, 2), None))]),
+            record([(
+                "field",
+                cell(
+                    Some(Value::Int(1)),
+                    clock(100, 1),
+                    crate::SyncPolicy::Inherit,
+                ),
+            )]),
+            record([(
+                "field",
+                cell(None, clock(200, 2), crate::SyncPolicy::Inherit),
+            )]),
             record([
-                ("field", cell(Some(Value::Int(3)), clock(300, 3), None)),
-                ("extra", cell(Some(Value::Bool(true)), clock(150, 3), None)),
+                (
+                    "field",
+                    cell(
+                        Some(Value::Int(3)),
+                        clock(300, 3),
+                        crate::SyncPolicy::Inherit,
+                    ),
+                ),
+                (
+                    "extra",
+                    cell(
+                        Some(Value::Bool(true)),
+                        clock(150, 3),
+                        crate::SyncPolicy::Inherit,
+                    ),
+                ),
             ]),
         ];
         let orders = [
@@ -341,15 +462,37 @@ mod tests {
 
     #[test]
     fn record_merge_recursively_combines_nested_records() {
-        let left_nested = record([("left", cell(Some(Value::Int(1)), clock(100, 1), None))]);
-        let right_nested = record([("right", cell(Some(Value::Int(2)), clock(100, 2), None))]);
+        let left_nested = record([(
+            "left",
+            cell(
+                Some(Value::Int(1)),
+                clock(100, 1),
+                crate::SyncPolicy::Inherit,
+            ),
+        )]);
+        let right_nested = record([(
+            "right",
+            cell(
+                Some(Value::Int(2)),
+                clock(100, 2),
+                crate::SyncPolicy::Inherit,
+            ),
+        )]);
         let mut left = record([(
             "nested",
-            cell(Some(Value::Record(left_nested)), clock(50, 1), None),
+            cell(
+                Some(Value::Record(left_nested)),
+                clock(50, 1),
+                crate::SyncPolicy::Inherit,
+            ),
         )]);
         let right = record([(
             "nested",
-            cell(Some(Value::Record(right_nested)), clock(50, 2), None),
+            cell(
+                Some(Value::Record(right_nested)),
+                clock(50, 2),
+                crate::SyncPolicy::Inherit,
+            ),
         )]);
 
         assert!(Type::merge(&mut left, &right, crate::MergeClocks::ZERO).unwrap());
@@ -363,14 +506,24 @@ mod tests {
     #[test]
     fn record_max_hlc_recurses_through_fields() {
         let mut nested = Record::default();
-        nested.insert("leaf".into(), cell(Some(Value::Int(1)), hlc(300), None));
+        nested.insert(
+            "leaf".into(),
+            cell(Some(Value::Int(1)), hlc(300), crate::SyncPolicy::Inherit),
+        );
 
         let mut record = Record::default();
         record.insert(
             "nested".into(),
-            cell(Some(Value::Record(nested)), hlc(100), None),
+            cell(
+                Some(Value::Record(nested)),
+                hlc(100),
+                crate::SyncPolicy::Inherit,
+            ),
         );
-        record.insert("deleted".into(), cell(None, hlc(200), None));
+        record.insert(
+            "deleted".into(),
+            cell(None, hlc(200), crate::SyncPolicy::Inherit),
+        );
 
         assert_eq!(record.max_hlc(), hlc(300));
     }
@@ -378,11 +531,21 @@ mod tests {
     #[test]
     fn record_compact_removes_stable_tombstones_and_recurses_into_live_values() {
         let mut nested = Record::default();
-        nested.insert("dead".into(), cell(None, hlc(100), None));
+        nested.insert(
+            "dead".into(),
+            cell(None, hlc(100), crate::SyncPolicy::Inherit),
+        );
         let mut record = record([
-            ("dead", cell(None, hlc(100), None)),
-            ("future", cell(None, hlc(300), None)),
-            ("nested", cell(Some(Value::Record(nested)), hlc(50), None)),
+            ("dead", cell(None, hlc(100), crate::SyncPolicy::Inherit)),
+            ("future", cell(None, hlc(300), crate::SyncPolicy::Inherit)),
+            (
+                "nested",
+                cell(
+                    Some(Value::Record(nested)),
+                    hlc(50),
+                    crate::SyncPolicy::Inherit,
+                ),
+            ),
         ]);
 
         assert!(Type::compact(&mut record, hlc(200)).unwrap());
@@ -399,9 +562,16 @@ mod tests {
         let mut val = Record::default();
         val.insert(
             "name".into(),
-            cell(Some(Value::String("Alice".into())), hlc(100), None),
+            cell(
+                Some(Value::String("Alice".into())),
+                hlc(100),
+                crate::SyncPolicy::Inherit,
+            ),
         );
-        val.insert("deleted".into(), cell(None, hlc(300), None));
+        val.insert(
+            "deleted".into(),
+            cell(None, hlc(300), crate::SyncPolicy::Inherit),
+        );
         let buf = encode_to_vec(&val, config::standard()).unwrap();
         let (decoded, consumed): (Record, usize) =
             decode_from_slice(&buf, config::standard()).unwrap();

@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeSet,
     io,
-    net::{SocketAddr, TcpListener, UdpSocket},
+    net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -14,9 +14,8 @@ use std::{
 
 use bincode::{Decode, Encode};
 use parking_lot::{Mutex, RwLock};
+use zendb_transport::{LanDiscoverySocket, TcpLinkListener};
 use zendb_types::{DeviceId, DevicePublicKey, SignatureBytes, WorkspaceId};
-
-use crate::DispatchOperator;
 
 use super::{now_ms, Workspace};
 
@@ -72,11 +71,8 @@ struct LanAnnouncement {
 /// Running networking owned by one client-side Workspace. It is concrete
 /// because there is only one cluster lifecycle implementation; applications
 /// configure endpoints and discovery targets rather than implementing a trait.
-pub struct ClusterRuntime<D>
-where
-    D: DispatchOperator,
-{
-    workspace: Arc<Workspace<D>>,
+pub struct ClusterRuntime {
+    workspace: Arc<Workspace>,
     local_address: SocketAddr,
     peers: Arc<RwLock<BTreeSet<SocketAddr>>>,
     stopping: Arc<AtomicBool>,
@@ -84,22 +80,16 @@ where
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
-impl<D> Workspace<D>
-where
-    D: DispatchOperator,
-{
+impl Workspace {
     /// Start the concrete listener, discovery, reconnect, and presence loops.
-    pub fn start_cluster(self: &Arc<Self>, config: ClusterConfig) -> io::Result<ClusterRuntime<D>> {
+    pub fn start_cluster(self: &Arc<Self>, config: ClusterConfig) -> io::Result<ClusterRuntime> {
         ClusterRuntime::start(Arc::clone(self), config)
     }
 }
 
-impl<D> ClusterRuntime<D>
-where
-    D: DispatchOperator,
-{
-    fn start(workspace: Arc<Workspace<D>>, config: ClusterConfig) -> io::Result<Self> {
-        let listener = TcpListener::bind(config.listen_address)?;
+impl ClusterRuntime {
+    fn start(workspace: Arc<Workspace>, config: ClusterConfig) -> io::Result<Self> {
+        let listener = TcpLinkListener::bind(config.listen_address)?;
         listener.set_nonblocking(true)?;
         let local_address = listener.local_addr()?;
         let advertised_address = config.advertised_address.unwrap_or(local_address);
@@ -138,9 +128,7 @@ where
             Arc::clone(&errors),
         ));
         if let Some(discovery_bind) = config.discovery_bind {
-            let socket = UdpSocket::bind(discovery_bind)?;
-            socket.set_nonblocking(true)?;
-            socket.set_broadcast(true)?;
+            let socket = LanDiscoverySocket::bind(discovery_bind)?;
             threads.push(spawn_discovery_loop(
                 Arc::clone(&workspace),
                 socket,
@@ -205,24 +193,18 @@ where
     }
 }
 
-impl<D> Drop for ClusterRuntime<D>
-where
-    D: DispatchOperator,
-{
+impl Drop for ClusterRuntime {
     fn drop(&mut self) {
         self.shutdown();
     }
 }
 
-fn spawn_listener<D>(
-    workspace: Arc<Workspace<D>>,
-    listener: TcpListener,
+fn spawn_listener(
+    workspace: Arc<Workspace>,
+    listener: TcpLinkListener,
     stopping: Arc<AtomicBool>,
     errors: Arc<Mutex<Vec<String>>>,
-) -> JoinHandle<()>
-where
-    D: DispatchOperator,
-{
+) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut sessions: Vec<JoinHandle<()>> = Vec::new();
         while !stopping.load(Ordering::Relaxed) {
@@ -236,15 +218,11 @@ where
                 }
             }
             match listener.accept() {
-                Ok((stream, _)) => {
-                    if let Err(error) = stream.set_nonblocking(false) {
-                        record_error(&errors, format!("accepted socket mode: {error}"));
-                        continue;
-                    }
+                Ok((link, _)) => {
                     let workspace = Arc::clone(&workspace);
                     let errors = Arc::clone(&errors);
                     sessions.push(thread::spawn(move || {
-                        if let Err(error) = workspace.serve_tcp(stream) {
+                        if let Err(error) = workspace.serve_tcp(link) {
                             record_error(&errors, format!("inbound session: {error}"));
                         }
                     }));
@@ -263,17 +241,14 @@ where
     })
 }
 
-fn spawn_sync_loop<D>(
-    workspace: Arc<Workspace<D>>,
+fn spawn_sync_loop(
+    workspace: Arc<Workspace>,
     peers: Arc<RwLock<BTreeSet<SocketAddr>>>,
     stopping: Arc<AtomicBool>,
     local_address: SocketAddr,
     interval: Duration,
     errors: Arc<Mutex<Vec<String>>>,
-) -> JoinHandle<()>
-where
-    D: DispatchOperator,
-{
+) -> JoinHandle<()> {
     thread::spawn(move || {
         let interval = interval.max(Duration::from_millis(100));
         while !stopping.load(Ordering::Relaxed) {
@@ -302,19 +277,16 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_discovery_loop<D>(
-    workspace: Arc<Workspace<D>>,
-    socket: UdpSocket,
+fn spawn_discovery_loop(
+    workspace: Arc<Workspace>,
+    socket: LanDiscoverySocket,
     peers: Arc<RwLock<BTreeSet<SocketAddr>>>,
     stopping: Arc<AtomicBool>,
     advertised_address: SocketAddr,
     targets: Vec<SocketAddr>,
     announce_interval: Duration,
     ttl: Duration,
-) -> JoinHandle<()>
-where
-    D: DispatchOperator,
-{
+) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut last_announcement = Instant::now() - announce_interval;
         let mut buffer = vec![0; 64 * 1024];
@@ -328,7 +300,7 @@ where
                 last_announcement = Instant::now();
             }
             loop {
-                match socket.recv_from(&mut buffer) {
+                match socket.receive_from(&mut buffer) {
                     Ok((length, _)) => {
                         if let Ok(endpoint) =
                             verify_announcement(&workspace, &buffer[..length], ttl)
@@ -347,14 +319,11 @@ where
     })
 }
 
-fn make_announcement<D>(
-    workspace: &Workspace<D>,
+fn make_announcement(
+    workspace: &Workspace,
     endpoint: SocketAddr,
     ttl: Duration,
-) -> io::Result<Vec<u8>>
-where
-    D: DispatchOperator,
-{
+) -> io::Result<Vec<u8>> {
     let emitted_at_ms = now_ms();
     let ttl_ms = ttl.as_millis().min(u64::MAX as u128) as u64;
     let expires_at_ms = emitted_at_ms.saturating_add(ttl_ms);
@@ -380,14 +349,11 @@ where
         .map_err(|error| io::Error::other(error.to_string()))
 }
 
-fn verify_announcement<D>(
-    workspace: &Workspace<D>,
+fn verify_announcement(
+    workspace: &Workspace,
     bytes: &[u8],
     maximum_ttl: Duration,
-) -> io::Result<SocketAddr>
-where
-    D: DispatchOperator,
-{
+) -> io::Result<SocketAddr> {
     let (announcement, consumed): (LanAnnouncement, usize) =
         bincode::decode_from_slice(bytes, bincode::config::standard())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;

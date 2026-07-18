@@ -5,7 +5,19 @@ use bincode::{Decode, Encode};
 /// Read access is implicit for every live device and therefore has no stored
 /// role. The values are deliberately non-overlapping; an owner is a UI label
 /// for a device that holds all three values, not a fourth protocol role.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Encode,
+    Decode,
+    ::zendb_types::CellCodec,
+)]
 pub enum WorkspaceRole {
     Contributor,
     Dispatcher,
@@ -22,6 +34,23 @@ pub enum WorkspaceAction {
 }
 
 impl WorkspaceRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Contributor => "contributor",
+            Self::Dispatcher => "dispatcher",
+            Self::Manager => "manager",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "contributor" => Some(Self::Contributor),
+            "dispatcher" => Some(Self::Dispatcher),
+            "manager" => Some(Self::Manager),
+            _ => None,
+        }
+    }
+
     pub const fn allows(self, action: WorkspaceAction) -> bool {
         matches!(
             (self, action),

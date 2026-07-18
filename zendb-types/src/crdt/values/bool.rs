@@ -2,9 +2,45 @@
 
 use bincode::{Decode, Encode};
 
-use crate::crdt::{_traits::Type, Hlc};
+use crate::{
+    CellCodecError, CellCodecKey, CrdtCodec, DefaultCrdtCodec, Hlc, PrimaryKey, Type, Value,
+};
 
 pub type Bool = bool;
+
+pub struct BoolCodec;
+
+impl CrdtCodec for BoolCodec {
+    type Rust = bool;
+
+    fn encode(value: &bool, _hlc: Hlc) -> Value {
+        Value::Bool(*value)
+    }
+
+    fn decode(value: &Value) -> Result<bool, CellCodecError> {
+        match value {
+            Value::Bool(value) => Ok(*value),
+            _ => Err(CellCodecError::expected("Bool")),
+        }
+    }
+}
+
+impl DefaultCrdtCodec for bool {
+    type Codec = BoolCodec;
+}
+
+impl CellCodecKey for bool {
+    fn to_primary_key(&self) -> PrimaryKey {
+        PrimaryKey::Bool(*self)
+    }
+
+    fn from_primary_key(key: &PrimaryKey) -> Result<Self, CellCodecError> {
+        match key {
+            PrimaryKey::Bool(value) => Ok(*value),
+            _ => Err(CellCodecError::expected("Bool primary key")),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum BoolOp {}

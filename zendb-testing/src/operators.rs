@@ -7,11 +7,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bincode::{Decode, Encode};
-use zendb_engine::{
-    define_operator_set, Change, DispatchOperator, Operator, OperatorDirective,
-    OperatorRuntimeConfig, StateHandle, Subscription, TableConfig, TableHandle, Workspace,
+use zendb_operator::{
+    define_operator_set, Change, DispatchOperator, Operator, OperatorDirective, OperatorHost,
+    OperatorRuntimeConfig, StateHandle, Subscription, TableConfig, TableHandle,
 };
-use zendb_storage::{core::traits::Backend, frontend::state::StateConfig};
+use zendb_storage::{ReadBackend, StateConfig, WriteBackend};
 use zendb_types::{
     device_id, init_device_id, Event, Hlc, Op, Path as ValuePath, PrimaryKey, Value,
 };
@@ -34,8 +34,6 @@ pub(crate) fn doc_event(doc_id: &str, content: &str, ms: u64) -> Event {
             value: Value::String(content.into()),
         },
         hlc: hlc(ms),
-        sync: false,
-        signature: Vec::new(),
     }
 }
 
@@ -95,7 +93,7 @@ impl Operator for IndexerOp {
     type Facet = ();
 
     fn create<'a, D>(
-        db: &'a Arc<Workspace<D>>,
+        db: &'a Arc<OperatorHost<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<Self>> + Send + 'a
@@ -115,7 +113,7 @@ impl Operator for IndexerOp {
     fn process<'a, D>(
         &'a mut self,
         changes: Vec<Change>,
-        _db: &'a Arc<Workspace<D>>,
+        _db: &'a Arc<OperatorHost<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -217,7 +215,7 @@ impl Operator for ArchiverOp {
     type Facet = ();
 
     fn create<'a, D>(
-        db: &'a Arc<Workspace<D>>,
+        db: &'a Arc<OperatorHost<D>>,
         name: &'a str,
         config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<Self>> + Send + 'a
@@ -226,7 +224,10 @@ impl Operator for ArchiverOp {
         Self: Sized,
     {
         async move {
-            let output = db.table("reports", Some(TableConfig::default()))?;
+            let output = db
+                .table("reports")
+                .config(TableConfig::default())
+                .create()?;
             let source_stats = db.state("doc_stats", None)?;
 
             let now = std::time::SystemTime::now()
@@ -249,7 +250,7 @@ impl Operator for ArchiverOp {
     fn process<'a, D>(
         &'a mut self,
         _changes: Vec<Change>,
-        _db: &'a Arc<Workspace<D>>,
+        _db: &'a Arc<OperatorHost<D>>,
         _name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -263,7 +264,7 @@ impl Operator for ArchiverOp {
         &'a mut self,
         _payload: (),
         _fire_at_ms: u64,
-        db: &'a Arc<Workspace<D>>,
+        db: &'a Arc<OperatorHost<D>>,
         name: &'a str,
         _config: &'a Self::Config,
     ) -> impl Future<Output = io::Result<OperatorDirective>> + Send + 'a
@@ -295,8 +296,6 @@ impl Operator for ArchiverOp {
                     value: Value::String(report_content),
                 },
                 hlc: hlc(1000 + self.reports_written),
-                sync: false,
-                signature: Vec::new(),
             })?;
 
             if self.reports_written >= self.max_reports {

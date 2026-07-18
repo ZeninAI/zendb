@@ -1,107 +1,49 @@
-# 001: Devices and Roles
+# 001: Devices And Fixed Roles
 
-Status: Accepted
-
-## Scope
-
-This decision defines Workspace membership, the Device record, Workspace-wide
-roles, and field ownership. Key rotation, presence, replication progress,
-onboarding, and operator leases have their own decisions.
+Status: Implemented
 
 ## Decision
 
-ZenDB authorizes devices. It does not model users, OAuth subjects, or services
-as database principals.
+DeviceId is the only database authorization subject. It is generated, stable,
+persisted in `DeviceProfile`, and independent of machine identity and signing
+keys. OAuth users, principals, services, and operators are application/runtime
+concepts rather than Workspace membership types.
 
-A `DeviceId` is a stable, randomly generated 128-bit identifier persisted in a
-local device profile. It is not derived from a public key or a machine ID.
-
-The Workspace control value contains one nested Device Cell per admitted
-device:
+Membership is one row:
 
 ```text
-WorkspaceControl: Record
-  devices: Record
-    <device_id>: Cell<Record(Device)>
-```
-
-A device belongs to the Workspace exactly while its Device Cell is live.
-Deleting that Cell tombstones membership. There is no device `Pending`,
-`Active`, `Online`, `Offline`, or `Revoked` field. Re-admission after deletion
-is an explicit Manager action.
-
-## Device Record
-
-```text
-Device: Record
+_devices[device_id]: Cell<DeviceRecord>
   name: String
-  key_ring: Record<DeviceKeyRing>
+  key_ring: DeviceKeyRing
   roles: Set<WorkspaceRole>
-  capabilities: OrSet<CapabilityId>
-  replication_frontier: Record<ContiguousFrontier>
+  capabilities: OR-Set<CapabilityId>
+  replication_frontier: ContiguousFrontier
 ```
 
-- `name` is a device-selected LWW alias.
-- `key_ring` is the device's authenticated signing-key state; ADR 005 defines
-  its contents and transition rules.
-- `roles` holds the fixed Workspace roles below.
-- `capabilities` is an advertised scheduling label set, not an authority grant.
-- `replication_frontier` is a durable checkpoint of shared-journal progress;
-  ADR 003 defines it.
+A live row admits the device. Tombstoning the row removes it. There is no
+status field, workspace_id column, role-binding table, or workspace private
+signing secret.
 
-All fields use the existing recursive Cell and CRDT primitives. The Device
-record is not a relational table, and no separate device-permission table is
-needed.
+## Authorization
 
-## Roles
+Every admitted device is an implicit Reader. Explicit roles are fixed and
+workspace-wide:
 
-Every admitted device can read and replicate shared Workspace data. `Reader` is
-implicit and is not stored.
+- `Contributor`: mutate inherited data and catalog rows.
+- `Dispatcher`: manage future distributed operator desired state.
+- `Manager`: admit/remove devices, change role sets, rename devices, and
+  manage enrollment tickets.
 
-There are exactly three explicit, Workspace-wide role values:
-
-```text
-Contributor
-  Create, alter, and delete shared tables; create, update, delete, and merge
-  shared data.
-
-Dispatcher
-  Create, update, enable, disable, and delete declarative operator specs.
-
-Manager
-  Admit or delete devices; rename any device; issue or delete enrollment
-  tickets; and add or remove roles from any Device record.
-```
-
-The roles have disjoint actions and are composable. `Owner` is only a UI label
-for a device holding all three roles; it is not a protocol role or bypass. A
-newly admitted device has no explicit role and is therefore a Reader.
-
-`roles` uses the HLC-backed `Set`, not `OrSet`. Authorization removal needs the
-Set's retained per-element delete clock; the additive-wins behavior of `OrSet`
-is not suitable for role revocation.
+Roles are non-overlapping protocol values. A creator receives all three. A new
+device receives none. "Owner" is only a UI description for all three roles.
 
 ## Field Ownership
 
-An admitted device may update only its own:
+- Admission is create-only and requires Manager, except ADR 004 ticket proof.
+- Removal and role changes require Manager.
+- Name may be changed by the device itself or a Manager.
+- Capabilities, key ring, and frontier may be changed only by that device.
+- A Manager cannot replace another device's cryptographic/runtime-owned state.
 
-```text
-name
-capabilities
-key_ring, using ADR 005
-replication_frontier, using ADR 003
-```
-
-A Manager may create or delete any Device Cell, change any device name, and
-mutate any device's role Set. A Manager does not gain shared-data write access
-without `Contributor`, and a Dispatcher does not gain shared-data write access
-by editing an operator spec.
-
-## Related Decisions
-
-- ADR 002 defines whether a device is currently reachable.
-- ADR 003 defines shared-journal progress and frontiers.
-- ADR 004 defines admission and bootstrap.
-- ADR 005 defines DeviceKeyRing rotation.
-- ADR 008 defines how local operator reconcilers use roles, capabilities, and
-  leases.
+Capabilities are self-advertised scheduling labels, not permissions,
+subscriptions, capability requests, or executable APIs.

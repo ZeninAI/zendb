@@ -1,88 +1,65 @@
-# 009: Shared Table Lifecycle
+# 009: Catalog-Backed Table Lifecycle
 
-Status: Accepted
+Status: Implemented
 
-## Scope
+## Catalog
 
-This decision defines how a table enters and leaves the shared plane. Local and
-nested sync boundaries are ADR 006. Event identity and anti-entropy are ADR
-003. This note does not define schemas, indexes, or operator outputs.
-
-## Context
-
-A local physical table catalog cannot establish distributed table existence.
-If each replica inferred shared tables from local files, an ordinary data event
-could silently create a table, bypass the Contributor role, and produce
-different lifecycle ordering on different devices.
-
-The Workspace control value therefore needs a small replicated declaration for
-each shared table. Physical `TableConfig` remains local because backend choice,
-buffer sizes, and storage tuning are device concerns rather than shared data.
-
-## Decision
-
-The control record contains a recursively nested shared-table map:
+`_catalog` is a replication-aware Table keyed by table name:
 
 ```text
-WorkspaceControl: Record
-  shared_tables: Record
-    <table_name>: Cell<Bool>
+_catalog[table_name]: Cell<Record>
+  config: Cell<Blob<TableConfig>>
 ```
 
-A live Cell means the shared table exists. A tombstoned Cell means it does not.
-The Cell's structural HLC is its lifecycle epoch. There is no relational table,
-`workspace_id` column, mutable status enum, or replicated storage config.
+The row's local SyncPolicy is the table-wide boundary. A live shared row means
+the inherited table exists; its tombstone deletes that lifecycle. A local row
+exists only for this device and ignores remote config/deletion until promoted.
 
-Only a Contributor may create or tombstone a shared-table declaration. Calling
-create on an already-live declaration is idempotent and must not advance the
-epoch. Recreating a tombstoned name creates a later epoch.
+`TableConfig` contains no sync flag. It is the replicated default recipe for a
+new device. A device may choose an override only when materializing storage;
+the effective config is persisted in `table.config`. A conflicting later
+override fails and requires explicit migration.
 
-## Data Event Validation
+## Bootstrap And System Tables
 
-A shared data event is accepted only when:
+`_catalog` has a fixed name, path, and initial physical format so it can open
+before reading itself. It contains these initial rows:
 
 ```text
-the author is an admitted Device
-the author has Contributor
-the shared-table declaration is live
-event.hlc >= the declaration's current lifecycle HLC
-the event signature and origin sequence are valid
+_catalog
+_devices
+_enrollment_tickets
 ```
 
-An event that arrives before the declaration is retained as pending and retried
-after other origins advance. An event older than the current creation/deletion
-epoch is rejected and cannot resurrect data from a previous incarnation.
+System rows and application rows use ordinary Table storage and replication.
+Concrete validators protect reserved schemas. There is no `_control` Cell or
+separate `_tables` KeyDir.
 
-The simplified policy intentionally uses HLC lifecycle ordering rather than a
-causal-context object. Concurrent create/delete/data races resolve by the same
-deterministic HLC ordering used by the CRDT cells. Applications that need a
-strong administrative cutover must synchronize that policy change before
-allowing further writers.
+## Lifecycle Rules
 
-## Physical State
+- Contributor creates, promotes, or tombstones inherited application rows.
+- Data waits if its catalog creation dependency is missing.
+- Data older than the current table lifecycle epoch cannot resurrect a table.
+- A local catalog boundary prevents remote lifecycle events from opening or
+  closing that local table.
+- Snapshot installation preserves same-named local catalog rows and skips the
+  hidden remote table.
 
-Creating a declaration opens or creates a local physical table with `sync =
-true`. A receiver lazily creates that physical table when the declaration or
-first valid data event arrives. Local backend configuration may differ while
-the logical CRDT state remains the same.
+## API
 
-Deleting a declaration closes the table but does not immediately erase its
-files or private overlays. Retention permits crash recovery, historical event
-validation, and later compaction. `list_shared_tables()` reports only live
-declarations; the low-level physical catalog is not the distributed namespace.
+```rust
+workspace.table("documents").open()?;
+workspace.table("drafts").config(config).local().create()?;
+workspace.table("documents").config(config).shared().create()?;
+workspace.table("documents").local().create()?;   // localize existing
+workspace.table("documents").shared().create()?;  // promote and reconcile
+workspace.table("documents").delete()?;
+```
 
-Direct insertion into a physical shared `Table` is forbidden. All shared data
-must pass through `Workspace::mutate()` so sequence allocation, authorization,
-signature, durable journal append, and application happen as one serialized
-path.
+`list_tables()` returns application tables; `list_catalog_tables()` also shows
+reserved system rows.
 
-## Snapshots And Re-Creation
-
-Snapshots contain only currently live shared tables. The control snapshot
-retains the lifecycle Cells and their HLCs, so a receiver can reject delayed
-events from a deleted incarnation even when its materialized table payload is
-absent.
-
-Recreating the same name starts a new lifecycle epoch. Retained older events
-remain journal history but do not apply to the recreated table when their HLC
-predates that epoch.
+The concrete Workspace emits `TableLifecycleEvent::{Opened, Closed}` after its
+cache changes. `observe_tables()` returns an RAII registration, so optional
+local subsystems can follow table lifecycle without being owned by or
+parameterizing Workspace. `zendb-operator::OperatorHost` is the first consumer.

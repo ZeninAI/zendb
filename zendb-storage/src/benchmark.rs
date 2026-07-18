@@ -1,7 +1,7 @@
 //! KeyDir, SkipList, Topic, LMDB, and BPlusTree storage benchmarks.
 //!
 //! The suite keeps the workload shape constant within each scenario and
-//! labels each backend by the write mode it actually implements:
+//! labels each WriteBackend by the write mode it actually implements:
 //!
 //! - LMDB is measured as one write transaction per item and as one batch
 //!   transaction as an external baseline.
@@ -47,13 +47,13 @@ use lmdb::{Database, Environment, EnvironmentFlags, Transaction, WriteFlags};
 use tempfile::TempDir;
 
 use crate::{
-    core::{
+    backend::{
+        _traits::{DurableStorage, ReadBackend, WriteBackend},
         btree::{BPlusTree, BPlusTreeConfig},
         keydir::{KeyDir, KeyDirConfig},
         skiplist::{SkipList, SkipListCapacity, SkipListConfig},
-        topic::{Topic, TopicConfig},
-        traits::{Backend, DurableStorage},
     },
+    topic::{Topic, TopicConfig},
     utils::serdes::{deserialize_from, serialize_to_vec},
 };
 
@@ -62,7 +62,7 @@ use crate::{
 // are directly comparable. KeyDir, SkipList, and LMDB use `u64` keys.
 // BPlusTree uses fixed-width `[u8; 8]` big-endian keys so its serialized
 // key bytes preserve numeric order without adding Vec allocation or a
-// length prefix. Values are `u64` for every backend.
+// length prefix. Values are `u64` for every WriteBackend.
 // ---------------------------------------------------------------------------
 
 /// Number of `put` operations in each write scenario.
@@ -173,7 +173,7 @@ fn lmdb_open(path: &Path) -> (Environment, Database) {
 /// is hit ~CHURN_FACTOR times.
 ///
 /// Pre-building puts the loop iteration outside the timed region so
-/// the bench measures the storage backend, not modulo arithmetic.
+/// the bench measures the storage WriteBackend, not modulo arithmetic.
 fn fresh_keys() -> Vec<u64> {
     (0..N).collect()
 }
@@ -697,7 +697,7 @@ fn btree_reads() -> io::Result<()> {
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn btree_range_scan() -> io::Result<()> {
-    use crate::core::traits::OrderedBackend;
+    use crate::backend::_traits::OrderedReadBackend;
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
     let mut t = BPlusTree::<[u8; 8], u64>::create(&path, btree_config())?;
@@ -722,7 +722,7 @@ fn btree_range_scan() -> io::Result<()> {
 #[test]
 #[ignore = "benchmark test; run explicitly with --ignored benchmark -- --nocapture"]
 fn btree_range_rev_scan() -> io::Result<()> {
-    use crate::core::traits::OrderedBackend;
+    use crate::backend::_traits::OrderedReadBackend;
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("btree.bin");
     let mut t = BPlusTree::<[u8; 8], u64>::create(&path, btree_config())?;

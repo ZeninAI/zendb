@@ -3,10 +3,12 @@
 Concrete client-side identity, authenticated transport, enrollment, and
 presence mechanics for ZenDB.
 
-This crate deliberately does not expose a graph of one-implementation bearer,
-session, discovery, or path-selection traits. The current product has concrete
-mechanisms and leaves application-specific Bluetooth, WebRTC, or relay adapters
-outside this crate until a second implementation requires a stable interface.
+`FramedLink` is the single carrier boundary: a reliable ordered sequence of
+frames with timeouts and close. `TcpLink` is the concrete implementation.
+Bluetooth, WebRTC data channels, QUIC streams, local sockets, and relay tunnels
+can implement the same boundary without duplicating authentication or
+encryption. Discovery and connection establishment stay concrete and
+application-owned until each mechanism has real implementation requirements.
 
 ## DeviceProfile
 
@@ -19,9 +21,9 @@ The profile allocates a shared sequence before journal append and commits it
 only after append succeeds. Opening a Workspace reconciles the counter from the
 durable journal. Key material is zeroized in memory on drop where supported.
 
-## SecureTcpSession
+## SecureSession
 
-`SecureTcpSession::connect()` and `accept()` perform a signed ephemeral X25519
+`SecureSession<L>::connect()` and `accept()` perform a signed ephemeral X25519
 handshake bound to WorkspaceId, DeviceId, declared session purpose, and both
 ephemeral keys. The derived directional keys protect length-delimited frames
 with ChaCha20-Poly1305 and monotonic nonces.
@@ -45,6 +47,8 @@ then feeds it to the tracker. It derives `Direct`, `Indirect`, `Suspect`,
 bounded arrival samples, and local grace policy. It also exposes a continuous
 suspicion score and never treats relayed evidence as direct contact.
 
-`DiscoveredPeer`, `NetworkEndpoint`, and rendezvous records are untrusted
-reachability values. They never grant membership. Hosted outbound clients live
-in `zendb-external`; server handlers are outside this repository.
+`ConnectionHint` is untrusted presentation metadata. `Tcp` is understood by
+the built-in connector; `Named` preserves application-specific addresses. A
+hint never grants membership, and every resulting link still performs the
+secure Workspace/device handshake. Hosted rendezvous server APIs are outside
+this client-side repository.

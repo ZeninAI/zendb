@@ -2,9 +2,31 @@
 
 use bincode::{Decode, Encode};
 
-use crate::crdt::{_traits::Type, Hlc};
+use crate::{CellCodecError, CrdtCodec, Hlc, Type, Value};
 
 pub type Timestamp = u64;
+
+/// Explicit timestamp codec for `u64` fields.
+///
+/// `u64` defaults to the `Int` codec. A derived field selects this alternate
+/// CRDT representation with `#[cell(codec =
+/// "zendb_types::crdt::values::TimestampCodec")]`.
+pub struct TimestampCodec;
+
+impl CrdtCodec for TimestampCodec {
+    type Rust = u64;
+
+    fn encode(value: &u64, _hlc: Hlc) -> Value {
+        Value::Timestamp(*value)
+    }
+
+    fn decode(value: &Value) -> Result<u64, CellCodecError> {
+        match value {
+            Value::Timestamp(value) => Ok(*value),
+            _ => Err(CellCodecError::expected("Timestamp")),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum TimestampOp {}

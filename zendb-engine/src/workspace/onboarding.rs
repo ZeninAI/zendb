@@ -3,20 +3,19 @@
 use std::{collections::BTreeSet, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use bincode::{Decode, Encode};
-use zendb_sync::{SnapshotExport, SnapshotManifest, SyncSnapshotChunk};
+use zendb_replication::{SnapshotExport, SnapshotManifest, SyncSnapshotChunk};
 use zendb_transport::{
     build_direct_request, evidence_from_request, ticket_admission_signing_bytes,
-    verify_candidate_request, BootstrapApproval, BootstrapRequest, EnrollmentPresentation,
-    HandshakePeer, NetworkEndpoint, SecureTcpSession, SessionPurpose,
+    verify_candidate_request, BootstrapApproval, BootstrapRequest, ConnectionHint,
+    EnrollmentPresentation, HandshakePeer, SecureSession, SessionPurpose, TcpLink,
+    TcpSecureSession,
 };
 use zendb_types::{
     CapabilityId, ContiguousFrontier, DeviceKeyPhase, DeviceKeyRing, DevicePublicKey, DeviceRecord,
     EnrollmentTicketId, Hlc,
 };
 
-use crate::DispatchOperator;
-
-use super::{control, now_ms, snapshot, Workspace};
+use super::{now_ms, snapshot, system, Workspace};
 
 const SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
 
@@ -38,17 +37,14 @@ pub struct OnboardingResult {
     pub admitted_device_id: zendb_types::DeviceId,
 }
 
-impl<D> Workspace<D>
-where
-    D: DispatchOperator,
-{
+impl Workspace {
     /// Create a replicated ticket verifier and return its secret QR/link
     /// presentation. Ordinary Manager authorization is enforced when the
     /// control event is applied.
     pub fn create_enrollment_ticket(
         self: &Arc<Self>,
         valid_for: Duration,
-        rendezvous_hints: Vec<NetworkEndpoint>,
+        connection_hints: Vec<ConnectionHint>,
     ) -> io::Result<EnrollmentPresentation> {
         let ticket_id = random_ticket_id()?;
         let now = now_ms();
@@ -67,10 +63,10 @@ where
             self.workspace_id().clone(),
             ticket_id.clone(),
             expires_at,
-            rendezvous_hints,
+            connection_hints,
         )?;
         let event_hlc = self.device_profile.next_hlc(now)?;
-        self.commit_shared_event(control::ticket_event(event_hlc, &ticket_id, &ticket))?;
+        self.commit_shared_event(system::ticket_event(event_hlc, &ticket_id, &ticket))?;
         Ok(presentation)
     }
 
@@ -80,7 +76,7 @@ where
         ticket_id: &EnrollmentTicketId,
     ) -> io::Result<()> {
         let at = self.device_profile.next_hlc(now_ms())?;
-        self.commit_shared_event(control::delete_ticket_event(at, ticket_id))?;
+        self.commit_shared_event(system::delete_ticket_event(at, ticket_id))?;
         Ok(())
     }
 
@@ -131,8 +127,8 @@ where
         expected_peer_key: Option<DevicePublicKey>,
         ticket_verifier: Option<DevicePublicKey>,
     ) -> io::Result<OnboardingResult> {
-        let mut session = SecureTcpSession::connect(
-            address,
+        let mut session = SecureSession::connect(
+            TcpLink::connect(address)?,
             self.workspace_id(),
             self.device_profile(),
             SessionPurpose::Bootstrap,
@@ -177,7 +173,7 @@ where
 
     pub(crate) fn serve_bootstrap_session(
         self: &Arc<Self>,
-        session: &mut SecureTcpSession,
+        session: &mut TcpSecureSession,
     ) -> io::Result<()> {
         let BootstrapMessage::Request(request) = session.receive_value()? else {
             return Err(io::Error::new(
@@ -201,7 +197,7 @@ where
             let record = candidate_record(&request);
             let at = self.device_profile.next_hlc(now_ms())?;
             self.commit_shared_event_with_admission(
-                control::admit_event(at, request.candidate_device_id, record),
+                system::admit_event(at, request.candidate_device_id, record),
                 Some(evidence),
             )?;
         } else {
@@ -250,16 +246,15 @@ where
         export: &SnapshotExport,
     ) -> io::Result<()> {
         let decoded = snapshot::decode_snapshot(self.workspace_id(), export)?;
-        let candidate = control::WorkspaceControl::device_from_root(
-            &decoded.control,
-            request.candidate_device_id,
-        )?
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "snapshot did not admit candidate",
-            )
-        })?;
+        let candidate = decoded
+            .system
+            .device(request.candidate_device_id)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "snapshot did not admit candidate",
+                )
+            })?;
         if candidate.name != request.requested_name
             || candidate.key_ring.primary_key != request.candidate_public_key
             || !candidate.roles.is_empty()
@@ -270,13 +265,12 @@ where
                 "snapshot candidate record does not match bootstrap request",
             ));
         }
-        let server = control::WorkspaceControl::device_from_root(&decoded.control, peer.device_id)?
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "bootstrap peer is absent from snapshot membership",
-                )
-            })?;
+        let server = decoded.system.device(peer.device_id)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "bootstrap peer is absent from snapshot membership",
+            )
+        })?;
         if server.key_ring.primary_key != peer.public_key
             && server.key_ring.secondary_key != Some(peer.public_key)
         {
@@ -289,14 +283,12 @@ where
             let proof = request.ticket_admission.as_ref().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "missing ticket proof")
             })?;
-            let ticket =
-                control::WorkspaceControl::ticket_from_root(&decoded.control, &proof.ticket_id)?
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "snapshot omitted enrollment ticket",
-                        )
-                    })?;
+            let ticket = decoded.system.ticket(&proof.ticket_id)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "snapshot omitted enrollment ticket",
+                )
+            })?;
             if ticket.verifier_key != expected_verifier {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -342,18 +334,11 @@ fn candidate_record(request: &BootstrapRequest) -> DeviceRecord {
 }
 
 fn random_ticket_id() -> io::Result<EnrollmentTicketId> {
-    let mut bytes = [0; 16];
-    getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
-    let mut id = String::with_capacity(32);
-    for byte in bytes {
-        use std::fmt::Write;
-        write!(&mut id, "{byte:02x}").expect("writing to String is infallible");
-    }
-    Ok(EnrollmentTicketId(id))
+    EnrollmentTicketId::generate()
 }
 
 fn receive_bootstrap_snapshot(
-    session: &mut SecureTcpSession,
+    session: &mut TcpSecureSession,
     manifest: SnapshotManifest,
     chunk_count: u32,
 ) -> io::Result<SnapshotExport> {

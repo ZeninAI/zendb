@@ -4,9 +4,11 @@ use bincode::{Decode, Encode};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    CapabilityId, DeviceId, DevicePublicKey, EnrollmentTicketId, Event, Hlc, Signature,
-    SignatureBytes, WorkspaceId,
+    CapabilityId, Cell, CellCodecError, CrdtCodec, DefaultCrdtCodec, DeviceId, DevicePublicKey,
+    EnrollmentTicketId, Event, Hlc, SignatureBytes, SyncPolicy, Value, WorkspaceId,
 };
+
+pub type Signature = Vec<u8>;
 
 /// Public evidence attached only to an exceptional ticket-based Device
 /// admission event. It lets every replica validate the admission without the
@@ -121,6 +123,48 @@ impl ContiguousFrontier {
         let local = self.applied_through(&origin);
         (local < remote_through).then_some((local + 1, remote_through))
     }
+}
+
+impl CrdtCodec for ContiguousFrontier {
+    type Rust = Self;
+
+    fn encode(value: &Self, hlc: Hlc) -> Value {
+        let record =
+            crate::crdt::values::Record::from_fields(value.entries().map(|(origin, sequence)| {
+                (
+                    origin.to_string(),
+                    Cell {
+                        value: Some(Value::Int((*sequence).try_into().unwrap_or(i64::MAX))),
+                        hlc,
+                        sync: SyncPolicy::Inherit,
+                    },
+                )
+            }));
+        Value::Record(record)
+    }
+
+    fn decode(value: &Value) -> Result<Self, CellCodecError> {
+        let Value::Record(record) = value else {
+            return Err(CellCodecError::expected("Record"));
+        };
+        let mut entries = Vec::new();
+        for (origin, sequence) in record.fields() {
+            let origin = DeviceId::parse(origin)
+                .map_err(|_| CellCodecError::expected("DeviceId record key"))?;
+            let Some(Value::Int(sequence)) = sequence.value.as_ref() else {
+                return Err(CellCodecError::expected("non-negative frontier sequence"));
+            };
+            if *sequence < 0 {
+                return Err(CellCodecError::expected("non-negative frontier sequence"));
+            }
+            entries.push((origin, *sequence as u64));
+        }
+        Ok(Self::from_applied(entries))
+    }
+}
+
+impl DefaultCrdtCodec for ContiguousFrontier {
+    type Codec = Self;
 }
 
 /// Element-wise minimum across every admitted device's frontier checkpoints.

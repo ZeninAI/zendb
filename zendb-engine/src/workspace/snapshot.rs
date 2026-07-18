@@ -3,23 +3,21 @@
 use std::{fs, io, path::Path};
 
 use bincode::{Decode, Encode};
-use zendb_sync::{SnapshotExport, SnapshotManifest, WorkspaceSyncSummary};
+use zendb_replication::{SnapshotExport, SnapshotManifest, WorkspaceSyncSummary};
 use zendb_types::{
     compaction_watermark, stable_frontier, Cell, ContiguousFrontier, Hlc, PrimaryKey, WorkspaceId,
 };
 
-use crate::DispatchOperator;
-
 use super::{Workspace, SNAPSHOT_FILE};
 
-const SNAPSHOT_FORMAT_VERSION: u16 = 1;
+const SNAPSHOT_FORMAT_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub(super) struct WorkspaceSnapshot {
     format_version: u16,
     workspace_id: WorkspaceId,
     frontier: ContiguousFrontier,
-    pub(super) control: Cell,
+    pub(super) system: super::system::SystemSnapshot,
     tables: Vec<SharedTableSnapshot>,
 }
 
@@ -29,22 +27,18 @@ struct SharedTableSnapshot {
     rows: Vec<(PrimaryKey, Cell)>,
 }
 
-impl<D> Workspace<D>
-where
-    D: DispatchOperator,
-{
+impl Workspace {
     /// Capture and durably retain a snapshot of the shared plane. Local tables,
-    /// local overlay policy, and local overlay values are never serialized.
+    /// local policy metadata, and values below local boundaries are omitted.
     pub fn export_snapshot(self: &std::sync::Arc<Self>) -> io::Result<SnapshotExport> {
         let _shared_guard = self.shared_mutation.lock();
         let frontier = self.shared_journal.lock().frontier().clone();
         let mut tables = Vec::new();
         for name in self.list_shared_tables()? {
-            let Some(config) = self.table_config(&name) else {
+            if self.table_config(&name).is_none() {
                 continue;
-            };
-            debug_assert!(config.sync);
-            let handle = self.table(&name, None)?;
+            }
+            let handle = self.table_impl(&name, None)?;
             let rows = handle.get()?.read().shared_rows();
             tables.push(SharedTableSnapshot { name, rows });
         }
@@ -54,7 +48,7 @@ where
             format_version: SNAPSHOT_FORMAT_VERSION,
             workspace_id: self.workspace_id().clone(),
             frontier: frontier.clone(),
-            control: self.control.lock().root().clone(),
+            system: self.control.lock().snapshot(),
             tables,
         };
         let bytes = bincode::encode_to_vec(&payload, bincode::config::standard())
@@ -69,6 +63,8 @@ where
                     frontier,
                     snapshot_generation: Some(generation),
                     compacted_through,
+                    requests_state_reconciliation: self.state_reconciliation_required(),
+                    table_merkle_roots: self.sync_summary().table_merkle_roots,
                 },
                 total_bytes: bytes.len() as u64,
                 snapshot_hash: *blake3::hash(&bytes).as_bytes(),
@@ -101,45 +97,31 @@ where
             ));
         }
 
-        super::control::WorkspaceControl::validate_root(&snapshot.control)?;
-        if super::control::WorkspaceControl::device_from_root(&snapshot.control, self.device_id())?
-            .is_none()
-        {
+        if snapshot.system.device(self.device_id())?.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "snapshot does not admit the local Device",
             ));
         }
 
-        // Validate every local/shared catalog conflict before mutating any
-        // durable shared state. Installation is idempotent and can be retried
-        // if an I/O failure occurs after this point.
-        for table in &snapshot.tables {
-            if self
-                .table_config(&table.name)
-                .is_some_and(|config| !config.sync)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "shared snapshot conflicts with local table {:?}",
-                        table.name
-                    ),
-                ));
-            }
-        }
-        self.control.lock().install_root(snapshot.control)?;
+        // Installation is idempotent and can be retried after an I/O failure.
+        // Local catalog rows are merged policy-aware and intentionally hide a
+        // same-named shared row rather than rejecting the whole snapshot.
+        self.control.lock().install_snapshot(snapshot.system)?;
 
         for table in snapshot.tables {
-            let mut config = self.table_config(&table.name).unwrap_or_default();
-            config.sync = true;
-            let handle = self.table(&table.name, Some(config))?;
+            if !self.is_shared_table(&table.name)? {
+                continue;
+            }
+            let config = self.table_config(&table.name).unwrap_or_default();
+            let handle = self.table_impl(&table.name, Some(config))?;
             handle.get()?.write().install_shared_rows(table.rows)?;
         }
         self.shared_journal
             .lock()
             .install_snapshot_frontier(snapshot.frontier)?;
         persist_snapshot(&self.path.join(SNAPSHOT_FILE), export)?;
+        self.clear_state_reconciliation_required()?;
         drop(_shared_guard);
         self.recover_shared_journal()
     }
@@ -173,7 +155,7 @@ where
         let _shared_guard = self.shared_mutation.lock();
         self.control.lock().compact_through(watermark)?;
         for name in self.list_shared_tables()? {
-            self.table(&name, None)?
+            self.table_impl(&name, None)?
                 .get()?
                 .write()
                 .compact_shared_through(watermark)?;

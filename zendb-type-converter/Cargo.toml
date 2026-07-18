@@ -1,0 +1,16 @@
+[package]
+name = "zendb-type-converter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Type-directed procedural derive for ZenDB CellCodec values"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true

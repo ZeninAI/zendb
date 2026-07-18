@@ -11,3 +11,5 @@ description = "Core type system for ZeninDB — HLC, Cell, Value, Op, Path, Even
 bincode.workspace = true
 blake3.workspace = true
 getrandom.workspace = true
+zendb-type-converter = { path = "../zendb-type-converter" }
+zendb-storage = { path = "../zendb-storage" }

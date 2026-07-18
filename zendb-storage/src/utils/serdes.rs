@@ -119,8 +119,7 @@ where
     f(&buf_a[..written_a], &buf_b[..written_b])
 }
 
-/// Decode a value from `src`. Returns the decoded value, discarding the
-/// trailing byte count.
+/// Decode a value from `src`. Discards the trailing byte count.
 pub fn deserialize_from<T: Decode<()>>(src: &[u8]) -> io::Result<T> {
     bincode::decode_from_slice(src, cfg())
         .map(|(value, _bytes_read)| value)

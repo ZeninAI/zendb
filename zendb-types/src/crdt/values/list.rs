@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bincode::{Decode, Encode};
 
-use crate::{Cell, ContainerType, Hlc, MergeClocks, Op, PathStep, Segment, Type, TypeError, Value};
+use crate::{
+    Cell, ContainerType, Hlc, MergeClocks, Op, PathStep, Segment, SyncScope, Type, TypeError, Value,
+};
 
 pub type ListId = Hlc;
 pub type ListSegment = ListId;
@@ -155,7 +157,7 @@ impl Type for List {
                 let incoming = Cell {
                     value: Some(value.clone()),
                     hlc: op_hlc,
-                    sync: None,
+                    sync: crate::SyncPolicy::Inherit,
                 };
                 match self.entries.get_mut(&op_hlc) {
                     Some(entry) => {
@@ -179,7 +181,7 @@ impl Type for List {
                 let tombstone = Cell {
                     value: None,
                     hlc: op_hlc,
-                    sync: None,
+                    sync: crate::SyncPolicy::Inherit,
                 };
                 match self.entries.get_mut(id) {
                     Some(entry) => Type::merge(&mut entry.cell, &tombstone, MergeClocks::ZERO)
@@ -220,19 +222,6 @@ impl Type for List {
         Ok(changed)
     }
 
-    fn is_synced(&self, inherited: bool, path: &[PathStep]) -> bool {
-        let Some((step, remaining)) = path.split_first() else {
-            return inherited;
-        };
-        let Segment::List(id) = step.segment else {
-            return inherited;
-        };
-        self.entries
-            .get(&id)
-            .map(|entry| entry.cell.is_synced(inherited, remaining))
-            .unwrap_or(inherited)
-    }
-
     fn compact(&mut self, watermark: Hlc) -> Result<bool, ListError> {
         let mut changed = false;
         for entry in self.entries.values_mut() {
@@ -267,6 +256,24 @@ impl Type for List {
 }
 
 impl ContainerType for List {
+    fn child(&self, segment: &Segment) -> Option<&Cell> {
+        let Segment::List(id) = segment else {
+            return None;
+        };
+        self.entries.get(id).map(|entry| &entry.cell)
+    }
+
+    fn child_mut(&mut self, segment: &Segment) -> Option<&mut Cell> {
+        let Segment::List(id) = segment else {
+            return None;
+        };
+        self.entries.get_mut(id).map(|entry| &mut entry.cell)
+    }
+
+    fn any_child(&self, predicate: &mut dyn FnMut(&Cell) -> bool) -> bool {
+        self.entries.values().any(|entry| predicate(&entry.cell))
+    }
+
     fn apply_walk(&mut self, op: &Op, op_hlc: Hlc, path: &[PathStep]) -> Result<bool, ListError> {
         let Some((step, remaining)) = path.split_first() else {
             return Ok(false);
@@ -281,22 +288,100 @@ impl ContainerType for List {
         let child_tag = remaining
             .first()
             .map(|step| step.container_tag)
-            .or_else(|| op.target_type());
+            .or_else(|| op.type_tag());
         let entry = self.entries.entry(id).or_insert_with(|| {
             let cell = child_tag
                 .map(|tag| Cell::dummy(Some(tag.empty_value())))
                 .unwrap_or(Cell {
                     value: None,
                     hlc: Hlc::ZERO,
-                    sync: None,
+                    sync: crate::SyncPolicy::Inherit,
                 });
             ListEntry::placeholder(cell)
         });
         if child_tag.is_some_and(|tag| !entry.cell.ensure_type(tag, op_hlc)) {
             return Ok(false);
         }
-        ContainerType::apply_walk(&mut entry.cell, op, op_hlc, remaining)
+        entry
+            .cell
+            .apply_walk(op, op_hlc, remaining)
             .map_err(|error| ListError::Child(Box::new(error)))
+    }
+
+    fn merge_shared(
+        &mut self,
+        remote: &Self,
+        _clocks: MergeClocks,
+        parent_scope: SyncScope,
+    ) -> Result<bool, ListError> {
+        let mut changed = false;
+        for (id, remote_entry) in &remote.entries {
+            match self.entries.get_mut(id) {
+                Some(local_entry) => {
+                    if remote_entry.after_known
+                        && resolve_position(local_entry, *id, remote_entry.after)?
+                    {
+                        changed = true;
+                    }
+                    changed |= ContainerType::merge_shared(
+                        &mut local_entry.cell,
+                        &remote_entry.cell,
+                        MergeClocks::ZERO,
+                        parent_scope,
+                    )
+                    .map_err(|error| ListError::Child(Box::new(error)))?;
+                }
+                None => {
+                    self.entries.insert(*id, remote_entry.clone());
+                    changed = true;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    fn shared_clone(&self, parent_scope: SyncScope) -> Option<Self> {
+        let mut entries: BTreeMap<ListId, ListEntry> = self
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                entry.cell.shared_clone(parent_scope).map(|cell| {
+                    (
+                        *id,
+                        ListEntry {
+                            after: entry.after,
+                            after_known: entry.after_known,
+                            cell,
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        // List placement refers to stable predecessor IDs. Preserve missing
+        // predecessor chains as zero-clock tombstone placeholders so shared
+        // descendants remain reachable without publishing local values.
+        let mut pending: Vec<ListId> = entries.values().filter_map(|entry| entry.after).collect();
+        while let Some(id) = pending.pop() {
+            if entries.contains_key(&id) {
+                continue;
+            }
+            let Some(local) = self.entries.get(&id) else {
+                continue;
+            };
+            if let Some(parent) = local.after {
+                pending.push(parent);
+            }
+            entries.insert(
+                id,
+                ListEntry {
+                    after: local.after,
+                    after_known: local.after_known,
+                    cell: Cell::dummy(None),
+                },
+            );
+        }
+        Some(Self { entries })
     }
 }
 
@@ -355,7 +440,7 @@ mod tests {
         Hlc::with_device_id(ms, 0, crate::DeviceId::from_bytes([device; 16])).unwrap()
     }
 
-    fn cell(value: Option<Value>, hlc: Hlc, sync: Option<bool>) -> Cell {
+    fn cell(value: Option<Value>, hlc: Hlc, sync: crate::SyncPolicy) -> Cell {
         Cell { value, hlc, sync }
     }
 
@@ -377,8 +462,6 @@ mod tests {
             path,
             op,
             hlc: at,
-            sync: false,
-            signature: Vec::new(),
         }
     }
 
@@ -723,7 +806,11 @@ mod tests {
     #[test]
     fn list_path_targets_stable_element_id() {
         let id = hlc(100, 1);
-        let mut root = cell(Some(Value::List(List::default())), hlc(50, 1), None);
+        let mut root = cell(
+            Some(Value::List(List::default())),
+            hlc(50, 1),
+            crate::SyncPolicy::Inherit,
+        );
         assert!(root
             .apply_event(
                 &event(
@@ -734,7 +821,7 @@ mod tests {
                     })),
                     id,
                 ),
-                true
+                crate::SyncScope::Shared
             )
             .unwrap());
         assert!(root
@@ -746,7 +833,7 @@ mod tests {
                     },
                     hlc(200, 1),
                 ),
-                true
+                crate::SyncScope::Shared
             )
             .unwrap());
 
@@ -768,7 +855,11 @@ mod tests {
             id,
             ListEntry::inserted(
                 None,
-                cell(Some(Value::String("stale".into())), hlc(100, 1), None),
+                cell(
+                    Some(Value::String("stale".into())),
+                    hlc(100, 1),
+                    crate::SyncPolicy::Inherit,
+                ),
             ),
         );
         let path = vec![
@@ -795,7 +886,11 @@ mod tests {
     #[test]
     fn matching_elements_recursively_merge_nested_cells() {
         let id = hlc(100, 1);
-        let mut base = cell(Some(Value::List(List::default())), hlc(50, 1), None);
+        let mut base = cell(
+            Some(Value::List(List::default())),
+            hlc(50, 1),
+            crate::SyncPolicy::Inherit,
+        );
         assert!(base
             .apply_event(
                 &event(
@@ -806,7 +901,7 @@ mod tests {
                     })),
                     id,
                 ),
-                true
+                crate::SyncScope::Shared
             )
             .unwrap());
 
@@ -829,7 +924,7 @@ mod tests {
                     },
                     hlc(200, 1),
                 ),
-                true
+                crate::SyncScope::Shared
             )
             .unwrap());
         assert!(right
@@ -848,7 +943,7 @@ mod tests {
                     },
                     hlc(200, 2),
                 ),
-                true
+                crate::SyncScope::Shared
             )
             .unwrap());
 
@@ -881,5 +976,38 @@ mod tests {
             decode_from_slice(&buf, config::standard()).unwrap();
         assert_eq!(consumed, buf.len());
         assert_eq!(decoded, list);
+    }
+
+    #[test]
+    fn shared_clone_keeps_local_predecessor_as_structural_anchor() {
+        let first = hlc(100, 1);
+        let second = hlc(101, 1);
+        let mut list = List::default();
+        list.insert(
+            first,
+            ListEntry::inserted(
+                None,
+                Cell {
+                    value: Some(Value::String("private".into())),
+                    hlc: first,
+                    sync: crate::SyncPolicy::Local,
+                },
+            ),
+        );
+        list.insert(
+            second,
+            ListEntry::inserted(
+                Some(first),
+                Cell {
+                    value: Some(Value::String("shared".into())),
+                    hlc: second,
+                    sync: crate::SyncPolicy::Inherit,
+                },
+            ),
+        );
+
+        let projected = ContainerType::shared_clone(&list, crate::SyncScope::Shared).unwrap();
+        assert_eq!(projected.visible_ids(), vec![second]);
+        assert!(projected.entries.get(&first).unwrap().cell.is_tombstone());
     }
 }

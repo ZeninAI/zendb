@@ -2,9 +2,45 @@
 
 use bincode::{Decode, Encode};
 
-use crate::crdt::{_traits::Type, Hlc};
+use crate::{
+    CellCodecError, CellCodecKey, CrdtCodec, DefaultCrdtCodec, Hlc, PrimaryKey, Type, Value,
+};
 
 pub type String = std::string::String;
+
+pub struct StringCodec;
+
+impl CrdtCodec for StringCodec {
+    type Rust = String;
+
+    fn encode(value: &String, _hlc: Hlc) -> Value {
+        Value::String(value.clone())
+    }
+
+    fn decode(value: &Value) -> Result<String, CellCodecError> {
+        match value {
+            Value::String(value) => Ok(value.clone()),
+            _ => Err(CellCodecError::expected("String")),
+        }
+    }
+}
+
+impl DefaultCrdtCodec for String {
+    type Codec = StringCodec;
+}
+
+impl CellCodecKey for String {
+    fn to_primary_key(&self) -> PrimaryKey {
+        PrimaryKey::String(self.clone())
+    }
+
+    fn from_primary_key(key: &PrimaryKey) -> Result<Self, CellCodecError> {
+        match key {
+            PrimaryKey::String(value) => Ok(value.clone()),
+            _ => Err(CellCodecError::expected("String primary key")),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum StringOp {}

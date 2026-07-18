@@ -1,24 +1,184 @@
 //! Table lookup and operator subscription maintenance.
 
-use std::{fs, io, sync::Arc};
+use std::{borrow::Cow, fs, io, sync::Arc};
 
-use log::{debug, info, trace};
+use log::{info, trace};
 use parking_lot::RwLock;
-use zendb_storage::core::traits::Backend;
-use zendb_storage::frontend::table::{Table, TableConfig};
+use zendb_replication::{Table, TableConfig};
+use zendb_storage::backend::_traits::{ReadBackend, Storage};
+use zendb_types::{
+    Cell, ContainerType, EventIdentity, Op, Path as ValuePath, PrimaryKey, SyncPolicy, SyncScope,
+    Value,
+};
 
-use crate::operator::worker::{OperatorInput, OperatorWorker};
-use crate::{DispatchConfig, DispatchOperator, OperatorPhase};
+use super::{TableHandle, TableLifecycleEvent, Workspace, TABLES_DIR};
 
-use super::{ConcurrentTable, TableHandle, Workspace, TABLES_DIR};
+/// Fluent table lookup/creation command.
+pub struct TableRequest {
+    workspace: Arc<Workspace>,
+    name: String,
+    config: Option<TableConfig>,
+    policy: Option<SyncPolicy>,
+}
 
-impl<D> Workspace<D>
-where
-    D: DispatchOperator,
-{
+/// Fluent row/path command backed by Workspace authorization and routing.
+pub struct RowRequest {
+    table: TableRequest,
+    key: PrimaryKey,
+    path: ValuePath,
+}
+
+impl TableRequest {
+    pub(crate) fn new(workspace: &Arc<Workspace>, name: &str) -> Self {
+        Self {
+            workspace: Arc::clone(workspace),
+            name: name.into(),
+            config: None,
+            policy: None,
+        }
+    }
+
+    pub fn config(mut self, config: TableConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    pub fn local(mut self) -> Self {
+        self.policy = Some(SyncPolicy::Local);
+        self
+    }
+
+    pub fn shared(mut self) -> Self {
+        self.policy = Some(SyncPolicy::Inherit);
+        self
+    }
+
+    pub fn row(self, key: PrimaryKey) -> RowRequest {
+        RowRequest {
+            table: self,
+            key,
+            path: ValuePath::new(),
+        }
+    }
+
+    /// Tombstone a shared declaration or remove a local table and its files.
+    pub fn delete(self) -> io::Result<bool> {
+        if !self.workspace.contains_table(&self.name) {
+            return Ok(false);
+        }
+        if self.workspace.is_shared_table(&self.name)? {
+            self.workspace.delete_shared_table(&self.name)
+        } else {
+            self.workspace.delete_table(&self.name)
+        }
+    }
+
+    /// Open a cataloged table without implicitly creating a new declaration.
+    pub fn open(self) -> io::Result<TableHandle> {
+        if !self.workspace.contains_table(&self.name) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("table {:?} is absent from _catalog", self.name),
+            ));
+        }
+        if let Some(policy) = self.policy {
+            let shared = self.workspace.is_shared_table(&self.name)?;
+            if shared != policy.resolve(SyncScope::Shared).is_shared() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "requested table policy conflicts with the local catalog Cell",
+                ));
+            }
+        }
+        self.workspace.table_impl(&self.name, self.config)
+    }
+
+    /// Create the declaration when absent, otherwise open the existing table.
+    pub fn create(self) -> io::Result<TableHandle> {
+        if self.workspace.contains_table(&self.name) {
+            // Validate a physical override before changing catalog policy.
+            let handle = self.workspace.table_impl(&self.name, self.config)?;
+            if let Some(policy) = self.policy {
+                let is_shared = self.workspace.is_shared_table(&self.name)?;
+                if is_shared != policy.resolve(SyncScope::Shared).is_shared() {
+                    self.workspace.set_table_sync_policy(&self.name, policy)?;
+                }
+            }
+            return Ok(handle);
+        }
+        let policy = self.policy.unwrap_or(SyncPolicy::Local);
+        match policy {
+            SyncPolicy::Inherit => self
+                .workspace
+                .create_shared_table(&self.name, self.config.unwrap_or_default()),
+            SyncPolicy::Local => self.workspace.table_impl(&self.name, self.config),
+        }
+    }
+}
+
+impl RowRequest {
+    pub fn at(mut self, path: ValuePath) -> Self {
+        self.path = path;
+        self
+    }
+
+    pub fn get(self) -> io::Result<Option<Cell>> {
+        let RowRequest { table, key, path } = self;
+        let handle = table.open()?;
+        let table = handle.get()?;
+        let value = ReadBackend::get(&*table.read(), &key).map(Cow::into_owned);
+        Ok(value.and_then(|cell| cell.cell_at_path(&path).cloned()))
+    }
+
+    pub fn replace(self, value: Value) -> io::Result<Option<EventIdentity>> {
+        self.apply(Op::Replace { value })
+    }
+
+    pub fn delete(self) -> io::Result<Option<EventIdentity>> {
+        self.apply(Op::Delete)
+    }
+
+    pub fn apply(self, op: Op) -> io::Result<Option<EventIdentity>> {
+        // Opening first makes a typo an error instead of implicitly creating a
+        // local table through the mutation path.
+        let _ = self.table.workspace.table(&self.table.name).open()?;
+        self.table
+            .workspace
+            .mutate(&self.table.name, self.key, self.path, op)
+    }
+
+    pub fn local(self) -> io::Result<bool> {
+        self.set_policy(SyncPolicy::Local)
+    }
+
+    pub fn inherit(self) -> io::Result<bool> {
+        self.set_policy(SyncPolicy::Inherit)
+    }
+
+    fn set_policy(self, policy: SyncPolicy) -> io::Result<bool> {
+        let RowRequest { table, key, path } = self;
+        // Verify the table exists and honor any requested physical override
+        // before routing the policy transition through Workspace replication.
+        let _ = table.workspace.table(&table.name).open()?;
+        table
+            .workspace
+            .set_path_sync_policy(&table.name, key, path, policy)
+    }
+}
+
+impl Workspace {
+    pub fn table(self: &Arc<Self>, name: &str) -> TableRequest {
+        TableRequest::new(self, name)
+    }
+
     /// Return `true` if a table exists in the durable table catalog.
     pub fn contains_table(&self, name: &str) -> bool {
-        self.table_catalog.lock().contains(&name.to_owned())
+        self.control
+            .lock()
+            .table_config(name)
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     /// Return `true` if a table is currently loaded in memory.
@@ -28,11 +188,17 @@ where
 
     /// List every table known to the durable table catalog.
     pub fn list_tables(&self) -> Vec<String> {
-        self.table_catalog
+        self.control
             .lock()
-            .keys()
-            .map(|name| name.into_owned())
+            .catalog_names()
+            .into_iter()
+            .filter(|name| !super::system::is_system_table(name))
             .collect()
+    }
+
+    /// List application and reserved system entries from `_catalog`.
+    pub fn list_catalog_tables(&self) -> Vec<String> {
+        self.control.lock().catalog_names()
     }
 
     /// List every table currently loaded in memory.
@@ -42,14 +208,11 @@ where
 
     /// Return the persisted config for a table, if the catalog contains one.
     pub fn table_config(&self, name: &str) -> Option<TableConfig> {
-        self.table_catalog
-            .lock()
-            .get(&name.to_owned())
-            .map(|config| config.into_owned())
+        self.control.lock().table_config(name).ok().flatten()
     }
 
-    /// Remove an open table from the in-memory cache and notify live operators
-    /// that the input closed. The durable table remains in the catalog and can
+    /// Remove an open table from the in-memory cache and notify observers that
+    /// the input closed. The durable table remains in the catalog and can
     /// be reopened later with [`Workspace::table`].
     pub fn close_table(&self, name: &str) -> bool {
         let removed = self.tables.write().remove(name).is_some();
@@ -58,10 +221,7 @@ where
         }
 
         info!("closing table {name:?}");
-        let workers: Vec<_> = self.operators.read().values().cloned().collect();
-        for worker in workers {
-            worker.detach_input(name);
-        }
+        self.notify_table_observers(TableLifecycleEvent::Closed(name.to_owned()));
         true
     }
 
@@ -93,15 +253,13 @@ where
         }
         let was_open = self.tables.write().remove(name).is_some();
 
-        if !self.table_catalog.lock().delete(&name.to_owned())? {
+        let at = self.device_profile.next_hlc(super::now_ms())?;
+        if !self.control.lock().delete_local_table(name, at)? {
             return Ok(false);
         }
 
         if was_open {
-            let workers: Vec<_> = self.operators.read().values().cloned().collect();
-            for worker in workers {
-                worker.detach_input(name);
-            }
+            self.notify_table_observers(TableLifecycleEvent::Closed(name.to_owned()));
         }
 
         // 4. Delete on-disk files (includes all consumer offsets).
@@ -114,45 +272,101 @@ where
     }
 
     /// Return an open table, opening it lazily from the catalog or creating it
-    /// with `config`. If the table is in the catalog and a different `config` is
-    /// supplied, the catalog is updated before opening. Automatically starts
-    /// catalog operators that subscribe to this table.
-    pub fn table(
+    /// with `config`. For an existing table, a supplied config is a local
+    /// physical-storage override; the replicated catalog baseline is unchanged.
+    /// Automatically starts catalog operators that subscribe to this table.
+    pub(crate) fn table_impl(
         self: &Arc<Self>,
         name: &str,
         config: Option<TableConfig>,
     ) -> io::Result<TableHandle> {
+        if matches!(
+            name,
+            super::system::CATALOG_TABLE
+                | super::system::DEVICES_TABLE
+                | super::system::TICKETS_TABLE
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "system tables are managed by Workspace APIs",
+            ));
+        }
         // Fast path: already open
         if let Some(table) = self.tables.read().get(name).cloned() {
+            if config
+                .as_ref()
+                .is_some_and(|requested| requested != &Storage::config(&*table.read()))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a table configuration override cannot migrate existing storage",
+                ));
+            }
             trace!("table {name:?} already open, returning cached handle");
             return Ok(TableHandle::new(name, &table));
         }
 
         // Slow path: open/create under table catalog lock, then spawn operators outside it.
-        let (table, workers_to_spawn) = {
-            let mut table_catalog = self.table_catalog.lock();
+        let table = {
+            let mut table_catalog = self.control.lock();
             // Double-check under catalog lock
             if let Some(table) = self.tables.read().get(name).cloned() {
+                if config
+                    .as_ref()
+                    .is_some_and(|requested| requested != &Storage::config(&*table.read()))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a table configuration override cannot migrate existing storage",
+                    ));
+                }
                 return Ok(TableHandle::new(name, &table));
             }
 
-            let table = match table_catalog.get(&name.to_owned()) {
+            let table = match table_catalog.table_config(name)? {
                 Some(saved_config) => {
-                    let saved_config = saved_config.as_ref();
-                    let effective_config = match &config {
-                        Some(new_config) if new_config != saved_config => {
-                            table_catalog.put(name.to_owned(), new_config.clone())?;
-                            new_config.clone()
-                        }
-                        _ => saved_config.clone(),
+                    let sync_policy = if table_catalog
+                        .shared_table_state(name)?
+                        .is_some_and(|(live, _)| live)
+                    {
+                        zendb_types::SyncPolicy::Inherit
+                    } else {
+                        zendb_types::SyncPolicy::Local
                     };
                     let path = self.path.join(TABLES_DIR).join(name);
-                    info!("opening existing table {name:?}");
-                    Arc::new(RwLock::new(Table::open_with_device(
-                        &path,
-                        effective_config,
-                        self.config.device_id,
-                    )?))
+                    if path.exists() {
+                        let persisted = Table::persisted_config(&path)?.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("table {name:?} has no physical configuration"),
+                            )
+                        })?;
+                        if config
+                            .as_ref()
+                            .is_some_and(|requested| requested != &persisted)
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "a table configuration override cannot migrate existing storage",
+                            ));
+                        }
+                        info!("opening existing table {name:?}");
+                        Arc::new(RwLock::new(Table::open_with_policy(
+                            &path,
+                            persisted,
+                            self.config.device_id,
+                            sync_policy,
+                        )?))
+                    } else {
+                        let effective_config = config.unwrap_or(saved_config);
+                        info!("materializing cataloged table {name:?}");
+                        Arc::new(RwLock::new(Table::create_with_policy(
+                            &path,
+                            effective_config,
+                            self.config.device_id,
+                            sync_policy,
+                        )?))
+                    }
                 }
                 None => {
                     let config = config.unwrap_or_default();
@@ -163,78 +377,22 @@ where
                     info!("creating new table {name:?}");
                     let raw =
                         Table::create_with_device(&path, config.clone(), self.config.device_id)?;
-                    table_catalog.put(name.to_owned(), config)?;
+                    table_catalog.put_local_table(
+                        name,
+                        config,
+                        self.device_profile.next_hlc(super::now_ms())?,
+                    )?;
                     Arc::new(RwLock::new(raw))
                 }
             };
-            // Insert table BEFORE building workers so build_worker can find it.
+            // Publish the cache entry before releasing the serialized open path.
             self.tables
                 .write()
                 .insert(name.to_owned(), Arc::clone(&table));
-            let workers = self.activate_table_subscribers(name, &table)?;
-            (table, workers)
+            table
         };
-        // Catalog locks released; safe to spawn (workers may call retire() immediately).
-
-        debug!(
-            "spawning {} subscriber(s) for table {name:?}",
-            workers_to_spawn.len()
-        );
-        for worker in workers_to_spawn {
-            worker.spawn(self);
-        }
-        Ok(TableHandle::new(name, &table))
-    }
-
-    /// Wire a newly opened table into matching operators. For operators already
-    /// running, creates a consumer and attaches. For catalog-only active operators,
-    /// builds them and returns them for spawning after catalog locks are released.
-    fn activate_table_subscribers(
-        self: &Arc<Self>,
-        name: &str,
-        table: &ConcurrentTable,
-    ) -> io::Result<Vec<Arc<OperatorWorker<D>>>> {
-        let operator_catalog = self.operator_catalog.lock(); // Hold this long for the duration of fn avoid race conditions
-        let matching_operators: Vec<(String, D::Config)> = operator_catalog
-            .entries()
-            .filter_map(|(op_name, entry)| {
-                let entry = entry.as_ref();
-                if entry.phase == OperatorPhase::Active
-                    && entry
-                        .config
-                        .runtime_config()
-                        .subscriptions
-                        .iter()
-                        .any(|s| s.matches(name))
-                {
-                    Some((op_name.into_owned(), entry.config.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        debug!(
-            "table {name:?} matched {} operator(s)",
-            matching_operators.len()
-        );
-
-        let mut to_spawn = Vec::new();
-        for (op_name, op_config) in matching_operators {
-            // Hold the write lock to serialize with suspend_operator — prevents
-            // attaching to a worker that is concurrently being removed.
-            let mut operators = self.operators.write();
-            if let Some(worker) = operators.get(&op_name).cloned() {
-                let reader = table.read().consumer(worker.name())?;
-                trace!("attaching input {name:?} to running operator {op_name:?}");
-                worker.attach_input(OperatorInput::new(name.to_owned(), reader));
-            } else {
-                trace!("building new worker for catalog operator {op_name:?}");
-                let worker = self.build_worker(op_name.clone(), op_config)?;
-                operators.insert(op_name, Arc::clone(&worker));
-                to_spawn.push(worker);
-            }
-        }
-        Ok(to_spawn)
+        let handle = TableHandle::new(name, &table);
+        self.notify_table_observers(TableLifecycleEvent::Opened(handle.clone()));
+        Ok(handle)
     }
 }

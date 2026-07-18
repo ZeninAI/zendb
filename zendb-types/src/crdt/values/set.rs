@@ -3,12 +3,16 @@
 //! Every element is identified by its [`PrimaryKey`]. Membership is resolved
 //! via per-element LWW metadata: an element is live when `updated > deleted`.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    marker::PhantomData,
+};
 
 use bincode::{Decode, Encode};
 
-use crate::crdt::{_traits::Type, Hlc};
-use crate::PrimaryKey;
+use crate::{
+    CellCodecError, CellCodecKey, CrdtCodec, DefaultCrdtCodec, Hlc, PrimaryKey, Type, Value,
+};
 
 /// Per-element LWW clock pair that determines set membership.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
@@ -37,6 +41,38 @@ impl Default for Meta {
 #[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
 pub struct Set {
     entries: BTreeMap<PrimaryKey, Meta>,
+}
+
+pub struct SetCodec<T>(PhantomData<fn() -> T>);
+
+impl<T: CellCodecKey + Ord> CrdtCodec for SetCodec<T> {
+    type Rust = BTreeSet<T>;
+
+    fn encode(values: &BTreeSet<T>, hlc: Hlc) -> Value {
+        let mut set = Set::default();
+        for value in values {
+            Type::apply(
+                &mut set,
+                &SetOp::Add {
+                    key: value.to_primary_key(),
+                },
+                hlc,
+            )
+            .expect("Set add is infallible");
+        }
+        Value::Set(set)
+    }
+
+    fn decode(value: &Value) -> Result<BTreeSet<T>, CellCodecError> {
+        let Value::Set(set) = value else {
+            return Err(CellCodecError::expected("Set"));
+        };
+        set.keys().map(T::from_primary_key).collect()
+    }
+}
+
+impl<T: CellCodecKey + Ord> DefaultCrdtCodec for BTreeSet<T> {
+    type Codec = SetCodec<T>;
 }
 
 impl Set {
@@ -227,7 +263,7 @@ mod tests {
 
     #[test]
     fn newer_add_beats_stale_remove() {
-        let key = PrimaryKey::Blob(vec![1, 2, 3]);
+        let key = PrimaryKey::Blob(vec![1, 2, 3].into());
         let mut set = Set::default();
         apply(&mut set, SetOp::Remove { key: key.clone() }, hlc(100, 1));
         apply(&mut set, SetOp::Add { key: key.clone() }, hlc(200, 2));
@@ -300,7 +336,7 @@ mod tests {
         apply(
             &mut set,
             SetOp::Add {
-                key: PrimaryKey::Blob(vec![1, 2, 3]),
+                key: PrimaryKey::Blob(vec![1, 2, 3].into()),
             },
             hlc(100, 1),
         );

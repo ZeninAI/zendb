@@ -6,12 +6,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use zendb_engine::operator::prelude::{
+use zendb_operator::operator::prelude::{
     FullTextIndexConfig, FullTextIndexFacet, FullTextIndexOperator, MerkleTreeConfig,
     MerkleTreeFacet, MerkleTreeOperator,
 };
-use zendb_engine::{OperatorPhase, Workspace, WorkspaceConfig};
-use zendb_storage::core::traits::Backend;
+use zendb_operator::{OperatorHost, OperatorPhase, WorkspaceConfig};
+use zendb_storage::backend::_traits::ReadBackend;
 use zendb_types::{
     device_id, init_device_id, Event, Op, Path as ValuePath, PrimaryKey, WorkspaceId,
 };
@@ -22,14 +22,13 @@ use crate::operators::{
     indexer_config, indexer_runtime_config, wait_until, ArchiverOp, IndexerOp,
 };
 
-type TestWorkspace = Workspace<OperatorInstance>;
+type TestWorkspace = OperatorHost<OperatorInstance>;
 
 fn workspace_config() -> WorkspaceConfig {
     init_device_id();
     WorkspaceConfig {
-        workspace_id: WorkspaceId::from("test-workspace"),
+        workspace_id: WorkspaceId::generate().unwrap(),
         device_id: device_id(),
-        graceful_shutdown_max_duration: Duration::from_millis(100),
     }
 }
 
@@ -80,7 +79,9 @@ fn document_indexing_pipeline() {
     let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     let documents = db
-        .table("documents", Some(zendb_engine::TableConfig::default()))
+        .table("documents")
+        .config(zendb_operator::TableConfig::default())
+        .create()
         .unwrap();
     db.dispatch_operator::<IndexerOp>("indexer", indexer_config(), indexer_runtime_config())
         .unwrap();
@@ -179,7 +180,7 @@ fn document_indexing_pipeline() {
     );
 
     // Verify reports were written.
-    let reports = db.table("reports", None).unwrap();
+    let reports = db.table("reports").open().unwrap();
     let reports_handle = reports.get().unwrap();
     let reports_read = reports_handle.read();
     let report1 = reports_read
@@ -220,7 +221,7 @@ fn document_indexing_pipeline() {
     drop(stats_read);
     drop(stats_handle2);
 
-    let reports = db.table("reports", None).unwrap();
+    let reports = db.table("reports").open().unwrap();
     let reports_handle2 = reports.get().unwrap();
     let reports_read = reports_handle2.read();
     assert!(reports_read
@@ -230,7 +231,7 @@ fn document_indexing_pipeline() {
     drop(reports_handle2);
 
     // --- Phase 3: verify cleanup ---
-    let documents = db.table("documents", None).unwrap();
+    let documents = db.table("documents").open().unwrap();
     let docs_handle = documents.get().unwrap();
     let docs_read = docs_handle.read();
     let mut archiver_consumer = docs_read.consumer("archiver").unwrap();
@@ -243,7 +244,7 @@ fn document_indexing_pipeline() {
     drop(docs_handle);
 
     // --- Phase 4: incremental indexing after reopen ---
-    let documents = db.table("documents", None).unwrap();
+    let documents = db.table("documents").open().unwrap();
     documents
         .get()
         .unwrap()
@@ -293,7 +294,9 @@ fn document_delete_removes_from_index() {
     let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     let documents = db
-        .table("documents", Some(zendb_engine::TableConfig::default()))
+        .table("documents")
+        .config(zendb_operator::TableConfig::default())
+        .create()
         .unwrap();
     db.dispatch_operator::<IndexerOp>("indexer", indexer_config(), indexer_runtime_config())
         .unwrap();
@@ -329,8 +332,6 @@ fn document_delete_removes_from_index() {
             path: ValuePath::new(),
             op: Op::Delete,
             hlc: hlc(200),
-            sync: false,
-            signature: Vec::new(),
         })
         .unwrap();
 
@@ -378,7 +379,9 @@ fn multiple_operators_share_table_cleanly() {
     let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     let documents = db
-        .table("documents", Some(zendb_engine::TableConfig::default()))
+        .table("documents")
+        .config(zendb_operator::TableConfig::default())
+        .create()
         .unwrap();
 
     db.dispatch_operator::<IndexerOp>("indexer_a", indexer_config(), indexer_runtime_config())
@@ -437,9 +440,13 @@ fn timers_are_evicted_on_retirement() {
 
     let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
-    db.table("documents", Some(zendb_engine::TableConfig::default()))
+    db.table("documents")
+        .config(zendb_operator::TableConfig::default())
+        .create()
         .unwrap();
-    db.table("reports", Some(zendb_engine::TableConfig::default()))
+    db.table("reports")
+        .config(zendb_operator::TableConfig::default())
+        .create()
         .unwrap();
 
     db.dispatch_operator::<ArchiverOp>("archiver", archiver_config(1), archiver_runtime_config())
@@ -451,7 +458,7 @@ fn timers_are_evicted_on_retirement() {
     );
 
     // Verify the report was written.
-    let reports = db.table("reports", None).unwrap();
+    let reports = db.table("reports").open().unwrap();
     let reports_h = reports.get().unwrap();
     let reports_read = reports_h.read();
     assert!(
@@ -464,7 +471,7 @@ fn timers_are_evicted_on_retirement() {
     drop(reports_h);
 
     // Verify consumer cleanup.
-    let documents = db.table("documents", None).unwrap();
+    let documents = db.table("documents").open().unwrap();
     documents
         .get()
         .unwrap()
@@ -495,7 +502,9 @@ fn merkle_tree_facet_provides_root() {
     let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     let documents = db
-        .table("documents", Some(zendb_engine::TableConfig::default()))
+        .table("documents")
+        .config(zendb_operator::TableConfig::default())
+        .create()
         .unwrap();
 
     // Insert documents BEFORE registering the operator so that rebuild_table
@@ -518,8 +527,8 @@ fn merkle_tree_facet_provides_root() {
         state: "merkle-state".to_owned(),
         leaf_bits: 4, // small for test
     };
-    let merkle_runtime = zendb_engine::OperatorRuntimeConfig {
-        subscriptions: vec![zendb_engine::Subscription::pattern("documents")],
+    let merkle_runtime = zendb_operator::OperatorRuntimeConfig {
+        subscriptions: vec![zendb_operator::Subscription::pattern("documents")],
         poll_size: 128,
     };
     db.dispatch_operator::<MerkleTreeOperator>("merkle", merkle_config, merkle_runtime)
@@ -590,15 +599,17 @@ fn facet_unavailable_after_operator_cancellation() {
     let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     let _documents = db
-        .table("documents", Some(zendb_engine::TableConfig::default()))
+        .table("documents")
+        .config(zendb_operator::TableConfig::default())
+        .create()
         .unwrap();
 
     let merkle_config = MerkleTreeConfig {
         state: "merkle-state".to_owned(),
         leaf_bits: 4,
     };
-    let merkle_runtime = zendb_engine::OperatorRuntimeConfig {
-        subscriptions: vec![zendb_engine::Subscription::pattern("documents")],
+    let merkle_runtime = zendb_operator::OperatorRuntimeConfig {
+        subscriptions: vec![zendb_operator::Subscription::pattern("documents")],
         poll_size: 128,
     };
     db.dispatch_operator::<MerkleTreeOperator>("merkle", merkle_config, merkle_runtime)
@@ -640,7 +651,9 @@ fn full_text_index_search() {
     let db = TestWorkspace::create(&path, Arc::new(ThreadExecutor), workspace_config()).unwrap();
 
     let documents = db
-        .table("documents", Some(zendb_engine::TableConfig::default()))
+        .table("documents")
+        .config(zendb_operator::TableConfig::default())
+        .create()
         .unwrap();
 
     // Insert documents before operator so rebuild picks them up cleanly.
@@ -672,8 +685,8 @@ fn full_text_index_search() {
         state: "fti-state".to_owned(),
         min_token_len: 2,
     };
-    let fti_runtime = zendb_engine::OperatorRuntimeConfig {
-        subscriptions: vec![zendb_engine::Subscription::pattern("documents")],
+    let fti_runtime = zendb_operator::OperatorRuntimeConfig {
+        subscriptions: vec![zendb_operator::Subscription::pattern("documents")],
         poll_size: 128,
     };
     db.dispatch_operator::<FullTextIndexOperator>("fti", fti_config, fti_runtime)

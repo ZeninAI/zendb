@@ -4,14 +4,9 @@ use std::{io, sync::Arc};
 
 use zendb_types::{DeviceKeyPhase, EventIdentity};
 
-use crate::DispatchOperator;
+use super::{now_ms, system, Workspace};
 
-use super::{control, now_ms, Workspace};
-
-impl<D> Workspace<D>
-where
-    D: DispatchOperator,
-{
+impl Workspace {
     /// Stage a fresh secondary public key using the current primary key.
     pub fn stage_local_key_rotation(self: &Arc<Self>) -> io::Result<EventIdentity> {
         let device = self.device(self.device_id())?.ok_or_else(|| {
@@ -37,8 +32,8 @@ where
         }
         let staged = self.device_profile.stage_rotation(&device.key_ring)?;
         let at = self.device_profile.next_hlc(now_ms())?;
-        let value = control::key_ring_value(&staged, at)?;
-        self.commit_shared_event(control::replace_field_event(
+        let value = system::key_ring_value(&staged, at)?;
+        self.commit_shared_event(system::replace_field_event(
             at,
             self.device_id(),
             "key_ring",
@@ -79,8 +74,8 @@ where
             .promote(promotion_sequence)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid staged key ring"))?;
         let at = self.device_profile.next_hlc(now_ms())?;
-        let value = control::key_ring_value(&promoted, at)?;
-        let identity = self.commit_shared_event_with_staged_key(control::replace_field_event(
+        let value = system::key_ring_value(&promoted, at)?;
+        let identity = self.commit_shared_event_with_staged_key(system::replace_field_event(
             at,
             self.device_id(),
             "key_ring",

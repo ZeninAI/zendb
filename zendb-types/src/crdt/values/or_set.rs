@@ -13,12 +13,14 @@
 //! Bieniusa, Zawirski, Preguiça, Shapiro, Baquero, Balegas & Duarte.
 //! "An optimized conflict-free replicated set." INRIA RR-8083, 2012.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    marker::PhantomData,
+};
 
 use bincode::{Decode, Encode};
 
-use crate::crdt::{_traits::Type, Hlc};
-use crate::PrimaryKey;
+use crate::{CellCodecError, CellCodecKey, CrdtCodec, Hlc, PrimaryKey, Type, Value};
 
 #[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
 struct OrSetEntry {
@@ -38,6 +40,35 @@ impl OrSetEntry {
 #[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
 pub struct OrSet {
     entries: BTreeMap<PrimaryKey, OrSetEntry>,
+}
+
+/// Selects additive-wins observed-remove semantics for a `BTreeSet` field.
+pub struct OrSetCodec<T>(PhantomData<fn() -> T>);
+
+impl<T: CellCodecKey + Ord> CrdtCodec for OrSetCodec<T> {
+    type Rust = BTreeSet<T>;
+
+    fn encode(values: &BTreeSet<T>, hlc: Hlc) -> Value {
+        let mut set = OrSet::default();
+        for value in values {
+            Type::apply(
+                &mut set,
+                &OrSetOp::Add {
+                    key: value.to_primary_key(),
+                },
+                hlc,
+            )
+            .expect("OR-Set add is infallible");
+        }
+        Value::OrSet(set)
+    }
+
+    fn decode(value: &Value) -> Result<BTreeSet<T>, CellCodecError> {
+        let Value::OrSet(set) = value else {
+            return Err(CellCodecError::expected("OR-Set"));
+        };
+        set.keys().map(T::from_primary_key).collect()
+    }
 }
 
 impl OrSet {

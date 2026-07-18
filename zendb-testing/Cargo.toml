@@ -9,6 +9,7 @@ description = "ZeninDB integration tests"
 zendb-types = { path = "../zendb-types" }
 zendb-storage = { path = "../zendb-storage" }
 zendb-engine = { path = "../zendb-engine" }
+zendb-operator = { path = "../zendb-operator" }
 bincode.workspace = true
 parking_lot.workspace = true
 log.workspace = true

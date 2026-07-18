@@ -10,7 +10,7 @@ use zendb_types::{
 };
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::{BootstrapRequest, BootstrapTicketProof, DeviceProfile, NetworkEndpoint};
+use crate::{BootstrapRequest, BootstrapTicketProof, ConnectionHint, DeviceProfile};
 
 /// Secret bearer presentation encoded into a QR code or link. It is never
 /// written to Workspace state and should be erased after use or expiry.
@@ -23,7 +23,7 @@ pub struct EnrollmentPresentation {
     #[zeroize(skip)]
     pub expires_at: Hlc,
     #[zeroize(skip)]
-    pub rendezvous_hints: Vec<NetworkEndpoint>,
+    pub connection_hints: Vec<ConnectionHint>,
     ticket_secret: [u8; 32],
 }
 
@@ -40,7 +40,7 @@ impl EnrollmentPresentation {
         workspace_id: WorkspaceId,
         ticket_id: EnrollmentTicketId,
         expires_at: Hlc,
-        rendezvous_hints: Vec<NetworkEndpoint>,
+        connection_hints: Vec<ConnectionHint>,
     ) -> io::Result<(EnrollmentTicket, Self)> {
         let mut ticket_secret = [0; 32];
         getrandom::fill(&mut ticket_secret).map_err(|error| io::Error::other(error.to_string()))?;
@@ -58,7 +58,7 @@ impl EnrollmentPresentation {
                 workspace_id,
                 ticket_id,
                 expires_at,
-                rendezvous_hints,
+                connection_hints,
                 ticket_secret,
             },
         ))

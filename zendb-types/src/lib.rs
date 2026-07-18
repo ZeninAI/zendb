@@ -12,12 +12,13 @@
 //!
 //! - `crdt::*` — Complete CRDT foundation (primitives, traits, and value types)
 //! - `identity::*` — Identity types that are part of shared truth
-//! - `control::*` — Control plane types for operators, jobs, leases (future)
+//! - `control::*` — Signed presence messages
 //!
 //! ## Adding a CRDT type
 //!
-//! 1. Create a module in `src/crdt/values/` with a struct implementing `Type`
-//! 2. Add one line to `register_types!` below
+//! 1. Create a module in `src/crdt/values/` implementing `Type`; values with
+//!    addressable child Cells also implement `ContainerType`.
+//! 2. Add one line to `register_types!` below.
 
 // --- hand-written modules ---
 pub mod control;
@@ -59,16 +60,16 @@ register_types! {
 
 // CRDT primitives and types (everything from crdt module)
 pub use crdt::*;
+pub use zendb_type_converter::CellCodec;
+
+extern crate self as zendb_types;
 
 // Identity types
-pub use control::{
-    DepartureNotice, DeviceCapabilitySummary, OperatorDesiredState, OperatorEffect, OperatorInput,
-    OperatorLease, OperatorOutputFence, OperatorSource, OperatorSpec, PresenceHeartbeat,
-};
+pub use control::{DepartureNotice, PresenceHeartbeat};
 pub use identity::{
     CapabilityId, DeviceId, DeviceKeyPhase, DeviceKeyRing, DevicePublicKey, DeviceRecord,
-    DeviceRecordError, EnrollmentTicket, EnrollmentTicketId, OperatorId, SignatureBytes,
-    WorkspaceAction, WorkspaceId, WorkspaceRole,
+    DeviceRecordError, EnrollmentTicket, EnrollmentTicketId, EntityIdGenerator, IdParseError,
+    OperatorId, SignatureBytes, WorkspaceAction, WorkspaceId, WorkspaceRole,
 };
 
 // TypeTag, Value, TypeOp, Segment, TypeError are generated above by register_types!

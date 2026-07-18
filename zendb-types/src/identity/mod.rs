@@ -7,7 +7,10 @@ pub mod ids;
 pub mod membership;
 pub mod role;
 
-pub use ids::{CapabilityId, DeviceId, EnrollmentTicketId, OperatorId, WorkspaceId};
+pub use ids::{
+    CapabilityId, DeviceId, EnrollmentTicketId, EntityIdGenerator, IdParseError, OperatorId,
+    WorkspaceId,
+};
 pub use membership::{
     DeviceKeyPhase, DeviceKeyRing, DevicePublicKey, DeviceRecord, DeviceRecordError,
     EnrollmentTicket, SignatureBytes,

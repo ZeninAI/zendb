@@ -1,22 +1,88 @@
 //! Shared/local mutation routing and signed journal application.
 
-use std::{io, sync::Arc};
+use std::{fs, io, io::Write, sync::Arc};
 
 use zendb_types::{
     DeviceId, DeviceKeyPhase, DeviceKeyRing, Event, EventIdentity, Op, Path, PrimaryKey,
-    ReplicatedEvent, SignatureBytes, SyncEnvelope, Value, WorkspaceAction,
+    ReplicatedEvent, SignatureBytes, SyncEnvelope, SyncPolicy, Value, WorkspaceAction,
 };
-
-use crate::{DispatchOperator, TableConfig};
 
 use super::{now_ms, Workspace};
 
 const MAX_SHARED_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
-impl<D> Workspace<D>
-where
-    D: DispatchOperator,
-{
+impl Workspace {
+    /// Change one row/path synchronization boundary on this replica.
+    ///
+    /// Localizing a path only persists policy metadata. Re-inheriting a path
+    /// publishes its current shared projection as a CRDT merge with the
+    /// projection's existing clocks; the policy toggle itself is never sent.
+    pub fn set_path_sync_policy(
+        self: &Arc<Self>,
+        table_id: &str,
+        primary_key: PrimaryKey,
+        path: Path,
+        policy: SyncPolicy,
+    ) -> io::Result<bool> {
+        let table = self.table(table_id).open()?;
+        if policy == SyncPolicy::Inherit {
+            self.require_local_action(WorkspaceAction::Contribute)?;
+        }
+        let projected = {
+            let table = table.get()?;
+            let mut table = table.write();
+            if !table.set_sync_policy(&primary_key, path.clone(), policy)? {
+                return Ok(false);
+            }
+            if policy == SyncPolicy::Local {
+                return Ok(true);
+            }
+            table.shared_cell(&primary_key, &path)
+        };
+
+        // An Inherit cell below a Local ancestor remains effectively local.
+        let Some(cell) = projected else {
+            return Ok(true);
+        };
+        self.mark_state_reconciliation_required()?;
+        let event = Event {
+            table_id: table_id.into(),
+            primary_key,
+            path,
+            op: Op::Merge { cell },
+            hlc: self.device_profile.next_hlc(now_ms())?,
+        };
+        self.commit_shared_event(event)?;
+        Ok(true)
+    }
+
+    pub(crate) fn state_reconciliation_required(&self) -> bool {
+        self.state_reconciliation_required
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_state_reconciliation_required(&self) -> io::Result<()> {
+        let path = self.path.join(super::RECONCILIATION_FILE);
+        let mut file = fs::File::create(path)?;
+        file.write_all(b"required")?;
+        file.sync_all()?;
+        self.state_reconciliation_required
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn clear_state_reconciliation_required(&self) -> io::Result<()> {
+        let path = self.path.join(super::RECONCILIATION_FILE);
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.state_reconciliation_required
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     /// Route one application mutation to the local or shared plane according
     /// to the table's durable configuration. Only shared mutations allocate an
     /// EventIdentity and require Contributor.
@@ -28,35 +94,19 @@ where
         op: Op,
     ) -> io::Result<Option<EventIdentity>> {
         let declared_shared = self.is_shared_table(table_id)?;
-        let mut config = self.table_config(table_id).unwrap_or_default();
-        if declared_shared {
-            config.sync = true;
-        } else if config.sync {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "table is configured as shared locally but is absent from Workspace control",
-            ));
-        }
+        let config = self.table_config(table_id).unwrap_or_default();
         let hlc = self.device_profile.next_hlc(now_ms())?;
-        let table = self.table(table_id, Some(config.clone()))?;
-        let shared = config.sync
-            && !matches!(op, Op::SetSync { .. })
-            && table.get()?.read().is_path_shared(&primary_key, &path);
+        let table = self.table_impl(table_id, Some(config.clone()))?;
+        let shared = declared_shared && table.get()?.read().is_path_shared(&primary_key, &path);
         let event = Event {
             table_id: table_id.into(),
             primary_key,
             path,
             op,
             hlc,
-            sync: shared,
-            signature: Vec::new(),
         };
         if !shared {
-            if config.sync {
-                table.get()?.write().insert_local_overlay_event(event)?;
-            } else {
-                table.get()?.write().insert_event(event)?;
-            }
+            table.get()?.write().insert_event(event)?;
             return Ok(None);
         }
         self.require_local_action(WorkspaceAction::Contribute)?;
@@ -69,7 +119,7 @@ where
 
     pub(crate) fn commit_shared_event_with_admission(
         self: &Arc<Self>,
-        mut event: Event,
+        event: Event,
         ticket_admission: Option<zendb_types::TicketAdmissionEvidence>,
     ) -> io::Result<EventIdentity> {
         if let Some(evidence) = &ticket_admission {
@@ -78,7 +128,6 @@ where
             self.validate_local_shared_event(&event)?;
         }
         let _shared_guard = self.shared_mutation.lock();
-        event.sync = true;
         let origin_seq = self.device_profile.next_origin_seq();
         let identity = EventIdentity {
             origin_device_id: self.device_id(),
@@ -110,10 +159,9 @@ where
 
     pub(crate) fn commit_shared_event_with_staged_key(
         self: &Arc<Self>,
-        mut event: Event,
+        event: Event,
     ) -> io::Result<EventIdentity> {
         let _shared_guard = self.shared_mutation.lock();
-        event.sync = true;
         let origin_seq = self.device_profile.next_origin_seq();
         let identity = EventIdentity {
             origin_device_id: self.device_id(),
@@ -152,13 +200,12 @@ where
         // an endless one-event checkpoint lag.
         frontier.advance_to(self.device_id(), origin_seq);
         let at = self.device_profile.next_hlc(now_ms())?;
-        let mut event = super::control::replace_field_event(
+        let event = super::system::replace_field_event(
             at,
             self.device_id(),
             "replication_frontier",
-            super::control::frontier_value(&frontier),
+            super::system::frontier_value(&frontier),
         );
-        event.sync = true;
         let identity = EventIdentity {
             origin_device_id: self.device_id(),
             origin_seq,
@@ -258,27 +305,25 @@ where
 
     fn apply_shared_event(self: &Arc<Self>, replicated: &ReplicatedEvent) -> io::Result<()> {
         let event = &replicated.event;
-        if event.table_id == "_control" {
+        if super::system::is_system_event(event) {
             if let Some(evidence) = &replicated.envelope.ticket_admission {
                 self.validate_ticket_admission(event, evidence)?;
                 self.control.lock().apply_ticket_admission(event)?;
             } else {
                 self.control.lock().apply_authorized(event)?;
             }
-            if let Some(name) = super::control::shared_table_target(event) {
+            if let Some(name) = super::system::shared_table_target(event) {
                 let state = self.control.lock().shared_table_state(name)?;
-                if state.is_some_and(|(live, _)| live) {
-                    if self.table_config(name).is_some_and(|config| !config.sync) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::AlreadyExists,
-                            "replicated shared table conflicts with a local-only table",
-                        ));
+                match state {
+                    Some((true, _)) => {
+                        self.table_impl(name, None)?;
                     }
-                    let mut config = self.table_config(name).unwrap_or_default();
-                    config.sync = true;
-                    self.table(name, Some(config))?;
-                } else {
-                    self.close_table(name);
+                    Some((false, _)) => {
+                        self.close_table(name);
+                    }
+                    // A local catalog boundary deliberately hides the remote
+                    // lifecycle event on this replica.
+                    None => {}
                 }
             }
             return Ok(());
@@ -312,33 +357,13 @@ where
                 ));
             }
         }
-        if self
-            .table_config(&event.table_id)
-            .is_some_and(|config| !config.sync)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "shared event conflicts with a local-only table of the same name",
-            ));
-        }
-        let table = if self.contains_table(&event.table_id) {
-            self.table(&event.table_id, None)?
-        } else {
-            self.table(
-                &event.table_id,
-                Some(TableConfig {
-                    sync: true,
-                    ..TableConfig::default()
-                }),
-            )?
-        };
+        let table = self.table_impl(&event.table_id, None)?;
         table.get()?.write().insert_shared_event(event.clone())
     }
 
     fn verify_replicated_event(&self, replicated: &ReplicatedEvent) -> io::Result<()> {
         if replicated.envelope.workspace_id != *self.workspace_id()
             || !replicated.envelope.matches_event(&replicated.event)
-            || !replicated.event.sync
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -412,7 +437,7 @@ where
     }
 
     fn validate_local_shared_event(&self, event: &Event) -> io::Result<()> {
-        if event.table_id == "_control" {
+        if super::system::is_system_event(event) {
             return self.control.lock().validate_authorized(event);
         }
         self.require_local_action(WorkspaceAction::Contribute)?;
@@ -452,7 +477,7 @@ where
         let proposed = DeviceKeyRing::from_cell(&zendb_types::Cell {
             value: Some(Value::Record(record.clone())),
             hlc: event.hlc,
-            sync: None,
+            sync: SyncPolicy::Inherit,
         })
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let staging = current.phase == DeviceKeyPhase::Stable
@@ -534,22 +559,32 @@ where
                 "enrollment ticket signature is invalid",
             ));
         }
-        if super::control::device_target(&event.path) != Some(evidence.candidate_device_id)
-            || event.path.len() != 2
+        if super::system::device_target(event) != Some(evidence.candidate_device_id)
+            || !event.path.is_empty()
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "ticket evidence does not match the admission target",
             ));
         }
-        let Op::Merge { cell } = &event.op else {
+        if self.device(evidence.candidate_device_id)?.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "ticket admission must merge a Device record",
+                "ticket admission cannot replace a live Device",
+            ));
+        }
+        let Op::Replace { value } = &event.op else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "ticket admission must replace a Device row",
             ));
         };
-        let admitted = zendb_types::DeviceRecord::from_cell(cell)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let admitted = zendb_types::DeviceRecord::from_cell(&zendb_types::Cell {
+            value: Some(value.clone()),
+            hlc: event.hlc,
+            sync: SyncPolicy::Inherit,
+        })
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         if admitted.name != evidence.requested_name
             || admitted.key_ring.primary_key != evidence.candidate_public_key
             || admitted.key_ring.secondary_key.is_some()
@@ -603,7 +638,7 @@ fn verification_key_for_event(
             let proposed = DeviceKeyRing::from_cell(&zendb_types::Cell {
                 value: Some(Value::Record(record.clone())),
                 hlc: event.hlc,
-                sync: None,
+                sync: SyncPolicy::Inherit,
             })
             .ok()?;
             if current.phase == DeviceKeyPhase::Staged
@@ -620,17 +655,14 @@ fn verification_key_for_event(
 }
 
 fn is_key_ring_event(event: &Event, origin: DeviceId) -> bool {
-    if event.table_id != "_control" || event.path.len() != 3 {
+    if event.table_id != super::system::DEVICES_TABLE
+        || event.primary_key != PrimaryKey::Blob(origin.0.to_vec().into())
+        || event.path.len() != 1
+    {
         return false;
     }
-    let names: Vec<&str> = event
-        .path
-        .iter()
-        .filter_map(|step| match &step.segment {
-            zendb_types::Segment::Record(name) => Some(name.as_str()),
-            _ => None,
-        })
-        .collect();
-    let origin = origin.to_string();
-    names.len() == 3 && names[0] == "devices" && names[1] == origin && names[2] == "key_ring"
+    matches!(
+        &event.path[0].segment,
+        zendb_types::Segment::Record(name) if name == "key_ring"
+    )
 }

@@ -1,127 +1,70 @@
 # zendb-types
 
-Pure portable data for ZenDB: CRDT values, clocks, events, device membership,
-fixed roles, enrollment records, presence messages, replication frontiers, and
-future operator desired-state records. This crate has no filesystem, sockets,
-policy lookup, hosted service, or execution runtime.
+Portable ZenDB data with no filesystem, sockets, hosted services, or runtime
+policy lookup.
 
-## CRDT Foundation
+## CRDT Core
 
-`Hlc` is a 24-byte hybrid logical clock ordered by physical milliseconds,
-logical counter, and stable DeviceId. DeviceId is random and persisted; it is
-not derived from a machine identifier or public key.
-
-`Cell` is the universal recursive state unit:
+`Cell` is the recursive state unit:
 
 ```rust
 pub struct Cell {
     pub value: Option<Value>,
     pub hlc: Hlc,
-    pub sync: Option<bool>,
+    pub sync: SyncPolicy,
 }
 ```
 
-`None` value is a CRDT tombstone. `sync` is local routing metadata, not
-replicated authorization. On a shared table, `Some(false)` starts a private
-overlay boundary. `Some(true)` cannot escape a private ancestor. Overlay
-storage and routing are implemented by `zendb-engine::Workspace`.
+`None` is a CRDT tombstone. `SyncPolicy::{Inherit, Local}` is durable
+replica-local routing metadata and never changes the HLC.
+`Cell::shared_clone` recursively projects shared state, strips policy, and
+preserves structural list anchors when a shared item follows a local item.
 
-`Event` addresses a table, primary key, recursive Path, operation, and HLC.
-Its `sync` field is transitional input to the local router; a remote sender
-cannot use it to choose the replication plane. Shared identity and signatures
-are carried by `ReplicatedEvent` and `SyncEnvelope`.
+`Event` contains only table ID, primary key, recursive path, operation, and
+HLC. Shared identity, payload hash, signature, and optional ticket evidence
+belong to `ReplicatedEvent` and `SyncEnvelope`.
 
-Built-in values include scalar Bool, Int, String, Timestamp, and Blob plus
-Record, Set, OrSet, Counter, MvRegister, List, Text, and PriorityQueue CRDTs.
-`Record` and `List` recursively contain Cells. The `register_types!` macro
-generates `TypeTag`, `PrimaryKey`, `Value`, `TypeOp`, `Segment`, and dispatch
-implementations.
+Values include scalars plus Record, Set, OR-Set, Counter, MV-register, List,
+Text, and PriorityQueue CRDTs. `Blob::encode` and `Blob::decode` provide
+bincode helpers using the shared storage codec configuration.
 
-`Type::compact(Hlc)` accepts an already proven watermark. Values do not infer
-distributed safety from a wall clock. The engine derives a shared watermark
-from durable frontiers before invoking recursive compaction.
+`CrdtCodec` implementations live beside their CRDT value types. Derived
+records use default codecs where unambiguous and can select an alternate codec
+with `#[cell(codec = "path::to::Codec")]`.
 
-## Device Membership
+## Device Authority
 
-`DeviceRecord` is the complete database membership and authorization subject:
+`DeviceRecord` contains:
 
 ```text
-DeviceRecord
-  name
-  key_ring
-  roles: Set<WorkspaceRole>
-  capabilities: Set<CapabilityId>
-  replication_frontier: ContiguousFrontier
+name
+key_ring
+roles: Set<Contributor | Dispatcher | Manager>
+capabilities: Set<CapabilityId>
+replication_frontier: ContiguousFrontier
 ```
 
-The Workspace stores each DeviceRecord in a nested Device Cell. A live Cell is
-membership; a tombstone is removal. There is no UserId, PrincipalId,
-DeviceMembership, WorkspaceMembership, OAuth record, status field, or shared
-workspace private secret.
+There is no user/principal membership model, status field, key-derived
+DeviceId, workspace signing secret, custom role definition, or row ACL.
+`DeviceKeyRing` supports one primary and optional staged/historic secondary
+without key IDs or expiries.
 
-`DeviceKeyRing` is an atomically replaced two-key state machine:
+## Progress And Presence
 
-```text
-primary_key
-secondary_key: optional
-primary_from_seq
-phase: Stable | Staged
-```
+`EventIdentity` is a per-device shared-journal coordinate.
+`ContiguousFrontier` proves a gap-free durable prefix; `VersionVector` only
+records maximum observation and is not a pruning proof.
 
-The secondary is either a staged candidate or a historic verifier, depending
-on phase. There is no key ID or expiry interval. DeviceId remains stable while
-keys rotate.
+Presence heartbeats and departure notices are signed ephemeral records. They
+do not affect membership or authorization. Enrollment records store public
+ticket verification material; private QR/link credentials live in transport
+presentations.
 
-Every admitted device is an implicit Reader. The only explicit role values are
-Contributor, Dispatcher, and Manager. `WorkspaceAction` is the fixed action
-vocabulary used by engine validation. Roles and actions are not customizable
-policy records.
+## Identifiers
 
-Capabilities are device-advertised string labels for future operator
-placement. They are not requests, permissions, subscriptions, or callable
-host functions.
-
-## Enrollment And Presence
-
-`EnrollmentTicket` stores only the public ticket verifier and expiry HLC. Its
-private credential belongs in an `EnrollmentPresentation` from
-`zendb-transport`, not replicated data.
-
-`PresenceHeartbeat` and `DepartureNotice` are signed ephemeral protocol
-messages. They are not DeviceRecord fields and do not affect membership or
-roles. The heartbeat carries the sender's advertised idle period so receivers
-can derive local liveness using an explicit grace policy.
-
-## Replication Progress
-
-`EventIdentity { origin_device_id, origin_seq }` identifies one shared-journal
-event. `ContiguousFrontier` records the durable, gap-free applied prefix for
-each origin. `VersionVector` only records maximum observed values and is not
-safe for compaction.
-
-`TicketAdmissionEvidence` is optional envelope evidence for the exceptional
-ticket-created Device event. Keeping it outside DeviceRecord lets every replica
-validate admission without expanding materialized membership state.
-
-## Operator Records
-
-The `control::operator` module contains portable desired-state and lease
-vocabulary reserved for ADR 008. Their existence does not imply that
-distributed reconciliation, scheduling, Rhai isolation, or fenced execution is
-implemented. The existing native operator runtime is in `zendb-engine`.
-
-## Module Map
-
-```text
-src/
-|-- crdt/
-|   |-- cell.rs, event.rs, hlc.rs, path.rs, replication.rs
-|   `-- values/       built-in scalar and recursive CRDT values
-|-- identity/
-|   |-- ids.rs        DeviceId, WorkspaceId, ticket/operator IDs
-|   |-- membership.rs DeviceRecord, key ring, ticket, signatures
-|   `-- role.rs       fixed WorkspaceRole and WorkspaceAction
-`-- control/
-    |-- presence.rs   heartbeat and departure messages
-    `-- operator.rs   future distributed operator records
-```
+`DeviceId`, `WorkspaceId`, `OperatorId`, and `EnrollmentTicketId` share one
+128-bit UUIDv7-compatible representation and generator. Their byte ordering is
+time-sortable and the embedded millisecond timestamp is diagnostic only; it is
+never authorization or causal evidence. Device identity remains independent of
+signing keys. `CapabilityId` deliberately stays a human-readable string label
+because capabilities are advertised scheduler vocabulary, not entity rows.

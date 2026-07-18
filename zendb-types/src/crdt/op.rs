@@ -12,23 +12,21 @@ use crate::{Cell, TypeOp, TypeTag, Value};
 pub enum Op {
     /// Apply a generated type-specific operation to the target cell.
     Type(TypeOp),
-    /// Set or clear the target cell's sync metadata.
-    SetSync { sync: Option<bool> },
     /// Tombstone the target cell at the event HLC.
     Delete,
     /// Replace the target cell's value at the event HLC.
     Replace { value: Value },
-    /// Merge remote cell state into the target cell.
+    /// Merge a shared Cell projection into the target.
     Merge { cell: Cell },
 }
 
 impl Op {
-    pub(crate) fn target_type(&self) -> Option<TypeTag> {
+    pub(crate) fn type_tag(&self) -> Option<TypeTag> {
         match self {
             Op::Type(op) => Some(op.type_tag()),
             Op::Replace { value } => Some(value.type_tag()),
             Op::Merge { cell } => cell.type_tag(),
-            Op::SetSync { .. } | Op::Delete => None,
+            Op::Delete => None,
         }
     }
 }

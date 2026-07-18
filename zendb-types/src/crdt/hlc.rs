@@ -15,14 +15,16 @@ use std::sync::OnceLock;
 
 use bincode::{Decode, Encode};
 
-use crate::DeviceId;
+use crate::{
+    CellCodecError, CellCodecKey, CrdtCodec, DefaultCrdtCodec, DeviceId, PrimaryKey, Value,
+};
 
 /// Compatibility name for code that treats the HLC device component as a
 /// separate type. It is intentionally an alias, not a second identity.
 pub type HlcDeviceId = DeviceId;
 
 // This fallback exists for old convenience APIs and tests. A real replica must
-// load its persisted DeviceId and call `Hlc::new_with_device` instead.
+// load its persisted DeviceId and call `Hlc::with_device_id` instead.
 static PROCESS_DEVICE_ID: OnceLock<DeviceId> = OnceLock::new();
 
 /// Initialize the process fallback with a fresh CSPRNG-generated identity.
@@ -44,25 +46,58 @@ pub fn device_id() -> DeviceId {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct Hlc([u8; 24]);
 
+pub struct HlcCodec;
+
+impl CrdtCodec for HlcCodec {
+    type Rust = Hlc;
+
+    fn encode(value: &Hlc, _hlc: Hlc) -> Value {
+        Value::Blob(value.as_bytes().to_vec().into())
+    }
+
+    fn decode(value: &Value) -> Result<Hlc, CellCodecError> {
+        let Value::Blob(value) = value else {
+            return Err(CellCodecError::expected("Blob"));
+        };
+        let bytes = value
+            .as_slice()
+            .try_into()
+            .map_err(|_| CellCodecError::expected("24-byte HLC Blob"))?;
+        Ok(Hlc::from_bytes(bytes))
+    }
+}
+
+impl DefaultCrdtCodec for Hlc {
+    type Codec = HlcCodec;
+}
+
+impl CellCodecKey for Hlc {
+    fn to_primary_key(&self) -> PrimaryKey {
+        PrimaryKey::Blob(self.as_bytes().to_vec().into())
+    }
+
+    fn from_primary_key(key: &PrimaryKey) -> Result<Self, CellCodecError> {
+        let PrimaryKey::Blob(value) = key else {
+            return Err(CellCodecError::expected("HLC Blob primary key"));
+        };
+        let bytes = value
+            .as_slice()
+            .try_into()
+            .map_err(|_| CellCodecError::expected("24-byte HLC Blob primary key"))?;
+        Ok(Hlc::from_bytes(bytes))
+    }
+}
+
 impl Hlc {
     pub const ZERO: Hlc = Hlc([0u8; 24]);
 
     /// Construct an HLC using the process fallback identity.
     ///
     /// This method remains convenient for local tests. A database replica
-    /// should use [`Self::new_with_device`] so multiple profiles in one process
+    /// should use [`Self::with_device_id`] so multiple profiles in one process
     /// cannot accidentally share an identity.
     pub fn new(physical_ms: u64, logical: u16) -> Option<Hlc> {
-        Self::new_with_device(physical_ms, logical, device_id())
-    }
-
-    /// Construct an HLC using the identity persisted for this replica.
-    pub const fn new_with_device(
-        physical_ms: u64,
-        logical: u16,
-        device_id: DeviceId,
-    ) -> Option<Hlc> {
-        Self::with_device_id(physical_ms, logical, device_id)
+        Self::with_device_id(physical_ms, logical, device_id())
     }
 
     /// Construct an HLC from explicit components. This is also used when

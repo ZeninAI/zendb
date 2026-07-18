@@ -1,72 +1,44 @@
 //! Eager workspace lifecycle and resource ownership.
 
 mod cluster;
-mod control;
-mod journal;
 mod network;
 mod onboarding;
-mod operators;
 mod replication;
 mod rotation;
 mod snapshot;
-mod states;
+mod system;
 mod tables;
-mod timers;
 
 use std::{
-    any::Any,
     fs, io,
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU32, AtomicU64},
+        atomic::{AtomicBool, AtomicU32, AtomicU64},
         Arc, Weak,
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use bincode::{Decode, Encode};
 use hashbrown::HashMap;
-use parking_lot::{Condvar, Mutex, RwLock};
-use zendb_storage::core::{
-    btree::{BPlusTree, BPlusTreeConfig},
-    keydir::{KeyDir, KeyDirConfig},
-    traits::DurableStorage,
-};
-use zendb_storage::frontend::{
-    state::{State, StateConfig},
-    table::Table,
-};
+use parking_lot::{Mutex, RwLock};
+use zendb_replication::SharedJournal;
+use zendb_replication::Table;
 use zendb_transport::DeviceProfile;
-use zendb_types::{DeviceId, WorkspaceId};
-
-use log::{debug, info};
-
-use crate::{
-    operator::worker::OperatorWorker, runtime::Executor, DispatchOperator, OperatorPhase,
-    TableConfig,
+use zendb_types::{
+    ContainerType, DeviceId, Event, Op, Path as ValuePath, PrimaryKey, SyncPolicy, SyncScope,
+    WorkspaceAction, WorkspaceId,
 };
+
+use log::info;
+
+use crate::TableConfig;
 
 pub use cluster::{ClusterConfig, ClusterRuntime};
 pub use network::SyncReport;
 pub use onboarding::OnboardingResult;
-use timers::run_scheduler;
-
-/// Ordering key: earliest `fire_at_ms` first; within the same millisecond,
-/// lexicographic by operator name.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
-pub(crate) struct TimerKey {
-    pub(crate) fire_at_ms: u64,
-    pub(crate) operator: String,
-}
-
-/// Opaque payload stored with each timer.
-#[derive(Debug, Clone, Encode, Decode)]
-pub(crate) struct TimerEntry {
-    pub(crate) payload: Vec<u8>,
-}
-
-pub(crate) type TimerStore = BPlusTree<TimerKey, TimerEntry>;
+pub use tables::{RowRequest, TableRequest};
 
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
@@ -75,28 +47,13 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
-pub(super) struct OperatorEntry<Config> {
-    pub(super) config: Config,
-    pub(super) phase: OperatorPhase,
-}
-
-pub(super) type TableCatalog = KeyDir<String, TableConfig>;
-pub(super) type StateCatalog = KeyDir<String, StateConfig>;
-pub(super) type OperatorCatalog<Config> = KeyDir<String, OperatorEntry<Config>>;
-
-const TABLE_CATALOG_FILE: &str = "_tables";
-const STATE_CATALOG_FILE: &str = "_states";
-const OPERATOR_CATALOG_FILE: &str = "_operators";
 pub(crate) const TABLES_DIR: &str = "tables";
-pub(crate) const STATES_DIR: &str = "states";
-const TIMERS_FILE: &str = "_timers";
 const WORKSPACE_ID_FILE: &str = "_workspace_id";
 const DEVICE_PROFILE_FILE: &str = "_device_profile";
-const CONTROL_FILE: &str = "_control";
 const SHARED_EVENTS_FILE: &str = "_shared_events";
 const FRONTIER_FILE: &str = "_replication_frontier";
 const SNAPSHOT_FILE: &str = "_snapshot";
+const RECONCILIATION_FILE: &str = "_state_reconciliation_required";
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct WorkspaceConfig {
@@ -105,23 +62,19 @@ pub struct WorkspaceConfig {
     /// Stable identity for this workspace installation/profile. It is persisted
     /// at the workspace root and reused when reopening the workspace.
     pub device_id: DeviceId,
-    pub graceful_shutdown_max_duration: Duration,
 }
 
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         let device_id = DeviceId::generate().expect("failed to generate workspace device id");
         Self {
-            workspace_id: WorkspaceId::from(format!("workspace-{device_id}")),
+            workspace_id: WorkspaceId::generate().expect("failed to generate workspace id"),
             device_id,
-            graceful_shutdown_max_duration: Duration::from_secs(7),
         }
     }
 }
 
 pub type ConcurrentTable = Arc<RwLock<Table>>;
-pub type ConcurrentState<K, V> = Arc<RwLock<State<K, V>>>;
-pub(super) type ErasedStateHandle = Arc<dyn Any + Send + Sync>;
 
 /// A durable, weak reference to a workspace table.
 ///
@@ -162,94 +115,54 @@ impl TableHandle {
     }
 }
 
-/// A durable, weak reference to a typed workspace state, mirroring
-/// [`TableHandle`]. The workspace owns the state; the handle never keeps it (or
-/// the workspace) alive.
+/// Notification emitted after the concrete table cache changes.
 #[derive(Clone)]
-pub struct StateHandle<K, V>
-where
-    K: Encode + Decode<()> + std::hash::Hash + Eq + Clone + Ord + Send + Sync + 'static,
-    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
-{
-    name: String,
-    inner: Weak<RwLock<State<K, V>>>,
+pub enum TableLifecycleEvent {
+    Opened(TableHandle),
+    Closed(String),
 }
 
-impl<K, V> StateHandle<K, V>
-where
-    K: Encode + Decode<()> + std::hash::Hash + Eq + Clone + Ord + Send + Sync + 'static,
-    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
-{
-    pub(crate) fn new(name: &str, state: &ConcurrentState<K, V>) -> Self {
-        Self {
-            name: name.to_owned(),
-            inner: Arc::downgrade(state),
+type TableObserver = Arc<dyn Fn(TableLifecycleEvent) + Send + Sync>;
+
+/// RAII registration for a table lifecycle observer.
+pub struct TableObservation {
+    workspace: Weak<Workspace>,
+    id: u64,
+}
+
+impl Drop for TableObservation {
+    fn drop(&mut self) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.table_observers.write().remove(&self.id);
         }
     }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Upgrade to a strong handle for a single operation, or fail if the owning
-    /// workspace has been dropped.
-    pub fn get(&self) -> io::Result<ConcurrentState<K, V>> {
-        self.inner.upgrade().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                format!(
-                    "state {:?} is unavailable because its workspace was dropped",
-                    self.name
-                ),
-            )
-        })
-    }
 }
 
-/// The workspace is the single lifecycle root. It holds the only strong
-/// references to its tables, states, and operator workers; everything it owns
-/// is torn down deterministically when the last `Arc<Workspace>` is dropped.
-pub struct Workspace<D>
-where
-    D: DispatchOperator,
-{
+/// Lifecycle root for one local replica of a Workspace.
+pub struct Workspace {
     path: PathBuf,
     config: WorkspaceConfig,
-    executor: Arc<dyn Executor>,
-    table_catalog: Mutex<TableCatalog>,
-    state_catalog: Mutex<StateCatalog>,
-    operator_catalog: Mutex<OperatorCatalog<D::Config>>,
     tables: RwLock<HashMap<String, ConcurrentTable>>,
-    states: RwLock<HashMap<String, ErasedStateHandle>>,
-    operators: RwLock<HashMap<String, Arc<OperatorWorker<D>>>>,
-    timers: Arc<RwLock<TimerStore>>,
+    table_observers: RwLock<HashMap<u64, TableObserver>>,
+    next_table_observer_id: AtomicU64,
     device_profile: Arc<DeviceProfile>,
-    control: Mutex<control::WorkspaceControl>,
-    shared_journal: Mutex<journal::SharedJournal>,
+    control: Mutex<system::WorkspaceControl>,
+    shared_journal: Mutex<SharedJournal>,
     /// Serializes shared sequence allocation, journal append, application,
     /// snapshot capture, and snapshot installation.
     shared_mutation: Mutex<()>,
+    state_reconciliation_required: AtomicBool,
     presence: Mutex<HashMap<DeviceId, zendb_transport::PresenceTracker>>,
     presence_idle_ms: AtomicU64,
     presence_grace_multiplier: AtomicU32,
-    /// Notified by `register_timer` to wake the scheduler early.
-    timer_notify: Arc<(Mutex<()>, Condvar)>,
 }
 
-impl<D> Workspace<D>
-where
-    D: DispatchOperator,
-{
+impl Workspace {
     /// Create a new workspace at `path`. Fails if the directory already contains a
     /// workspace; use [`Workspace::open`] to reopen an existing one.
-    pub fn create(
-        path: &Path,
-        executor: Arc<dyn Executor>,
-        config: WorkspaceConfig,
-    ) -> io::Result<Arc<Self>> {
+    pub fn create(path: &Path, config: WorkspaceConfig) -> io::Result<Arc<Self>> {
         Self::create_with_initial_device(
             path,
-            executor,
             config,
             None,
             std::collections::BTreeSet::new(),
@@ -265,14 +178,12 @@ where
     /// no roles and is replaced by a verified peer snapshot during onboarding.
     pub fn create_joining(
         path: &Path,
-        executor: Arc<dyn Executor>,
         config: WorkspaceConfig,
         requested_name: String,
         capabilities: std::collections::BTreeSet<zendb_types::CapabilityId>,
     ) -> io::Result<Arc<Self>> {
         Self::create_with_initial_device(
             path,
-            executor,
             config,
             Some(requested_name),
             capabilities,
@@ -282,7 +193,6 @@ where
 
     fn create_with_initial_device(
         path: &Path,
-        executor: Arc<dyn Executor>,
         config: WorkspaceConfig,
         requested_name: Option<String>,
         capabilities: std::collections::BTreeSet<zendb_types::CapabilityId>,
@@ -294,15 +204,6 @@ where
             config.device_id,
         )?);
         persist_workspace_id(&path.join(WORKSPACE_ID_FILE), &config.workspace_id)?;
-        let table_catalog =
-            TableCatalog::create(&path.join(TABLE_CATALOG_FILE), KeyDirConfig::default())?;
-        let state_catalog =
-            StateCatalog::create(&path.join(STATE_CATALOG_FILE), KeyDirConfig::default())?;
-        let operator_catalog = OperatorCatalog::<D::Config>::create(
-            &path.join(OPERATOR_CATALOG_FILE),
-            KeyDirConfig::default(),
-        )?;
-        let timers = TimerStore::create(&path.join(TIMERS_FILE), BPlusTreeConfig::default())?;
         let initial_hlc = device_profile.next_hlc(now_ms())?;
         let initial_device = zendb_types::DeviceRecord {
             name: requested_name.unwrap_or_else(|| format!("device-{}", config.device_id)),
@@ -311,109 +212,59 @@ where
             capabilities,
             replication_frontier: zendb_types::ContiguousFrontier::default(),
         };
-        let control = control::WorkspaceControl::create(
-            &path.join(CONTROL_FILE),
+        let control = system::WorkspaceControl::create(
+            &path.join(TABLES_DIR),
             config.device_id,
             initial_device,
             initial_hlc,
         )?;
-        let shared_journal = journal::SharedJournal::create(
-            &path.join(SHARED_EVENTS_FILE),
-            &path.join(FRONTIER_FILE),
-        )?;
+        let shared_journal =
+            SharedJournal::create(&path.join(SHARED_EVENTS_FILE), &path.join(FRONTIER_FILE))?;
         info!("creating workspace at {:?}", path);
-        let workspace = Self::from_parts(
-            path,
-            table_catalog,
-            state_catalog,
-            operator_catalog,
-            timers,
-            executor,
-            config,
-            device_profile,
-            control,
-            shared_journal,
-        )?;
+        let workspace = Self::from_parts(path, config, device_profile, control, shared_journal)?;
         workspace.recover_shared_journal()?;
         Ok(workspace)
     }
 
     /// Open an existing workspace at `path`. Fails if the directory does not
     /// contain a valid workspace.
-    pub fn open(
-        path: &Path,
-        executor: Arc<dyn Executor>,
-        config: WorkspaceConfig,
-    ) -> io::Result<Arc<Self>> {
+    pub fn open(path: &Path, config: WorkspaceConfig) -> io::Result<Arc<Self>> {
         let mut config = config;
         let device_profile = Arc::new(DeviceProfile::open(&path.join(DEVICE_PROFILE_FILE))?);
         config.device_id = device_profile.device_id();
         config.workspace_id =
             load_or_persist_workspace_id(&path.join(WORKSPACE_ID_FILE), config.workspace_id)?;
-        let table_catalog =
-            TableCatalog::open(&path.join(TABLE_CATALOG_FILE), KeyDirConfig::default())?;
-        let state_catalog =
-            StateCatalog::open(&path.join(STATE_CATALOG_FILE), KeyDirConfig::default())?;
-        let operator_catalog = OperatorCatalog::<D::Config>::open(
-            &path.join(OPERATOR_CATALOG_FILE),
-            KeyDirConfig::default(),
-        )?;
-        let timers = TimerStore::open(&path.join(TIMERS_FILE), BPlusTreeConfig::default())?;
-        let control = control::WorkspaceControl::open(&path.join(CONTROL_FILE))?;
-        let shared_journal = journal::SharedJournal::open(
-            &path.join(SHARED_EVENTS_FILE),
-            &path.join(FRONTIER_FILE),
-        )?;
+        let control = system::WorkspaceControl::open(&path.join(TABLES_DIR), config.device_id)?;
+        let shared_journal =
+            SharedJournal::open(&path.join(SHARED_EVENTS_FILE), &path.join(FRONTIER_FILE))?;
         info!("opening workspace at {:?}", path);
-        let workspace = Self::from_parts(
-            path,
-            table_catalog,
-            state_catalog,
-            operator_catalog,
-            timers,
-            executor,
-            config,
-            device_profile,
-            control,
-            shared_journal,
-        )?;
+        let workspace = Self::from_parts(path, config, device_profile, control, shared_journal)?;
         workspace.recover_shared_journal()?;
         Ok(workspace)
     }
 
-    /// Assemble a `Workspace` from its constituent parts and spawn the background timer scheduler.
+    /// Assemble a Workspace from its durable core resources.
     fn from_parts(
         path: &Path,
-        table_catalog: TableCatalog,
-        state_catalog: StateCatalog,
-        operator_catalog: OperatorCatalog<D::Config>,
-        timers: TimerStore,
-        executor: Arc<dyn Executor>,
         config: WorkspaceConfig,
         device_profile: Arc<DeviceProfile>,
-        control: control::WorkspaceControl,
-        shared_journal: journal::SharedJournal,
+        control: system::WorkspaceControl,
+        shared_journal: SharedJournal,
     ) -> io::Result<Arc<Self>> {
-        let timer_notify = Arc::new((Mutex::new(()), Condvar::new()));
         let workspace = Arc::new(Self {
             path: path.to_path_buf(),
             config,
-            executor,
-            table_catalog: Mutex::new(table_catalog),
-            state_catalog: Mutex::new(state_catalog),
-            operator_catalog: Mutex::new(operator_catalog),
             tables: RwLock::new(HashMap::new()),
-            states: RwLock::new(HashMap::new()),
-            operators: RwLock::new(HashMap::new()),
-            timers: Arc::new(RwLock::new(timers)),
+            table_observers: RwLock::new(HashMap::new()),
+            next_table_observer_id: AtomicU64::new(1),
             device_profile,
             control: Mutex::new(control),
             shared_journal: Mutex::new(shared_journal),
             shared_mutation: Mutex::new(()),
+            state_reconciliation_required: AtomicBool::new(path.join(RECONCILIATION_FILE).exists()),
             presence: Mutex::new(HashMap::new()),
             presence_idle_ms: AtomicU64::new(30_000),
             presence_grace_multiplier: AtomicU32::new(3),
-            timer_notify: Arc::clone(&timer_notify),
         });
         let highest_local_sequence = workspace
             .shared_journal
@@ -427,16 +278,34 @@ where
                 .device_profile
                 .reconcile_key_ring(&local_device.key_ring)?;
         }
-        let workspace_weak = Arc::downgrade(&workspace);
-        debug!("spawning background timer scheduler");
-        workspace
-            .executor
-            .spawn(Box::pin(run_scheduler(workspace_weak, timer_notify)));
         Ok(workspace)
     }
 
-    pub(crate) fn executor(&self) -> Arc<dyn Executor> {
-        Arc::clone(&self.executor)
+    /// Filesystem root used by optional local subsystems such as operators.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Subscribe to table open/close events. Callbacks must return quickly.
+    pub fn observe_tables(
+        self: &Arc<Self>,
+        observer: impl Fn(TableLifecycleEvent) + Send + Sync + 'static,
+    ) -> TableObservation {
+        let id = self
+            .next_table_observer_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.table_observers.write().insert(id, Arc::new(observer));
+        TableObservation {
+            workspace: Arc::downgrade(self),
+            id,
+        }
+    }
+
+    pub(crate) fn notify_table_observers(&self, event: TableLifecycleEvent) {
+        let observers: Vec<_> = self.table_observers.read().values().cloned().collect();
+        for observer in observers {
+            observer(event.clone());
+        }
     }
 
     /// Return a reference to the workspace configuration.
@@ -454,8 +323,8 @@ where
         self.config.device_id
     }
 
-    /// Access the durable local signing and sequence profile.
-    pub fn device_profile(&self) -> &DeviceProfile {
+    /// Internal access to durable local signing and sequence state.
+    pub(crate) fn device_profile(&self) -> &DeviceProfile {
         &self.device_profile
     }
 
@@ -488,34 +357,111 @@ where
     pub fn create_shared_table(
         self: &Arc<Self>,
         name: &str,
-        mut config: TableConfig,
+        config: TableConfig,
     ) -> io::Result<TableHandle> {
         if self.is_shared_table(name)? {
-            return self.table(name, None);
+            return self.table_impl(name, None);
         }
-        if self
-            .table_config(name)
-            .is_some_and(|existing| !existing.sync)
-        {
+        if self.table_config(name).is_some() {
+            // Validate the requested physical override before making the
+            // catalog row shared; a failed migration must not change policy.
+            self.table_impl(name, Some(config))?;
+            self.set_table_sync_policy(name, SyncPolicy::Inherit)?;
+            return self.table_impl(name, None);
+        }
+        let at = self.device_profile.next_hlc(now_ms())?;
+        self.commit_shared_event(system::catalog_event(at, name, Some(config.clone()))?)?;
+        self.table_impl(name, Some(config))
+    }
+
+    /// Change this device's table-wide synchronization boundary.
+    ///
+    /// Local-to-inherited promotion publishes CRDT merge state with original
+    /// row clocks. Inherited-to-local is replica-local and emits no data event.
+    pub fn set_table_sync_policy(
+        self: &Arc<Self>,
+        name: &str,
+        policy: SyncPolicy,
+    ) -> io::Result<bool> {
+        if self.table_config(name).is_none() {
             return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "a local-only table already uses this name",
+                io::ErrorKind::NotFound,
+                format!("table {name:?} is absent from _catalog"),
             ));
         }
-        config.sync = true;
+        if policy == SyncPolicy::Inherit {
+            let local = self.device(self.device_id())?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "local Device is not admitted",
+                )
+            })?;
+            if !local.allows(WorkspaceAction::Contribute) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Contributor is required to publish a local table",
+                ));
+            }
+        }
+
+        let catalog_cell = {
+            let mut control = self.control.lock();
+            if !control.set_catalog_policy(name, policy)? {
+                return Ok(false);
+            }
+            control
+                .catalog_cell(name)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "catalog row disappeared"))?
+        };
+        let table = self.table_impl(name, None)?;
+        table.get()?.write().set_table_sync_policy(policy);
+
+        if policy == SyncPolicy::Local {
+            return Ok(true);
+        }
+
+        self.mark_state_reconciliation_required()?;
+
         let at = self.device_profile.next_hlc(now_ms())?;
-        self.commit_shared_event(control::shared_table_event(at, name, true))?;
-        self.table(name, Some(config))
+        self.commit_shared_event(Event {
+            table_id: system::CATALOG_TABLE.into(),
+            primary_key: PrimaryKey::String(name.into()),
+            path: ValuePath::new(),
+            op: Op::Merge {
+                cell: catalog_cell
+                    .shared_clone(SyncScope::Shared)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "promoted catalog row still resolves to local policy",
+                        )
+                    })?,
+            },
+            hlc: at,
+        })?;
+
+        let rows = table.get()?.read().shared_rows();
+        for (primary_key, cell) in rows {
+            let at = self.device_profile.next_hlc(now_ms())?;
+            self.commit_shared_event(Event {
+                table_id: name.into(),
+                primary_key,
+                path: ValuePath::new(),
+                op: Op::Merge { cell },
+                hlc: at,
+            })?;
+        }
+        Ok(true)
     }
 
     /// Tombstone a live shared-table declaration. Physical files are retained
-    /// for recovery, overlays, and later compaction.
+    /// for recovery and explicit later cleanup.
     pub fn delete_shared_table(self: &Arc<Self>, name: &str) -> io::Result<bool> {
         if !self.is_shared_table(name)? {
             return Ok(false);
         }
         let at = self.device_profile.next_hlc(now_ms())?;
-        self.commit_shared_event(control::shared_table_event(at, name, false))?;
+        self.commit_shared_event(system::catalog_event(at, name, None)?)?;
         self.close_table(name);
         Ok(true)
     }
@@ -528,16 +474,16 @@ where
         device_id: DeviceId,
         record: zendb_types::DeviceRecord,
     ) -> io::Result<bool> {
-        control::validate_initial_device(&record)?;
+        system::validate_initial_device(&record)?;
         let at = self.device_profile.next_hlc(now_ms())?;
-        self.commit_shared_event(control::admit_event(at, device_id, record))?;
+        self.commit_shared_event(system::admit_event(at, device_id, record))?;
         Ok(true)
     }
 
     /// Tombstone a Device membership Cell. Requires the Manager role.
     pub fn remove_device(self: &Arc<Self>, device_id: DeviceId) -> io::Result<bool> {
         let at = self.device_profile.next_hlc(now_ms())?;
-        self.commit_shared_event(control::remove_device_event(at, device_id))?;
+        self.commit_shared_event(system::remove_device_event(at, device_id))?;
         Ok(true)
     }
 
@@ -545,7 +491,7 @@ where
     /// Device requires Manager.
     pub fn rename_device(self: &Arc<Self>, device_id: DeviceId, name: String) -> io::Result<bool> {
         let at = self.device_profile.next_hlc(now_ms())?;
-        self.commit_shared_event(control::replace_field_event(
+        self.commit_shared_event(system::replace_field_event(
             at,
             device_id,
             "name",
@@ -562,7 +508,7 @@ where
         enabled: bool,
     ) -> io::Result<bool> {
         let at = self.device_profile.next_hlc(now_ms())?;
-        self.commit_shared_event(control::role_event(at, device_id, role, enabled))?;
+        self.commit_shared_event(system::role_event(at, device_id, role, enabled))?;
         Ok(true)
     }
 
@@ -634,40 +580,8 @@ fn load_or_persist_workspace_id(path: &Path, configured: WorkspaceId) -> io::Res
     }
 }
 
-// Close table loop
-impl<D> Drop for Workspace<D>
-where
-    D: DispatchOperator,
-{
+impl Drop for Workspace {
     fn drop(&mut self) {
-        let deadline = Instant::now() + self.config.graceful_shutdown_max_duration;
-
-        loop {
-            let tables_to_close: Vec<String> = {
-                let mut tables = self.tables.write();
-                let tables_to_close = tables.keys().cloned().collect();
-                tables.clear();
-                tables_to_close
-            };
-
-            if !tables_to_close.is_empty() {
-                let workers: Vec<_> = self.operators.read().values().cloned().collect();
-                for table in &tables_to_close {
-                    for worker in &workers {
-                        worker.detach_input(table);
-                    }
-                }
-            }
-
-            if self.tables.read().is_empty() && self.operators.read().is_empty() {
-                return;
-            }
-
-            if Instant::now() >= deadline {
-                return;
-            }
-
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        self.tables.write().clear();
     }
 }

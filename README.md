@@ -1,228 +1,183 @@
 # ZenDB
 
-An embedded, local-first CRDT database for applications that need durable local
-state and optional peer-to-peer workspace replication without a central
-authority.
+ZenDB is an embedded, local-first CRDT workspace for client applications. A
+workspace may stay entirely local or replicate directly among admitted devices
+without a central database authority.
 
-ZenDB provides:
+## Current Model
 
-- recursively nested CRDT values and deterministic merge;
-- local tables and device-private nested overlays;
-- signed shared journals with durable per-origin contiguous frontiers;
-- device-only workspace membership and fixed workspace roles;
-- QR/link ticket onboarding and direct Manager pre-admission;
-- mutually authenticated encrypted TCP anti-entropy;
-- signed LAN discovery, heartbeat presence, departure notices, and reconnect;
-- snapshot bootstrap, stable-frontier derivation, and tombstone compaction; and
-- an existing native local streaming operator runtime.
+- `Workspace` is the concrete lifecycle and authorization root.
+- A generated, persisted `DeviceId` is the only database identity.
+- Every admitted device receives all shared data and is an implicit Reader.
+- `Contributor`, `Dispatcher`, and `Manager` are fixed, workspace-wide roles.
+- Tables and nested Cells can be local on one device or inherit replication.
+- Local and shared values occupy one materialized Cell tree, not an overlay.
+- Shared events are signed and identified by per-device origin sequences.
+- Exact event ranges are the normal anti-entropy path; canonical table Merkle
+  roots and a durable repair marker trigger verified snapshot state repair.
+- OAuth, accounts, subscriptions, and hosted authorization stay in the
+  application layer.
 
-ZenDB is not SQL, distributed consensus, or a cloud control plane. Every
-workspace replica runs inside the client application. Optional hosted adapters
-can help peers find each other, but they do not become database authorities.
-
-## Architecture
-
-```text
-Application
-    |
-    v
-zendb-engine::Workspace<D>
-    |-- local/shared mutation routing and authorization
-    |-- device control state and signed shared journal
-    |-- onboarding, anti-entropy, snapshots, compaction
-    |-- TCP cluster runtime and LAN peer discovery
-    `-- existing local operator workers and timers
-         |
-         +--> zendb-transport  authenticated encrypted sessions, profile
-         +--> zendb-sync       portable replication wire records
-         +--> zendb-storage    durable tables, states, logs, indexes
-         `--> zendb-types      CRDTs, IDs, devices, roles, frontiers
-
-zendb-external                optional outbound hosted discovery/rendezvous
-```
-
-The dependency direction keeps values portable and the product policy in one
-concrete owner. `zendb-types` has no filesystem or socket behavior.
-`zendb-storage` does not decide authorization. `zendb-transport` authenticates
-and encrypts a byte session but does not admit devices. `Workspace` composes
-those pieces and enforces the complete operation.
+ZenDB is not SQL, consensus, a server control plane, or a source of
+linearizable locks.
 
 ## Crates
 
-| Crate | Responsibility | Important exports |
-|---|---|---|
-| [`zendb-types`](zendb-types/) | CRDT data and portable control records | `Cell`, `Event`, `Hlc`, `Value`, `DeviceRecord`, `WorkspaceRole`, `ContiguousFrontier` |
-| [`zendb-storage`](zendb-storage/) | Generic durable data structures | `BPlusTree`, `KeyDir`, `SkipList`, `Topic`, `State`, `Table` |
-| [`zendb-transport`](zendb-transport/) | Concrete client transport mechanics | `DeviceProfile`, `SecureTcpSession`, `EnrollmentPresentation`, `PresenceTracker` |
-| [`zendb-sync`](zendb-sync/) | Engine-independent sync records | `SyncEnvelope`, `RangeRequest`, `WorkspaceSyncSummary`, `SnapshotManifest`, `SyncSnapshotChunk` |
-| [`zendb-engine`](zendb-engine/) | Concrete workspace product runtime | `Workspace`, `ClusterConfig`, `ClusterRuntime`, `SyncReport`, `OnboardingResult` |
-| [`zendb-external`](zendb-external/) | Optional outbound hosted adapters | `HostedRendezvousClient`, `HostedDiscoveryClient` |
-| [`zendb-testing`](zendb-testing/) | Integration fixtures and local operators | document pipeline test types |
+| Crate | Owns |
+|---|---|
+| `zendb-types` | CRDT values, IDs, device records, roles, frontiers, and wire-safe records |
+| `zendb-storage` | Generic B+ tree, KeyDir, SkipList, State, and Topic storage |
+| `zendb-replication` | Replication-aware Table materialization, shared journal, and sync protocol records |
+| `zendb-transport` | Durable device keys, carrier-neutral secure sessions, TCP/LAN mechanics, enrollment, and presence |
+| `zendb-engine` | Concrete Workspace policy, system tables, onboarding, sync orchestration, and cluster runtime |
+| `zendb-operator` | Optional local operator host, state, timers, Rhai, and native operators |
+| `zendb-testing` | Integration fixtures and example operators |
 
-The former `zendb-identity` crate was removed. The database does not model
-OAuth users or principals. Application identity may inform whether an app asks
-a Manager to admit a device, but the replicated authority is always DeviceId.
+The former `zendb-identity` crate is gone. Application users and OAuth
+principals are not replicated authorization subjects.
 
-## Workspace Model
+## Devices And Roles
 
-A workspace is one distributed CRDT ledger with one stable `WorkspaceId`.
-Every installation has a random, stable `DeviceId` and a durable signing
-profile. DeviceId is independent of the signing key so keys can rotate.
+`_devices[device_id]` is the membership record. A live row admits the device;
+its Cell tombstone removes it. The record contains its display name, two-key
+rotation ring, fixed role set, advertised capability labels, and replicated
+frontier checkpoint.
 
-Membership is represented by a live `devices.<device_id>` Cell in replicated
-control state. Deleting that Cell revokes the device. There is no separate
-membership table, status row, workspace secret, owner key, or principal-device
-binding.
+- `Contributor` mutates shared data and table declarations.
+- `Dispatcher` is reserved for distributed operator specifications.
+- `Manager` admits/removes devices, changes role sets, renames devices, and
+  manages enrollment tickets.
 
-Every admitted device receives all shared data and is an implicit Reader. The
-only explicit workspace-wide roles are:
+Roles are non-overlapping. The creator receives all three; a new device starts
+with none and is read-only. A device updates its own name, capabilities, key
+ring, and frontier. A Manager cannot forge another device's cryptographic or
+runtime-owned fields.
 
-- `Contributor`: create/delete shared tables and mutate shared data.
-- `Dispatcher`: manage operator specifications.
-- `Manager`: manage devices, role sets, and enrollment tickets.
+Capabilities such as `gpu` or `vpn` are scheduling labels, not permissions or
+callable functions.
 
-The creator starts with all three roles. Newly onboarded devices start with no
-explicit role and therefore read only. The roles are fixed protocol values,
-not user-defined policy programs. Capabilities such as `vpn` or `gpu` are
-self-advertised device labels for future placement, not permissions.
+## Table API
 
-## Local And Shared Data
-
-A local table is present only in the local catalog. It requires no workspace
-role and consumes no shared origin sequence:
+`_catalog` is itself a Table. Each row stores a bincode `Blob<TableConfig>`;
+the catalog row's local `SyncPolicy` is the table-wide replication boundary.
+`_devices` and `_enrollment_tickets` are cataloged system tables using the same
+Table storage and replication path with stricter engine validators.
 
 ```rust
-let table = workspace.table("drafts", Some(local_config))?;
-table.get()?.write().insert_event(local_event)?;
+use zendb_engine::{TableConfig, Workspace};
+use zendb_types::{PrimaryKey, Value};
+
+let drafts = workspace
+    .table("drafts")
+    .config(TableConfig::default())
+    .local()
+    .create()?;
+
+let documents = workspace
+    .table("documents")
+    .config(TableConfig::default())
+    .shared()
+    .create()?;
+
+workspace
+    .table("documents")
+    .row(PrimaryKey::String("doc-1".into()))
+    .replace(Value::String("hello".into()))?;
 ```
 
-A shared table is a replicated control declaration. Contributors create it and
-route all data mutations through `Workspace`:
+The same row/path API routes local mutations without a shared identity and
+shared mutations through authorization, signing, durable journal append, and
+CRDT application. `Table` implements `ReadBackend` and `OrderedReadBackend`, so
+callers can use lookup, iteration, endpoint, reverse, and range reads directly
+through a table guard. It intentionally does not expose raw backend mutation.
+
+The catalog config is the cross-device construction default. The effective
+physical config chosen on one device is persisted in `table.config`; changing
+it later requires explicit migration.
+
+## Local Boundaries
+
+Every Cell carries replica-local metadata:
 
 ```rust
-let table = workspace.create_shared_table("documents", TableConfig::default())?;
-workspace.mutate("documents", document_id, shared_event)?;
+pub enum SyncPolicy {
+    Inherit,
+    Local,
+}
 ```
 
-Direct insertion on a physical shared table is rejected. The workspace path is
-responsible for role validation, durable origin-sequence allocation, signing,
-journal append, and application.
+`Local` prevents local publication and remote materialization at that subtree.
+It is durable but excluded from replicated projections, signatures, snapshots,
+and Merkle roots. A remote ancestor replacement cannot erase a local child.
 
-Within shared data, `Cell.sync = Some(false)` creates a device-private overlay
-at that recursive path. Local writes under it never enter the shared journal.
-Remote ancestor changes cannot erase the overlay. Re-enabling sync discards
-the private overlay and reveals current shared state; it never silently
-publishes local data.
+Returning a path or table to `Inherit` publishes its current projected CRDT
+state with the original data clocks and records durable reconciliation debt.
+The next successful peer sync installs current shared state and clears the
+debt. LWW and type-specific merge rules, not the toggle time, select winners.
+Publishing local state requires `Contributor`.
 
 ## Onboarding
 
-A joining installation first persists its DeviceId and signing key. Discovery
-or a successful socket connection is not admission. ZenDB has two protocols:
+There are two database protocols:
 
-1. **Enrollment presentation.** A Manager publishes a ticket verifier and puts
-   the private ticket credential in a QR code or link. The candidate signs an
-   exact admission proof. Any admitted reader can validate and relay it.
-2. **Direct admission.** A Manager receives the candidate DeviceId and public
-   key out of band and adds the Device record. The candidate may then bootstrap
-   from any peer while pinning an expected peer public key.
+1. A Manager creates an `_enrollment_tickets` row and a QR/link presentation
+   containing the private ticket credential. The candidate binds its DeviceId,
+   public key, name, and capabilities into a possession proof. Any admitted
+   peer can validate and relay the narrowly authorized admission.
+2. A Manager directly creates a known candidate's `_devices` row. The
+   candidate later bootstraps from any peer while pinning the expected peer
+   public key.
 
-Both flows prove possession of the candidate private key and transfer a
-manifest-verified, independently hashed chunked snapshot. The resulting device
-has no explicit roles. Ticket admission evidence accompanies the admission
-event so every replica can validate the exceptional Manager-free write.
+Both paths transfer a manifest-verified chunked snapshot and then continue
+normal anti-entropy. Discovery and connectivity never imply admission.
 
-Relevant APIs are `Workspace::create_joining()`,
-`create_enrollment_ticket()`, `bootstrap_with_ticket()`, `admit_device()`,
-and `bootstrap_direct()`.
+## Networking And Progress
 
-## Networking And Synchronization
+`sync_tcp()` creates a mutually authenticated encrypted session using signed
+ephemeral X25519 handshakes and ChaCha20-Poly1305 framing. Peers exchange
+signed presence, contiguous frontiers, exact missing event ranges, table
+Merkle roots, and snapshot state when history or current materialization needs
+repair.
 
-`Workspace::sync_tcp()` performs a single bilateral anti-entropy session. The
-transport uses signed ephemeral X25519 handshakes authenticated by accepted
-Ed25519 device keys and ChaCha20-Poly1305 encrypted framing. Peers then:
+`start_cluster()` adds a TCP listener, reconnect loop, signed UDP LAN
+announcements, frontier checkpoints, heartbeats, and best-effort departure
+notices. Presence is local soft state and never changes membership.
 
-1. exchange signed heartbeat presence and contiguous frontier summaries;
-2. request exact missing `(origin, sequence range)` history;
-3. send bounded batches of signed events;
-4. retain out-of-order events until gaps and control dependencies arrive; and
-5. use a chunked snapshot fallback when retained history is unavailable.
+Only shared events consume `EventIdentity { origin_device_id, origin_seq }`.
+The stable frontier is the per-origin minimum checkpoint across every admitted
+device. Offline members hold retention and key-rotation barriers until a
+Manager removes them.
 
-`Workspace::start_cluster(ClusterConfig)` runs a TCP listener plus periodic
-multi-peer sync and reconnect. Optional signed UDP announcements discover LAN
-peers. The runtime publishes frontier checkpoints and sends a signed departure
-after stopping heartbeat producers.
+## Key Rotation And Compaction
 
-Presence is deliberately local. A signed heartbeat advertises its intended
-idle interval; each receiver derives `Direct`, `Indirect`, `Suspect`,
-`Unreachable`, `Departed`, or `Unknown` using bounded arrival samples and a
-local grace multiplier. A continuous suspicion score is available to consumers.
-None of these observations revoke membership or grant authorization.
+DeviceId is independent of signing keys. Rotation stages a secondary key,
+waits for the stable frontier to cover the stage event, then promotes it and
+retains the old key only for earlier event sequences.
 
-## Frontiers, Snapshots, And Compaction
-
-Only shared events receive `EventIdentity { origin_device_id, origin_seq }`.
-Each replica durably tracks the largest gap-free prefix per origin and
-checkpoints it in its own Device record.
-
-The stable frontier is the point observed by every admitted device. Offline
-members continue to hold it back until a Manager removes them. This is a
-membership and storage-retention consequence, not a liveness timeout.
-
-Snapshots contain shared control and live shared tables only. They exclude
-local tables and private overlays. `compact_shared()` first requires a
-retained snapshot, derives a stable HLC from the stable frontier, and recursively
-removes CRDT tombstones no newer than that proof. Shared journal pruning is not
-implemented yet; retaining history is the conservative recovery behavior.
-
-## Signing-Key Rotation
-
-A device calls `stage_local_key_rotation()` to stage a secondary key in its
-replicated key ring. It continues using
-the primary until the stable frontier proves that every admitted device has
-received the stage event. Promotion is signed by the staged key and swaps the
-two keys. The prior primary remains as the secondary verifier for delayed old
-events and is replaced by a later rotation. `promote_local_key_rotation()`
-performs the stable-frontier-gated swap. DeviceId never changes.
+Snapshots and physical storage compaction are implemented. Irreversible CRDT
+tombstone and shared-journal pruning are deliberately disabled: a scalar HLC
+watermark cannot safely distinguish a never-existing value from a compacted
+deletion when old local branches may return. ADR 007 tracks the required
+pruning-context design.
 
 ## Operators
 
-The existing native operator runtime supports compiled Rust operators,
-subscriptions, local state, facets, timers, and worker lifecycle. Distributed
-declarative operator reconciliation, capability placement, leases, fencing,
-Rhai isolation, and Dispatcher enforcement are intentionally not implemented
-in this pass. They are specified separately in ADR 008 and must not be inferred
-from similarly named legacy operator types.
+The native local operator runtime is available through
+`zendb_operator::OperatorHost<D>`, which wraps a concrete `Arc<Workspace>`.
+Core replication does not depend on an executor, Rhai, or an operator set.
+Distributed
+declarative placement, leases, fencing, and capability scheduling are proposed
+in ADR 008 and are not represented as completed functionality.
 
-## Decisions
+## Documentation
 
-The normative distributed design is split into narrow records under
-[`.plan/decisions`](.plan/decisions/README.md):
+The concise source of truth is [`.plan/README.md`](.plan/README.md). Narrow
+decisions live in [`.plan/decisions`](.plan/decisions/README.md), and only open
+work appears in [`.plan/roadmap.md`](.plan/roadmap.md).
 
-1. devices and roles;
-2. device liveness;
-3. shared journal and replication frontiers;
-4. device onboarding;
-5. device signing-key rotation;
-6. local/shared sync boundaries;
-7. tombstone compaction watermarks;
-8. proposed distributed operator reconciliation and leases; and
-9. shared-table lifecycle.
-
-Older large documents under `.plan` are retained as historical exploration.
-Their principal/OAuth abstractions and broad transport traits are not current
-APIs.
-
-## Building And Testing
+## Verification
 
 ```bash
-cargo build --workspace
+cargo check --workspace
 cargo test --workspace
 ```
-
-The workspace uses Rust 2021. The engine has integration coverage for local and
-shared routing, authenticated sync, ticket/direct onboarding, key rotation,
-presence/departure, snapshots, and compaction.
-
-## License
-
-License terms have not yet been declared in this repository.

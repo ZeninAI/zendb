@@ -2,44 +2,26 @@
 
 use std::{
     io,
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use bincode::{Decode, Encode};
-use zendb_sync::{
+use zendb_replication::{
     EventBatch, RangeRequest, SnapshotExport, SnapshotManifest, SyncSnapshotChunk,
-    SyncSnapshotMeta, WorkspaceSyncSummary,
+    SyncSnapshotMeta, WorkspaceMessage, WorkspaceSyncSummary,
 };
 use zendb_transport::{
-    HandshakePeer, PresenceStatus, PresenceTracker, SecureTcpSession, SessionPurpose,
+    HandshakePeer, PresenceStatus, PresenceTracker, SecureSession, SessionPurpose, TcpLink,
+    TcpLinkListener, TcpSecureSession,
 };
 use zendb_types::{DepartureNotice, DeviceId, PresenceHeartbeat, SignatureBytes, WorkspaceId};
-
-use crate::DispatchOperator;
 
 use super::{now_ms, Workspace};
 
 const DEFAULT_BATCH_EVENTS: usize = 256;
 const MAX_EVENT_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
-
-#[derive(Debug, Clone, Encode, Decode)]
-enum WorkspaceMessage {
-    Summary {
-        summary: WorkspaceSyncSummary,
-        heartbeat: PresenceHeartbeat,
-    },
-    Pull(Vec<RangeRequest>),
-    Events(EventBatch),
-    SnapshotMeta(SyncSnapshotMeta),
-    SnapshotChunk(SyncSnapshotChunk),
-    PullComplete,
-    Complete,
-    Departure(DepartureNotice),
-    Error(String),
-}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyncReport {
@@ -48,16 +30,28 @@ pub struct SyncReport {
     pub snapshot_installed: bool,
 }
 
-impl<D> Workspace<D>
-where
-    D: DispatchOperator,
-{
+impl Workspace {
     pub fn sync_summary(&self) -> WorkspaceSyncSummary {
+        let table_merkle_roots = self
+            .tables
+            .read()
+            .iter()
+            .filter_map(|(name, table)| {
+                table
+                    .read()
+                    .shared_merkle_root()
+                    .ok()
+                    .flatten()
+                    .map(|root| (name.clone(), root))
+            })
+            .collect();
         WorkspaceSyncSummary {
             workspace_id: self.workspace_id().clone(),
             frontier: self.shared_frontier(),
             snapshot_generation: None,
             compacted_through: self.shared_watermark().ok().flatten(),
+            requests_state_reconciliation: self.state_reconciliation_required(),
+            table_merkle_roots,
         }
     }
 
@@ -65,8 +59,8 @@ where
     /// authenticated encrypted TCP connection.
     pub fn sync_tcp(self: &Arc<Self>, address: SocketAddr) -> io::Result<SyncReport> {
         let workspace = Arc::clone(self);
-        let mut session = SecureTcpSession::connect(
-            address,
+        let mut session = SecureSession::connect(
+            TcpLink::connect(address)?,
             self.workspace_id(),
             self.device_profile(),
             SessionPurpose::Replication,
@@ -78,10 +72,10 @@ where
 
     /// Accept one already-connected TCP stream and serve its declared session
     /// purpose. Bootstrap is handled by the onboarding module.
-    pub fn serve_tcp(self: &Arc<Self>, stream: TcpStream) -> io::Result<SyncReport> {
+    pub fn serve_tcp(self: &Arc<Self>, link: TcpLink) -> io::Result<SyncReport> {
         let workspace = Arc::clone(self);
-        let mut session = SecureTcpSession::accept(
-            stream,
+        let mut session = SecureSession::accept(
+            link,
             self.workspace_id(),
             self.device_profile(),
             move |peer| match peer.purpose {
@@ -108,8 +102,8 @@ where
     /// Bind a listener without introducing a server-side abstraction. The
     /// returned standard listener can be integrated with any application event
     /// loop; [`serve_tcp`](Self::serve_tcp) handles each accepted connection.
-    pub fn bind_tcp(address: SocketAddr) -> io::Result<TcpListener> {
-        TcpListener::bind(address)
+    pub fn bind_tcp(address: SocketAddr) -> io::Result<TcpLinkListener> {
+        TcpLinkListener::bind(address)
     }
 
     fn authorize_replication_peer(&self, peer: &HandshakePeer) -> io::Result<()> {
@@ -138,7 +132,7 @@ where
 
     fn run_sync_initiator(
         self: &Arc<Self>,
-        session: &mut SecureTcpSession,
+        session: &mut TcpSecureSession,
     ) -> io::Result<SyncReport> {
         let local_summary = self.sync_summary();
         session.send_value(&WorkspaceMessage::Summary {
@@ -154,16 +148,21 @@ where
         };
         self.verify_heartbeat(session.peer(), &heartbeat)?;
 
-        session.send_value(&WorkspaceMessage::Pull(missing_ranges(
-            &local_summary,
-            &remote_summary,
-        )))?;
+        session.send_value(&WorkspaceMessage::Pull {
+            ranges: missing_ranges(&local_summary, &remote_summary),
+            include_snapshot: local_summary.requests_state_reconciliation
+                || merkle_mismatch(&local_summary, &remote_summary),
+        })?;
         let mut report = self.receive_pull(session)?;
 
-        let WorkspaceMessage::Pull(requests) = session.receive_value()? else {
+        let WorkspaceMessage::Pull {
+            ranges,
+            include_snapshot,
+        } = session.receive_value()?
+        else {
             return protocol_error("expected responder pull request");
         };
-        report.events_sent = self.send_pull(session, requests)?;
+        report.events_sent = self.send_pull(session, ranges, include_snapshot)?;
         session.send_value(&WorkspaceMessage::Complete)?;
         match session.receive_value()? {
             WorkspaceMessage::Complete => Ok(report),
@@ -174,7 +173,7 @@ where
 
     fn run_sync_responder(
         self: &Arc<Self>,
-        session: &mut SecureTcpSession,
+        session: &mut TcpSecureSession,
     ) -> io::Result<SyncReport> {
         let (remote_summary, heartbeat) = match session.receive_value()? {
             WorkspaceMessage::Summary { summary, heartbeat } => (summary, heartbeat),
@@ -191,18 +190,23 @@ where
             heartbeat: self.make_heartbeat()?,
         })?;
 
-        let WorkspaceMessage::Pull(requests) = session.receive_value()? else {
+        let WorkspaceMessage::Pull {
+            ranges,
+            include_snapshot,
+        } = session.receive_value()?
+        else {
             return protocol_error("expected initiator pull request");
         };
         let mut report = SyncReport {
-            events_sent: self.send_pull(session, requests)?,
+            events_sent: self.send_pull(session, ranges, include_snapshot)?,
             ..SyncReport::default()
         };
 
-        session.send_value(&WorkspaceMessage::Pull(missing_ranges(
-            &local_summary,
-            &remote_summary,
-        )))?;
+        session.send_value(&WorkspaceMessage::Pull {
+            ranges: missing_ranges(&local_summary, &remote_summary),
+            include_snapshot: local_summary.requests_state_reconciliation
+                || merkle_mismatch(&local_summary, &remote_summary),
+        })?;
         let received = self.receive_pull(session)?;
         report.events_received = received.events_received;
         report.snapshot_installed = received.snapshot_installed;
@@ -218,8 +222,9 @@ where
 
     fn send_pull(
         self: &Arc<Self>,
-        session: &mut SecureTcpSession,
+        session: &mut TcpSecureSession,
         requests: Vec<RangeRequest>,
+        include_snapshot: bool,
     ) -> io::Result<u64> {
         let mut sent = 0;
         for request in requests {
@@ -273,11 +278,14 @@ where
                 }))?;
             }
         }
+        if include_snapshot {
+            send_snapshot(session, self.export_snapshot()?)?;
+        }
         session.send_value(&WorkspaceMessage::PullComplete)?;
         Ok(sent)
     }
 
-    fn receive_pull(self: &Arc<Self>, session: &mut SecureTcpSession) -> io::Result<SyncReport> {
+    fn receive_pull(self: &Arc<Self>, session: &mut TcpSecureSession) -> io::Result<SyncReport> {
         let mut report = SyncReport::default();
         loop {
             match session.receive_value()? {
@@ -435,8 +443,8 @@ where
 
     pub(crate) fn send_departure_tcp(self: &Arc<Self>, address: SocketAddr) -> io::Result<()> {
         let workspace = Arc::clone(self);
-        let mut session = SecureTcpSession::connect(
-            address,
+        let mut session = SecureSession::connect(
+            TcpLink::connect(address)?,
             self.workspace_id(),
             self.device_profile(),
             SessionPurpose::Replication,
@@ -513,6 +521,15 @@ fn missing_ranges(
         .collect()
 }
 
+fn merkle_mismatch(local: &WorkspaceSyncSummary, remote: &WorkspaceSyncSummary) -> bool {
+    local.table_merkle_roots.iter().any(|(table, local_root)| {
+        remote
+            .table_merkle_roots
+            .get(table)
+            .is_some_and(|remote_root| remote_root != local_root)
+    })
+}
+
 fn presence_signing_bytes(
     workspace_id: &WorkspaceId,
     device_id: DeviceId,
@@ -538,7 +555,7 @@ fn protocol_error<T>(message: &str) -> io::Result<T> {
     Err(io::Error::new(io::ErrorKind::InvalidData, message))
 }
 
-fn send_snapshot(session: &mut SecureTcpSession, snapshot: SnapshotExport) -> io::Result<()> {
+fn send_snapshot(session: &mut TcpSecureSession, snapshot: SnapshotExport) -> io::Result<()> {
     let chunk_count = snapshot_chunk_count(snapshot.bytes.len())?;
     session.send_value(&WorkspaceMessage::SnapshotMeta(SyncSnapshotMeta {
         workspace_id: snapshot.manifest.workspace_id.clone(),
@@ -577,7 +594,7 @@ pub(super) fn expected_snapshot_chunk_count(total_bytes: u64) -> io::Result<u32>
 }
 
 fn receive_snapshot(
-    session: &mut SecureTcpSession,
+    session: &mut TcpSecureSession,
     meta: SyncSnapshotMeta,
 ) -> io::Result<SnapshotExport> {
     if meta.chunk_count != expected_snapshot_chunk_count(meta.total_bytes)? {

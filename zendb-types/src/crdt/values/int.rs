@@ -2,9 +2,93 @@
 
 use bincode::{Decode, Encode};
 
-use crate::crdt::{_traits::Type, Hlc};
+use std::marker::PhantomData;
+
+use crate::{
+    CellCodecError, CellCodecKey, CrdtCodec, DefaultCrdtCodec, Hlc, PrimaryKey, Type, Value,
+};
 
 pub type Int = i64;
+
+pub struct IntCodec<T>(PhantomData<T>);
+
+macro_rules! signed_codec {
+    ($($type:ty),+ $(,)?) => {$(
+        impl CrdtCodec for IntCodec<$type> {
+            type Rust = $type;
+
+            fn encode(value: &$type, _hlc: Hlc) -> Value {
+                Value::Int(*value as i64)
+            }
+
+            fn decode(value: &Value) -> Result<$type, CellCodecError> {
+                let Value::Int(value) = value else {
+                    return Err(CellCodecError::expected("Int"));
+                };
+                <$type>::try_from(*value).map_err(|_| CellCodecError::expected("in-range Int"))
+            }
+        }
+
+        impl DefaultCrdtCodec for $type {
+            type Codec = IntCodec<$type>;
+        }
+
+        impl CellCodecKey for $type {
+            fn to_primary_key(&self) -> PrimaryKey {
+                PrimaryKey::Int(*self as i64)
+            }
+
+            fn from_primary_key(key: &PrimaryKey) -> Result<Self, CellCodecError> {
+                let PrimaryKey::Int(value) = key else {
+                    return Err(CellCodecError::expected("Int primary key"));
+                };
+                <$type>::try_from(*value)
+                    .map_err(|_| CellCodecError::expected("in-range Int primary key"))
+            }
+        }
+    )+};
+}
+
+macro_rules! unsigned_codec {
+    ($($type:ty),+ $(,)?) => {$(
+        impl CrdtCodec for IntCodec<$type> {
+            type Rust = $type;
+
+            fn encode(value: &$type, _hlc: Hlc) -> Value {
+                Value::Int(i64::try_from(*value).unwrap_or(i64::MAX))
+            }
+
+            fn decode(value: &Value) -> Result<$type, CellCodecError> {
+                let Value::Int(value) = value else {
+                    return Err(CellCodecError::expected("Int"));
+                };
+                <$type>::try_from(*value)
+                    .map_err(|_| CellCodecError::expected("non-negative, in-range Int"))
+            }
+        }
+
+        impl DefaultCrdtCodec for $type {
+            type Codec = IntCodec<$type>;
+        }
+
+        impl CellCodecKey for $type {
+            fn to_primary_key(&self) -> PrimaryKey {
+                PrimaryKey::Int(i64::try_from(*self).unwrap_or(i64::MAX))
+            }
+
+            fn from_primary_key(key: &PrimaryKey) -> Result<Self, CellCodecError> {
+                let PrimaryKey::Int(value) = key else {
+                    return Err(CellCodecError::expected("Int primary key"));
+                };
+                <$type>::try_from(*value)
+                    .map_err(|_| CellCodecError::expected("non-negative, in-range Int primary key"))
+            }
+        }
+    )+};
+}
+
+signed_codec!(i8, i16, i32, i64, isize);
+unsigned_codec!(u8, u16, u32, u64, usize);
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum IntOp {}

@@ -1,10 +1,4 @@
-//! Shared database control-plane records.
+//! Signed presence messages outside replicated database state.
 
-pub mod operator;
 pub mod presence;
-
-pub use operator::{
-    DeviceCapabilitySummary, OperatorDesiredState, OperatorEffect, OperatorInput, OperatorLease,
-    OperatorOutputFence, OperatorSource, OperatorSpec,
-};
 pub use presence::{DepartureNotice, PresenceHeartbeat};

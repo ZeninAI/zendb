@@ -3,7 +3,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use zendb_types::{
@@ -14,7 +14,10 @@ use crate::{
     bootstrap::Bootstrap,
     devices::{Devices, PeerRecord},
     states::States,
-    tables::Tables,
+    tables::{
+        listeners::{CatalogSyncListener, DeviceSyncListener, ReceiptListener},
+        Tables, TablesCore, DEVICES_NAME, TABLE_CATALOG_NAME,
+    },
     Error, Result,
 };
 
@@ -108,20 +111,12 @@ impl Workspace {
         peer: Arc<dyn PeerIdentity>,
         mode: Mode,
     ) -> Result<Self> {
-        let local_peer_id = peer.peer_id();
-        let physical_ms = physical_ms().ok_or(Error::ClockExhausted)?;
-        let catalog_stamp = EventStamp::new(
-            EventId::new(local_peer_id, 1),
-            EventTime::new(physical_ms, 0),
-        );
-        let devices_stamp = EventStamp::new(
-            EventId::new(local_peer_id, 2),
-            EventTime::new(physical_ms, 1),
-        );
-
+        // Open the system tables and (on create) the system states. No catalog
+        // rows are written yet — the bootstrap rows go through the listener
+        // path below so the CatalogSync and Receipt callbacks fire for them.
         let tables_core = match mode {
-            Mode::Create => crate::tables::TablesCore::create(&root, catalog_stamp, devices_stamp)?,
-            Mode::Open => crate::tables::TablesCore::open(&root)?,
+            Mode::Create => TablesCore::create(&root)?,
+            Mode::Open => TablesCore::open(&root)?,
         };
         let states_core = match mode {
             Mode::Create => crate::states::StatesCore::create(&root)?,
@@ -129,18 +124,55 @@ impl Workspace {
         };
         let devices = match mode {
             Mode::Create => Devices::create(
-                tables_core.table_entry(crate::tables::DEVICES_NAME)?,
-                states_core.peer_state::<PeerId, PeerRecord>()?,
+                tables_core.table_entry(DEVICES_NAME)?,
+                states_core.raw_peer_state::<PeerId, PeerRecord>()?,
                 peer.clone(),
             )?,
             Mode::Open => Devices::open(
-                tables_core.table_entry(crate::tables::DEVICES_NAME)?,
-                states_core.peer_state::<PeerId, PeerRecord>()?,
+                tables_core.table_entry(DEVICES_NAME)?,
+                states_core.raw_peer_state::<PeerId, PeerRecord>()?,
                 peer.clone(),
             )?,
         };
-        tables_core.replay_receipts(&devices)?;
+
+        // Register listeners. The receipt listener is shared so CatalogSync
+        // can register it on application tables it opens at runtime.
+        let devices_weak: Weak<Devices> = Arc::downgrade(&devices);
+        let receipt_listener = ReceiptListener::build(devices_weak.clone());
+        let catalog_sync =
+            CatalogSyncListener::build(Arc::downgrade(&tables_core), receipt_listener.clone());
+        let device_sync = DeviceSyncListener::build(devices_weak);
+        // Register on every currently-open table (the system tables).
+        for entry in tables_core.tables.read().values() {
+            entry.add_listener(receipt_listener.clone());
+        }
+        tables_core
+            .table_entry(TABLE_CATALOG_NAME)?
+            .add_listener(catalog_sync);
+        tables_core
+            .table_entry(DEVICES_NAME)?
+            .add_listener(device_sync);
+
+        // Bootstrap: write the catalog rows for the system tables through the
+        // normal insert path. The CatalogSync callback fires and no-ops (the
+        // tables are already open); the Receipt callback observes the stamps.
         if matches!(mode, Mode::Create) {
+            let local_peer_id = peer.peer_id();
+            let physical_ms = physical_ms().ok_or(Error::ClockExhausted)?;
+            let catalog_stamp = EventStamp::new(
+                EventId::new(local_peer_id, 1),
+                EventTime::new(physical_ms, 0),
+            );
+            let devices_stamp = EventStamp::new(
+                EventId::new(local_peer_id, 2),
+                EventTime::new(physical_ms, 1),
+            );
+            tables_core.write_bootstrap_entry(
+                TABLE_CATALOG_NAME,
+                &Default::default(),
+                catalog_stamp,
+            )?;
+            tables_core.write_bootstrap_entry(DEVICES_NAME, &Default::default(), devices_stamp)?;
             devices.bootstrap_local()?;
         }
 

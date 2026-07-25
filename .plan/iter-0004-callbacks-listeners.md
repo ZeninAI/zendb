@@ -424,12 +424,11 @@ The CRUD methods become thin: validate, publish, return.
         self.write_entry(name, &config, stamp)
     }
 
-    fn update_table(&self, name: &str, config: TableConfig, stamp: EventStamp) -> Result<UpdateOutcome> {
-        if is_system_table(name) { return Err(Error::ResourceBusy(name.to_owned())); }
+    fn update_table(&self, name: &str, config: TableConfig, stamp: EventStamp) -> Result<bool> {
         let current = self.catalog_entry(name)?;
-        if current == config { return Ok(UpdateOutcome::Unchanged); }
+        if current == config { return Ok(false); }
         self.write_entry(name, &config, stamp)?;
-        Ok(UpdateOutcome::Updated)
+        Ok(true)
     }
 
     fn delete_table(&self, name: &str, stamp: EventStamp) -> Result<bool> {
@@ -462,9 +461,94 @@ and `create` returning the handle. The explicit `observe(stamp)` call is gone
 — `ReceiptListener` on `_table_catalog` handles it.
 
 `Tables::update` and `Tables::delete` similarly drop their explicit `observe`
-calls; the `ReceiptListener` covers them.
+calls; the `ReceiptListener` covers them. `Tables::update` returns
+`Result<bool>` (true if the config changed, false if it was already the
+same) — consistent with `Tables::delete`. The `UpdateOutcome` enum is removed.
 
-### 10.2 `States::create` and `States::open`
+### 10.2 System tables: openable and updatable, not deletable, not directly writable
+
+System tables (`_table_catalog`, `_devices`) follow different rules than
+application tables:
+
+- **`Tables::open`** returns a handle to a system table. The workspace itself
+  needs handles to system tables (e.g. `Devices` holds the `_devices` handle),
+  and there is no reason to hide them from applications for reads.
+- **`Tables::update`** works on system tables. A system table's `TableConfig`
+  may change (e.g. `max_buffered_records`), and the catalog row is updated.
+  The `CatalogSync` callback sees the `Upsert`, finds the table already open,
+  and (in this iteration) no-ops. A future iteration may migrate the table on
+  config change.
+- **`Tables::delete`** refuses system tables with `ResourceBusy`. System
+  tables cannot be removed; they are structural.
+- **`TableHandle::insert`** refuses system tables. An application holding a
+  handle to `_table_catalog` or `_devices` must not write to it directly —
+  those tables are maintained by the workspace through `TablesCore` CRUD
+  methods and `Devices` methods, which publish events that the callbacks
+  react to. Direct writes would bypass authorization, minting, and the
+  callback model.
+
+The `is_system_table` check is **not** evaluated per insert. Instead, the
+`TableHandle` stores an `is_system: bool` flag set at construction time:
+
+    pub struct TableHandle {
+        name: String,
+        entry: Arc<TableEntry>,
+        devices: Arc<Devices>,
+        is_system: bool,
+    }
+
+    impl TableHandle {
+        pub fn insert(&self, primary_key: PrimaryKey, path: Path, op: Op) -> Result<InsertOutcome> {
+            if self.is_system {
+                return Err(Error::PermissionDenied);
+            }
+            self.devices.authorize(Roles::Contributor)?;
+            let stamp = self.devices.mint()?;
+            self.entry.insert(Event { primary_key, path, op, stamp })
+        }
+    }
+
+`Tables::open` sets `is_system` based on `is_system_table(name)`. The check
+is a single branch per insert, not a string match or a hashmap lookup.
+
+Internal workspace code (`TablesCore`, `Devices`, `PeerStore`) does not go
+through `TableHandle` for system-table writes. It calls
+`TableEntry::insert(event)` directly, bypassing the `is_system` check. This
+is the seam between the workspace's internal authority and the application's
+restricted handle.
+
+### 10.3 System states: same model
+
+`StateHandle` follows the same pattern. It stores `is_system: bool` set at
+construction. `StateHandle::write()` returns `Result` and refuses if the
+state is a system state:
+
+    pub struct StateHandle<K: Ord, V> {
+        name: String,
+        state: Arc<RwLock<State<K, V>>>,
+        is_system: bool,
+    }
+
+    impl<K: Ord, V> StateHandle<K, V> {
+        pub fn write(&self) -> Result<RwLockWriteGuard<'_, State<K, V>>> {
+            if self.is_system { return Err(Error::PermissionDenied); }
+            Ok(self.state.write())
+        }
+        pub fn read(&self) -> RwLockReadGuard<'_, State<K, V>> { self.state.read() }
+    }
+
+Internal workspace code that needs to write to a system state (`PeerStore`
+writing `_peer_state`) does not go through `StateHandle`. It holds the raw
+`Arc<RwLock<State<K, V>>>` directly, bypassing the `is_system` check.
+`StatesCore::open` returns the `StateHandle` with `is_system` set, but
+`StatesCore` also exposes a `pub(crate)` accessor for internal callers that
+need the raw `Arc`.
+
+`States::create` and `States::delete` refuse system states (as today).
+`States::open` returns a handle to a system state with `is_system` set, so
+reads work but writes are refused.
+
+### 10.4 `States::create` and `States::open`
 
 States have a different lifecycle than Tables. Tables are eagerly opened:
 every declared table is in the in-memory handle map, so `Tables::open` is a
@@ -494,7 +578,6 @@ The two operations are split:
         K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
         V: Encode + Decode<()> + Clone + Send + Sync + 'static,
     {
-        if is_system_state(name) { return Err(Error::NotFound(name.to_owned())); }
         self.core.open::<K, V>(name)
     }
 
@@ -552,7 +635,7 @@ explicitly requested.
   `write_record`.
 - Verify receipts are live-observed via the callback.
 
-### Phase 4: CatalogSyncListener
+### Phase 4: CatalogSyncListener and system-handle protection
 
 - Implement `CatalogSyncListener` holding `Weak<TablesCore>` + shared
   `Arc<dyn ChangeListener>` (the receipt listener).
@@ -562,8 +645,15 @@ explicitly requested.
 - `create_table` / `delete_table` become validate + publish.
 - `Tables::create` becomes void-returning; callers use `Tables::open` to
   obtain a handle.
+- Remove `UpdateOutcome`; `Tables::update` returns `Result<bool>`.
+- `Tables::update` no longer refuses system tables (config updates allowed).
+- Add `is_system: bool` to `TableHandle`; `insert` refuses if true.
+- `Tables::open` sets `is_system` based on `is_system_table(name)` and no
+  longer refuses system tables.
+- Internal workspace code calls `TableEntry::insert` directly, bypassing the
+  `is_system` check.
 
-### Phase 5: DeviceSyncListener and States split
+### Phase 5: DeviceSyncListener, States split, and system-state protection
 
 - Implement `DeviceSyncListener` holding `Weak<DevicesInner>`.
 - Register it on `_devices`.
@@ -575,8 +665,15 @@ explicitly requested.
   Result<StateHandle<K, V>>` (lazy-load: check open map, else read declaration
   + physically open + return typed handle).
 - `States::create` is void-returning; `States::open` returns the typed
-  `StateHandle` (lazy-loading on first access).
-- Update `StatesCore::peer_state` to use `create` + `open`.
+  `StateHandle` (lazy-loading on first access, including for system states).
+- Add `is_system: bool` to `StateHandle`; `write()` returns `Result` and
+  refuses if true. `read()` is unaffected.
+- `States::open` no longer refuses system states; it returns a handle with
+  `is_system` set.
+- Internal workspace code (`PeerStore`) holds the raw `Arc<RwLock<State>>`
+  directly for system-state writes, bypassing `StateHandle`.
+- Update `StatesCore::peer_state` to use `create` + `open` (or raw `Arc`
+  accessor for internal writes).
 
 ### Phase 6: bootstrap restructure
 
@@ -636,6 +733,20 @@ explicitly requested.
 13. `ChangeListener` is `pub` and `TableHandle::add_listener` is `pub`, so
     applications can register custom listeners on tables they hold handles
     to. Internal listeners and application listeners share the same `Vec`.
+14. `UpdateOutcome` is removed. `Tables::update` returns `Result<bool>`
+    (true if the config changed, false if unchanged), consistent with
+    `Tables::delete`.
+15. System tables are openable and updatable but not deletable and not
+    directly writable via `TableHandle`. `TableHandle` stores `is_system: bool`
+    set at construction; `insert` refuses if true. Internal workspace code
+    calls `TableEntry::insert` directly, bypassing the check. The check is a
+    single branch per insert, not a string match or hashmap lookup.
+16. System states follow the same model: `StateHandle` stores `is_system: bool`;
+    `write()` returns `Result` and refuses if true; `read()` is unaffected.
+    Internal workspace code (`PeerStore`) holds the raw `Arc<RwLock<State>>`
+    directly for system-state writes. `States::open` returns handles to system
+    states with `is_system` set; `States::create` and `States::delete` refuse
+    system states.
 
 ## 13. Completion Criteria
 
@@ -662,6 +773,13 @@ Iteration 0004 is complete when:
 - `States::create` is void-returning; `States::open` returns a typed
   `StateHandle` and lazy-loads on first access; `StatesCore` is split into
   `create` and `open::<K, V>`;
+- `UpdateOutcome` is removed; `Tables::update` returns `Result<bool>`;
+- `TableHandle` stores `is_system: bool` and refuses `insert` on system tables;
+  `Tables::open` returns handles to system tables; `Tables::update` works on
+  system tables; `Tables::delete` refuses system tables;
+- `StateHandle` stores `is_system: bool` and refuses `write()` on system
+  states; `States::open` returns handles to system states; `States::create`
+  and `States::delete` refuse system states;
 - `ChangeListener` is `pub` and `TableHandle::add_listener` is `pub`, so
   applications can register custom listeners;
 - bootstrap writes catalog rows through the callback path;

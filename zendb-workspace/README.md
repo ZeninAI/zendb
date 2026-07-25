@@ -43,67 +43,97 @@ a shared `Arc`-backed core:
   messages on behalf of the local device without the workspace holding the
   private key.
 
-`Workspace` itself retains only identity, bootstrap, lock, root, and flush
-responsibilities.
+## Event-Driven Maintenance
+
+Table and device maintenance is **reactive**: CRUD methods validate and publish
+events; callbacks react. This makes local edits and (future) remote events go
+through the exact same code path.
+
+### Change listeners
+
+`ChangeListener` is a `pub` trait on `TableEntry`:
+
+```rust
+pub trait ChangeListener: Send + Sync {
+    fn on_change(&self, change: &Change);
+}
+```
+
+Listeners are registered at open time and dispatched synchronously on every
+`TableEntry::insert`. `TableHandle::add_listener` is `pub`, so applications can
+register custom listeners on tables they hold handles to. Internal listeners
+and application listeners share the same listener list.
+
+### Internal listeners
+
+| Listener | Registered on | Reaction |
+| --- | --- | --- |
+| `ReceiptListener` | every table | `Devices::observe(stamp)` — replaces the one-shot replay consumer |
+| `CatalogSyncListener` | `_table_catalog` | open tables on `Upsert`, close + rmdir on `Delete` — single owner of the handle map |
+| `DeviceSyncListener` | `_devices` | upsert/remove in the in-memory device records map — single owner after `reload` |
+
+`CatalogSyncListener` holds a shared `Arc<dyn ChangeListener>` (the receipt
+listener) to register on newly opened application tables, so every table has
+the receipt listener.
+
+### CRUD methods publish; callbacks react
+
+`TablesCore` CRUD methods validate a precondition and publish a catalog event.
+They do not open/close tables or mutate the handle map directly — the
+`CatalogSync` callback does. `Devices::write_record` mints and publishes; the
+`DeviceSync` callback updates the in-memory map and the `Receipt` callback
+observes the stamp.
 
 ## Tables
 
-`Tables` is the table catalog management surface. It owns `TablesCore`, the
-only workspace component that opens storage Tables or chooses physical table
-paths.
+`Tables` is the table catalog management surface. `TablesCore` owns the
+`_table_catalog` Table and the in-memory map of opened `TableEntry` handles.
+The `_table_catalog` Table is the source of truth for declarations; only opened
+handles are cached in memory.
 
-- `_table_catalog` is a normal self-registering Table. Blob cells contain
-  `CatalogEntry { config: TableConfig }`.
-- `_devices` is opened eagerly from the table catalog.
-- Application Tables are eagerly opened from declarations.
+- `Tables::create(name, config) -> Result<()>` — declare a new table
+  (void-returning). The `CatalogSync` callback opens it synchronously.
+- `Tables::open(name) -> Result<TableHandle>` — obtain a handle to an existing
+  table. Returns handles to system tables too; system handles refuse `insert`.
+- `Tables::update(name, config) -> Result<bool>` — update a table's config.
+  Works on system tables. Returns `true` if the config changed.
+- `Tables::delete(name) -> Result<bool>` — delete a table. Refuses system
+  tables with `ResourceBusy`.
 
-`Tables` exposes `contains`, `list`, `create`, `update`, `delete`, and
-`open(name) -> TableHandle`. Mutating methods wrap
-`authorize(Roles::Operator)` + `mint` + core op + `observe`. `open` returns a
-handle without stamping.
+### System tables
 
-There is no format version, generic name validator, migration branch, or
-runtime liveness flag. Exact system names are reserved structurally. The
-`_table_catalog` Table is the source of truth for table declarations;
-`TablesCore` caches only the opened `TableEntry` handles in memory, not the
-declarations themselves. Deleting an application Table returns `ResourceBusy`
-while a handle still owns it; otherwise `TablesCore` removes the declaration
-and directory before the name can be recreated.
+System tables (`_table_catalog`, `_devices`) are openable and updatable but
+not deletable and not directly writable via `TableHandle`. `TableHandle`
+stores `is_system: bool` set at construction; `insert` refuses if true.
+Internal workspace code calls `TableEntry::insert` directly, bypassing the
+check.
 
 ### Table operations
 
-`Tables` does not expose table operations such as `insert`. Callers obtain a
-`TableHandle` via `Tables::open` and perform operations directly on the handle:
-
-    let table = workspace.tables().open("users")?;
-    table.insert(primary_key, path, op)?;
-
-`TableHandle::read` returns a guard that dereferences to the real storage
-`Table`. Callers use `ReadBackend` and `OrderedReadBackend` methods directly,
-and iterators stay lazy while the guard is held. There are no `get` or
-materializing `entries` proxy methods on the handle.
-
-`TableConsumer` owns a named Topic consumer. `next_change` decodes one Change,
-`read` acquires a direct Table guard, and `commit` persists the consumer
-cursor. It does not build an intermediate row snapshot.
+`TableHandle::insert` is the single local mutation path for application tables:
+authorize, mint, `TableEntry::insert` (which dispatches callbacks). `read`
+returns a guard dereferencing to the storage `Table`. `consumer` returns a
+streaming `TableConsumer`.
 
 ## States
 
-`States` is the state catalog management surface. It owns `StatesCore`, the
-only workspace component that opens storage States or chooses physical state
-paths.
+`States` is the state catalog management surface. States are **lazy**: a state
+may be declared in `_state_catalog` but not currently open.
 
-- `_state_catalog` is `State<String, StateConfig>` and contains its own
-  declaration.
-- `_peer_state` is `State<PeerId, PeerRecord>` and is opened for `Devices`
-  during bootstrap.
-- Application States are typed and retain open/close semantics: the caller
-  supplies `K` and `V` when requesting a `StateHandle`.
+- `States::create(name, config) -> Result<()>` — declare a new state
+  (void-returning). Writes the declaration only; the physical state is created
+  on first `open`.
+- `States::open::<K, V>(name) -> Result<StateHandle<K, V>>` — obtain a typed
+  handle. Lazy-loads: if already open, downcast and return; otherwise read the
+  declaration, physically create or open the state, and return the handle.
+  Returns handles to system states too; system handles refuse `write()`.
 
-`States` exposes `contains`, `list`, `open::<K, V>(name, config)`,
-`list_open`, `config`, `close`, and `delete`. State declarations are not
-gated by a role in this iteration; reads and writes happen through the
-returned `StateHandle`.
+### System states
+
+`StateHandle` stores `is_system: bool`; `write()` returns `Result` and refuses
+if true. `read()` is unaffected. Internal workspace code (`PeerStore` writing
+`_peer_state`) holds the raw `Arc<RwLock<State>>` directly via
+`StatesCore::raw_peer_state`, bypassing the `StateHandle` check.
 
 ## Peers And Roles
 
@@ -122,6 +152,6 @@ for lock-free reads, serializes mutations, and tracks dirty peers for flush.
 Minting persists the local sequence high-water mark before returning, so a
 failed mutation burns a sequence rather than risking reuse.
 
-Local mutations are linear: authorize, mint, insert, then observe. There is no
-callback-based mutation API, reconciliation poison state, or event journal
-outside each Table's Topic.
+Local mutations are linear: authorize, mint, insert, then observe (via
+callback). There is no callback-based mutation API, reconciliation poison
+state, or event journal outside each Table's Topic.

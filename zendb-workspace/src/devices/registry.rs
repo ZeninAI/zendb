@@ -8,7 +8,7 @@ use std::{
 
 use bincode::{Decode, Encode};
 use parking_lot::RwLock;
-use zendb_storage::{InsertOutcome, ReadBackend};
+use zendb_storage::{ReadBackend, State};
 use zendb_types::{
     Blob, Event, EventId, EventStamp, Op, Path, PeerId, PeerIdentity, PrimaryKey, Roles, Value,
 };
@@ -17,7 +17,7 @@ use super::{
     clock::{PeerRecord, PeerStore},
     receipts::ObserveOutcome,
 };
-use crate::{states::StateHandle, tables::TableEntry, Error, Result};
+use crate::{tables::TableEntry, Error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct DeviceRecord {
@@ -25,10 +25,10 @@ pub struct DeviceRecord {
     pub roles: BTreeSet<Roles>,
 }
 
-struct DevicesInner {
-    registry: Arc<TableEntry>,
-    peers: Arc<PeerStore>,
-    records: RwLock<BTreeMap<PeerId, DeviceRecord>>,
+pub(crate) struct DevicesInner {
+    pub(crate) registry: Arc<TableEntry>,
+    pub(crate) peers: Arc<PeerStore>,
+    pub(crate) records: RwLock<BTreeMap<PeerId, DeviceRecord>>,
 }
 
 #[derive(Clone)]
@@ -39,7 +39,7 @@ pub struct Devices {
 impl Devices {
     pub(crate) fn create(
         registry: Arc<TableEntry>,
-        state: StateHandle<PeerId, PeerRecord>,
+        state: Arc<RwLock<State<PeerId, PeerRecord>>>,
         peer: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
         Self::bind(registry, PeerStore::create(state, peer)?)
@@ -47,7 +47,7 @@ impl Devices {
 
     pub(crate) fn open(
         registry: Arc<TableEntry>,
-        state: StateHandle<PeerId, PeerRecord>,
+        state: Arc<RwLock<State<PeerId, PeerRecord>>>,
         peer: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
         Self::bind(registry, PeerStore::open(state, peer)?)
@@ -63,6 +63,10 @@ impl Devices {
         });
         devices.reload()?;
         Ok(devices)
+    }
+
+    pub(crate) fn inner(&self) -> &Arc<DevicesInner> {
+        &self.inner
     }
 
     pub(crate) fn bootstrap_local(&self) -> Result<()> {
@@ -144,25 +148,6 @@ impl Devices {
         }
     }
 
-    pub(crate) fn insert_application(
-        &self,
-        entry: &Arc<TableEntry>,
-        primary_key: PrimaryKey,
-        path: Path,
-        op: Op,
-    ) -> Result<InsertOutcome> {
-        self.authorize(Roles::Contributor)?;
-        let stamp = self.mint()?;
-        let outcome = entry.table.write().insert(Event {
-            primary_key,
-            path,
-            op,
-            stamp,
-        })?;
-        self.observe(stamp)?;
-        Ok(outcome)
-    }
-
     fn has_role(&self, required: Roles) -> bool {
         self.inner
             .records
@@ -177,7 +162,7 @@ impl Devices {
     fn write_record(&self, peer: PeerId, record: DeviceRecord) -> Result<()> {
         let stamp = self.mint()?;
         let blob = Blob::encode(&record)?;
-        self.inner.registry.table.write().insert(Event {
+        self.inner.registry.insert(Event {
             primary_key: PrimaryKey::PeerId(peer),
             path: Path::new(),
             op: Op::Upsert {
@@ -185,8 +170,6 @@ impl Devices {
             },
             stamp,
         })?;
-        self.observe(stamp)?;
-        self.inner.records.write().insert(peer, record);
         Ok(())
     }
 

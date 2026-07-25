@@ -28,10 +28,10 @@ fn workspace_create_tables_states_and_cleanup() {
         assert!(!ws.id().to_string().is_empty());
 
         // ---- create a table and insert rows ----
-        let table = ws
-            .tables()
+        ws.tables()
             .create("users", TableConfig::default())
             .expect("failed to create table");
+        let table = ws.tables().open("users").expect("failed to open table");
 
         table
             .insert(
@@ -66,13 +66,17 @@ fn workspace_create_tables_states_and_cleanup() {
         assert!(tables.iter().any(|t| t.name == "users"));
 
         // ---- initialize a state and write to it ----
+        ws.states()
+            .create("greetings", StateConfig::default())
+            .expect("failed to create state");
         let state = ws
             .states()
-            .open::<String, Greeting>("greetings", Some(StateConfig::default()))
+            .open::<String, Greeting>("greetings")
             .expect("failed to open state");
 
         state
             .write()
+            .expect("system state write should be refused only for system states")
             .put(
                 "hello".to_owned(),
                 Greeting {

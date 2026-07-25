@@ -11,12 +11,6 @@ pub struct TableInfo {
     pub config: TableConfig,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpdateOutcome {
-    Unchanged,
-    Updated,
-}
-
 pub(crate) fn is_system_table(name: &str) -> bool {
     matches!(name, TABLE_CATALOG_NAME | DEVICES_NAME)
 }

@@ -8,12 +8,12 @@ use std::{
 
 use arc_swap::ArcSwap;
 use bincode::{Decode, Encode};
-use parking_lot::Mutex;
-use zendb_storage::{DurableStorage, ReadBackend, WriteBackend};
+use parking_lot::{Mutex, RwLock};
+use zendb_storage::{DurableStorage, ReadBackend, State, WriteBackend};
 use zendb_types::{utils::time::physical_ms, EventId, EventStamp, EventTime, PeerId, PeerIdentity};
 
 use super::receipts::{ObserveOutcome, ReceiptWindow};
-use crate::{states::StateHandle, Error, Result};
+use crate::{Error, Result};
 
 type PeerMap = BTreeMap<PeerId, PeerRecord>;
 
@@ -39,14 +39,14 @@ pub(crate) struct PeerStore {
     #[allow(dead_code)]
     peer: Arc<dyn PeerIdentity>,
     local_peer_id: PeerId,
-    state: StateHandle<PeerId, PeerRecord>,
+    state: Arc<RwLock<State<PeerId, PeerRecord>>>,
     snapshot: ArcSwap<PeerMap>,
     writer: Mutex<PeerMutationState>,
 }
 
 impl PeerStore {
     pub(crate) fn create(
-        state: StateHandle<PeerId, PeerRecord>,
+        state: Arc<RwLock<State<PeerId, PeerRecord>>>,
         peer: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
         let local_peer_id = peer.peer_id();
@@ -74,7 +74,7 @@ impl PeerStore {
     }
 
     pub(crate) fn open(
-        state: StateHandle<PeerId, PeerRecord>,
+        state: Arc<RwLock<State<PeerId, PeerRecord>>>,
         peer: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
         let local_peer_id = peer.peer_id();

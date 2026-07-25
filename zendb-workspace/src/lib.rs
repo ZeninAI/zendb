@@ -12,6 +12,6 @@ pub use devices::{
 };
 pub use error::{Error, Result};
 pub use states::{StateHandle, States};
-pub use tables::{TableConsumer, TableHandle, TableInfo, TableReadGuard, UpdateOutcome};
+pub use tables::{ChangeListener, TableConsumer, TableHandle, TableInfo, TableReadGuard};
 pub use workspace::{JoinHints, Workspace, WorkspaceConfig};
 pub use zendb_types::Roles;

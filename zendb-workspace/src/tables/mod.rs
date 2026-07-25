@@ -1,5 +1,6 @@
 //! Table catalog management: table lifecycle, declarations, and runtime handles.
 
+pub(crate) mod listeners;
 mod model;
 mod runtime;
 
@@ -14,10 +15,10 @@ use parking_lot::RwLock;
 use zendb_storage::{DurableStorage, ReadBackend, Table, TableConfig};
 use zendb_types::{Blob, Cell, Event, EventStamp, Op, Path as CrdtPath, PrimaryKey, Value};
 
+pub use model::TableInfo;
 pub(crate) use model::{is_system_table, DEVICES_NAME, TABLE_CATALOG_NAME};
-pub use model::{TableInfo, UpdateOutcome};
 pub(crate) use runtime::TableEntry;
-pub use runtime::{TableConsumer, TableHandle, TableReadGuard};
+pub use runtime::{ChangeListener, TableConsumer, TableHandle, TableReadGuard};
 
 use crate::{devices::Devices, Error, Result};
 
@@ -45,47 +46,41 @@ impl Tables {
         self.core.list_tables()
     }
 
-    pub fn create(&self, name: &str, config: TableConfig) -> Result<TableHandle> {
+    /// Declare a new table. Void-returning: the caller obtains a handle
+    /// separately via [`Tables::open`]. The table is opened synchronously by
+    /// the `CatalogSync` callback during the catalog write.
+    pub fn create(&self, name: &str, config: TableConfig) -> Result<()> {
         self.devices.authorize(zendb_types::Roles::Operator)?;
         let stamp = self.devices.mint()?;
-        let entry = self.core.create_table(name, config, stamp)?;
-        self.devices.observe(stamp)?;
-        Ok(TableHandle::new(
-            name.to_owned(),
-            entry,
-            self.devices.clone(),
-        ))
+        self.core.create_table(name, config, stamp)
     }
 
+    /// Obtain a handle to an existing table. Returns handles to system tables
+    /// too; system handles refuse `insert` (see [`TableHandle::is_system`]).
     pub fn open(&self, name: &str) -> Result<TableHandle> {
-        if is_system_table(name) {
-            return Err(Error::NotFound(name.to_owned()));
-        }
         Ok(TableHandle::new(
             name.to_owned(),
             self.core.table_entry(name)?,
             self.devices.clone(),
+            is_system_table(name),
         ))
     }
 
-    pub fn update(&self, name: &str, config: TableConfig) -> Result<UpdateOutcome> {
+    /// Update a table's config. Returns `true` if the config changed, `false`
+    /// if it was already the same. Works on system tables (config updates are
+    /// allowed); the `CatalogSync` callback no-ops since they're already open.
+    pub fn update(&self, name: &str, config: TableConfig) -> Result<bool> {
         self.devices.authorize(zendb_types::Roles::Operator)?;
         let stamp = self.devices.mint()?;
-        let outcome = self.core.update_table(name, config, stamp)?;
-        if outcome == UpdateOutcome::Updated {
-            self.devices.observe(stamp)?;
-        }
-        Ok(outcome)
+        self.core.update_table(name, config, stamp)
     }
 
+    /// Delete a table. Returns `true` if a row was removed, `false` if the
+    /// table was not declared. Refuses system tables with `ResourceBusy`.
     pub fn delete(&self, name: &str) -> Result<bool> {
         self.devices.authorize(zendb_types::Roles::Operator)?;
         let stamp = self.devices.mint()?;
-        let deleted = self.core.delete_table(name, stamp)?;
-        if deleted {
-            self.devices.observe(stamp)?;
-        }
-        Ok(deleted)
+        self.core.delete_table(name, stamp)
     }
 }
 
@@ -95,57 +90,50 @@ impl Tables {
 /// The `_table_catalog` Table is the source of truth for table declarations.
 /// This struct does not cache declarations in memory; `contains`/`list`/`update`
 /// read the catalog Table directly. Only the opened [`TableEntry`] handles are
-/// cached, keyed by table name.
+/// cached, keyed by table name. Handle-map mutation after bootstrap is owned
+/// by the `CatalogSync` listener; the CRUD methods here only validate and
+/// publish catalog events.
 pub(crate) struct TablesCore {
-    root: PathBuf,
-    catalog: Arc<TableEntry>,
-    tables: RwLock<HashMap<String, Arc<TableEntry>>>,
+    pub(crate) root: PathBuf,
+    pub(crate) catalog: Arc<TableEntry>,
+    pub(crate) tables: RwLock<HashMap<String, Arc<TableEntry>>>,
 }
 
 impl TablesCore {
-    pub(crate) fn create(
-        root: &Path,
-        catalog_stamp: EventStamp,
-        devices_stamp: EventStamp,
-    ) -> Result<Arc<Self>> {
+    /// Open the system tables (`_table_catalog`, `_devices`) and insert them
+    /// into the handle map. Writes NO catalog rows — the bootstrap caller
+    /// writes those after listeners are registered, via
+    /// [`Self::write_bootstrap_entry`].
+    pub(crate) fn create(root: &Path) -> Result<Arc<Self>> {
         let tables_root = root.join("tables");
         fs::create_dir_all(&tables_root)?;
 
-        let catalog_config = TableConfig::default();
-        let catalog = TableEntry::new(Table::create(
+        let catalog = TableEntry::build(Table::create(
             &tables_root.join(TABLE_CATALOG_NAME),
-            catalog_config.clone(),
+            TableConfig::default(),
+        )?)?;
+        let devices = TableEntry::build(Table::create(
+            &tables_root.join(DEVICES_NAME),
+            TableConfig::default(),
         )?)?;
         let result = Arc::new(Self {
             root: root.to_path_buf(),
             catalog: catalog.clone(),
             tables: RwLock::new(HashMap::new()),
         });
-        result
-            .tables
-            .write()
-            .insert(TABLE_CATALOG_NAME.to_owned(), catalog);
-        result.write_entry(TABLE_CATALOG_NAME, &catalog_config, catalog_stamp)?;
-
-        let devices_config = TableConfig::default();
-        let devices = TableEntry::new(Table::create(
-            &tables_root.join(DEVICES_NAME),
-            devices_config.clone(),
-        )?)?;
-        result.write_entry(DEVICES_NAME, &devices_config, devices_stamp)?;
-        result
-            .tables
-            .write()
-            .insert(DEVICES_NAME.to_owned(), devices);
+        {
+            let mut tables = result.tables.write();
+            tables.insert(TABLE_CATALOG_NAME.to_owned(), catalog);
+            tables.insert(DEVICES_NAME.to_owned(), devices);
+        }
         Ok(result)
     }
 
     pub(crate) fn open(root: &Path) -> Result<Arc<Self>> {
         let tables_root = root.join("tables");
-        let catalog_config = TableConfig::default();
-        let catalog = TableEntry::new(Table::open(
+        let catalog = TableEntry::build(Table::open(
             &tables_root.join(TABLE_CATALOG_NAME),
-            catalog_config,
+            TableConfig::default(),
         )?)?;
         let result = Arc::new(Self {
             root: root.to_path_buf(),
@@ -172,7 +160,7 @@ impl TablesCore {
                 let table = if name == TABLE_CATALOG_NAME {
                     catalog.clone()
                 } else {
-                    TableEntry::new(Table::open(&tables_root.join(&name), config.clone())?)?
+                    TableEntry::build(Table::open(&tables_root.join(&name), config.clone())?)?
                 };
                 tables.insert(name, table);
             }
@@ -188,36 +176,24 @@ impl TablesCore {
             .ok_or_else(|| Error::NotFound(name.to_owned()))
     }
 
-    pub(crate) fn replay_receipts(&self, devices: &Devices) -> Result<()> {
-        let entries: Vec<_> = self.tables.read().values().cloned().collect();
-        for entry in entries {
-            let mut receipt = entry.receipt.lock();
-            for change in receipt.by_ref() {
-                devices.observe(change?.event.stamp)?;
-            }
-            receipt.commit()?;
-        }
-        Ok(())
-    }
-
-    fn create_table(
+    /// Write a bootstrap catalog row directly. Used only during workspace
+    /// bootstrap, after listeners are registered, so the `CatalogSync`
+    /// callback fires (and no-ops since the system tables are pre-opened) and
+    /// the `Receipt` callback observes the stamp.
+    pub(crate) fn write_bootstrap_entry(
         &self,
         name: &str,
-        config: TableConfig,
+        config: &TableConfig,
         stamp: EventStamp,
-    ) -> Result<Arc<TableEntry>> {
-        if is_system_table(name) || self.tables.read().contains_key(name) {
+    ) -> Result<()> {
+        self.write_entry(name, config, stamp)
+    }
+
+    fn create_table(&self, name: &str, config: TableConfig, stamp: EventStamp) -> Result<()> {
+        if is_system_table(name) || self.catalog_entry(name).is_ok() {
             return Err(Error::AlreadyExists(name.to_owned()));
         }
-
-        let path = self.root.join("tables").join(name);
-        if path.exists() {
-            fs::remove_dir_all(&path)?;
-        }
-        let table = TableEntry::new(Table::create(&path, config.clone())?)?;
-        self.write_entry(name, &config, stamp)?;
-        self.tables.write().insert(name.to_owned(), table.clone());
-        Ok(table)
+        self.write_entry(name, &config, stamp)
     }
 
     fn contains_table(&self, name: &str) -> bool {
@@ -251,57 +227,27 @@ impl TablesCore {
         tables
     }
 
-    fn update_table(
-        &self,
-        name: &str,
-        config: TableConfig,
-        stamp: EventStamp,
-    ) -> Result<UpdateOutcome> {
-        if is_system_table(name) {
-            return Err(Error::ResourceBusy(name.to_owned()));
-        }
+    fn update_table(&self, name: &str, config: TableConfig, stamp: EventStamp) -> Result<bool> {
         let current = self.catalog_entry(name)?;
         if current == config {
-            return Ok(UpdateOutcome::Unchanged);
+            return Ok(false);
         }
-
         self.write_entry(name, &config, stamp)?;
-        Ok(UpdateOutcome::Updated)
+        Ok(true)
     }
 
     fn delete_table(&self, name: &str, stamp: EventStamp) -> Result<bool> {
         if is_system_table(name) {
             return Err(Error::ResourceBusy(name.to_owned()));
         }
-
-        let mut tables = self.tables.write();
-        let Some(entry) = tables.get(name) else {
+        if let Some(entry) = self.tables.read().get(name) {
+            if Arc::strong_count(entry) > 1 {
+                return Err(Error::ResourceBusy(name.to_owned()));
+            }
+        } else {
             return Ok(false);
-        };
-        if Arc::strong_count(entry) > 1 {
-            return Err(Error::ResourceBusy(name.to_owned()));
         }
-
-        {
-            let mut catalog = self.catalog.table.write();
-            catalog.insert(Event {
-                primary_key: PrimaryKey::String(name.to_owned()),
-                path: CrdtPath::new(),
-                op: Op::Delete,
-                stamp,
-            })?;
-            catalog.sync()?;
-        }
-        // Drop the handle before removing the physical directory so the Table
-        // closes its files first. The `tables` lock is still held, which is
-        // fine: directory removal does not touch the index.
-        let entry = tables.remove(name);
-        drop(entry);
-
-        let path = self.root.join("tables").join(name);
-        if path.exists() {
-            fs::remove_dir_all(path)?;
-        }
+        self.write_delete(name, stamp)?;
         Ok(true)
     }
 
@@ -330,8 +276,7 @@ impl TablesCore {
 
     fn write_entry(&self, name: &str, config: &TableConfig, stamp: EventStamp) -> Result<()> {
         let blob = Blob::encode(config)?;
-        let mut catalog = self.catalog.table.write();
-        catalog.insert(Event {
+        self.catalog.insert(Event {
             primary_key: PrimaryKey::String(name.to_owned()),
             path: CrdtPath::new(),
             op: Op::Upsert {
@@ -339,7 +284,18 @@ impl TablesCore {
             },
             stamp,
         })?;
-        catalog.sync()?;
+        self.catalog.table.write().sync()?;
+        Ok(())
+    }
+
+    fn write_delete(&self, name: &str, stamp: EventStamp) -> Result<()> {
+        self.catalog.insert(Event {
+            primary_key: PrimaryKey::String(name.to_owned()),
+            path: CrdtPath::new(),
+            op: Op::Delete,
+            stamp,
+        })?;
+        self.catalog.table.write().sync()?;
         Ok(())
     }
 }

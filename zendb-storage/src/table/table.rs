@@ -8,7 +8,7 @@ use zendb_types::{Cell, ContainerType, Event, EventStamp, MergeStamps, PrimaryKe
 use crate::{
     DurableStorage, OrderedReadBackend, ReadBackend, SkipList, SkipListCapacity, SkipListConfig,
     SkipListStats, State, StateConfig, StateStats, Storage, Topic, TopicConfig, TopicConsumer,
-    TopicOffset, TopicStats, WriteBackend,
+    TopicStats, WriteBackend,
 };
 
 use super::{
@@ -21,10 +21,10 @@ const RECOVERY_CONSUMER: &str = "__zendb_table_recovery";
 
 type TableEntry<'a> = (Cow<'a, PrimaryKey>, Cow<'a, Cell>);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum InsertOutcome {
     Ignored,
-    Applied { offset: TopicOffset },
+    Applied(Box<Change>),
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
@@ -94,7 +94,7 @@ impl Table {
             self.novel_pending += 1;
         }
         self.recovery.seek(offset + 1);
-        Ok(InsertOutcome::Applied { offset })
+        Ok(InsertOutcome::Applied(Box::new(change)))
     }
 
     fn prepare_cache(&mut self, key: &PrimaryKey) -> io::Result<()> {

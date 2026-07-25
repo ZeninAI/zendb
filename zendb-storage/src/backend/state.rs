@@ -35,6 +35,10 @@ pub enum StateStats {
 
 /// Runtime dispatch between ordered B+ tree, unordered KeyDir, and in-memory
 /// SkipList state.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "backend values stay inline to preserve the existing State representation"
+)]
 pub enum State<K: Ord, V> {
     Ordered {
         backend: BPlusTree<K, V>,
@@ -51,10 +55,10 @@ pub enum State<K: Ord, V> {
 }
 
 impl<K: Ord, V> State<K, V> {
-    fn flush_on_drop(&mut self) -> io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         match self {
-            Self::Ordered { backend, .. } => backend.flush_on_drop(),
-            Self::Unordered { backend, .. } => backend.flush_on_drop(),
+            Self::Ordered { backend, .. } => BPlusTree::flush(backend),
+            Self::Unordered { backend, .. } => KeyDir::flush(backend),
             Self::InMemory { .. } => Ok(()),
         }
     }
@@ -62,7 +66,7 @@ impl<K: Ord, V> State<K, V> {
 
 impl<K: Ord, V> Drop for State<K, V> {
     fn drop(&mut self) {
-        let _ = self.flush_on_drop();
+        let _ = State::flush(self);
     }
 }
 
@@ -139,7 +143,7 @@ where
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.flush_on_drop()
+        State::flush(self)
     }
 
     fn sync(&mut self) -> io::Result<()> {
@@ -239,8 +243,17 @@ where
             Self::Ordered { backend, .. } => {
                 Box::new(backend.range(start, end)) as Box<dyn Iterator<Item = _>>
             }
-            Self::Unordered { .. } => {
-                panic!("ordered reads are unavailable for unordered state backends")
+            Self::Unordered { backend, .. } => {
+                let mut rows: Vec<_> = backend
+                    .entries()
+                    .filter(|(key, _)| key.as_ref() >= start && key.as_ref() < end)
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect();
+                rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+                Box::new(
+                    rows.into_iter()
+                        .map(|(key, value)| (Cow::Owned(key), Cow::Owned(value))),
+                )
             }
             Self::InMemory { backend, .. } => Box::new(backend.range(start, end)),
         }
@@ -253,9 +266,9 @@ where
     {
         match self {
             Self::Ordered { backend, .. } => backend.first(),
-            Self::Unordered { .. } => {
-                panic!("ordered reads are unavailable for unordered state backends")
-            }
+            Self::Unordered { backend, .. } => backend
+                .entries()
+                .min_by(|left, right| left.0.as_ref().cmp(right.0.as_ref())),
             Self::InMemory { backend, .. } => backend.first(),
         }
     }
@@ -267,9 +280,9 @@ where
     {
         match self {
             Self::Ordered { backend, .. } => backend.last(),
-            Self::Unordered { .. } => {
-                panic!("ordered reads are unavailable for unordered state backends")
-            }
+            Self::Unordered { backend, .. } => backend
+                .entries()
+                .max_by(|left, right| left.0.as_ref().cmp(right.0.as_ref())),
             Self::InMemory { backend, .. } => backend.last(),
         }
     }
@@ -283,8 +296,16 @@ where
             Self::Ordered { backend, .. } => {
                 Box::new(backend.entries_rev()) as Box<dyn Iterator<Item = _>>
             }
-            Self::Unordered { .. } => {
-                panic!("ordered reads are unavailable for unordered state backends")
+            Self::Unordered { backend, .. } => {
+                let mut rows: Vec<_> = backend
+                    .entries()
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect();
+                rows.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+                Box::new(
+                    rows.into_iter()
+                        .map(|(key, value)| (Cow::Owned(key), Cow::Owned(value))),
+                )
             }
             Self::InMemory { backend, .. } => Box::new(backend.entries_rev()),
         }
@@ -303,8 +324,17 @@ where
             Self::Ordered { backend, .. } => {
                 Box::new(backend.range_rev(start, end)) as Box<dyn Iterator<Item = _>>
             }
-            Self::Unordered { .. } => {
-                panic!("ordered reads are unavailable for unordered state backends")
+            Self::Unordered { backend, .. } => {
+                let mut rows: Vec<_> = backend
+                    .entries()
+                    .filter(|(key, _)| key.as_ref() >= start && key.as_ref() < end)
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect();
+                rows.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+                Box::new(
+                    rows.into_iter()
+                        .map(|(key, value)| (Cow::Owned(key), Cow::Owned(value))),
+                )
             }
             Self::InMemory { backend, .. } => Box::new(backend.range_rev(start, end)),
         }
@@ -532,14 +562,35 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ordered reads are unavailable for unordered state backends")]
-    fn unordered_state_rejects_ordered_reads() {
+    fn unordered_state_materializes_order_only_for_ordered_reads() {
         let path = tmp("unordered-ordered-read");
-        let state: State<u64, u64> = State::Unordered {
+        let mut state: State<u64, u64> = State::Unordered {
             backend: KeyDir::create(&path, KeyDirConfig::default()).unwrap(),
             config: StateConfig::Unordered(KeyDirConfig::default()),
         };
+        state.put(2, 20).unwrap();
+        state.put(1, 10).unwrap();
+        state.put(3, 30).unwrap();
 
-        let _ = state.first();
+        assert_eq!(state.first().map(|(key, _)| *key), Some(1));
+        assert_eq!(state.last().map(|(key, _)| *key), Some(3));
+        assert_eq!(
+            state
+                .range(&1, &3)
+                .map(|(key, value)| (*key, *value))
+                .collect::<Vec<_>>(),
+            vec![(1, 10), (2, 20)]
+        );
+        assert_eq!(
+            state.entries_rev().map(|(key, _)| *key).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        assert_eq!(
+            state
+                .range_rev(&1, &3)
+                .map(|(key, _)| *key)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
     }
 }

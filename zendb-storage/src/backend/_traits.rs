@@ -1,7 +1,7 @@
 //! Contracts implemented by ZenDB key/value storage backends.
 //!
 //! Read and write authority are deliberately separate. Raw storage engines
-//! implement both; invariant-preserving facades such as a replicated `Table`
+//! implement both; invariant-preserving facades such as a CRDT `Table`
 //! expose reads without exposing writes that bypass their mutation pipeline.
 
 use std::{borrow::Cow, fmt::Debug, hash::Hash, io, path::Path};
@@ -10,7 +10,7 @@ use bincode::{Decode, Encode};
 
 pub trait Storage {
     type Stats: Clone + Encode + Decode<()> + Debug;
-    type Config: Clone + Default + Encode + Decode<()> + Debug + PartialEq;
+    type Config: Clone + Debug;
 
     fn stats(&self) -> Self::Stats;
     fn config(&self) -> Self::Config;
@@ -190,17 +190,7 @@ where
     fn entries_rev<'a>(&'a self) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
     where
         K: 'a,
-        V: 'a,
-    {
-        let mut entries: Vec<(K, V)> = self
-            .entries()
-            .map(|(key, value)| (key.into_owned(), value.into_owned()))
-            .collect();
-        entries.reverse();
-        entries
-            .into_iter()
-            .map(|(key, value)| (Cow::Owned(key), Cow::Owned(value)))
-    }
+        V: 'a;
 
     fn range_rev<'a>(
         &'a self,
@@ -209,15 +199,5 @@ where
     ) -> impl Iterator<Item = (Cow<'a, K>, Cow<'a, V>)> + 'a
     where
         K: 'a,
-        V: 'a,
-    {
-        let mut entries: Vec<(K, V)> = self
-            .range(start, end)
-            .map(|(key, value)| (key.into_owned(), value.into_owned()))
-            .collect();
-        entries.reverse();
-        entries
-            .into_iter()
-            .map(|(key, value)| (Cow::Owned(key), Cow::Owned(value)))
-    }
+        V: 'a;
 }

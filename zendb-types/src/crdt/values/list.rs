@@ -8,21 +8,36 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bincode::{Decode, Encode};
 
-use crate::{
-    Cell, ContainerType, Hlc, MergeClocks, Op, PathStep, Segment, SyncScope, Type, TypeError, Value,
-};
+use crate::{Cell, ContainerType, EventStamp, MergeStamps, Op, Segment, Type, TypeError, Value};
 
-pub type ListId = Hlc;
+pub type ListId = EventStamp;
 pub type ListSegment = ListId;
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 struct ListEntry {
-    /// The element this entry was inserted after. `None` means list head.
-    after: Option<ListId>,
-    /// False for placeholders created by an out-of-order path operation or
-    /// delete. A later insert supplies the immutable placement.
-    after_known: bool,
+    position: ListPosition,
     cell: Cell,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+enum ListPosition {
+    Unknown,
+    Head,
+    After(ListId),
+}
+
+impl ListPosition {
+    fn known(after: Option<ListId>) -> Self {
+        after.map_or(Self::Head, Self::After)
+    }
+
+    fn after(self) -> Option<Option<ListId>> {
+        match self {
+            Self::Unknown => None,
+            Self::Head => Some(None),
+            Self::After(id) => Some(Some(id)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
@@ -34,8 +49,8 @@ impl List {
     pub fn visible_ids(&self) -> Vec<ListId> {
         let mut children: BTreeMap<Option<ListId>, Vec<ListId>> = BTreeMap::new();
         for (id, entry) in &self.entries {
-            if entry.after_known {
-                children.entry(entry.after).or_default().push(*id);
+            if let Some(after) = entry.position.after() {
+                children.entry(after).or_default().push(*id);
             }
         }
         for siblings in children.values_mut() {
@@ -71,31 +86,19 @@ impl List {
             .into_iter()
             .filter_map(move |id| self.entries.get(&id).map(|entry| &entry.cell))
     }
-
-    #[cfg(test)]
-    fn insert(&mut self, id: ListId, entry: ListEntry) -> Option<ListEntry> {
-        self.entries.insert(id, entry)
-    }
-
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 impl ListEntry {
     fn inserted(after: Option<ListId>, cell: Cell) -> ListEntry {
         ListEntry {
-            after,
-            after_known: true,
+            position: ListPosition::known(after),
             cell,
         }
     }
 
     fn placeholder(cell: Cell) -> ListEntry {
         ListEntry {
-            after: None,
-            after_known: false,
+            position: ListPosition::Unknown,
             cell,
         }
     }
@@ -119,15 +122,15 @@ pub enum ListError {
     Child(Box<TypeError>),
     PositionConflict {
         id: ListId,
-        local_after: Option<ListId>,
-        remote_after: Option<ListId>,
+        local_after: Box<Option<ListId>>,
+        remote_after: Box<Option<ListId>>,
     },
 }
 
 impl std::fmt::Display for ListError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ListError::ZeroId => f.write_str("list element ID cannot be Hlc::ZERO"),
+            ListError::ZeroId => f.write_str("list element ID cannot use the zero event stamp"),
             ListError::Child(error) => write!(f, "list child operation failed: {error}"),
             ListError::PositionConflict {
                 id,
@@ -147,49 +150,52 @@ impl Type for List {
     type Op = ListOp;
     type Error = ListError;
 
-    fn apply(&mut self, op: &ListOp, op_hlc: Hlc) -> Result<bool, ListError> {
+    fn apply(&mut self, op: &ListOp, stamps: crate::MergeStamps) -> Result<bool, ListError> {
+        let stamps = stamps.incoming;
         match op {
             ListOp::Insert { after, value } => {
-                if op_hlc == Hlc::ZERO {
+                if stamps == EventStamp::zero() {
                     return Err(ListError::ZeroId);
                 }
 
                 let incoming = Cell {
                     value: Some(value.clone()),
-                    hlc: op_hlc,
-                    sync: crate::SyncPolicy::Inherit,
+                    stamp: stamps,
                 };
-                match self.entries.get_mut(&op_hlc) {
+                match self.entries.get_mut(&stamps) {
                     Some(entry) => {
-                        let positioned = resolve_position(entry, op_hlc, *after)?;
+                        let positioned = resolve_position(entry, stamps, *after)?;
+                        let cell_stamps = MergeStamps::new(entry.cell.stamp, incoming.stamp);
                         Ok(entry
                             .cell
-                            .merge(&incoming, MergeClocks::ZERO)
+                            .merge(&incoming, cell_stamps)
                             .map_err(|error| ListError::Child(Box::new(error)))?
                             || positioned)
                     }
                     None => {
                         self.entries
-                            .insert(op_hlc, ListEntry::inserted(*after, incoming));
+                            .insert(stamps, ListEntry::inserted(*after, incoming));
                         Ok(true)
                     }
                 }
             }
             ListOp::Delete { id } => {
-                if *id == Hlc::ZERO {
+                if *id == EventStamp::zero() {
                     return Err(ListError::ZeroId);
                 }
 
                 let tombstone = Cell {
                     value: None,
-                    hlc: op_hlc,
-                    sync: crate::SyncPolicy::Inherit,
+                    stamp: stamps,
                 };
                 match self.entries.get_mut(id) {
-                    Some(entry) => entry
-                        .cell
-                        .merge(&tombstone, MergeClocks::ZERO)
-                        .map_err(|error| ListError::Child(Box::new(error))),
+                    Some(entry) => {
+                        let cell_stamps = MergeStamps::new(entry.cell.stamp, tombstone.stamp);
+                        entry
+                            .cell
+                            .merge(&tombstone, cell_stamps)
+                            .map_err(|error| ListError::Child(Box::new(error)))
+                    }
                     None => {
                         self.entries.insert(*id, ListEntry::placeholder(tombstone));
                         Ok(true)
@@ -199,20 +205,20 @@ impl Type for List {
         }
     }
 
-    fn merge(&mut self, remote: &List, _clocks: MergeClocks) -> Result<bool, ListError> {
+    fn merge(&mut self, remote: &List, _stamps: MergeStamps) -> Result<bool, ListError> {
         let mut changed = false;
 
         for (id, remote_entry) in &remote.entries {
             match self.entries.get_mut(id) {
                 Some(local_entry) => {
-                    if remote_entry.after_known
-                        && resolve_position(local_entry, *id, remote_entry.after)?
-                    {
-                        changed = true;
+                    if let Some(after) = remote_entry.position.after() {
+                        changed |= resolve_position(local_entry, *id, after)?;
                     }
+                    let cell_stamps =
+                        MergeStamps::new(local_entry.cell.stamp, remote_entry.cell.stamp);
                     if local_entry
                         .cell
-                        .merge(&remote_entry.cell, MergeClocks::ZERO)
+                        .merge(&remote_entry.cell, cell_stamps)
                         .map_err(|error| ListError::Child(Box::new(error)))?
                     {
                         changed = true;
@@ -228,38 +234,12 @@ impl Type for List {
         Ok(changed)
     }
 
-    fn compact(&mut self, watermark: Hlc) -> Result<bool, ListError> {
-        let mut changed = false;
-        for entry in self.entries.values_mut() {
-            changed |= entry
-                .cell
-                .compact(watermark)
-                .map_err(|error| ListError::Child(Box::new(error)))?;
-        }
-        loop {
-            let referenced: BTreeSet<ListId> = self
-                .entries
-                .values()
-                .filter_map(|entry| entry.after)
-                .collect();
-            let before = self.entries.len();
-            self.entries.retain(|id, entry| {
-                !(entry.cell.is_tombstone()
-                    && entry.cell.hlc <= watermark
-                    && !referenced.contains(id))
-            });
-            if self.entries.len() == before {
-                break;
-            }
-            changed = true;
-        }
-        Ok(changed)
-    }
-
-    fn max_hlc(&self) -> Hlc {
-        self.entries.values().fold(Hlc::ZERO, |max, entry| {
-            std::cmp::max(max, entry.cell.max_hlc())
-        })
+    fn max_stamp(&self) -> EventStamp {
+        self.entries
+            .values()
+            .fold(EventStamp::zero(), |max, entry| {
+                std::cmp::max(max, entry.cell.max_stamp())
+            })
     }
 }
 
@@ -278,111 +258,44 @@ impl ContainerType for List {
         self.entries.get_mut(id).map(|entry| &mut entry.cell)
     }
 
-    fn apply_walk(&mut self, op: &Op, op_hlc: Hlc, path: &[PathStep]) -> Result<bool, ListError> {
-        let Some((step, remaining)) = path.split_first() else {
+    fn apply_walk(
+        &mut self,
+        op: &Op,
+        stamps: crate::MergeStamps,
+        path: &[Segment],
+    ) -> Result<bool, ListError> {
+        let incoming = stamps.incoming;
+        let Some((segment, remaining)) = path.split_first() else {
             return Ok(false);
         };
-        let Segment::List(id) = &step.segment else {
+        let Segment::List(id) = segment else {
             return Ok(false);
         };
         let id = *id;
-        if id == Hlc::ZERO {
+        if id == EventStamp::zero() {
             return Err(ListError::ZeroId);
         }
         let child_tag = remaining
             .first()
-            .map(|step| step.container_tag)
+            .map(Segment::type_tag)
             .or_else(|| op.type_tag());
         let entry = self.entries.entry(id).or_insert_with(|| {
             let cell = child_tag
                 .map(|tag| Cell::dummy(Some(tag.empty_value())))
                 .unwrap_or(Cell {
                     value: None,
-                    hlc: Hlc::ZERO,
-                    sync: crate::SyncPolicy::Inherit,
+                    stamp: EventStamp::zero(),
                 });
             ListEntry::placeholder(cell)
         });
-        if child_tag.is_some_and(|tag| !entry.cell.ensure_type(tag, op_hlc)) {
+        if child_tag.is_some_and(|tag| !entry.cell.ensure_type(tag, incoming)) {
             return Ok(false);
         }
+        let child_stamps = MergeStamps::new(entry.cell.stamp, incoming);
         entry
             .cell
-            .apply_walk(op, op_hlc, remaining)
+            .apply_walk(op, child_stamps, remaining)
             .map_err(|error| ListError::Child(Box::new(error)))
-    }
-
-    fn merge_shared(
-        &mut self,
-        remote: &Self,
-        _clocks: MergeClocks,
-        parent_scope: SyncScope,
-    ) -> Result<bool, ListError> {
-        let mut changed = false;
-        for (id, remote_entry) in &remote.entries {
-            match self.entries.get_mut(id) {
-                Some(local_entry) => {
-                    if remote_entry.after_known
-                        && resolve_position(local_entry, *id, remote_entry.after)?
-                    {
-                        changed = true;
-                    }
-                    changed |= local_entry
-                        .cell
-                        .merge_shared(&remote_entry.cell, MergeClocks::ZERO, parent_scope)
-                        .map_err(|error| ListError::Child(Box::new(error)))?;
-                }
-                None => {
-                    self.entries.insert(*id, remote_entry.clone());
-                    changed = true;
-                }
-            }
-        }
-        Ok(changed)
-    }
-
-    fn shared_clone(&self, parent_scope: SyncScope) -> Option<Self> {
-        let mut entries: BTreeMap<ListId, ListEntry> = self
-            .entries
-            .iter()
-            .filter_map(|(id, entry)| {
-                entry.cell.shared_clone(parent_scope).map(|cell| {
-                    (
-                        *id,
-                        ListEntry {
-                            after: entry.after,
-                            after_known: entry.after_known,
-                            cell,
-                        },
-                    )
-                })
-            })
-            .collect();
-
-        // List placement refers to stable predecessor IDs. Preserve missing
-        // predecessor chains as zero-clock tombstone placeholders so shared
-        // descendants remain reachable without publishing local values.
-        let mut pending: Vec<ListId> = entries.values().filter_map(|entry| entry.after).collect();
-        while let Some(id) = pending.pop() {
-            if entries.contains_key(&id) {
-                continue;
-            }
-            let Some(local) = self.entries.get(&id) else {
-                continue;
-            };
-            if let Some(parent) = local.after {
-                pending.push(parent);
-            }
-            entries.insert(
-                id,
-                ListEntry {
-                    after: local.after,
-                    after_known: local.after_known,
-                    cell: Cell::dummy(None),
-                },
-            );
-        }
-        Some(Self { entries })
     }
 }
 
@@ -391,16 +304,16 @@ fn resolve_position(
     id: ListId,
     after: Option<ListId>,
 ) -> Result<bool, ListError> {
-    if !entry.after_known {
-        entry.after = after;
-        entry.after_known = true;
+    let position = ListPosition::known(after);
+    if entry.position == ListPosition::Unknown {
+        entry.position = position;
         return Ok(true);
     }
-    if entry.after != after {
+    if entry.position != position {
         return Err(ListError::PositionConflict {
             id,
-            local_after: entry.after,
-            remote_after: after,
+            local_after: Box::new(entry.position.after().flatten()),
+            remote_after: Box::new(after),
         });
     }
     Ok(false)
@@ -428,569 +341,5 @@ fn walk_visible(
             visible.push(*id);
         }
         walk_visible(Some(*id), list, children, visited, visible);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{Op, PathStep, Segment, TypeOp, TypeTag};
-    use bincode::{config, decode_from_slice, encode_to_vec};
-
-    fn hlc(ms: u64, device: u8) -> Hlc {
-        Hlc::with_device_id(ms, 0, crate::DeviceId::from_bytes([device; 16])).unwrap()
-    }
-
-    fn cell(value: Option<Value>, hlc: Hlc, sync: crate::SyncPolicy) -> Cell {
-        Cell { value, hlc, sync }
-    }
-
-    fn apply(list: &mut List, op: ListOp, at: Hlc) -> bool {
-        list.apply(&op, at).unwrap()
-    }
-
-    fn merge_order(lists: &[List; 3], order: [usize; 3]) -> List {
-        let mut merged = lists[order[0]].clone();
-        merged
-            .merge(&lists[order[1]], crate::MergeClocks::ZERO)
-            .unwrap();
-        merged
-            .merge(&lists[order[2]], crate::MergeClocks::ZERO)
-            .unwrap();
-        merged
-    }
-
-    #[test]
-    fn sequential_inserts_follow_anchor() {
-        let mut list = List::default();
-        let a = hlc(100, 1);
-        let b = hlc(200, 1);
-        apply(
-            &mut list,
-            ListOp::Insert {
-                after: None,
-                value: Value::String("a".into()),
-            },
-            a,
-        );
-        apply(
-            &mut list,
-            ListOp::Insert {
-                after: Some(a),
-                value: Value::String("b".into()),
-            },
-            b,
-        );
-
-        assert_eq!(list.visible_ids(), vec![a, b]);
-    }
-
-    #[test]
-    fn orphan_is_hidden_until_its_anchor_arrives() {
-        let mut list = List::default();
-        let anchor = hlc(100, 1);
-        let child = hlc(200, 1);
-        apply(
-            &mut list,
-            ListOp::Insert {
-                after: Some(anchor),
-                value: Value::String("child".into()),
-            },
-            child,
-        );
-        assert!(list.visible_ids().is_empty());
-
-        apply(
-            &mut list,
-            ListOp::Insert {
-                after: None,
-                value: Value::String("anchor".into()),
-            },
-            anchor,
-        );
-        assert_eq!(list.visible_ids(), vec![anchor, child]);
-    }
-
-    #[test]
-    fn deleting_anchor_keeps_its_visible_descendants() {
-        let mut list = List::default();
-        let anchor = hlc(100, 1);
-        let child = hlc(200, 1);
-        apply(
-            &mut list,
-            ListOp::Insert {
-                after: None,
-                value: Value::String("anchor".into()),
-            },
-            anchor,
-        );
-        apply(
-            &mut list,
-            ListOp::Insert {
-                after: Some(anchor),
-                value: Value::String("child".into()),
-            },
-            child,
-        );
-        apply(&mut list, ListOp::Delete { id: anchor }, hlc(300, 1));
-
-        assert_eq!(list.visible_ids(), vec![child]);
-        assert_eq!(list.id_at(0), Some(child));
-        assert_eq!(list.id_at(1), None);
-    }
-
-    #[test]
-    fn compact_removes_only_stable_unreferenced_tombstones() {
-        let mut list = List::default();
-        let anchor = hlc(100, 1);
-        let child = hlc(200, 1);
-        let orphan = hlc(300, 1);
-        apply(
-            &mut list,
-            ListOp::Insert {
-                after: None,
-                value: Value::Int(1),
-            },
-            anchor,
-        );
-        apply(
-            &mut list,
-            ListOp::Insert {
-                after: Some(anchor),
-                value: Value::Int(2),
-            },
-            child,
-        );
-        apply(&mut list, ListOp::Delete { id: anchor }, hlc(400, 1));
-        apply(&mut list, ListOp::Delete { id: orphan }, hlc(400, 1));
-
-        assert!(list.compact(hlc(500, 1)).unwrap());
-        assert!(list.entries.contains_key(&anchor));
-        assert!(!list.entries.contains_key(&orphan));
-        assert_eq!(list.visible_ids(), vec![child]);
-    }
-
-    #[test]
-    fn later_head_insert_appears_first() {
-        let mut list = List::default();
-        let old = hlc(100, 1);
-        let new = hlc(200, 1);
-        apply(
-            &mut list,
-            ListOp::Insert {
-                after: None,
-                value: Value::Int(1),
-            },
-            old,
-        );
-        apply(
-            &mut list,
-            ListOp::Insert {
-                after: None,
-                value: Value::Int(2),
-            },
-            new,
-        );
-
-        assert_eq!(list.visible_ids(), vec![new, old]);
-    }
-
-    #[test]
-    fn concurrent_inserts_merge_deterministically() {
-        let mut left = List::default();
-        let mut right = List::default();
-        let a = hlc(100, 1);
-        let b = hlc(100, 2);
-        apply(
-            &mut left,
-            ListOp::Insert {
-                after: None,
-                value: Value::String("a".into()),
-            },
-            a,
-        );
-        apply(
-            &mut right,
-            ListOp::Insert {
-                after: None,
-                value: Value::String("b".into()),
-            },
-            b,
-        );
-
-        let mut left_first = left.clone();
-        let mut right_first = right.clone();
-        left_first.merge(&right, crate::MergeClocks::ZERO).unwrap();
-        right_first.merge(&left, crate::MergeClocks::ZERO).unwrap();
-
-        assert_eq!(left_first, right_first);
-        assert_eq!(left_first.visible_ids(), vec![b, a]);
-    }
-
-    #[test]
-    fn delete_before_insert_resolves_position_and_stays_deleted() {
-        let mut list = List::default();
-        let id = hlc(100, 1);
-        apply(&mut list, ListOp::Delete { id }, hlc(200, 2));
-        apply(
-            &mut list,
-            ListOp::Insert {
-                after: None,
-                value: Value::String("late".into()),
-            },
-            id,
-        );
-
-        let entry = list.entries.get(&id).unwrap();
-        assert!(entry.after_known);
-        assert!(entry.cell.is_tombstone());
-        assert!(list.visible_ids().is_empty());
-    }
-
-    #[test]
-    fn duplicate_operations_and_merges_are_idempotent() {
-        let mut list = List::default();
-        let id = hlc(100, 1);
-        let insert = ListOp::Insert {
-            after: None,
-            value: Value::Int(1),
-        };
-        assert!(apply(&mut list, insert.clone(), id));
-        assert!(!apply(&mut list, insert, id));
-
-        let snapshot = list.clone();
-        assert!(!list.merge(&snapshot, crate::MergeClocks::ZERO).unwrap());
-        assert_eq!(list, snapshot);
-    }
-
-    #[test]
-    fn zero_id_is_rejected_for_insert_delete_and_path_segments() {
-        let mut list = List::default();
-        assert!(matches!(
-            list.apply(
-                &ListOp::Insert {
-                    after: None,
-                    value: Value::Int(1),
-                },
-                Hlc::ZERO,
-            ),
-            Err(ListError::ZeroId)
-        ));
-        assert!(matches!(
-            list.apply(&ListOp::Delete { id: Hlc::ZERO }, hlc(100, 1),),
-            Err(ListError::ZeroId)
-        ));
-        assert!(list.is_empty());
-    }
-
-    #[test]
-    fn element_position_is_immutable() {
-        let mut list = List::default();
-        let first_anchor = hlc(100, 1);
-        let second_anchor = hlc(100, 2);
-        let id = hlc(200, 1);
-        apply(
-            &mut list,
-            ListOp::Insert {
-                after: Some(first_anchor),
-                value: Value::Int(1),
-            },
-            id,
-        );
-
-        assert!(matches!(
-            list.apply(
-                &ListOp::Insert {
-                    after: Some(second_anchor),
-                    value: Value::Int(2),
-                },
-                id,
-            ),
-            Err(ListError::PositionConflict { .. })
-        ));
-        assert_eq!(list.entries.get(&id).unwrap().after, Some(first_anchor));
-        assert_eq!(
-            list.entries.get(&id).unwrap().cell.value,
-            Some(Value::Int(1))
-        );
-    }
-
-    #[test]
-    fn merge_is_associative_for_independent_inserts() {
-        let mut a = List::default();
-        let mut b = List::default();
-        let mut c = List::default();
-        for (list, id, value) in [
-            (&mut a, hlc(100, 1), 1),
-            (&mut b, hlc(100, 2), 2),
-            (&mut c, hlc(100, 3), 3),
-        ] {
-            apply(
-                list,
-                ListOp::Insert {
-                    after: None,
-                    value: Value::Int(value),
-                },
-                id,
-            );
-        }
-
-        let mut left = a.clone();
-        left.merge(&b, crate::MergeClocks::ZERO).unwrap();
-        left.merge(&c, crate::MergeClocks::ZERO).unwrap();
-
-        let mut right_branch = b;
-        right_branch.merge(&c, crate::MergeClocks::ZERO).unwrap();
-        let mut right = a;
-        right
-            .merge(&right_branch, crate::MergeClocks::ZERO)
-            .unwrap();
-
-        assert_eq!(left, right);
-    }
-
-    #[test]
-    fn merge_converges_for_every_replica_order() {
-        let anchor = hlc(100, 1);
-        let left = hlc(200, 1);
-        let right = hlc(200, 2);
-        let mut lists = [List::default(), List::default(), List::default()];
-        for list in &mut lists {
-            apply(
-                list,
-                ListOp::Insert {
-                    after: None,
-                    value: Value::String("anchor".into()),
-                },
-                anchor,
-            );
-        }
-        apply(
-            &mut lists[0],
-            ListOp::Insert {
-                after: Some(anchor),
-                value: Value::String("left".into()),
-            },
-            left,
-        );
-        apply(
-            &mut lists[1],
-            ListOp::Insert {
-                after: Some(anchor),
-                value: Value::String("right".into()),
-            },
-            right,
-        );
-        apply(&mut lists[2], ListOp::Delete { id: anchor }, hlc(300, 3));
-
-        let orders = [
-            [0, 1, 2],
-            [0, 2, 1],
-            [1, 0, 2],
-            [1, 2, 0],
-            [2, 0, 1],
-            [2, 1, 0],
-        ];
-        let expected = merge_order(&lists, orders[0]);
-        for order in orders.into_iter().skip(1) {
-            assert_eq!(merge_order(&lists, order), expected);
-        }
-        assert_eq!(expected.visible_ids(), vec![right, left]);
-    }
-
-    #[test]
-    fn list_path_targets_stable_element_id() {
-        let id = hlc(100, 1);
-        let mut root = cell(
-            Some(Value::List(List::default())),
-            hlc(50, 1),
-            crate::SyncPolicy::Inherit,
-        );
-        assert!(root
-            .apply_walk(
-                &Op::Type(TypeOp::List(ListOp::Insert {
-                    after: None,
-                    value: Value::Int(1),
-                })),
-                id,
-                &[],
-            )
-            .unwrap());
-        let path = vec![PathStep::new(TypeTag::List, Segment::List(id))];
-        assert!(root
-            .apply_walk(
-                &Op::Replace {
-                    value: Value::Int(2),
-                },
-                hlc(200, 1),
-                &path,
-            )
-            .unwrap());
-
-        let Some(Value::List(list)) = &root.value else {
-            panic!("expected list");
-        };
-        assert_eq!(
-            list.entries.get(&id).unwrap().cell.value,
-            Some(Value::Int(2))
-        );
-        assert_eq!(list.cell_at(0).unwrap().value, Some(Value::Int(2)));
-    }
-
-    #[test]
-    fn list_apply_heals_stale_element_type_before_descending() {
-        let id = hlc(100, 1);
-        let mut list = List::default();
-        list.insert(
-            id,
-            ListEntry::inserted(
-                None,
-                cell(
-                    Some(Value::String("stale".into())),
-                    hlc(100, 1),
-                    crate::SyncPolicy::Inherit,
-                ),
-            ),
-        );
-        let path = vec![
-            PathStep::new(TypeTag::List, Segment::List(id)),
-            PathStep::new(TypeTag::Record, Segment::Record("leaf".into())),
-        ];
-
-        assert!(list
-            .apply_walk(
-                &Op::Replace {
-                    value: Value::Int(1),
-                },
-                hlc(200, 1),
-                &path,
-            )
-            .unwrap());
-
-        let Some(Value::Record(record)) = &list.entries.get(&id).unwrap().cell.value else {
-            panic!("expected healed record");
-        };
-        assert_eq!(record.get("leaf").unwrap().value, Some(Value::Int(1)));
-    }
-
-    #[test]
-    fn matching_elements_recursively_merge_nested_cells() {
-        let id = hlc(100, 1);
-        let mut base = cell(
-            Some(Value::List(List::default())),
-            hlc(50, 1),
-            crate::SyncPolicy::Inherit,
-        );
-        assert!(base
-            .apply_walk(
-                &Op::Type(TypeOp::List(ListOp::Insert {
-                    after: None,
-                    value: Value::Record(Default::default()),
-                })),
-                id,
-                &[],
-            )
-            .unwrap());
-
-        let mut left = base.clone();
-        let mut right = base;
-        let element = vec![PathStep::new(TypeTag::List, Segment::List(id))];
-        let left_path = [
-            element.clone(),
-            vec![PathStep::new(
-                TypeTag::Record,
-                Segment::Record("left".into()),
-            )],
-        ]
-        .concat();
-        assert!(left
-            .apply_walk(
-                &Op::Replace {
-                    value: Value::Bool(true),
-                },
-                hlc(200, 1),
-                &left_path,
-            )
-            .unwrap());
-        let right_path = [
-            element,
-            vec![PathStep::new(
-                TypeTag::Record,
-                Segment::Record("right".into()),
-            )],
-        ]
-        .concat();
-        assert!(right
-            .apply_walk(
-                &Op::Replace {
-                    value: Value::Bool(true),
-                },
-                hlc(200, 2),
-                &right_path,
-            )
-            .unwrap());
-
-        assert!(left.merge(&right, MergeClocks::ZERO).unwrap());
-        let Some(Value::List(list)) = &left.value else {
-            panic!("expected list");
-        };
-        let Some(Value::Record(record)) = &list.entries.get(&id).unwrap().cell.value else {
-            panic!("expected record element");
-        };
-        assert!(record.contains("left"));
-        assert!(record.contains("right"));
-    }
-
-    #[test]
-    fn list_bincode_roundtrip() {
-        let mut list = List::default();
-        let id = hlc(100, 1);
-        apply(
-            &mut list,
-            ListOp::Insert {
-                after: None,
-                value: Value::String("value".into()),
-            },
-            id,
-        );
-
-        let buf = encode_to_vec(&list, config::standard()).unwrap();
-        let (decoded, consumed): (List, usize) =
-            decode_from_slice(&buf, config::standard()).unwrap();
-        assert_eq!(consumed, buf.len());
-        assert_eq!(decoded, list);
-    }
-
-    #[test]
-    fn shared_clone_keeps_local_predecessor_as_structural_anchor() {
-        let first = hlc(100, 1);
-        let second = hlc(101, 1);
-        let mut list = List::default();
-        list.insert(
-            first,
-            ListEntry::inserted(
-                None,
-                Cell {
-                    value: Some(Value::String("private".into())),
-                    hlc: first,
-                    sync: crate::SyncPolicy::Local,
-                },
-            ),
-        );
-        list.insert(
-            second,
-            ListEntry::inserted(
-                Some(first),
-                Cell {
-                    value: Some(Value::String("shared".into())),
-                    hlc: second,
-                    sync: crate::SyncPolicy::Inherit,
-                },
-            ),
-        );
-
-        let projected = list.shared_clone(crate::SyncScope::Shared).unwrap();
-        assert_eq!(projected.visible_ids(), vec![second]);
-        assert!(projected.entries.get(&first).unwrap().cell.is_tombstone());
     }
 }

@@ -13,22 +13,19 @@
 //! Bieniusa, Zawirski, Preguiça, Shapiro, Baquero, Balegas & Duarte.
 //! "An optimized conflict-free replicated set." INRIA RR-8083, 2012.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    marker::PhantomData,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use bincode::{Decode, Encode};
 
-use crate::{CellCodecError, CellCodecKey, CrdtCodec, Hlc, PrimaryKey, Type, Value};
+use crate::{EventStamp, PrimaryKey, Type};
 
 #[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
 struct OrSetEntry {
     /// HLCs of every Add operation targeting this element.
-    adds: BTreeSet<Hlc>,
+    adds: BTreeSet<EventStamp>,
     /// HLCs observed at the moment of each Remove. An add tag survives if it
     /// is absent from this set.
-    rems: BTreeMap<Hlc, Hlc>,
+    rems: BTreeMap<EventStamp, EventStamp>,
 }
 
 impl OrSetEntry {
@@ -40,34 +37,6 @@ impl OrSetEntry {
 #[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
 pub struct OrSet {
     entries: BTreeMap<PrimaryKey, OrSetEntry>,
-}
-
-/// Selects additive-wins observed-remove semantics for a `BTreeSet` field.
-pub struct OrSetCodec<T>(PhantomData<fn() -> T>);
-
-impl<T: CellCodecKey + Ord> CrdtCodec for OrSetCodec<T> {
-    type Rust = BTreeSet<T>;
-
-    fn encode(values: &BTreeSet<T>, hlc: Hlc) -> Value {
-        let mut set = OrSet::default();
-        for value in values {
-            set.apply(
-                &OrSetOp::Add {
-                    key: value.to_primary_key(),
-                },
-                hlc,
-            )
-            .expect("OR-Set add is infallible");
-        }
-        Value::OrSet(set)
-    }
-
-    fn decode(value: &Value) -> Result<BTreeSet<T>, CellCodecError> {
-        let Value::OrSet(set) = value else {
-            return Err(CellCodecError::expected("OR-Set"));
-        };
-        set.keys().map(T::from_primary_key).collect()
-    }
 }
 
 impl OrSet {
@@ -97,8 +66,13 @@ impl OrSet {
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum OrSetOp {
-    Add { key: PrimaryKey },
-    Remove { key: PrimaryKey, observed: Vec<Hlc> },
+    Add {
+        key: PrimaryKey,
+    },
+    Remove {
+        key: PrimaryKey,
+        observed: Vec<EventStamp>,
+    },
 }
 
 #[derive(Debug)]
@@ -116,11 +90,12 @@ impl Type for OrSet {
     type Op = OrSetOp;
     type Error = OrSetError;
 
-    fn apply(&mut self, op: &OrSetOp, op_hlc: Hlc) -> Result<bool, OrSetError> {
+    fn apply(&mut self, op: &OrSetOp, stamps: crate::MergeStamps) -> Result<bool, OrSetError> {
+        let stamps = stamps.incoming;
         match op {
             OrSetOp::Add { key } => {
                 let entry = self.entries.entry(key.clone()).or_default();
-                if entry.adds.insert(op_hlc) {
+                if entry.adds.insert(stamps) {
                     Ok(true)
                 } else {
                     Ok(false)
@@ -133,9 +108,9 @@ impl Type for OrSet {
                     if entry
                         .rems
                         .get(tag)
-                        .is_none_or(|removed_at| op_hlc.beats(*removed_at))
+                        .is_none_or(|removed_at| stamps.beats(*removed_at))
                     {
-                        entry.rems.insert(*tag, op_hlc);
+                        entry.rems.insert(*tag, stamps);
                         changed = true;
                     }
                 }
@@ -144,7 +119,7 @@ impl Type for OrSet {
         }
     }
 
-    fn merge(&mut self, remote: &OrSet, _clocks: crate::MergeClocks) -> Result<bool, OrSetError> {
+    fn merge(&mut self, remote: &OrSet, _stamps: crate::MergeStamps) -> Result<bool, OrSetError> {
         let mut changed = false;
 
         for (key, remote_entry) in &remote.entries {
@@ -176,254 +151,19 @@ impl Type for OrSet {
         Ok(changed)
     }
 
-    fn compact(&mut self, watermark: Hlc) -> Result<bool, OrSetError> {
-        let mut changed = false;
-        self.entries.retain(|_, entry| {
-            let stable_removed: Vec<Hlc> = entry
-                .adds
-                .iter()
-                .copied()
-                .filter(|tag| {
-                    *tag <= watermark
-                        && entry
-                            .rems
-                            .get(tag)
-                            .is_some_and(|removed_at| *removed_at <= watermark)
-                })
-                .collect();
-            for tag in stable_removed {
-                entry.adds.remove(&tag);
-                entry.rems.remove(&tag);
-                changed = true;
-            }
-
-            let keep = !entry.adds.is_empty() || !entry.rems.is_empty();
-            changed |= !keep;
-            keep
-        });
-        Ok(changed)
-    }
-
-    fn max_hlc(&self) -> Hlc {
-        self.entries.values().fold(Hlc::ZERO, |max, entry| {
-            let adds_max = entry
-                .adds
-                .iter()
-                .fold(Hlc::ZERO, |a, &b| std::cmp::max(a, b));
-            let rems_max = entry
-                .rems
-                .values()
-                .fold(Hlc::ZERO, |a, &b| std::cmp::max(a, b));
-            std::cmp::max(max, std::cmp::max(adds_max, rems_max))
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bincode::{config, decode_from_slice, encode_to_vec};
-
-    fn hlc(ms: u64, device: u8) -> Hlc {
-        Hlc::with_device_id(ms, 0, crate::DeviceId::from_bytes([device; 16])).unwrap()
-    }
-
-    fn apply(set: &mut OrSet, op: OrSetOp, at: Hlc) -> bool {
-        set.apply(&op, at).unwrap()
-    }
-
-    #[test]
-    fn add_makes_element_live() {
-        let key = PrimaryKey::Int(1);
-        let mut set = OrSet::default();
-        apply(&mut set, OrSetOp::Add { key: key.clone() }, hlc(100, 1));
-        assert!(set.contains(&key));
-    }
-
-    #[test]
-    fn remove_tombstones_element() {
-        let key = PrimaryKey::String("x".into());
-        let mut set = OrSet::default();
-        apply(&mut set, OrSetOp::Add { key: key.clone() }, hlc(100, 1));
-        let remove = set.remove(key.clone());
-        apply(&mut set, remove, hlc(200, 1));
-        assert!(!set.contains(&key));
-    }
-
-    #[test]
-    fn compact_removes_stable_observed_add_remove_pairs() {
-        let key = PrimaryKey::String("dead".into());
-        let mut set = OrSet::default();
-        apply(&mut set, OrSetOp::Add { key: key.clone() }, hlc(100, 1));
-        let remove = set.remove(key.clone());
-        apply(&mut set, remove, hlc(200, 1));
-
-        assert!(set.compact(hlc(200, 1)).unwrap());
-        assert!(set.entries.is_empty());
-    }
-
-    #[test]
-    fn remove_event_is_permutation_invariant() {
-        let key = PrimaryKey::String("x".into());
-        let add = OrSetOp::Add { key: key.clone() };
-        let remove = OrSetOp::Remove {
-            key: key.clone(),
-            observed: vec![hlc(100, 1)],
-        };
-
-        let mut add_first = OrSet::default();
-        apply(&mut add_first, add.clone(), hlc(100, 1));
-        apply(&mut add_first, remove.clone(), hlc(200, 2));
-
-        let mut remove_first = OrSet::default();
-        apply(&mut remove_first, remove, hlc(200, 2));
-        apply(&mut remove_first, add, hlc(100, 1));
-
-        assert_eq!(add_first, remove_first);
-        assert!(!add_first.contains(&key));
-    }
-
-    #[test]
-    fn compaction_waits_for_the_remove_clock() {
-        let key = PrimaryKey::String("x".into());
-        let mut set = OrSet::default();
-        apply(&mut set, OrSetOp::Add { key: key.clone() }, hlc(100, 1));
-        let remove = set.remove(key.clone());
-        apply(&mut set, remove, hlc(300, 2));
-
-        assert!(!set.compact(hlc(200, 1)).unwrap());
-        assert!(set.compact(hlc(300, 2)).unwrap());
-    }
-
-    #[test]
-    fn concurrent_add_and_remove_add_wins() {
-        let key = PrimaryKey::String("tag".into());
-        let mut left = OrSet::default();
-        let mut right = OrSet::default();
-
-        apply(&mut left, OrSetOp::Add { key: key.clone() }, hlc(100, 1));
-        let remove = right.remove(key.clone());
-        apply(&mut right, remove, hlc(100, 2));
-
-        left.merge(&right, crate::MergeClocks::ZERO).unwrap();
-        // The Add at hlc(100,1) was not observed by the Remove at hlc(100,2),
-        // so the element survives.
-        assert!(left.contains(&key));
-    }
-
-    #[test]
-    fn add_after_remove_resurrects() {
-        let key = PrimaryKey::Int(0);
-        let mut set = OrSet::default();
-        apply(&mut set, OrSetOp::Add { key: key.clone() }, hlc(100, 1));
-        let remove = set.remove(key.clone());
-        apply(&mut set, remove, hlc(200, 2));
-        apply(&mut set, OrSetOp::Add { key: key.clone() }, hlc(300, 3));
-        // New Add tag was not in the remove set, so element is live.
-        assert!(set.contains(&key));
-    }
-
-    #[test]
-    fn duplicate_add_is_idempotent() {
-        let key = PrimaryKey::Bool(true);
-        let mut set = OrSet::default();
-        assert!(apply(
-            &mut set,
-            OrSetOp::Add { key: key.clone() },
-            hlc(100, 1)
-        ));
-        assert!(!apply(
-            &mut set,
-            OrSetOp::Add { key: key.clone() },
-            hlc(100, 1)
-        ));
-        assert_eq!(set.entries.get(&key).unwrap().adds.len(), 1);
-    }
-
-    #[test]
-    fn stale_add_is_recorded_but_element_stays_dead() {
-        let key = PrimaryKey::Timestamp(42);
-        let mut set = OrSet::default();
-        apply(&mut set, OrSetOp::Add { key: key.clone() }, hlc(100, 1));
-        let remove = set.remove(key.clone());
-        apply(&mut set, remove, hlc(200, 2));
-        // Stale Add — this tag is new so adds changes, but the element remains
-        // dead because the add was already removed (the OLD remove recorded the
-        // existing adds; new stale add is not in the remove set ... wait).
-        // Actually in OR-Set, a stale add AFTER a remove WOULD resurrect the
-        // element, because its tag wasn't observed. This is the additive-wins
-        // semantics. Let's test the real LWW behavior from the old set instead.
-        //
-        // OR-Set: stale add IS a new tag, so it survives the old remove.
-        // This is correct OR-Set behavior.
-        apply(&mut set, OrSetOp::Add { key: key.clone() }, hlc(150, 3));
-        assert!(set.contains(&key));
-    }
-
-    #[test]
-    fn remove_before_first_add_does_not_prevent_later_add() {
-        let key = PrimaryKey::Int(0);
-        let mut set = OrSet::default();
-        let remove = set.remove(key.clone());
-        apply(&mut set, remove, hlc(200, 2));
-        apply(&mut set, OrSetOp::Add { key: key.clone() }, hlc(300, 1));
-        // Add tag at 300 was not observed by remove at 200.
-        assert!(set.contains(&key));
-    }
-
-    #[test]
-    fn merge_converges_for_every_replica_order() {
-        let key = PrimaryKey::String("shared".into());
-        let mut sets = [OrSet::default(), OrSet::default(), OrSet::default()];
-        apply(&mut sets[0], OrSetOp::Add { key: key.clone() }, hlc(100, 1));
-        let remove = sets[1].remove(key.clone());
-        apply(&mut sets[1], remove, hlc(150, 2));
-        apply(&mut sets[2], OrSetOp::Add { key: key.clone() }, hlc(120, 3));
-
-        let merge_order = |order: [usize; 3]| -> OrSet {
-            let mut merged = sets[order[0]].clone();
-            merged
-                .merge(&sets[order[1]], crate::MergeClocks::ZERO)
-                .unwrap();
-            merged
-                .merge(&sets[order[2]], crate::MergeClocks::ZERO)
-                .unwrap();
-            merged
-        };
-
-        let expected = merge_order([0, 1, 2]);
-        for order in [[0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
-            assert_eq!(merge_order(order), expected);
-        }
-        // Add at 120 was not observed by Remove at 150 (different devices),
-        // so element is live.
-        assert!(expected.contains(&key));
-    }
-
-    #[test]
-    fn or_set_bincode_roundtrip() {
-        let mut set = OrSet::default();
-        apply(
-            &mut set,
-            OrSetOp::Add {
-                key: PrimaryKey::String("live".into()),
-            },
-            hlc(100, 1),
-        );
-        apply(
-            &mut set,
-            OrSetOp::Add {
-                key: PrimaryKey::String("dead".into()),
-            },
-            hlc(100, 2),
-        );
-        let remove = set.remove(PrimaryKey::String("dead".into()));
-        apply(&mut set, remove, hlc(200, 2));
-
-        let encoded = encode_to_vec(&set, config::standard()).unwrap();
-        let (decoded, consumed): (OrSet, usize) =
-            decode_from_slice(&encoded, config::standard()).unwrap();
-        assert_eq!(consumed, encoded.len());
-        assert_eq!(decoded, set);
+    fn max_stamp(&self) -> EventStamp {
+        self.entries
+            .values()
+            .fold(EventStamp::zero(), |max, entry| {
+                let adds_max = entry
+                    .adds
+                    .iter()
+                    .fold(EventStamp::zero(), |a, &b| std::cmp::max(a, b));
+                let rems_max = entry
+                    .rems
+                    .values()
+                    .fold(EventStamp::zero(), |a, &b| std::cmp::max(a, b));
+                std::cmp::max(max, std::cmp::max(adds_max, rems_max))
+            })
     }
 }

@@ -18,7 +18,7 @@
 //!
 //! Generic over `K` (key) and `V` (value). Uses bincode 2 for both
 //! directions:
-//! - **Write**: [`serialize_into`] writes the encoded bytes directly into
+//! - **Write**: `serialize_into` writes the encoded bytes directly into
 //!   the mmap (no intermediate `Vec<u8>` allocation). `write_entry_into`
 //!   measures both halves up front and grows the file at most once per
 //!   `put`, even when the new record straddles the previous capacity.
@@ -65,7 +65,7 @@
 //!
 //! [`KeyDirStats`] tracks only the two counters that *can't* be derived
 //! from anything else — `data_size` (next write position) and `dead_bytes`
-//! read straight from `index.len()` via [`ReadBackend::size`]. That means
+//! read straight from `index.len()` via `ReadBackend::size`. That means
 //! there's no separate counter to update on every mutation, and no
 //! `refresh_stats()` call to forget to make.
 //!
@@ -85,7 +85,7 @@ use hashbrown::HashMap;
 use memmap2::MmapMut;
 
 use crate::backend::_traits::{DurableStorage, Storage};
-use crate::utils::serdes::{deserialize_from, rd_u32, read_u32_le, with_two_scratches};
+use zendb_types::utils::serdes::{deserialize_from, rd_u32, read_u32_le, with_two_scratches};
 
 const DEFAULT_INITIAL_CAPACITY: u64 = 16 * 1024 * 1024;
 const DEFAULT_COMPACTION_RATIO: f64 = 0.5;
@@ -260,7 +260,7 @@ pub struct KeyDir<K, V> {
 }
 
 impl<K, V> KeyDir<K, V> {
-    pub(crate) fn flush_on_drop(&mut self) -> io::Result<()> {
+    pub(crate) fn flush(&mut self) -> io::Result<()> {
         self.mmap.flush_async()
     }
 }
@@ -359,10 +359,10 @@ impl<K, V> Drop for KeyDir<K, V> {
     /// Schedule a final writeback without blocking. We don't promise
     /// crash recovery in this layer, so a sync `flush()` here would
     /// just stall shutdown for a guarantee we don't make. Callers that
-    /// need durability should call [`WriteBackend::sync`] explicitly before
+    /// need durability should call [`DurableStorage::sync`] explicitly before
     /// dropping.
     fn drop(&mut self) {
-        let _ = self.flush_on_drop();
+        let _ = KeyDir::flush(self);
     }
 }
 
@@ -487,7 +487,7 @@ where
     /// Schedule mmap writeback asynchronously. Returns once the OS has
     /// accepted the request; use [`sync`](Self::sync) to wait for it.
     fn flush(&mut self) -> io::Result<()> {
-        self.flush_on_drop()
+        KeyDir::flush(self)
     }
 
     /// Block until pending mmap writes have been flushed by the OS.
@@ -583,7 +583,7 @@ where
 
     /// Remove from the index, then write a tombstone using the
     /// already-encoded key bytes that still live in the deleted entry's
-    /// slot — see [`write_tombstone_into`]. No bincode encode, no
+    /// slot — see `write_tombstone_into`. No bincode encode, no
     /// scratch `Vec<u8>`.
     fn delete(&mut self, key: &K) -> io::Result<bool> {
         let Some(old) = self.index.remove(key) else {

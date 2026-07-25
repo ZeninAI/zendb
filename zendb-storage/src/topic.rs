@@ -25,7 +25,10 @@ use crate::backend::{
     _traits::{DurableStorage, ReadBackend, Storage, WriteBackend},
     keydir::{KeyDir, KeyDirConfig},
 };
-use crate::utils::serdes::{deserialize_from, with_scratch};
+use zendb_types::utils::{
+    reusables::PooledBuf,
+    serdes::{deserialize_from, with_scratch},
+};
 
 pub type TopicOffset = u64;
 
@@ -106,7 +109,7 @@ pub struct Topic<T> {
 }
 
 impl<T> Topic<T> {
-    fn flush_on_drop(&mut self) -> io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         self.active.flush()?;
         self.shared.offsets.lock().flush()
     }
@@ -380,7 +383,7 @@ where
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.flush_on_drop()
+        Topic::flush(self)
     }
 
     fn sync(&mut self) -> io::Result<()> {
@@ -391,7 +394,7 @@ where
 
 impl<T> Drop for Topic<T> {
     fn drop(&mut self) {
-        let _ = self.flush_on_drop();
+        let _ = Topic::flush(self);
     }
 }
 
@@ -504,7 +507,7 @@ where
         let mut size = [0; 4];
         let result = cursor.file.read_exact(&mut size).and_then(|_| {
             let value_size = u32::from_le_bytes(size) as usize;
-            let mut bytes = crate::utils::reusables::PooledBuf::acquire();
+            let mut bytes = PooledBuf::acquire();
             bytes.resize(value_size, 0);
             cursor.file.read_exact(&mut bytes[..])?;
             deserialize_from(&bytes[..])

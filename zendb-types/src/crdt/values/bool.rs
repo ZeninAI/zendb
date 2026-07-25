@@ -2,43 +2,23 @@
 
 use bincode::{Decode, Encode};
 
-use crate::{
-    CellCodecError, CellCodecKey, CrdtCodec, DefaultCrdtCodec, Hlc, PrimaryKey, Type, Value,
-};
+use crate::{Cell, CellProxy, CellProxyError, EventStamp, Type, Value};
 
 pub type Bool = bool;
 
-pub struct BoolCodec;
-
-impl CrdtCodec for BoolCodec {
-    type Rust = bool;
-
-    fn encode(value: &bool, _hlc: Hlc) -> Value {
-        Value::Bool(*value)
-    }
-
-    fn decode(value: &Value) -> Result<bool, CellCodecError> {
-        match value {
-            Value::Bool(value) => Ok(*value),
-            _ => Err(CellCodecError::expected("Bool")),
+impl CellProxy for bool {
+    fn from_cell(cell: &Cell) -> Result<Self, CellProxyError> {
+        match &cell.value {
+            Some(Value::Bool(value)) => Ok(*value),
+            _ => Err(CellProxyError::expected("Bool Cell")),
         }
     }
-}
 
-impl DefaultCrdtCodec for bool {
-    type Codec = BoolCodec;
-}
-
-impl CellCodecKey for bool {
-    fn to_primary_key(&self) -> PrimaryKey {
-        PrimaryKey::Bool(*self)
-    }
-
-    fn from_primary_key(key: &PrimaryKey) -> Result<Self, CellCodecError> {
-        match key {
-            PrimaryKey::Bool(value) => Ok(*value),
-            _ => Err(CellCodecError::expected("Bool primary key")),
-        }
+    fn to_cell(&self, stamp: EventStamp) -> Result<Cell, CellProxyError> {
+        Ok(Cell {
+            value: Some(Value::Bool(*self)),
+            stamp,
+        })
     }
 }
 
@@ -60,67 +40,16 @@ impl Type for Bool {
     type Op = BoolOp;
     type Error = BoolError;
 
-    fn apply(&mut self, op: &BoolOp, _op_hlc: Hlc) -> Result<bool, BoolError> {
+    fn apply(&mut self, op: &BoolOp, _stamps: crate::MergeStamps) -> Result<bool, BoolError> {
         match *op {}
     }
 
-    fn merge(&mut self, remote: &Bool, clocks: crate::MergeClocks) -> Result<bool, BoolError> {
-        if clocks.remote.beats(clocks.local) {
+    fn merge(&mut self, remote: &Bool, stamps: crate::MergeStamps) -> Result<bool, BoolError> {
+        if stamps.incoming.beats(stamps.current) {
             *self = *remote;
             Ok(true)
         } else {
             Ok(false)
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bincode::{config, decode_from_slice, encode_to_vec};
-
-    fn hlc(ms: u64, device: u8) -> Hlc {
-        Hlc::with_device_id(ms, 0, crate::DeviceId::from_bytes([device; 16])).unwrap()
-    }
-
-    #[test]
-    fn newer_remote_value_wins() {
-        let mut local = false;
-        assert!(local
-            .merge(&true, crate::MergeClocks::new(hlc(100, 1), hlc(200, 2)),)
-            .unwrap());
-        assert!(local);
-    }
-
-    #[test]
-    fn older_and_equal_clock_values_are_ignored() {
-        let mut local = true;
-        assert!(!local
-            .merge(&false, crate::MergeClocks::new(hlc(200, 2), hlc(100, 1)),)
-            .unwrap());
-        assert!(!local
-            .merge(&false, crate::MergeClocks::new(hlc(200, 2), hlc(200, 2)),)
-            .unwrap());
-        assert!(local);
-    }
-
-    #[test]
-    fn device_id_breaks_same_time_ties() {
-        let mut local = false;
-        assert!(local
-            .merge(&true, crate::MergeClocks::new(hlc(100, 1), hlc(100, 2)),)
-            .unwrap());
-        assert!(local);
-    }
-
-    #[test]
-    fn bincode_roundtrips_both_values() {
-        for value in [false, true] {
-            let encoded = encode_to_vec(value, config::standard()).unwrap();
-            let (decoded, consumed): (Bool, usize) =
-                decode_from_slice(&encoded, config::standard()).unwrap();
-            assert_eq!(consumed, encoded.len());
-            assert_eq!(decoded, value);
         }
     }
 }

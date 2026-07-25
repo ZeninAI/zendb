@@ -14,8 +14,8 @@ pub enum Op {
     Type(TypeOp),
     /// Tombstone the target cell at the event HLC.
     Delete,
-    /// Replace the target cell's value at the event HLC.
-    Replace { value: Value },
+    /// Create or replace the target cell's value at the event stamp.
+    Upsert { value: Value },
     /// Merge a shared Cell projection into the target.
     Merge { cell: Cell },
 }
@@ -24,7 +24,7 @@ impl Op {
     pub(crate) fn type_tag(&self) -> Option<TypeTag> {
         match self {
             Op::Type(op) => Some(op.type_tag()),
-            Op::Replace { value } => Some(value.type_tag()),
+            Op::Upsert { value } => Some(value.type_tag()),
             Op::Merge { cell } => cell.type_tag(),
             Op::Delete => None,
         }

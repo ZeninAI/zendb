@@ -5,15 +5,15 @@
 //! authorization, workspace, or networking policy.
 
 pub mod backend;
+pub mod table;
 pub mod topic;
-pub mod utils;
-
-#[cfg(test)]
-mod benchmark;
 
 pub use backend::{
     BPlusTree, BPlusTreeConfig, BPlusTreeStats, DurableStorage, KeyDir, KeyDirConfig, KeyDirStats,
     OrderedReadBackend, ReadBackend, SkipList, SkipListCapacity, SkipListConfig, SkipListStats,
     State, StateConfig, StateStats, Storage, WriteBackend,
+};
+pub use table::{
+    Change, InsertOutcome, Table, TableConfig, TableStats, DEFAULT_MAX_BUFFERED_RECORDS,
 };
 pub use topic::{Topic, TopicConfig, TopicConsumer, TopicOffset, TopicStats};

@@ -5,7 +5,7 @@ use std::{borrow::Cow, hash::Hash, io};
 use bincode::{Decode, Encode};
 
 use super::_traits::{OrderedReadBackend, ReadBackend, Storage, WriteBackend};
-use crate::utils::fast_rand;
+use zendb_types::utils::fast_rand;
 
 const MAX_LEVEL: usize = 16;
 type Links = [Option<usize>; MAX_LEVEL];
@@ -304,8 +304,8 @@ where
                 if self.arena[index].key >= key {
                     break;
                 }
-                for level in 0..self.arena[index].level {
-                    update[level] = Some(index);
+                for predecessor in update.iter_mut().take(self.arena[index].level) {
+                    *predecessor = Some(index);
                 }
                 current = self.arena[index].next[0];
             }
@@ -343,8 +343,8 @@ where
                 if self.arena[index].key >= *key {
                     break;
                 }
-                for level in 0..self.arena[index].level {
-                    update[level] = Some(index);
+                for predecessor in update.iter_mut().take(self.arena[index].level) {
+                    *predecessor = Some(index);
                 }
                 current = self.arena[index].next[0];
             }

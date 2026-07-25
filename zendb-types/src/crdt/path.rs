@@ -1,43 +1,9 @@
-//! Path — recursive addressing into the cell tree.
+//! Recursive addressing into the cell tree.
 //!
-//! A `Path` is a sequence of `PathStep`s from a row root to any cell.
+//! A `Path` is a sequence of container segments from a row root to any cell.
 //! An empty path refers to the row root itself.
-//!
-//! Each `PathStep` carries a `container_tag` so the apply walk knows
-//! what type to expect at each depth — this is what enables self-healing
-//! when intermediate containers don't yet exist locally.
 
-use bincode::{Decode, Encode};
+use crate::Segment;
 
-use crate::{Segment, TypeTag};
-
-/// One step in a Path: the expected container type and how to descend.
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub struct PathStep {
-    pub container_tag: TypeTag,
-    pub segment: Segment,
-}
-
-impl PathStep {
-    pub fn new(container_tag: TypeTag, segment: Segment) -> PathStep {
-        PathStep {
-            container_tag,
-            segment,
-        }
-    }
-}
-
-/// A sequence of path steps from a row root to a target cell.
-pub type Path = Vec<PathStep>;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_path_is_root() {
-        let path = Path::new();
-        assert!(path.is_empty());
-        assert_eq!(path.len(), 0);
-    }
-}
+/// A sequence of container segments from a row root to a target cell.
+pub type Path = Vec<Segment>;

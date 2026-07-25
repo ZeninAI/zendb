@@ -1,35 +1,56 @@
 # zendb-storage
 
-Generic persistent and in-memory key/value mechanics. This crate knows nothing
-about CRDTs, devices, authorization, workspaces, or networking.
+`zendb-storage` owns persistence mechanics. Its algorithms are independent of
+Catalog, peer identity, roles, and network policy.
 
-## Backends
+## Storage Types
 
-| Type | Durable | Ordered | Purpose |
-|---|---:|---:|---|
-| `BPlusTree<K, V>` | yes | yes | range-oriented persistent state |
-| `KeyDir<K, V>` | yes | no | fast persistent point lookup |
-| `SkipList<K, V>` | no | yes | bounded or unbounded in-memory state |
-| `Topic<T>` | yes | append order | segmented change logs and consumer offsets |
-| `State<K, V>` | configurable | configurable | runtime wrapper over the three KV backends |
+- `BPlusTree<K, V>`: ordered durable storage.
+- `KeyDir<K, V>`: unordered durable storage.
+- `SkipList<K, V>`: ordered in-memory storage.
+- `State<K, V>`: runtime selection across those backends.
+- `Topic<T>`: segmented append-only log with named durable consumers.
 
-## Contracts
+`ReadBackend`, `WriteBackend`, `OrderedReadBackend`, `Storage`, and
+`DurableStorage` define the contracts. Binary helpers live in `zendb-types`, so
+backend pages, Topic records, Blob metadata, and workspace metadata use one
+bincode configuration.
 
-- `Storage`: config and statistics.
-- `DurableStorage`: create/open/flush/sync/physical compact.
-- `ReadBackend`: read-only lookup and iteration for invariant-preserving
-  facades and raw stores.
-- `WriteBackend`: raw CRUD and bulk mutation; it extends `ReadBackend`.
-- `OrderedReadBackend`: read-only ordered extension.
+## Table
 
-The split lets a Table expose the complete getter surface without implementing
-raw writes that bypass CRDT and replication invariants. Concrete B+ tree,
-KeyDir, SkipList, and State backends implement both read and write contracts;
-only genuinely ordered implementations expose `OrderedReadBackend`.
+`Table` is the invariant-preserving storage facade:
 
-Backends serialize keys and values using bincode 2. B+ tree ordering follows
-serialized key bytes; SkipList ordering follows `K::Ord`. Generic callers must
-use key encodings for which those orders agree when switching backends.
+```text
+Table
+  State<PrimaryKey, Cell>
+  SkipList<PrimaryKey, Cell> write cache
+  Topic<Change>
+  recovery consumer
+```
 
-`Topic` persists consumer offsets independently, permits one active reader per
-consumer, and retains compacted segments while a reader still references them.
+`TableConfig` is accepted by `DurableStorage::create` and `open`; Table stores
+no name, identifier, or duplicate full configuration value. The workspace
+Catalog owns persisted table configuration.
+
+`Table::insert(Event)` is its only mutation path. It applies the operation,
+returns `Ignored` when state does not change, or appends
+`Change { event, previous, current }` before updating the cache.
+
+Table implements `ReadBackend` and `OrderedReadBackend`, but not
+`WriteBackend`. Ordered state and cache rows use a lazy two-way merge where the
+cache wins equal keys. Plain unordered reads stream rows while filtering keys
+shadowed by the cache. Ordered views over an unordered backend are the one
+case that requires temporary sorting.
+
+Reverse iteration is explicit on every ordered backend; the trait no longer
+provides a hidden collect-and-reverse default. Lifecycle writeback remains on
+`DurableStorage`, while trait flush and `Drop` share Table's single inherent
+flush implementation.
+
+## Topic
+
+Named Topic consumers decode one record per iterator step and commit their
+cursor explicitly. Table recovery and workspace consumers preserve that
+streaming behavior.
+
+The retained tests belong only to B+ tree, KeyDir, SkipList, State, and Topic.

@@ -1,18 +1,5 @@
-//! Device-centric shared identity and membership vocabulary.
-
-#[macro_use]
-pub mod _macros;
+//! Libp2p-compatible peer and workspace identities plus persisted roles.
 
 pub mod ids;
-pub mod membership;
-pub mod role;
 
-pub use ids::{
-    CapabilityId, DeviceId, EnrollmentTicketId, EntityIdGenerator, IdParseError, OperatorId,
-    WorkspaceId,
-};
-pub use membership::{
-    DeviceKeyPhase, DeviceKeyRing, DevicePublicKey, DeviceRecord, DeviceRecordError,
-    EnrollmentTicket, SignatureBytes,
-};
-pub use role::{WorkspaceAction, WorkspaceRole};
+pub use ids::{IdParseError, PeerId, Roles, WorkspaceId};

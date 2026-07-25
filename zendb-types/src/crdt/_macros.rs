@@ -1,61 +1,15 @@
-//! Macro definitions for CRDT type registration and dispatch.
-//!
-//! The `register_types!` macro generates the complete type dispatch layer:
-//! - `TypeTag` enum for runtime type identification
-//! - `PrimaryKey` enum for table keys
-//! - `Value` enum for runtime value dispatch
-//! - `TypeOp` enum for operation dispatch
-//! - `Segment` enum for container path segments
-//! - `TypeError` enum for unified error handling
-//!
-//! This allows adding new CRDT types with minimal boilerplate - just implement
-//! the `Type` trait and add one line to the macro invocation.
+//! Registration and runtime dispatch for CRDT values.
 
-pub use zendb_type_converter::CellCodec;
-
-/// Generate the complete CRDT type dispatch layer.
-///
-/// # Syntax
-///
-/// ```ignore
-/// register_types! {
-///     key TypeName => path::to::Type,    // Types that can be primary keys
-///     leaf TypeName => path::to::Type,   // Scalar CRDT types
-///     container TypeName(SegmentType) => path::to::Type,  // Container types
-/// }
-/// ```
-///
-/// # Generated Types
-///
-/// - `TypeTag`: Enum identifying each registered type
-/// - `PrimaryKey`: Enum for table primary keys
-/// - `Value`: Enum for runtime value dispatch
-/// - `TypeOp`: Enum for operation dispatch
-/// - `Segment`: Enum for container path segments
-/// - `TypeError`: Enum for unified error handling
-#[macro_export]
 macro_rules! register_types {
     (
         $( key $key_var:ident => $key_ty:ty, )*
         $( leaf $leaf_var:ident => $leaf_ty:ty, )*
         $( container $cont_var:ident ($seg_ty:ty) => $cont_ty:ty, )*
     ) => {
-        // =================================================================
-        // TypeTag
-        // =================================================================
         #[derive(
-            Debug,
-            Clone,
-            Copy,
-            PartialEq,
-            Eq,
-            PartialOrd,
-            Ord,
-            Hash,
-            ::bincode::Encode,
-            ::bincode::Decode,
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
+            ::bincode::Encode, ::bincode::Decode,
         )]
-        #[repr(u8)]
         pub enum TypeTag {
             $($leaf_var,)*
             $($cont_var,)*
@@ -64,63 +18,51 @@ macro_rules! register_types {
         impl TypeTag {
             pub const fn name(self) -> &'static str {
                 match self {
-                    $(TypeTag::$leaf_var => stringify!($leaf_var),)*
-                    $(TypeTag::$cont_var => stringify!($cont_var),)*
+                    $(Self::$leaf_var => stringify!($leaf_var),)*
+                    $(Self::$cont_var => stringify!($cont_var),)*
                 }
             }
 
-            /// Produce an empty value for this type tag.
             pub fn empty_value(self) -> Value {
                 match self {
-                    $(TypeTag::$leaf_var => Value::$leaf_var(<$leaf_ty as Default>::default()),)*
-                    $(TypeTag::$cont_var => Value::$cont_var(<$cont_ty as Default>::default()),)*
+                    $(Self::$leaf_var => Value::$leaf_var(<$leaf_ty as Default>::default()),)*
+                    $(Self::$cont_var => Value::$cont_var(<$cont_ty as Default>::default()),)*
                 }
             }
         }
 
         impl std::fmt::Display for TypeTag {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(self.name())
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.name())
             }
         }
 
-        // =================================================================
-        // PrimaryKey
-        // =================================================================
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, ::bincode::Encode, ::bincode::Decode)]
+        #[derive(
+            Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash,
+            ::bincode::Encode, ::bincode::Decode,
+        )]
         pub enum PrimaryKey {
             $($key_var($key_ty),)*
         }
 
-        impl PrimaryKey {
-            pub fn type_tag(&self) -> TypeTag {
-                match self {
-                    $(PrimaryKey::$key_var(_) => TypeTag::$key_var,)*
-                }
-            }
-        }
-
-        // =================================================================
-        // TypeError — per-type variants + cross-cutting errors
-        // =================================================================
         #[derive(Debug)]
         pub enum TypeError {
             $($leaf_var(<$leaf_ty as $crate::Type>::Error),)*
             $($cont_var(<$cont_ty as $crate::Type>::Error),)*
             TypeMismatch { expected: TypeTag, actual: TypeTag },
-            MergeConflict { local: TypeTag, remote: TypeTag },
+            MergeConflict { current: TypeTag, incoming: TypeTag },
         }
 
         impl std::fmt::Display for TypeError {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match self {
-                    $(TypeError::$leaf_var(e) => write!(f, "{}({})", TypeTag::$leaf_var.name(), e),)*
-                    $(TypeError::$cont_var(e) => write!(f, "{}({})", TypeTag::$cont_var.name(), e),)*
-                    TypeError::TypeMismatch { expected, actual } => {
-                        write!(f, "type mismatch: expected {:?}, got {:?}", expected, actual)
+                    $(Self::$leaf_var(error) => write!(formatter, "{}({error})", TypeTag::$leaf_var),)*
+                    $(Self::$cont_var(error) => write!(formatter, "{}({error})", TypeTag::$cont_var),)*
+                    Self::TypeMismatch { expected, actual } => {
+                        write!(formatter, "type mismatch: expected {expected}, got {actual}")
                     }
-                    TypeError::MergeConflict { local, remote } => {
-                        write!(f, "merge conflict: {:?} vs {:?}", local, remote)
+                    Self::MergeConflict { current, incoming } => {
+                        write!(formatter, "merge conflict: {current} vs {incoming}")
                     }
                 }
             }
@@ -129,16 +71,13 @@ macro_rules! register_types {
         impl std::error::Error for TypeError {
             fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
                 match self {
-                    $(TypeError::$leaf_var(e) => Some(e),)*
-                    $(TypeError::$cont_var(e) => Some(e),)*
+                    $(Self::$leaf_var(error) => Some(error),)*
+                    $(Self::$cont_var(error) => Some(error),)*
                     _ => None,
                 }
             }
         }
 
-        // =================================================================
-        // Value
-        // =================================================================
         #[derive(Debug, Clone, PartialEq, ::bincode::Encode, ::bincode::Decode)]
         pub enum Value {
             $($leaf_var($leaf_ty),)*
@@ -148,11 +87,10 @@ macro_rules! register_types {
         impl Value {
             pub fn type_tag(&self) -> TypeTag {
                 match self {
-                    $(Value::$leaf_var(_) => TypeTag::$leaf_var,)*
-                    $(Value::$cont_var(_) => TypeTag::$cont_var,)*
+                    $(Self::$leaf_var(_) => TypeTag::$leaf_var,)*
+                    $(Self::$cont_var(_) => TypeTag::$cont_var,)*
                 }
             }
-
         }
 
         impl $crate::Type for Value {
@@ -162,67 +100,41 @@ macro_rules! register_types {
             fn apply(
                 &mut self,
                 op: &TypeOp,
-                op_hlc: $crate::Hlc,
+                stamps: $crate::MergeStamps,
             ) -> Result<bool, TypeError> {
                 match (self, op) {
-                    $(
-                        (Value::$leaf_var(v), TypeOp::$leaf_var(o)) => {
-                            v.apply(o, op_hlc)
-                                .map_err(TypeError::$leaf_var)
-                        }
-                    )*
-                    $(
-                        (Value::$cont_var(v), TypeOp::$cont_var(o)) => {
-                            v.apply(o, op_hlc)
-                                .map_err(TypeError::$cont_var)
-                        }
-                    )*
-                    (v, o) => Err(TypeError::TypeMismatch {
-                        expected: v.type_tag(),
-                        actual: o.type_tag(),
+                    $((Value::$leaf_var(value), TypeOp::$leaf_var(op)) =>
+                        value.apply(op, stamps).map_err(TypeError::$leaf_var),)*
+                    $((Value::$cont_var(value), TypeOp::$cont_var(op)) =>
+                        value.apply(op, stamps).map_err(TypeError::$cont_var),)*
+                    (value, op) => Err(TypeError::TypeMismatch {
+                        expected: value.type_tag(),
+                        actual: op.type_tag(),
                     }),
                 }
             }
 
             fn merge(
                 &mut self,
-                remote: &Value,
-                clocks: $crate::MergeClocks,
+                incoming: &Value,
+                stamps: $crate::MergeStamps,
             ) -> Result<bool, TypeError> {
-                match (self, remote) {
-                    $(
-                        (Value::$leaf_var(l), Value::$leaf_var(r)) => {
-                            l.merge(r, clocks)
-                                .map_err(TypeError::$leaf_var)
-                        }
-                    )*
-                    $(
-                        (Value::$cont_var(l), Value::$cont_var(r)) => {
-                            l.merge(r, clocks)
-                                .map_err(TypeError::$cont_var)
-                        }
-                    )*
-                    (l, r) => Err(TypeError::MergeConflict {
-                        local: l.type_tag(),
-                        remote: r.type_tag(),
+                match (self, incoming) {
+                    $((Value::$leaf_var(current), Value::$leaf_var(incoming)) =>
+                        current.merge(incoming, stamps).map_err(TypeError::$leaf_var),)*
+                    $((Value::$cont_var(current), Value::$cont_var(incoming)) =>
+                        current.merge(incoming, stamps).map_err(TypeError::$cont_var),)*
+                    (current, incoming) => Err(TypeError::MergeConflict {
+                        current: current.type_tag(),
+                        incoming: incoming.type_tag(),
                     }),
                 }
             }
 
-            fn compact(
-                &mut self,
-                watermark: $crate::Hlc,
-            ) -> Result<bool, TypeError> {
+            fn max_stamp(&self) -> $crate::EventStamp {
                 match self {
-                    $(Value::$leaf_var(v) => v.compact(watermark).map_err(TypeError::$leaf_var),)*
-                    $(Value::$cont_var(v) => v.compact(watermark).map_err(TypeError::$cont_var),)*
-                }
-            }
-
-            fn max_hlc(&self) -> $crate::Hlc {
-                match self {
-                    $(Value::$leaf_var(v) => v.max_hlc(),)*
-                    $(Value::$cont_var(v) => v.max_hlc(),)*
+                    $(Value::$leaf_var(value) => value.max_stamp(),)*
+                    $(Value::$cont_var(value) => value.max_stamp(),)*
                 }
             }
         }
@@ -235,107 +147,27 @@ macro_rules! register_types {
                 }
             }
 
-            fn child_mut(
-                &mut self,
-                segment: &$crate::Segment,
-            ) -> Option<&mut $crate::Cell> {
+            fn child_mut(&mut self, segment: &$crate::Segment) -> Option<&mut $crate::Cell> {
                 match self {
                     $(Value::$cont_var(value) => value.child_mut(segment),)*
                     _ => None,
                 }
             }
 
-            fn cell_at_path(
-                &self,
-                path: &[$crate::PathStep],
-            ) -> Option<&$crate::Cell> {
-                match self {
-                    $(Value::$cont_var(value) => value.cell_at_path(path),)*
-                    _ => None,
-                }
-            }
-
-            fn cell_at_path_mut(
-                &mut self,
-                path: &[$crate::PathStep],
-            ) -> Option<&mut $crate::Cell> {
-                match self {
-                    $(Value::$cont_var(value) => value.cell_at_path_mut(path),)*
-                    _ => None,
-                }
-            }
-
-            fn effective_scope_at(
-                &self,
-                parent_scope: $crate::SyncScope,
-                path: &[$crate::PathStep],
-            ) -> $crate::SyncScope {
-                match self {
-                    $(Value::$cont_var(value) => {
-                        value.effective_scope_at(parent_scope, path)
-                    },)*
-                    _ => parent_scope,
-                }
-            }
-
             fn apply_walk(
                 &mut self,
                 op: &$crate::Op,
-                op_hlc: $crate::Hlc,
-                path: &[$crate::PathStep],
+                stamps: $crate::MergeStamps,
+                path: &[$crate::Segment],
             ) -> Result<bool, TypeError> {
                 match self {
-                    $(Value::$cont_var(v) => {
-                        v.apply_walk(op, op_hlc, path)
-                            .map_err(TypeError::$cont_var)
-                    },)*
+                    $(Value::$cont_var(value) =>
+                        value.apply_walk(op, stamps, path).map_err(TypeError::$cont_var),)*
                     _ => Ok(false),
-                }
-            }
-
-            fn merge_shared(
-                &mut self,
-                remote: &Self,
-                clocks: $crate::MergeClocks,
-                parent_scope: $crate::SyncScope,
-            ) -> Result<bool, TypeError> {
-                match (self, remote) {
-                    $(
-                        (Value::$leaf_var(local), Value::$leaf_var(remote)) => {
-                            local.merge(remote, clocks)
-                                .map_err(TypeError::$leaf_var)
-                        }
-                    )*
-                    $(
-                        (Value::$cont_var(local), Value::$cont_var(remote)) => {
-                            local.merge_shared(remote, clocks, parent_scope)
-                            .map_err(TypeError::$cont_var)
-                        }
-                    )*
-                    (local, remote) => Err(TypeError::MergeConflict {
-                        local: local.type_tag(),
-                        remote: remote.type_tag(),
-                    }),
-                }
-            }
-
-            fn shared_clone(
-                &self,
-                parent_scope: $crate::SyncScope,
-            ) -> Option<Self> {
-                match self {
-                    $(Value::$leaf_var(value) => Some(Value::$leaf_var(value.clone())),)*
-                    $(Value::$cont_var(value) => {
-                        value.shared_clone(parent_scope)
-                            .map(Value::$cont_var)
-                    },)*
                 }
             }
         }
 
-        // =================================================================
-        // TypeOp
-        // =================================================================
         #[derive(Debug, Clone, ::bincode::Encode, ::bincode::Decode)]
         pub enum TypeOp {
             $($leaf_var(<$leaf_ty as $crate::Type>::Op),)*
@@ -345,15 +177,12 @@ macro_rules! register_types {
         impl TypeOp {
             pub fn type_tag(&self) -> TypeTag {
                 match self {
-                    $(TypeOp::$leaf_var(_) => TypeTag::$leaf_var,)*
-                    $(TypeOp::$cont_var(_) => TypeTag::$cont_var,)*
+                    $(Self::$leaf_var(_) => TypeTag::$leaf_var,)*
+                    $(Self::$cont_var(_) => TypeTag::$cont_var,)*
                 }
             }
         }
 
-        // =================================================================
-        // Segment
-        // =================================================================
         #[derive(Debug, Clone, PartialEq, Eq, ::bincode::Encode, ::bincode::Decode)]
         pub enum Segment {
             $($cont_var($seg_ty),)*
@@ -362,10 +191,9 @@ macro_rules! register_types {
         impl Segment {
             pub fn type_tag(&self) -> TypeTag {
                 match self {
-                    $(Segment::$cont_var(_) => TypeTag::$cont_var,)*
+                    $(Self::$cont_var(_) => TypeTag::$cont_var,)*
                 }
             }
         }
-
     };
 }

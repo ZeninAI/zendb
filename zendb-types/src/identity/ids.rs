@@ -1,213 +1,169 @@
-use std::{
-    fmt, io,
-    sync::{Mutex, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
-};
+//! Libp2p-backed domain identities and inert workspace role data.
 
-const RANDOM_BITS: u32 = 74;
-const RANDOM_MASK: u128 = (1u128 << RANDOM_BITS) - 1;
-const MAX_TIMESTAMP_MS: u64 = (1u64 << 48) - 1;
+use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IdParseError;
+use bincode::{de::Decoder, enc::Encoder, Decode, Encode};
+use libp2p_identity::{Keypair, PeerId as Libp2pPeerId};
 
-impl fmt::Display for IdParseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("expected a canonical 128-bit UUID identifier")
+pub type IdParseError = libp2p_identity::ParseError;
+
+/// A network peer identity encoded as canonical libp2p PeerId bytes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PeerId(Libp2pPeerId);
+
+impl PeerId {
+    pub fn generate() -> Self {
+        let keypair = Keypair::generate_ed25519();
+        Self(Libp2pPeerId::from_public_key(&keypair.public()))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, IdParseError> {
+        Libp2pPeerId::from_bytes(bytes).map(Self)
+    }
+
+    pub fn to_bytes(self) -> Vec<u8> {
+        self.0.to_bytes()
+    }
+
+    pub const fn as_libp2p(&self) -> &Libp2pPeerId {
+        &self.0
     }
 }
 
-impl std::error::Error for IdParseError {}
-
-#[derive(Debug, Clone, Copy)]
-struct GeneratorState {
-    timestamp_ms: u64,
-    random: u128,
-}
-
-/// Process-local UUIDv7 generator with monotonic output during equal or
-/// backwards-moving wall-clock milliseconds.
-#[derive(Debug)]
-pub struct EntityIdGenerator {
-    state: Mutex<Option<GeneratorState>>,
-}
-
-impl Default for EntityIdGenerator {
+impl Default for PeerId {
     fn default() -> Self {
-        Self::new()
+        // A valid identity-multihash with a zero digest is the CRDT sentinel.
+        Self::from_bytes(&[
+            0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+        ])
+        .expect("the zero PeerId sentinel is a valid identity multihash")
     }
 }
 
-impl EntityIdGenerator {
-    pub const fn new() -> Self {
-        Self {
-            state: Mutex::new(None),
-        }
-    }
-
-    pub fn generate(&self) -> io::Result<[u8; 16]> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .as_millis()
-            .try_into()
-            .map_err(|_| io::Error::other("system time exceeds UUIDv7 timestamp range"))?;
-        self.generate_at(now)
-    }
-
-    /// Generate using a caller-supplied wall clock, primarily for deterministic
-    /// tests and embedders with an existing clock source.
-    pub fn generate_at(&self, now_ms: u64) -> io::Result<[u8; 16]> {
-        if now_ms > MAX_TIMESTAMP_MS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "timestamp exceeds UUIDv7 48-bit millisecond range",
-            ));
-        }
-
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("entity ID generator lock poisoned"))?;
-        let next = match *state {
-            Some(previous) if now_ms <= previous.timestamp_ms => {
-                if previous.random == RANDOM_MASK {
-                    if previous.timestamp_ms == MAX_TIMESTAMP_MS {
-                        return Err(io::Error::other("UUIDv7 generator exhausted"));
-                    }
-                    GeneratorState {
-                        timestamp_ms: previous.timestamp_ms + 1,
-                        random: random_74_bits()?,
-                    }
-                } else {
-                    GeneratorState {
-                        timestamp_ms: previous.timestamp_ms,
-                        random: previous.random + 1,
-                    }
-                }
-            }
-            _ => GeneratorState {
-                timestamp_ms: now_ms,
-                random: random_74_bits()?,
-            },
-        };
-        *state = Some(next);
-        Ok(encode_uuid_v7(next.timestamp_ms, next.random))
+impl std::fmt::Display for PeerId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 
-fn random_74_bits() -> io::Result<u128> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(u128::from_be_bytes(bytes) & RANDOM_MASK)
-}
-
-const fn encode_uuid_v7(timestamp_ms: u64, random: u128) -> [u8; 16] {
-    let rand_a = (random >> 62) & 0x0fff;
-    let rand_b = random & ((1u128 << 62) - 1);
-    let encoded = ((timestamp_ms as u128) << 80)
-        | (0x7u128 << 76)
-        | (rand_a << 64)
-        | (0b10u128 << 62)
-        | rand_b;
-    encoded.to_be_bytes()
-}
-
-pub(crate) fn generate_entity_id() -> io::Result<[u8; 16]> {
-    static GENERATOR: OnceLock<EntityIdGenerator> = OnceLock::new();
-    GENERATOR.get_or_init(EntityIdGenerator::new).generate()
-}
-
-pub const fn entity_id_timestamp_ms(bytes: &[u8; 16]) -> u64 {
-    ((bytes[0] as u64) << 40)
-        | ((bytes[1] as u64) << 32)
-        | ((bytes[2] as u64) << 24)
-        | ((bytes[3] as u64) << 16)
-        | ((bytes[4] as u64) << 8)
-        | bytes[5] as u64
-}
-
-pub fn format_entity_id(bytes: &[u8; 16], formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    for (index, byte) in bytes.iter().enumerate() {
-        if matches!(index, 4 | 6 | 8 | 10) {
-            formatter.write_str("-")?;
-        }
-        write!(formatter, "{byte:02x}")?;
-    }
-    Ok(())
-}
-
-pub fn parse_entity_id(value: &str) -> Result<[u8; 16], IdParseError> {
-    let canonical = value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => byte == b'-',
-            _ => byte.is_ascii_hexdigit(),
-        });
-    let compact_form = value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
-    if !canonical && !compact_form {
-        return Err(IdParseError);
-    }
-
-    let mut compact = [0u8; 32];
-    let mut length = 0;
-    for byte in value.bytes() {
-        if byte == b'-' {
-            continue;
-        }
-        if length == compact.len() || !byte.is_ascii_hexdigit() {
-            return Err(IdParseError);
-        }
-        compact[length] = byte;
-        length += 1;
-    }
-    if length != compact.len() {
-        return Err(IdParseError);
-    }
-
-    let mut bytes = [0u8; 16];
-    for (index, output) in bytes.iter_mut().enumerate() {
-        let high = hex(compact[index * 2]).ok_or(IdParseError)?;
-        let low = hex(compact[index * 2 + 1]).ok_or(IdParseError)?;
-        *output = (high << 4) | low;
-    }
-    Ok(bytes)
-}
-
-const fn hex(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
+impl std::fmt::Debug for PeerId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("PeerId").field(&self.0).finish()
     }
 }
 
-define_entity_id!(DeviceId);
-define_entity_id!(WorkspaceId);
-define_entity_id!(OperatorId);
-define_entity_id!(EnrollmentTicketId);
-define_label!(CapabilityId);
+impl FromStr for PeerId {
+    type Err = IdParseError;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse().map(Self)
+    }
+}
 
-    #[test]
-    fn generated_ids_are_monotonic_and_expose_the_timestamp() {
-        let generator = EntityIdGenerator::new();
-        let first = DeviceId(generator.generate_at(1_700_000_000_000).unwrap());
-        let second = DeviceId(generator.generate_at(1_700_000_000_000).unwrap());
-        let rollback = DeviceId(generator.generate_at(1_699_999_999_000).unwrap());
+impl From<Libp2pPeerId> for PeerId {
+    fn from(value: Libp2pPeerId) -> Self {
+        Self(value)
+    }
+}
 
-        assert!(first < second && second < rollback);
-        assert_eq!(first.created_at_ms(), 1_700_000_000_000);
-        assert_eq!(rollback.created_at_ms(), 1_700_000_000_000);
+impl From<PeerId> for Libp2pPeerId {
+    fn from(value: PeerId) -> Self {
+        value.0
+    }
+}
+
+impl Encode for PeerId {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), bincode::error::EncodeError> {
+        self.0.to_bytes().encode(encoder)
+    }
+}
+
+impl<Context> Decode<Context> for PeerId {
+    fn decode<D: Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let bytes = Vec::<u8>::decode(decoder)?;
+        Self::from_bytes(&bytes).map_err(|error| {
+            bincode::error::DecodeError::OtherString(format!("invalid PeerId: {error}"))
+        })
+    }
+}
+
+bincode::impl_borrow_decode!(PeerId);
+
+/// A workspace identity using the same primitive and encoding as PeerId.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkspaceId(Libp2pPeerId);
+
+impl WorkspaceId {
+    pub fn generate() -> Self {
+        let keypair = Keypair::generate_ed25519();
+        Self(Libp2pPeerId::from_public_key(&keypair.public()))
     }
 
-    #[test]
-    fn display_and_parse_round_trip() {
-        let id = WorkspaceId::generate().unwrap();
-        assert_eq!(WorkspaceId::parse(&id.to_string()).unwrap(), id);
-        assert!(WorkspaceId::parse("0000000-00000-0000-0000-000000000000").is_err());
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, IdParseError> {
+        Libp2pPeerId::from_bytes(bytes).map(Self)
     }
+
+    pub fn to_bytes(self) -> Vec<u8> {
+        self.0.to_bytes()
+    }
+
+    pub const fn as_libp2p(&self) -> &Libp2pPeerId {
+        &self.0
+    }
+}
+
+impl Default for WorkspaceId {
+    fn default() -> Self {
+        Self(PeerId::default().0)
+    }
+}
+
+impl std::fmt::Display for WorkspaceId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::fmt::Debug for WorkspaceId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("WorkspaceId").field(&self.0).finish()
+    }
+}
+
+impl FromStr for WorkspaceId {
+    type Err = IdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse().map(Self)
+    }
+}
+
+impl Encode for WorkspaceId {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), bincode::error::EncodeError> {
+        self.0.to_bytes().encode(encoder)
+    }
+}
+
+impl<Context> Decode<Context> for WorkspaceId {
+    fn decode<D: Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let bytes = Vec::<u8>::decode(decoder)?;
+        Self::from_bytes(&bytes).map_err(|error| {
+            bincode::error::DecodeError::OtherString(format!("invalid WorkspaceId: {error}"))
+        })
+    }
+}
+
+bincode::impl_borrow_decode!(WorkspaceId);
+
+/// Persisted workspace capabilities. Enforcement belongs to zendb-workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+pub enum Roles {
+    Contributor,
+    Operator,
+    Dispatcher,
 }

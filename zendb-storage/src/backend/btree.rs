@@ -85,8 +85,8 @@ use hashbrown::HashMap;
 use crate::backend::_traits::{
     DurableStorage, OrderedReadBackend, ReadBackend, Storage, WriteBackend,
 };
-use crate::utils::reusables::PooledBuf;
-use crate::utils::serdes::{
+use zendb_types::utils::reusables::PooledBuf;
+use zendb_types::utils::serdes::{
     deserialize_from, rd_u16, rd_u32, rd_u64, serialize_to_vec, with_scratch, with_two_scratches,
     wr_u16, wr_u32, wr_u64,
 };
@@ -309,7 +309,7 @@ pub struct BPlusTree<K, V> {
 }
 
 impl<K, V> BPlusTree<K, V> {
-    pub(crate) fn flush_on_drop(&mut self) -> io::Result<()> {
+    pub(crate) fn flush(&mut self) -> io::Result<()> {
         self.mmap.flush_async()
     }
 }
@@ -2197,7 +2197,7 @@ where
 
     /// Schedule mmap writeback asynchronously.
     fn flush(&mut self) -> io::Result<()> {
-        self.flush_on_drop()
+        BPlusTree::flush(self)
     }
 
     /// Block until pending mmap writes have been flushed.
@@ -2326,7 +2326,7 @@ where
 
     /// One descent that's reused for the read AND the write. Reads the
     /// current value via the descent's slot, then routes to
-    /// [`insert_bytes`] (overwrite/insert) or [`delete_at`] (delete) —
+    /// `insert_bytes` (overwrite/insert) or `delete_at` (delete) —
     /// both consume the resolved `(leaf_page, slot)` directly so the
     /// descent isn't repeated.
     fn update<F>(&mut self, key: &K, f: F) -> io::Result<()>
@@ -2534,7 +2534,7 @@ where
     }
 
     /// Smallest live entry. Walks right from the leftmost leaf via
-    /// [`leftmost_nonempty_leaf`] to skip leaves that `delete` may have
+    /// `leftmost_nonempty_leaf` to skip leaves that `delete` may have
     /// drained but not unlinked.
     fn first<'a>(&'a self) -> Option<(Cow<'a, K>, Cow<'a, V>)>
     where
@@ -2550,8 +2550,8 @@ where
         Some((Cow::Owned(k), Cow::Owned(v)))
     }
 
-    /// Largest live entry. Mirror of [`first`] — walks left via
-    /// [`rightmost_nonempty_leaf`].
+    /// Largest live entry. Mirror of `first` — walks left via
+    /// `rightmost_nonempty_leaf`.
     fn last<'a>(&'a self) -> Option<(Cow<'a, K>, Cow<'a, V>)>
     where
         K: 'a,
@@ -2949,9 +2949,9 @@ where
 impl<K, V> Drop for BPlusTree<K, V> {
     /// Schedule a final writeback without blocking. We don't promise
     /// crash recovery; callers that need durability should call
-    /// `WriteBackend::sync` explicitly before dropping.
+    /// `DurableStorage::sync` explicitly before dropping.
     fn drop(&mut self) {
-        let _ = self.flush_on_drop();
+        let _ = BPlusTree::flush(self);
     }
 }
 
@@ -3341,8 +3341,8 @@ mod tests {
         // Iteration order is correct.
         let collected: Vec<Vec<u8>> = t.entries().map(|(k, _)| k.into_owned()).collect();
         assert_eq!(collected.len(), 500);
-        for i in 0..500 {
-            assert_eq!(collected[i], format!("k{:04}", i).into_bytes());
+        for (index, key) in collected.iter().enumerate() {
+            assert_eq!(*key, format!("k{index:04}").into_bytes());
         }
     }
 

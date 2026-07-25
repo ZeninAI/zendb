@@ -2,14 +2,9 @@
 resolver = "2"
 
 members = [
-    "zendb-type-converter",
     "zendb-types",
     "zendb-storage",
-    "zendb-replication",
-    "zendb-engine",
-    "zendb-operator",
-    "zendb-testing",
-    "zendb-transport",
+    "zendb-workspace",
 ]
 
 [workspace.package]
@@ -24,26 +19,9 @@ authors = ["ZeninDB Contributors"]
 memmap2 = "0.9"
 hashbrown = "0.15"
 
-# serialization
 bincode = { version = "2", features = ["derive"] }
-rkyv = "0.8"
-proc-macro2 = "1"
-quote = "1"
-syn = { version = "2", features = ["full"] }
 
-# zendb-types
-getrandom = "0.3"
-ed25519-dalek = "2"
-zeroize = { version = "1", features = ["derive"] }
-x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
-chacha20poly1305 = "0.10"
-hkdf = "0.12"
-sha2 = "0.10"
+libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand"] }
 
-# zendb-engine
-blake3 = "1"
-
-# concurrency
 parking_lot = "0.12"
-log = "0.4"
 arc-swap = "1"

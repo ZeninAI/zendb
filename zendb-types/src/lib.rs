@@ -1,41 +1,13 @@
-//! # zendb-types
-//!
-//! Core type system for ZeninDB — an embedded, local-first, eventually
-//! consistent database with first-class collaborative editing.
-//!
-//! This crate contains portable data and protocol types shared by devices:
-//! - **CRDT primitives & values**: HLC, Event, Path, Cell, collaborative types
-//! - **Device control**: membership, fixed roles, keys, and admission
-//! - **Control plane types**: presence, operator specifications, and leases
-//!
-//! ## Module Organization
-//!
-//! - `crdt::*` — Complete CRDT foundation (primitives, traits, and value types)
-//! - `identity::*` — Identity types that are part of shared truth
-//! - `control::*` — Signed presence messages
-//!
-//! ## Adding a CRDT type
-//!
-//! 1. Create a module in `src/crdt/values/` implementing `Type`; values with
-//!    addressable child Cells also implement `ContainerType`.
-//! 2. Add one line to `register_types!` below.
-
-// --- hand-written modules ---
-pub mod control;
+//! Portable identifiers, event stamps, and CRDT values used by ZenDB.
 
 #[macro_use]
 pub mod crdt;
 
-#[macro_use]
 pub mod identity;
+pub mod utils;
 
-// --- Type registration and dispatch ---
-// The register_types! macro is defined in crdt/_macros.rs and generates:
-// - TypeTag, PrimaryKey, Value, TypeOp, Segment, TypeError enums
-// - Trait implementations for type dispatch
-
-// --- invoke the macro ---
 register_types! {
+    key PeerId => crate::PeerId,
     key Bool => crate::crdt::values::bool::Bool,
     key Int => crate::crdt::values::int::Int,
     key String => crate::crdt::values::string::String,
@@ -46,6 +18,8 @@ register_types! {
     leaf String => crate::crdt::values::string::String,
     leaf Timestamp => crate::crdt::values::timestamp::Timestamp,
     leaf Blob => crate::crdt::values::blob::Blob,
+    leaf Float32 => crate::crdt::values::float::Float32,
+    leaf Float64 => crate::crdt::values::float::Float64,
     leaf Counter => crate::crdt::values::counter::Counter,
     leaf MvRegister => crate::crdt::values::mv_register::MvRegister,
     leaf OrSet => crate::crdt::values::or_set::OrSet,
@@ -56,20 +30,5 @@ register_types! {
     container List(crate::crdt::values::list::ListSegment) => crate::crdt::values::list::List,
 }
 
-// --- re-exports ---
-
-// CRDT primitives and types (everything from crdt module)
 pub use crdt::*;
-pub use zendb_type_converter::CellCodec;
-
-extern crate self as zendb_types;
-
-// Identity types
-pub use control::{DepartureNotice, PresenceHeartbeat};
-pub use identity::{
-    CapabilityId, DeviceId, DeviceKeyPhase, DeviceKeyRing, DevicePublicKey, DeviceRecord,
-    DeviceRecordError, EnrollmentTicket, EnrollmentTicketId, EntityIdGenerator, IdParseError,
-    OperatorId, SignatureBytes, WorkspaceAction, WorkspaceId, WorkspaceRole,
-};
-
-// TypeTag, Value, TypeOp, Segment, TypeError are generated above by register_types!
+pub use identity::{IdParseError, PeerId, Roles, WorkspaceId};

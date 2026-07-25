@@ -29,11 +29,11 @@ impl TableEntry {
 pub struct TableHandle {
     name: String,
     entry: Arc<TableEntry>,
-    devices: Devices,
+    devices: Arc<Devices>,
 }
 
 impl TableHandle {
-    pub(crate) fn new(name: String, entry: Arc<TableEntry>, devices: Devices) -> Self {
+    pub(crate) fn new(name: String, entry: Arc<TableEntry>, devices: Arc<Devices>) -> Self {
         Self {
             name,
             entry,

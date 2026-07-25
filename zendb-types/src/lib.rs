@@ -31,4 +31,7 @@ register_types! {
 }
 
 pub use crdt::*;
-pub use identity::{IdParseError, PeerId, Roles, WorkspaceId};
+pub use identity::{
+    IdParseError, LocalPeerIdentity, PeerId, PeerIdentity, Roles, Signature, SigningError,
+    WorkspaceId,
+};

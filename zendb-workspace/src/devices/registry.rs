@@ -9,16 +9,15 @@ use std::{
 use bincode::{Decode, Encode};
 use parking_lot::RwLock;
 use zendb_storage::{InsertOutcome, ReadBackend};
-use zendb_types::{Blob, Event, EventId, EventStamp, Op, Path, PeerId, PrimaryKey, Roles, Value};
+use zendb_types::{
+    Blob, Event, EventId, EventStamp, Op, Path, PeerId, PeerIdentity, PrimaryKey, Roles, Value,
+};
 
 use super::{
     clock::{PeerRecord, PeerStore},
     receipts::ObserveOutcome,
 };
-use crate::{
-    catalog::{StateHandle, TableEntry},
-    Error, Result,
-};
+use crate::{states::StateHandle, tables::TableEntry, Error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct DeviceRecord {
@@ -41,32 +40,32 @@ impl Devices {
     pub(crate) fn create(
         registry: Arc<TableEntry>,
         state: StateHandle<PeerId, PeerRecord>,
-        local_peer_id: PeerId,
-    ) -> Result<Self> {
-        Self::bind(registry, PeerStore::create(state, local_peer_id)?)
+        peer: Arc<dyn PeerIdentity>,
+    ) -> Result<Arc<Self>> {
+        Self::bind(registry, PeerStore::create(state, peer)?)
     }
 
     pub(crate) fn open(
         registry: Arc<TableEntry>,
         state: StateHandle<PeerId, PeerRecord>,
-        local_peer_id: PeerId,
-    ) -> Result<Self> {
-        Self::bind(registry, PeerStore::open(state, local_peer_id)?)
+        peer: Arc<dyn PeerIdentity>,
+    ) -> Result<Arc<Self>> {
+        Self::bind(registry, PeerStore::open(state, peer)?)
     }
 
-    fn bind(registry: Arc<TableEntry>, peers: Arc<PeerStore>) -> Result<Self> {
-        let devices = Self {
+    fn bind(registry: Arc<TableEntry>, peers: Arc<PeerStore>) -> Result<Arc<Self>> {
+        let devices = Arc::new(Self {
             inner: Arc::new(DevicesInner {
                 registry,
                 peers,
                 records: RwLock::new(BTreeMap::new()),
             }),
-        };
+        });
         devices.reload()?;
         Ok(devices)
     }
 
-    pub(crate) fn bootstrap_local(&self, name: String) -> Result<()> {
+    pub(crate) fn bootstrap_local(&self) -> Result<()> {
         if self
             .inner
             .records
@@ -78,7 +77,7 @@ impl Devices {
         self.write_record(
             self.local_peer_id(),
             DeviceRecord {
-                name,
+                name: String::new(),
                 roles: BTreeSet::from([Roles::Operator]),
             },
         )

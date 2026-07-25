@@ -1046,6 +1046,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zendb-it"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "tempfile",
+ "zendb-storage",
+ "zendb-types",
+ "zendb-workspace",
+]
+
+[[package]]
 name = "zendb-storage"
 version = "0.1.0"
 dependencies = [

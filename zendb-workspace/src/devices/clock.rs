@@ -4,17 +4,16 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ops::RangeInclusive,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use arc_swap::ArcSwap;
 use bincode::{Decode, Encode};
 use parking_lot::Mutex;
 use zendb_storage::{DurableStorage, ReadBackend, WriteBackend};
-use zendb_types::{EventId, EventStamp, EventTime, PeerId};
+use zendb_types::{utils::time::physical_ms, EventId, EventStamp, EventTime, PeerId, PeerIdentity};
 
 use super::receipts::{ObserveOutcome, ReceiptWindow};
-use crate::{catalog::StateHandle, Error, Result};
+use crate::{states::StateHandle, Error, Result};
 
 type PeerMap = BTreeMap<PeerId, PeerRecord>;
 
@@ -35,6 +34,10 @@ struct PeerMutationState {
 }
 
 pub(crate) struct PeerStore {
+    // Retained for future event signing. The workspace never sees the
+    // private key; `PeerIdentity::sign` goes through this handle.
+    #[allow(dead_code)]
+    peer: Arc<dyn PeerIdentity>,
     local_peer_id: PeerId,
     state: StateHandle<PeerId, PeerRecord>,
     snapshot: ArcSwap<PeerMap>,
@@ -44,8 +47,9 @@ pub(crate) struct PeerStore {
 impl PeerStore {
     pub(crate) fn create(
         state: StateHandle<PeerId, PeerRecord>,
-        local_peer_id: PeerId,
+        peer: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
+        let local_peer_id = peer.peer_id();
         let record = PeerRecord {
             receipts: ReceiptWindow::default(),
             clock: Some(ClockCheckpoint {
@@ -59,6 +63,7 @@ impl PeerStore {
             storage.sync()?;
         }
         Ok(Arc::new(Self {
+            peer,
             local_peer_id,
             state,
             snapshot: ArcSwap::from_pointee(BTreeMap::from([(local_peer_id, record)])),
@@ -70,8 +75,9 @@ impl PeerStore {
 
     pub(crate) fn open(
         state: StateHandle<PeerId, PeerRecord>,
-        local_peer_id: PeerId,
+        peer: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
+        let local_peer_id = peer.peer_id();
         let peers = state
             .read()
             .entries()
@@ -87,6 +93,7 @@ impl PeerStore {
             ));
         }
         Ok(Arc::new(Self {
+            peer,
             local_peer_id,
             state,
             snapshot: ArcSwap::from_pointee(peers),
@@ -233,10 +240,5 @@ fn observe_time(local: EventTime, remote: EventTime, wall: u64) -> EventTime {
 }
 
 fn wall_time_ms() -> Result<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?
-        .as_millis()
-        .try_into()
-        .map_err(|_| Error::ClockExhausted)
+    physical_ms().ok_or(Error::ClockExhausted)
 }

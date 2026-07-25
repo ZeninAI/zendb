@@ -1,4 +1,4 @@
-//! Catalog-owned declarations and typed runtime handles for local States.
+//! State catalog management: typed State lifecycle and declarations.
 
 use std::{
     any::Any,
@@ -13,10 +13,78 @@ use bincode::{Decode, Encode};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use zendb_storage::{DurableStorage, KeyDirConfig, ReadBackend, State, StateConfig, WriteBackend};
 
-use super::model::STATE_CATALOG_NAME;
 use crate::{Error, Result};
 
-type ErasedState = Arc<dyn Any + Send + Sync>;
+pub const STATE_CATALOG_NAME: &str = "_state_catalog";
+pub const PEER_STATE_NAME: &str = "_peer_state";
+
+pub(crate) fn is_system_state(name: &str) -> bool {
+    matches!(name, STATE_CATALOG_NAME | PEER_STATE_NAME)
+}
+
+/// Public handler for state catalog management.
+///
+/// Exposes lifecycle operations (open/declare, list, contains, close, delete)
+/// and returns typed [`StateHandle`]s. State reads and writes are performed
+/// through the handle, not on this handler.
+#[derive(Clone)]
+pub struct States {
+    core: Arc<StatesCore>,
+}
+
+impl States {
+    pub(crate) fn new(core: Arc<StatesCore>) -> Self {
+        Self { core }
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        !is_system_state(name) && self.core.contains(name)
+    }
+
+    pub fn list(&self) -> Vec<String> {
+        self.core
+            .list()
+            .into_iter()
+            .filter(|name| !is_system_state(name))
+            .collect()
+    }
+
+    pub fn open<K, V>(&self, name: &str, config: Option<StateConfig>) -> Result<StateHandle<K, V>>
+    where
+        K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+        V: Encode + Decode<()> + Clone + Send + Sync + 'static,
+    {
+        if is_system_state(name) {
+            return Err(Error::NotFound(name.to_owned()));
+        }
+        self.core.state(name, config)
+    }
+
+    pub fn list_open(&self) -> Vec<String> {
+        self.core
+            .list_open()
+            .into_iter()
+            .filter(|name| !is_system_state(name))
+            .collect()
+    }
+
+    pub fn config(&self, name: &str) -> Option<StateConfig> {
+        (!is_system_state(name))
+            .then(|| self.core.config(name))
+            .flatten()
+    }
+
+    pub fn close(&self, name: &str) -> bool {
+        !is_system_state(name) && self.core.close(name)
+    }
+
+    pub fn delete(&self, name: &str) -> Result<bool> {
+        if is_system_state(name) {
+            return Err(Error::ResourceBusy(name.to_owned()));
+        }
+        self.core.delete(name)
+    }
+}
 
 pub struct StateHandle<K: Ord, V> {
     name: String,
@@ -46,18 +114,20 @@ impl<K: Ord, V> StateHandle<K, V> {
     }
 }
 
-struct StateCatalogInner {
+type ErasedState = Arc<dyn Any + Send + Sync>;
+
+struct StatesCoreInner {
     declarations: State<String, StateConfig>,
     open: HashMap<String, ErasedState>,
 }
 
-pub(crate) struct StateCatalog {
+pub(crate) struct StatesCore {
     states_root: PathBuf,
-    inner: Mutex<StateCatalogInner>,
+    inner: Mutex<StatesCoreInner>,
 }
 
-impl StateCatalog {
-    pub(crate) fn create(root: &Path) -> Result<Self> {
+impl StatesCore {
+    pub(crate) fn create(root: &Path) -> Result<Arc<Self>> {
         let states_root = root.join("states");
         fs::create_dir_all(&states_root)?;
         let config = catalog_config();
@@ -65,24 +135,24 @@ impl StateCatalog {
             State::create(&states_root.join(STATE_CATALOG_NAME), config.clone())?;
         declarations.put(STATE_CATALOG_NAME.to_owned(), config)?;
         declarations.sync()?;
-        Ok(Self {
+        Ok(Arc::new(Self {
             states_root,
-            inner: Mutex::new(StateCatalogInner {
+            inner: Mutex::new(StatesCoreInner {
                 declarations,
                 open: HashMap::new(),
             }),
-        })
+        }))
     }
 
-    pub(crate) fn open(root: &Path) -> Result<Self> {
+    pub(crate) fn open(root: &Path) -> Result<Arc<Self>> {
         let states_root = root.join("states");
-        Ok(Self {
-            inner: Mutex::new(StateCatalogInner {
+        Ok(Arc::new(Self {
+            inner: Mutex::new(StatesCoreInner {
                 declarations: State::open(&states_root.join(STATE_CATALOG_NAME), catalog_config())?,
                 open: HashMap::new(),
             }),
             states_root,
-        })
+        }))
     }
 
     pub(crate) fn state<K, V>(
@@ -123,11 +193,23 @@ impl StateCatalog {
         })
     }
 
-    pub(crate) fn contains(&self, name: &str) -> bool {
+    /// Opens the `_peer_state` system State for Devices bootstrap.
+    pub(crate) fn peer_state<K, V>(&self) -> Result<StateHandle<K, V>>
+    where
+        K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+        V: Encode + Decode<()> + Clone + Send + Sync + 'static,
+    {
+        self.state(
+            PEER_STATE_NAME,
+            Some(StateConfig::Unordered(KeyDirConfig::default())),
+        )
+    }
+
+    fn contains(&self, name: &str) -> bool {
         self.inner.lock().declarations.contains(&name.to_owned())
     }
 
-    pub(crate) fn list(&self) -> Vec<String> {
+    fn list(&self) -> Vec<String> {
         let mut names: Vec<_> = self
             .inner
             .lock()
@@ -139,13 +221,13 @@ impl StateCatalog {
         names
     }
 
-    pub(crate) fn list_open(&self) -> Vec<String> {
+    fn list_open(&self) -> Vec<String> {
         let mut names: Vec<_> = self.inner.lock().open.keys().cloned().collect();
         names.sort();
         names
     }
 
-    pub(crate) fn config(&self, name: &str) -> Option<StateConfig> {
+    fn config(&self, name: &str) -> Option<StateConfig> {
         self.inner
             .lock()
             .declarations
@@ -153,7 +235,7 @@ impl StateCatalog {
             .map(|config| config.into_owned())
     }
 
-    pub(crate) fn close(&self, name: &str) -> bool {
+    fn close(&self, name: &str) -> bool {
         let mut inner = self.inner.lock();
         if inner
             .open
@@ -166,7 +248,7 @@ impl StateCatalog {
         true
     }
 
-    pub(crate) fn delete(&self, name: &str) -> Result<bool> {
+    fn delete(&self, name: &str) -> Result<bool> {
         if name == STATE_CATALOG_NAME {
             return Err(Error::ResourceBusy(name.to_owned()));
         }

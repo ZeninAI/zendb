@@ -1,0 +1,17 @@
+[package]
+name = "zendb-it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Integration tests for ZenDB"
+
+[dependencies]
+bincode.workspace = true
+zendb-workspace = { path = "../zendb-workspace" }
+zendb-storage = { path = "../zendb-storage" }
+zendb-types = { path = "../zendb-types" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -643,7 +643,91 @@ Retain only errors needed for current behavior:
 The final enum can be reduced further after call sites change. Do not add
 defensive categories for hypothetical network or migration paths.
 
-## 15. Implementation Sequence
+## 15. Public Handler Surface
+
+The workspace public API is split into three handlers, each a cheaply
+cloneable owning facade over a shared `Arc`-backed core. `Workspace` exposes
+`devices()`, `tables()`, and `states()` accessors and retains only identity,
+bootstrap, lock, root, and flush responsibilities. It no longer hosts table or
+state management methods directly.
+
+### 15.1 Three handlers
+
+- `Devices` — peer registry, hybrid clock, roles, and duplicate-event tracking.
+  Unchanged from the unified peer state design in section 10.
+- `Tables` — table catalog management. Owns the renamed `TablesCore` (the
+  former `Catalog` minus state methods) and exposes `contains`, `list`,
+  `create`, `update`, `delete`, and `open(name) -> TableHandle`. Mutating
+  methods wrap `authorize(Roles::Operator)` + `mint` + core op + `observe`.
+  `open` returns a handle without stamping.
+- `States` — state catalog management. Owns the extracted `StatesCore` (the
+  former `StateCatalog`) and exposes `contains`, `list`,
+  `open::<K, V>(name, config)`, `list_open`, `config`, `close`, and `delete`.
+  No mint/observe and no authorization: the state catalog is a `State`, not a
+  stamped Table, and state declarations are not gated by a role in this
+  iteration.
+
+### 15.2 Table operations live on the handle
+
+`Tables` is a catalog management surface. It does not expose table operations
+such as `insert` or `write_entry`. Callers obtain a `TableHandle` via
+`Tables::open` and perform operations directly on the handle:
+
+    let table = workspace.tables().open("users")?;
+    table.insert(primary_key, path, op)?;
+    let guard = table.read();
+    // ReadBackend / OrderedReadBackend methods on guard
+
+This mirrors how `States::open` returns a `StateHandle` whose `read`/`write`
+methods are the operation surface, while `States` itself only manages
+lifecycle.
+
+### 15.3 Module layout
+
+The `catalog/` module is removed. Its responsibilities are split between two
+new top-level modules:
+
+- `tables/` — `Tables` (public handler), `TablesCore` (internal storage
+  boundary for tables), `TableEntry`, `TableHandle`, `TableConsumer`,
+  `TableReadGuard`, `CatalogEntry`, `TableInfo`, `UpdateOutcome`, and the
+  table system-name constants (`_table_catalog`, `_devices`).
+- `states/` — `States` (public handler), `StatesCore` (internal storage
+  boundary for states), `StateHandle`, and the state system-name constants
+  (`_state_catalog`, `_peer_state`).
+
+`TablesCore` remains the only workspace component that opens storage Tables or
+chooses physical table paths. `StatesCore` is the only component that opens
+storage States or chooses physical state paths. `Devices` depends on
+`TablesCore`-provided table entries and `StatesCore`-provided state handles;
+it never imports storage backends directly.
+
+### 15.4 Two-phase construction
+
+`TablesCore` and `Devices` have a construction dependency: `Devices` needs the
+`_devices` table entry and the `_peer_state` state handle, both of which come
+from the cores. The bootstrap sequence is therefore staged:
+
+1. `TablesCore::create(...)` returns `Arc<TablesCore>` with `_table_catalog`
+   and `_devices` opened and self-registered.
+2. `StatesCore::create(...)` returns `Arc<StatesCore>` with `_state_catalog`
+   self-registered.
+3. `Devices::create(core.table_entry(DEVICES_NAME)?, states.peer_state()?,
+   ...)` returns `Arc<Devices>`.
+4. Assemble `Tables { core, devices }` and `States { core }`.
+5. `core.replay_receipts(&devices)`.
+6. `devices.bootstrap_local(...)`.
+
+This mirrors how `Devices` already receives Catalog-provided handles at
+construction time. No new pattern is introduced.
+
+### 15.5 System-name reservation
+
+System-name filtering (`is_system_table`, `is_system_state`) moves into the
+respective handler modules and is applied at the public API boundary. The
+cores do not filter; they serve all declared names so that internal callers
+such as `Devices` can reach `_devices` and `_peer_state`.
+
+## 16. Implementation Sequence
 
 Each phase should compile before the next one. No tests are added unless
 explicitly requested.
@@ -701,7 +785,19 @@ explicitly requested.
 - Move receipt replay to a streaming consumer loop.
 - Audit backend reverse/range iteration for avoidable materialization.
 
-### Phase 7: documentation and static verification
+### Phase 7: three-handler public surface
+
+- Rename `catalog/` to `tables/` and split state management into a new
+  `states/` module.
+- Introduce `Tables` and `States` public handlers wrapping `Arc<TablesCore>`
+  and `Arc<StatesCore>`.
+- Move table/state management methods off `Workspace` and onto the handlers.
+- Keep `TableHandle` as the table operation surface; `Tables` exposes only
+  catalog management.
+- Update `Workspace` to expose `devices()`, `tables()`, and `states()`.
+- Update integration tests and READMEs to the new API.
+
+### Phase 8: documentation and static verification
 
 - Update root, types, storage, and workspace READMEs.
 - Run cargo fmt --all.
@@ -709,7 +805,7 @@ explicitly requested.
 - Use clippy --workspace --lib --no-deps -- -D warnings if supported.
 - Do not add or run new tests unless requested.
 
-## 16. Resolved Implementation Decisions
+## 17. Resolved Implementation Decisions
 
 1. Identity uses the narrow `libp2p-identity` crate. Local `PeerId` and
    `WorkspaceId` newtypes wrap its `PeerId` and encode canonical PeerId bytes.
@@ -721,8 +817,16 @@ explicitly requested.
 5. `mint()` persists the local clock high-water mark before returning.
 6. `TableConsumer` owns the Table `Arc` and reacquires a borrowed read guard;
    it never creates a row snapshot.
+7. The public workspace API is split into `Devices`, `Tables`, and `States`
+   handlers. `Tables` exposes only catalog management; table operations are
+   performed through `TableHandle` obtained from `Tables::open`.
+8. `TablesCore` (the renamed `Catalog` minus state methods) is the only
+   workspace component that opens storage Tables; `StatesCore` is the only one
+   that opens storage States. `Devices` depends on handles from both.
+9. `Workspace` exposes `devices()`, `tables()`, and `states()` accessors and
+   hosts no table or state management methods itself.
 
-## 17. Completion Criteria
+## 18. Completion Criteria
 
 Iteration 0002 is complete when:
 
@@ -738,8 +842,12 @@ Iteration 0002 is complete when:
 - workspace has no format-version, generic name-validation, migration, or
   reconciliation machinery;
 - one Catalog-owned _peer_state State owns receipts and optional local clock state;
-- Catalog is the only workspace module that opens storage or chooses physical
-  paths; Devices uses Catalog-provided handles;
+- TablesCore is the only workspace module that opens storage Tables and
+  StatesCore is the only module that opens storage States; Devices uses
+  core-provided handles;
+- the public API is split into `Devices`, `Tables`, and `States` handlers;
+  `Tables` exposes only catalog management and table operations are performed
+  through `TableHandle` obtained from `Tables::open`;
 - read paths use lock-free snapshots while writes are flushed through one peer
   state authority;
 - minting is a simple function with a documented sequence durability policy;

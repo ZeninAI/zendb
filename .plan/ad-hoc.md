@@ -4,3 +4,4 @@
 - Check the iteration methods for the storage and make sure that they are maximum performant
 - Table config changes that might cause migration need to be handled
 - We need to carefully trace the Drop methods and make sure that in-memory data is correctly flushed after the drop method is called
+- Logging and error hardening

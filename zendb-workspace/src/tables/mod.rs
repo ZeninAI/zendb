@@ -19,7 +19,9 @@ use zendb_types::{
 pub use runtime::{ChangeListener, TableHandle};
 
 use crate::{
-    consts::{is_system_table, DEVICES_TABLE_NAME, TABLES_DIR, TABLE_CATALOG_NAME},
+    consts::{
+        is_system_table, DEVICES_TABLE_NAME, SYSTEM_TABLE_CONFIG, TABLES_DIR, TABLE_CATALOG_NAME,
+    },
     devices::{Devices, PeerRecord},
     states::StateHandle,
     Error, Result,
@@ -54,14 +56,14 @@ impl Tables {
 
         let devices_table = TableHandle::new(
             DEVICES_TABLE_NAME.to_owned(),
-            Table::create(&root.join(DEVICES_TABLE_NAME), TableConfig::default())?,
+            Table::create(&root.join(DEVICES_TABLE_NAME), SYSTEM_TABLE_CONFIG.clone())?,
             Weak::new(),
             true,
         );
         let devices = Devices::create(devices_table.clone(), peer_state, peer)?;
         let catalog = TableHandle::new(
             TABLE_CATALOG_NAME.to_owned(),
-            Table::create(&root.join(TABLE_CATALOG_NAME), TableConfig::default())?,
+            Table::create(&root.join(TABLE_CATALOG_NAME), SYSTEM_TABLE_CONFIG.clone())?,
             Arc::downgrade(&devices),
             true,
         );
@@ -77,8 +79,8 @@ impl Tables {
         });
         tables.register_listeners();
 
-        tables.write_entry(TABLE_CATALOG_NAME, &TableConfig::default(), devices.mint()?)?;
-        tables.write_entry(DEVICES_TABLE_NAME, &TableConfig::default(), devices.mint()?)?;
+        tables.write_entry(TABLE_CATALOG_NAME, &SYSTEM_TABLE_CONFIG, devices.mint()?)?;
+        tables.write_entry(DEVICES_TABLE_NAME, &SYSTEM_TABLE_CONFIG, devices.mint()?)?;
         devices.bootstrap_local()?;
 
         Ok(tables)
@@ -92,7 +94,10 @@ impl Tables {
         let tables_dir = root.join(TABLES_DIR);
         let devices_table = TableHandle::new(
             DEVICES_TABLE_NAME.to_owned(),
-            Table::open(&tables_dir.join(DEVICES_TABLE_NAME), TableConfig::default())?,
+            Table::open(
+                &tables_dir.join(DEVICES_TABLE_NAME),
+                SYSTEM_TABLE_CONFIG.clone(),
+            )?,
             Weak::new(),
             true,
         );
@@ -100,7 +105,10 @@ impl Tables {
         let devices_weak = Arc::downgrade(&devices);
         let catalog = TableHandle::new(
             TABLE_CATALOG_NAME.to_owned(),
-            Table::open(&tables_dir.join(TABLE_CATALOG_NAME), TableConfig::default())?,
+            Table::open(
+                &tables_dir.join(TABLE_CATALOG_NAME),
+                SYSTEM_TABLE_CONFIG.clone(),
+            )?,
             devices_weak.clone(),
             true,
         );

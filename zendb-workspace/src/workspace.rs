@@ -6,14 +6,13 @@ use std::{
     sync::Arc,
 };
 
-use zendb_storage::{KeyDirConfig, StateConfig};
 use zendb_types::{
     utils::{deserialize_from, serialize_to_vec},
     PeerId, PeerIdentity, WorkspaceId,
 };
 
 use crate::{
-    consts::{IDENTITY_FILE, LOCK_FILE, PEER_STATE_NAME},
+    consts::{IDENTITY_FILE, LOCK_FILE, PEER_STATE_NAME, SYSTEM_STATE_CONFIG},
     devices::{Devices, PeerRecord},
     states::States,
     tables::Tables,
@@ -127,10 +126,7 @@ impl Workspace {
             Mode::Open => States::open(&root)?,
         };
         if matches!(mode, Mode::Create) {
-            states.upsert_internal(
-                PEER_STATE_NAME,
-                StateConfig::Unordered(KeyDirConfig::default()),
-            )?;
+            states.upsert_internal(PEER_STATE_NAME, SYSTEM_STATE_CONFIG.clone())?;
         }
         let peer_state = states.get::<PeerId, PeerRecord>(PEER_STATE_NAME)?;
 

@@ -13,12 +13,12 @@ use std::{
 
 use bincode::{Decode, Encode};
 use parking_lot::RwLock;
-use zendb_storage::{DurableStorage, KeyDirConfig, ReadBackend, State, StateConfig, WriteBackend};
+use zendb_storage::{DurableStorage, ReadBackend, State, StateConfig, WriteBackend};
 
 pub use runtime::StateHandle;
 
 use crate::{
-    consts::{is_system_state, STATES_DIR, STATE_CATALOG_NAME},
+    consts::{is_system_state, STATES_DIR, STATE_CATALOG_NAME, SYSTEM_STATE_CONFIG},
     Error, Result,
 };
 
@@ -45,7 +45,7 @@ impl States {
     pub(crate) fn create(root: &Path) -> Result<Arc<Self>> {
         let root = root.join(STATES_DIR);
         fs::create_dir_all(&root)?;
-        let config = StateConfig::Unordered(KeyDirConfig::default());
+        let config = SYSTEM_STATE_CONFIG.clone();
         let mut catalog = State::create(&root.join(STATE_CATALOG_NAME), config.clone())?;
         catalog.put(STATE_CATALOG_NAME.to_owned(), config)?;
         let catalog = Arc::new(StateHandle {
@@ -67,7 +67,7 @@ impl States {
             name: STATE_CATALOG_NAME.to_owned(),
             state: RwLock::new(State::open(
                 &root.join(STATE_CATALOG_NAME),
-                StateConfig::Unordered(KeyDirConfig::default()),
+                SYSTEM_STATE_CONFIG.clone(),
             )?),
             is_system: true,
         });

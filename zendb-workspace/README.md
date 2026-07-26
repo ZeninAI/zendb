@@ -31,6 +31,7 @@ logic lives directly in `workspace.rs`; there is no separate bootstrap type.
 Persisted file, directory, and system-resource names are centralized in
 `consts.rs`. Wall-clock reads go through
 `zendb-types::utils::time::physical_ms()`.
+System state and table bootstrap configurations are also centralized there.
 
 ## Public Surface
 

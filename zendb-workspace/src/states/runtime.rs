@@ -31,7 +31,7 @@ impl<K: Ord, V> StateHandle<K, V> {
         if self.is_system {
             return Err(Error::SystemStateReadOnly(self.name.clone()));
         }
-        Ok(self.state.write())
+        Ok(self.write_internal())
     }
 
     /// Workspace-managed mutation path for system state.

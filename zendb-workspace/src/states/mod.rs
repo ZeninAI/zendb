@@ -18,7 +18,9 @@ use zendb_storage::{DurableStorage, ReadBackend, State, StateConfig, WriteBacken
 pub use runtime::StateHandle;
 
 use crate::{
-    consts::{is_system_state, STATES_DIR, STATE_CATALOG_NAME, SYSTEM_STATE_CONFIG},
+    consts::{
+        is_system_state, PEER_STATE_NAME, STATES_DIR, STATE_CATALOG_NAME, SYSTEM_STATE_CONFIG,
+    },
     Error, Result,
 };
 
@@ -45,20 +47,22 @@ impl States {
     pub(crate) fn create(root: &Path) -> Result<Arc<Self>> {
         let root = root.join(STATES_DIR);
         fs::create_dir_all(&root)?;
-        let config = SYSTEM_STATE_CONFIG.clone();
-        let mut catalog = State::create(&root.join(STATE_CATALOG_NAME), config.clone())?;
-        catalog.put(STATE_CATALOG_NAME.to_owned(), config)?;
+        let mut catalog =
+            State::create(&root.join(STATE_CATALOG_NAME), SYSTEM_STATE_CONFIG.clone())?;
+        catalog.put(STATE_CATALOG_NAME.to_owned(), SYSTEM_STATE_CONFIG.clone())?;
         let catalog = Arc::new(StateHandle {
             name: STATE_CATALOG_NAME.to_owned(),
             state: RwLock::new(catalog),
             is_system: true,
         });
         let erased: ErasedStateHandle = catalog.clone();
-        Ok(Arc::new(Self {
+        let states = Arc::new(Self {
             root,
             catalog,
             states: RwLock::new(HashMap::from([(STATE_CATALOG_NAME.to_owned(), erased)])),
-        }))
+        });
+        states.upsert_internal(PEER_STATE_NAME, SYSTEM_STATE_CONFIG.clone())?;
+        Ok(states)
     }
 
     pub(crate) fn open(root: &Path) -> Result<Arc<Self>> {

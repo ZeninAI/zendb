@@ -122,11 +122,13 @@ and dispatches callbacks. `read` returns the storage table's
 `zendb_storage::TopicConsumer<Change>` directly; the storage consumer already
 owns its topic state and cursor.
 
-`Tables::create/open` owns table and device bootstrap: it creates or opens both
-system table handles, constructs `Devices`, builds the eager handle map,
-registers listeners, and writes the self-referencing system catalog rows on
-creation. The constructors return `Arc<Tables>`; `Workspace::assemble` obtains
-its device handle by cloning the crate-visible `Tables::devices` field.
+`Tables::create/open` owns table runtime initialization: it creates or opens
+both system table handles, constructs `Devices`, builds the eager handle map,
+registers listeners, and (on create) writes the self-referencing system
+catalog rows. The constructors return `Arc<Tables>`; `Workspace::assemble`
+obtains its device handle by cloning the crate-visible `Tables::devices` field,
+and bootstraps the local device on create. `Devices::open` reloads the durable
+device registry as part of opening.
 
 ## States
 
@@ -154,9 +156,9 @@ of opening the same backend a second time.
 `StateHandle` stores `is_system: bool`; public `write()` returns
 `SystemStateReadOnly` for system states, while `read()` is unaffected.
 `PeerStore` owns the `_peer_state` handle and uses its crate-internal
-`write_internal()` method for workspace-managed updates. Workspace creation
-uses `States::upsert_internal()` to bootstrap that system declaration without
-exposing the bypass publicly.
+`write_internal()` method for workspace-managed updates. `States::create`
+declares and materializes the `_peer_state` system state before returning;
+`Workspace::assemble` only obtains its handle with `States::get`.
 
 ## Peers And Roles
 

@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Weak},
+    sync::Arc,
 };
 
 use parking_lot::RwLock;
@@ -54,13 +54,11 @@ impl Tables {
         let root = root.join(TABLES_DIR);
         fs::create_dir_all(&root)?;
 
-        let devices_table = TableHandle::new(
-            DEVICES_TABLE_NAME.to_owned(),
+        let devices = Devices::create(
             Table::create(&root.join(DEVICES_TABLE_NAME), SYSTEM_TABLE_CONFIG.clone())?,
-            Weak::new(),
-            true,
-        );
-        let devices = Devices::create(devices_table.clone(), peer_state, peer)?;
+            peer_state,
+            peer,
+        )?;
         let catalog = TableHandle::new(
             TABLE_CATALOG_NAME.to_owned(),
             Table::create(&root.join(TABLE_CATALOG_NAME), SYSTEM_TABLE_CONFIG.clone())?,
@@ -69,7 +67,7 @@ impl Tables {
         );
         let tables = HashMap::from([
             (TABLE_CATALOG_NAME.to_owned(), catalog.clone()),
-            (DEVICES_TABLE_NAME.to_owned(), devices_table),
+            (DEVICES_TABLE_NAME.to_owned(), devices.registry.clone()),
         ]);
         let tables = Arc::new(Self {
             root,
@@ -81,7 +79,6 @@ impl Tables {
 
         tables.write_entry(TABLE_CATALOG_NAME, &SYSTEM_TABLE_CONFIG, devices.mint()?)?;
         tables.write_entry(DEVICES_TABLE_NAME, &SYSTEM_TABLE_CONFIG, devices.mint()?)?;
-        devices.bootstrap_local()?;
 
         Ok(tables)
     }
@@ -92,16 +89,14 @@ impl Tables {
         peer: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
         let tables_dir = root.join(TABLES_DIR);
-        let devices_table = TableHandle::new(
-            DEVICES_TABLE_NAME.to_owned(),
+        let devices = Devices::open(
             Table::open(
                 &tables_dir.join(DEVICES_TABLE_NAME),
                 SYSTEM_TABLE_CONFIG.clone(),
             )?,
-            Weak::new(),
-            true,
-        );
-        let devices = Devices::open(devices_table.clone(), peer_state, peer)?;
+            peer_state,
+            peer,
+        )?;
         let devices_weak = Arc::downgrade(&devices);
         let catalog = TableHandle::new(
             TABLE_CATALOG_NAME.to_owned(),
@@ -126,7 +121,7 @@ impl Tables {
             .collect();
         let mut tables = HashMap::from([
             (TABLE_CATALOG_NAME.to_owned(), catalog.clone()),
-            (DEVICES_TABLE_NAME.to_owned(), devices_table),
+            (DEVICES_TABLE_NAME.to_owned(), devices.registry.clone()),
         ]);
         for (name, config) in catalog_rows {
             if !is_system_table(&name) {
@@ -223,12 +218,7 @@ impl Tables {
         Ok(true)
     }
 
-    pub(crate) fn write_entry(
-        &self,
-        name: &str,
-        config: &TableConfig,
-        stamp: EventStamp,
-    ) -> Result<()> {
+    fn write_entry(&self, name: &str, config: &TableConfig, stamp: EventStamp) -> Result<()> {
         let blob = Blob::encode(config)?;
         self.catalog.insert_internal(Event {
             primary_key: PrimaryKey::String(name.to_owned()),

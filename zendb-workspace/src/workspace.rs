@@ -12,7 +12,7 @@ use zendb_types::{
 };
 
 use crate::{
-    consts::{IDENTITY_FILE, LOCK_FILE, PEER_STATE_NAME, SYSTEM_STATE_CONFIG},
+    consts::{IDENTITY_FILE, LOCK_FILE, PEER_STATE_NAME},
     devices::{Devices, PeerRecord},
     states::States,
     tables::Tables,
@@ -121,20 +121,27 @@ impl Workspace {
         peer: Arc<dyn PeerIdentity>,
         mode: Mode,
     ) -> Result<Self> {
+        // States owns the system catalog and materializes _peers during create;
+        // Devices needs that typed handle to build its clock and receipt store.
         let states = match mode {
             Mode::Create => States::create(&root)?,
             Mode::Open => States::open(&root)?,
         };
-        if matches!(mode, Mode::Create) {
-            states.upsert_internal(PEER_STATE_NAME, SYSTEM_STATE_CONFIG.clone())?;
-        }
         let peer_state = states.get::<PeerId, PeerRecord>(PEER_STATE_NAME)?;
 
+        // Tables creates or opens the system tables, constructs Devices, opens
+        // application tables, and installs listeners before returning.
         let tables = match mode {
             Mode::Create => Tables::create(&root, peer_state, peer.clone())?,
             Mode::Open => Tables::open(&root, peer_state, peer.clone())?,
         };
         let devices = tables.devices.clone();
+
+        // The local device row is written only after table listeners are live,
+        // so DeviceSync and ReceiptListener observe the bootstrap event.
+        if matches!(mode, Mode::Create) {
+            devices.bootstrap_local()?;
+        }
 
         Ok(Self {
             root,

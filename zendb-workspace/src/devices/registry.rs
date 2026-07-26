@@ -8,7 +8,7 @@ use std::{
 
 use bincode::{Decode, Encode};
 use parking_lot::RwLock;
-use zendb_storage::ReadBackend;
+use zendb_storage::{ReadBackend, Table};
 use zendb_types::{
     Blob, Event, EventId, EventStamp, Op, Path, PeerId, PeerIdentity, PrimaryKey, Roles, Value,
 };
@@ -17,7 +17,7 @@ use super::{
     clock::{PeerRecord, PeerStore},
     receipts::ObserveOutcome,
 };
-use crate::{states::StateHandle, tables::TableHandle, Error, Result};
+use crate::{consts::DEVICES_TABLE_NAME, states::StateHandle, tables::TableHandle, Error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct DeviceRecord {
@@ -39,29 +39,34 @@ pub struct Devices {
 
 impl Devices {
     pub(crate) fn create(
-        registry: Arc<TableHandle>,
+        table: Table,
         peer_state: Arc<StateHandle<PeerId, PeerRecord>>,
         peer: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
-        Self::bind(registry, PeerStore::create(peer_state, peer)?)
+        Self::bind(table, PeerStore::create(peer_state, peer)?)
     }
 
     pub(crate) fn open(
-        registry: Arc<TableHandle>,
+        table: Table,
         peer_state: Arc<StateHandle<PeerId, PeerRecord>>,
         peer: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
-        Self::bind(registry, PeerStore::open(peer_state, peer)?)
-    }
-
-    fn bind(registry: Arc<TableHandle>, peers: Arc<PeerStore>) -> Result<Arc<Self>> {
-        let devices = Arc::new(Self {
-            registry,
-            peers,
-            records: RwLock::new(BTreeMap::new()),
-        });
+        let devices = Self::bind(table, PeerStore::open(peer_state, peer)?)?;
         devices.reload()?;
         Ok(devices)
+    }
+
+    fn bind(table: Table, peers: Arc<PeerStore>) -> Result<Arc<Self>> {
+        Ok(Arc::new_cyclic(|devices_weak| Self {
+            registry: TableHandle::new(
+                DEVICES_TABLE_NAME.to_owned(),
+                table,
+                devices_weak.clone(),
+                true,
+            ),
+            peers,
+            records: RwLock::new(BTreeMap::new()),
+        }))
     }
 
     pub(crate) fn bootstrap_local(&self) -> Result<()> {
@@ -160,7 +165,7 @@ impl Devices {
         Ok(())
     }
 
-    fn reload(&self) -> Result<()> {
+    pub(crate) fn reload(&self) -> Result<()> {
         let table = self.registry.read();
         let mut records = BTreeMap::new();
         for (key, cell) in table.entries() {

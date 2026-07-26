@@ -6,12 +6,15 @@ pub enum Error {
     AlreadyExists(String),
     NotFound(String),
     PermissionDenied,
+    SystemStateReadOnly(String),
+    SystemTableReadOnly(String),
     TypeMismatch(String),
     CorruptCatalog(String),
     CorruptLocalState(String),
     CorruptDeviceRegistry(String),
     InvalidEventSequence,
     ClockExhausted,
+    WorkspaceClosed,
     ResourceBusy(String),
 }
 
@@ -24,6 +27,14 @@ impl std::fmt::Display for Error {
             Self::AlreadyExists(name) => write!(formatter, "{name:?} already exists"),
             Self::NotFound(name) => write!(formatter, "{name:?} was not found"),
             Self::PermissionDenied => formatter.write_str("permission denied"),
+            Self::SystemStateReadOnly(name) => write!(
+                formatter,
+                "system state {name:?} is read-only through public APIs"
+            ),
+            Self::SystemTableReadOnly(name) => write!(
+                formatter,
+                "system table {name:?} is read-only through public APIs"
+            ),
             Self::TypeMismatch(name) => {
                 write!(formatter, "state {name:?} is open with other types")
             }
@@ -36,6 +47,7 @@ impl std::fmt::Display for Error {
             }
             Self::InvalidEventSequence => formatter.write_str("event sequence zero is reserved"),
             Self::ClockExhausted => formatter.write_str("device clock exhausted"),
+            Self::WorkspaceClosed => formatter.write_str("workspace is closed"),
             Self::ResourceBusy(name) => write!(formatter, "{name:?} is still in use"),
         }
     }

@@ -16,7 +16,7 @@ use super::{
     iter::{IterationOrder, MergedEntries},
 };
 
-pub const DEFAULT_MAX_BUFFERED_RECORDS: usize = 1_000;
+pub const DEFAULT_MAX_BUFFERED_RECORDS: usize = 1_024;
 const RECOVERY_CONSUMER: &str = "__zendb_table_recovery";
 
 type TableEntry<'a> = (Cow<'a, PrimaryKey>, Cow<'a, Cell>);

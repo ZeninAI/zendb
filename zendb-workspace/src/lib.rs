@@ -1,6 +1,6 @@
 //! Synchronous workspace lifecycle and mutation orchestration.
 
-mod bootstrap;
+mod consts;
 mod devices;
 mod error;
 mod states;
@@ -12,6 +12,6 @@ pub use devices::{
 };
 pub use error::{Error, Result};
 pub use states::{StateHandle, States};
-pub use tables::{ChangeListener, TableConsumer, TableHandle, TableInfo, TableReadGuard};
+pub use tables::{ChangeListener, TableHandle};
 pub use workspace::{JoinHints, Workspace, WorkspaceConfig};
 pub use zendb_types::Roles;

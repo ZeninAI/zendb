@@ -1,23 +1,22 @@
-//! Workspace bootstrap lifecycle and synchronous orchestration API.
+//! Workspace identity, lock lifecycle, and synchronous orchestration API.
 
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
-    sync::{Arc, Weak},
+    sync::Arc,
 };
 
+use zendb_storage::{KeyDirConfig, StateConfig};
 use zendb_types::{
-    utils::time::physical_ms, EventId, EventStamp, EventTime, PeerId, PeerIdentity, WorkspaceId,
+    utils::{deserialize_from, serialize_to_vec},
+    PeerId, PeerIdentity, WorkspaceId,
 };
 
 use crate::{
-    bootstrap::Bootstrap,
+    consts::{IDENTITY_FILE, LOCK_FILE, PEER_STATE_NAME},
     devices::{Devices, PeerRecord},
     states::States,
-    tables::{
-        listeners::{CatalogSyncListener, DeviceSyncListener, ReceiptListener},
-        Tables, TablesCore, DEVICES_NAME, TABLE_CATALOG_NAME,
-    },
+    tables::Tables,
     Error, Result,
 };
 
@@ -46,11 +45,13 @@ enum Mode {
 
 pub struct Workspace {
     root: PathBuf,
-    bootstrap: Bootstrap,
+    workspace_id: WorkspaceId,
     peer: Arc<dyn PeerIdentity>,
-    tables: Tables,
-    states: States,
-    devices: Devices,
+    tables: Arc<Tables>,
+    states: Arc<States>,
+    devices: Arc<Devices>,
+    // Declared last so the lock outlives every storage-owning field.
+    _lock: File,
 }
 
 impl Workspace {
@@ -66,8 +67,14 @@ impl Workspace {
     ) -> Result<Self> {
         let root = path.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
-        let bootstrap = Bootstrap::create(&root)?;
-        Self::assemble(root, bootstrap, peer, Mode::Create)
+        let lock = acquire_lock(&root)?;
+        let identity_path = root.join(IDENTITY_FILE);
+        if identity_path.exists() {
+            return Err(Error::AlreadyExists("workspace identity".to_owned()));
+        }
+        let workspace_id = WorkspaceId::generate();
+        fs::write(identity_path, serialize_to_vec(&workspace_id)?)?;
+        Self::assemble(root, workspace_id, lock, peer, Mode::Create)
     }
 
     /// Open an existing workspace at `path`.
@@ -77,8 +84,10 @@ impl Workspace {
     /// match a record in `_devices`).
     pub fn open(path: impl AsRef<Path>, peer: Arc<dyn PeerIdentity>) -> Result<Self> {
         let root = path.as_ref().to_path_buf();
-        let bootstrap = Bootstrap::open(&root)?;
-        Self::assemble(root, bootstrap, peer, Mode::Open)
+        let lock = acquire_lock(&root)?;
+        let bytes = fs::read(root.join(IDENTITY_FILE))?;
+        let workspace_id = deserialize_from(&bytes)?;
+        Self::assemble(root, workspace_id, lock, peer, Mode::Open)
     }
 
     /// Join an existing workspace by its known `WorkspaceId`.
@@ -101,93 +110,49 @@ impl Workspace {
         let _ = hints; // forwarded to networking in a future iteration
         let root = path.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
-        let bootstrap = Bootstrap::join(&root, workspace_id)?;
-        Self::assemble(root, bootstrap, peer, Mode::Create)
+        let lock = acquire_lock(&root)?;
+        fs::write(root.join(IDENTITY_FILE), serialize_to_vec(&workspace_id)?)?;
+        Self::assemble(root, workspace_id, lock, peer, Mode::Create)
     }
 
     fn assemble(
         root: PathBuf,
-        bootstrap: Bootstrap,
+        workspace_id: WorkspaceId,
+        lock: File,
         peer: Arc<dyn PeerIdentity>,
         mode: Mode,
     ) -> Result<Self> {
-        // Open the system tables and (on create) the system states. No catalog
-        // rows are written yet — the bootstrap rows go through the listener
-        // path below so the CatalogSync and Receipt callbacks fire for them.
-        let tables_core = match mode {
-            Mode::Create => TablesCore::create(&root)?,
-            Mode::Open => TablesCore::open(&root)?,
+        let states = match mode {
+            Mode::Create => States::create(&root)?,
+            Mode::Open => States::open(&root)?,
         };
-        let states_core = match mode {
-            Mode::Create => crate::states::StatesCore::create(&root)?,
-            Mode::Open => crate::states::StatesCore::open(&root)?,
-        };
-        let devices = match mode {
-            Mode::Create => Devices::create(
-                tables_core.table_entry(DEVICES_NAME)?,
-                states_core.raw_peer_state::<PeerId, PeerRecord>()?,
-                peer.clone(),
-            )?,
-            Mode::Open => Devices::open(
-                tables_core.table_entry(DEVICES_NAME)?,
-                states_core.raw_peer_state::<PeerId, PeerRecord>()?,
-                peer.clone(),
-            )?,
-        };
-
-        // Register listeners. The receipt listener is shared so CatalogSync
-        // can register it on application tables it opens at runtime.
-        let devices_weak: Weak<Devices> = Arc::downgrade(&devices);
-        let receipt_listener = ReceiptListener::build(devices_weak.clone());
-        let catalog_sync =
-            CatalogSyncListener::build(Arc::downgrade(&tables_core), receipt_listener.clone());
-        let device_sync = DeviceSyncListener::build(devices_weak);
-        // Register on every currently-open table (the system tables).
-        for entry in tables_core.tables.read().values() {
-            entry.add_listener(receipt_listener.clone());
-        }
-        tables_core
-            .table_entry(TABLE_CATALOG_NAME)?
-            .add_listener(catalog_sync);
-        tables_core
-            .table_entry(DEVICES_NAME)?
-            .add_listener(device_sync);
-
-        // Bootstrap: write the catalog rows for the system tables through the
-        // normal insert path. The CatalogSync callback fires and no-ops (the
-        // tables are already open); the Receipt callback observes the stamps.
         if matches!(mode, Mode::Create) {
-            let local_peer_id = peer.peer_id();
-            let physical_ms = physical_ms().ok_or(Error::ClockExhausted)?;
-            let catalog_stamp = EventStamp::new(
-                EventId::new(local_peer_id, 1),
-                EventTime::new(physical_ms, 0),
-            );
-            let devices_stamp = EventStamp::new(
-                EventId::new(local_peer_id, 2),
-                EventTime::new(physical_ms, 1),
-            );
-            tables_core.write_bootstrap_entry(
-                TABLE_CATALOG_NAME,
-                &Default::default(),
-                catalog_stamp,
+            states.upsert_internal(
+                PEER_STATE_NAME,
+                StateConfig::Unordered(KeyDirConfig::default()),
             )?;
-            tables_core.write_bootstrap_entry(DEVICES_NAME, &Default::default(), devices_stamp)?;
-            devices.bootstrap_local()?;
         }
+        let peer_state = states.get::<PeerId, PeerRecord>(PEER_STATE_NAME)?;
+
+        let tables = match mode {
+            Mode::Create => Tables::create(&root, peer_state, peer.clone())?,
+            Mode::Open => Tables::open(&root, peer_state, peer.clone())?,
+        };
+        let devices = tables.devices.clone();
 
         Ok(Self {
             root,
-            bootstrap,
+            workspace_id,
             peer,
-            tables: Tables::new(tables_core, devices.clone()),
-            states: States::new(states_core),
-            devices: (*devices).clone(),
+            tables,
+            states,
+            devices,
+            _lock: lock,
         })
     }
 
     pub fn id(&self) -> WorkspaceId {
-        self.bootstrap.workspace_id()
+        self.workspace_id
     }
 
     pub fn root(&self) -> &Path {
@@ -223,4 +188,16 @@ impl Drop for Workspace {
     fn drop(&mut self) {
         let _ = self.flush();
     }
+}
+
+fn acquire_lock(root: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(LOCK_FILE))?;
+    file.try_lock()
+        .map_err(|_| Error::AlreadyExists("workspace is already open".to_owned()))?;
+    Ok(file)
 }

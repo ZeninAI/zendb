@@ -14,13 +14,13 @@ here except where the callback model changes their internals.
 Iteration 0003 left table and device maintenance logic coupled to the CRUD
 methods that publish the events:
 
-- `TablesCore::create_table` both writes the catalog row AND opens the table
+- `Tables::create` both writes the catalog row AND opens the table
   + inserts the handle into the in-memory map.
-- `TablesCore::delete_table` both writes the tombstone AND removes the handle
+- `Tables::delete` both writes the tombstone AND removes the handle
   + removes the physical directory.
 - `Devices::write_record` both writes the device row AND updates the
   in-memory `records` map AND calls `observe`.
-- `TablesCore::replay_receipts` drains a one-shot `TopicConsumer` per table at
+- `Tables::replay_receipts` drains a one-shot `TopicConsumer` per table at
   startup to feed `Devices::observe`, even though receipts are persisted in
   `_peer_state`.
 
@@ -47,7 +47,7 @@ record a receipt) becomes a callback's job.
 
 | Layer | Responsibility |
 | --- | --- |
-| `TablesCore` CRUD methods | Validate a precondition (read), publish an event to `_table_catalog`, return. No side effects. |
+| `Tables` CRUD methods | Validate a precondition (read), publish an event to `_table_catalog`, return. No side effects. |
 | `CatalogSync` callback (on `_table_catalog`) | React to catalog events: open tables on `Upsert`, close + rmdir on `Delete`. This is the single owner of table-handle-map mutation. |
 | `Devices::upsert` / `bootstrap_local` | Validate authorization, mint, publish an event to `_devices`. No side effects on the in-memory map. |
 | `DeviceSync` callback (on `_devices`) | React to device events: upsert/remove in the in-memory `records` map. This is the single owner of in-memory device-record mutation after initial load. |
@@ -107,7 +107,7 @@ is the source of truth; the in-memory handle map is a cache.
 `on_change` returns `()` — fire-and-forget. The insert that triggered the
 callback has already succeeded and is durable. A failing callback leaves the
 in-memory state stale but never corrupts the durable state; on restart the
-in-memory state is rebuilt from durable state (`reload`, `TablesCore::open`).
+in-memory state is rebuilt from durable state (`reload`, `Tables::open`).
 Callback errors are swallowed now; when logging is added they will be logged.
 
 ### 3.2 Listeners live on TableEntry
@@ -126,7 +126,7 @@ HashMap is consulted per insert — each table owns its listeners directly.
 The one storage API change:
 
     pub enum InsertOutcome {
-        Applied(Change),
+        Applied(Box<Change>),
         Ignored,
     }
 
@@ -184,7 +184,7 @@ application listeners and system listeners use the same `Vec`.
 Registered on every table, including system tables and application tables
 opened by `CatalogSync`.
 
-    struct ReceiptListener { devices: Weak<DevicesInner> }
+    struct ReceiptListener { devices: Weak<Devices> }
 
     impl ChangeListener for ReceiptListener {
         fn on_change(&self, change: &Change) {
@@ -194,20 +194,20 @@ opened by `CatalogSync`.
         }
     }
 
-This replaces `TablesCore::replay_receipts` and the inline `observe` calls in
+This replaces `Tables::replay_receipts` and the inline `observe` calls in
 `Devices::insert_application` and `Devices::write_record`. Receipts are now
 live-observed on every insert, local or remote.
 
 ### 4.2 CatalogSyncListener (on `_table_catalog` only)
 
     struct CatalogSyncListener {
-        core: Weak<TablesCore>,
+        tables: Weak<Tables>,
         receipt_listener: Arc<dyn ChangeListener>,
     }
 
     impl ChangeListener for CatalogSyncListener {
         fn on_change(&self, change: &Change) {
-            let Some(core) = self.core.upgrade() else { return; };
+            let Some(tables) = self.tables.upgrade() else { return; };
             match &change.event.op {
                 Op::Upsert { value: Value::Blob(blob) } => {
                     let name = match &change.event.primary_key {
@@ -215,12 +215,12 @@ live-observed on every insert, local or remote.
                         _ => return,
                     };
                     let config = match blob.decode() { Ok(c) => c, Err(_) => return };
-                    if core.tables.read().contains_key(&name) {
+                    if tables.tables.read().contains_key(&name) {
                         // Already open (update case or bootstrap no-op).
                         // Future: migrate on config change.
                         return;
                     }
-                    match open_table(&core, &name, config) {
+                    match open_table(&tables, &name, config) {
                         Ok(entry) => {
                             entry.listeners.write().push(self.receipt_listener.clone());
                             core.tables.write().insert(name, entry);
@@ -260,7 +260,7 @@ will be dropped on close or restart.
 
 ### 4.3 DeviceSyncListener (on `_devices` only)
 
-    struct DeviceSyncListener { devices: Weak<DevicesInner> }
+    struct DeviceSyncListener { devices: Weak<Devices> }
 
     impl ChangeListener for DeviceSyncListener {
         fn on_change(&self, change: &Change) {
@@ -291,20 +291,20 @@ The callback handles subsequent deltas. `reload` and the callback share the
 
 ## 5. Cycle-Breaking With Weak
 
-`TablesCore` owns the `_table_catalog` `TableEntry`, whose listeners include
-`CatalogSyncListener`, which holds `Weak<TablesCore>`. This is a cycle broken
+`Tables` owns the `_table_catalog` `TableEntry`, whose listeners include
+`CatalogSyncListener`, which holds `Weak<Tables>`. This is a cycle broken
 by `Weak`:
 
-    TablesCore
+    Tables
       → Arc<TableEntry> (_table_catalog)
         → Vec<ChangeListener>
           → CatalogSyncListener
-            → Weak<TablesCore>
+            → Weak<Tables>
 
 The `Weak` means `CatalogSyncListener::on_change` must `upgrade()` before
-use; if `TablesCore` has been dropped (workspace shutting down), the callback
+use; if `Tables` has been dropped (workspace shutting down), the callback
 no-ops. The same pattern applies to `ReceiptListener` and
-`DeviceSyncListener` holding `Weak<DevicesInner>`.
+`DeviceSyncListener` holding `Weak<Devices>`.
 
 No `Arc` cycles exist. The listeners are registered after their owners are
 constructed and hold only `Weak` back-references.
@@ -312,13 +312,13 @@ constructed and hold only `Weak` back-references.
 ## 6. Bootstrap Restructured
 
 The current bootstrap writes the `_table_catalog` and `_devices` catalog rows
-inside `TablesCore::create`, then constructs `Devices`, then calls
+inside `Tables::create`, then constructs `Devices`, then calls
 `replay_receipts`. With the callback model, bootstrap is staged so that every
 catalog write goes through the callback path:
 
-1. **`TablesCore::create`** opens the `_table_catalog` and `_devices` physical
+1. **`Tables::build`** opens the `_table_catalog` and `_devices` physical
    tables and inserts them into the handle map. It writes NO catalog rows.
-2. **`StatesCore::create`** opens `_state_catalog` (unchanged).
+2. **`States::build`** opens `_state_catalog` (unchanged).
 3. **`Devices::create`** constructs `PeerStore` and calls `reload()` to load
    existing device records into the in-memory map.
 4. **Register listeners.** The workspace assembly registers:
@@ -344,7 +344,7 @@ catalog table existing).
 
 The bootstrap catalog rows still need stamps. `Workspace::assemble` mints
 them up front (sequences 1 and 2 for the local peer) and passes them to
-`TablesCore::create`, which now only uses them to construct the bootstrap
+`Tables::build`, which now only uses them to construct the bootstrap
 `Event`s in step 5. The stamps are observed by the `Receipt` callback in step
 5, so no separate `replay_receipts` is needed.
 
@@ -353,15 +353,15 @@ them up front (sequences 1 and 2 for the local peer) and passes them to
 | Removed / moved | Reason |
 | --- | --- |
 | `TableEntry::receipt: Mutex<TopicConsumer>` | Receipts are live-observed via `ReceiptListener` |
-| `TablesCore::replay_receipts()` | Redundant — receipts come from the callback + persisted `_peer_state` |
+| `Tables::replay_receipts()` | Redundant — receipts come from the callback + persisted `_peer_state` |
 | `RECEIPT_CONSUMER` constant | Unused |
 | `Devices::insert_application()` | Inlined into `TableHandle::insert` (authorize + mint + `TableEntry::insert`) |
 | Inline `observe()` calls in `write_record` and `insert_application` | `ReceiptListener` does this reactively |
 | Inline `records.insert()` in `write_record` | `DeviceSyncListener` does this reactively |
-| Inline table-open in `TablesCore::create_table` | `CatalogSyncListener` does this reactively |
-| Inline table-close + rmdir in `TablesCore::delete_table` | `CatalogSyncListener` does this reactively |
+| Inline table-open in `Tables::create` | `CatalogSyncListener` does this reactively |
+| Inline table-close + rmdir in `Tables::delete` | `CatalogSyncListener` does this reactively |
 
-`Devices::reload()` stays (initial cold-start load). `TablesCore::open()`
+`Devices::reload()` stays (initial cold-start load). `Tables::build_open`
 stays (reads catalog declarations and opens tables at workspace open — this is
 the cold-start equivalent of what `CatalogSync` does at runtime).
 
@@ -413,25 +413,25 @@ dispatch move into `TableEntry::insert`, observe moves into `ReceiptListener`.
 The in-memory map update and the `observe` call are gone from `write_record` —
 the `DeviceSync` and `Receipt` callbacks handle them.
 
-## 10. TablesCore CRUD Methods
+## 10. Tables CRUD Methods
 
 The CRUD methods become thin: validate, publish, return.
 
-    fn create_table(&self, name: &str, config: TableConfig, stamp: EventStamp) -> Result<()> {
+    fn create(&self, name: &str, config: TableConfig, stamp: EventStamp) -> Result<()> {
         if is_system_table(name) || self.catalog_entry(name).is_ok() {
             return Err(Error::AlreadyExists(name.to_owned()));
         }
         self.write_entry(name, &config, stamp)
     }
 
-    fn update_table(&self, name: &str, config: TableConfig, stamp: EventStamp) -> Result<bool> {
+    fn update(&self, name: &str, config: TableConfig, stamp: EventStamp) -> Result<bool> {
         let current = self.catalog_entry(name)?;
         if current == config { return Ok(false); }
         self.write_entry(name, &config, stamp)?;
         Ok(true)
     }
 
-    fn delete_table(&self, name: &str, stamp: EventStamp) -> Result<bool> {
+    fn delete(&self, name: &str, stamp: EventStamp) -> Result<bool> {
         if is_system_table(name) { return Err(Error::ResourceBusy(name.to_owned())); }
         if let Some(entry) = self.tables.read().get(name) {
             if Arc::strong_count(entry) > 1 { return Err(Error::ResourceBusy(name.to_owned())); }
@@ -441,7 +441,7 @@ The CRUD methods become thin: validate, publish, return.
         self.write_delete(name, stamp)
     }
 
-`create_table` returns `()`. The callback opens the table synchronously
+`create` returns `()`. The callback opens the table synchronously
 during `write_entry`'s dispatch, but the caller does not need the handle
 immediately — `Tables::create` is now void-returning (see §10.1).
 
@@ -452,7 +452,10 @@ immediately — `Tables::create` is now void-returning (see §10.1).
     pub fn create(&self, name: &str, config: TableConfig) -> Result<()> {
         self.devices.authorize(Roles::Operator)?;
         let stamp = self.devices.mint()?;
-        self.core.create_table(name, config, stamp)
+        if is_system_table(name) || self.catalog_entry(name).is_ok() {
+            return Err(Error::AlreadyExists(name.to_owned()));
+        }
+        self.write_entry(name, &config, stamp)
     }
 
 The caller obtains a handle separately via `Tables::open(name)` when needed.
@@ -482,7 +485,7 @@ application tables:
   tables cannot be removed; they are structural.
 - **`TableHandle::insert`** refuses system tables. An application holding a
   handle to `_table_catalog` or `_devices` must not write to it directly —
-  those tables are maintained by the workspace through `TablesCore` CRUD
+  those tables are maintained by the workspace through `Tables` CRUD
   methods and `Devices` methods, which publish events that the callbacks
   react to. Direct writes would bypass authorization, minting, and the
   callback model.
@@ -511,7 +514,7 @@ The `is_system_table` check is **not** evaluated per insert. Instead, the
 `Tables::open` sets `is_system` based on `is_system_table(name)`. The check
 is a single branch per insert, not a string match or a hashmap lookup.
 
-Internal workspace code (`TablesCore`, `Devices`, `PeerStore`) does not go
+Internal workspace code (`Tables`, `Devices`, `PeerStore`) does not go
 through `TableHandle` for system-table writes. It calls
 `TableEntry::insert(event)` directly, bypassing the `is_system` check. This
 is the seam between the workspace's internal authority and the application's
@@ -540,20 +543,20 @@ state is a system state:
 Internal workspace code that needs to write to a system state (`PeerStore`
 writing `_peer_state`) does not go through `StateHandle`. It holds the raw
 `Arc<RwLock<State<K, V>>>` directly, bypassing the `is_system` check.
-`StatesCore::open` returns the `StateHandle` with `is_system` set, but
-`StatesCore` also exposes a `pub(crate)` accessor for internal callers that
+`States::open_state` returns the `StateHandle` with `is_system` set, but
+`States` also exposes a `raw_peer_state` accessor for internal callers that
 need the raw `Arc`.
 
 `States::create` and `States::delete` refuse system states (as today).
-`States::open` returns a handle to a system state with `is_system` set, so
+`States::open_state` returns a handle to a system state with `is_system` set, so
 reads work but writes are refused.
 
-### 10.4 `States::create` and `States::open`
+### 10.4 `States::create` and `States::open_state`
 
 States have a different lifecycle than Tables. Tables are eagerly opened:
 every declared table is in the in-memory handle map, so `Tables::open` is a
 hashmap lookup. States are **lazy**: a state may be declared in
-`_state_catalog` but not currently open. `States::open` must check the open
+`_state_catalog` but not currently open. `States::open_state` must check the open
 map, return if present, otherwise open from the catalog.
 
 The two operations are split:
@@ -562,7 +565,7 @@ The two operations are split:
   `_state_catalog` and physically create it. Void-returning. Refuses if the
   state is already declared. This is the analog of `Tables::create`: it
   publishes the declaration.
-- **`States::open::<K, V>(name) -> Result<StateHandle<K, V>>`** — obtain a
+- **`States::open_state::<K, V>(name) -> Result<StateHandle<K, V>>`** — obtain a
   typed handle to an existing state. If the state is already in the open
   map, downcast and return. Otherwise, read its declaration from
   `_state_catalog`, physically open it, insert into the open map, and return
@@ -570,36 +573,39 @@ The two operations are split:
 
     pub fn create(&self, name: &str, config: StateConfig) -> Result<()> {
         if is_system_state(name) { return Err(Error::NotFound(name.to_owned())); }
-        self.core.create(name, config)
+        // ...write declaration to _state_catalog, sync...
     }
 
-    pub fn open<K, V>(&self, name: &str) -> Result<StateHandle<K, V>>
+    pub fn open_state<K, V>(&self, name: &str) -> Result<StateHandle<K, V>>
     where
         K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
         V: Encode + Decode<()> + Clone + Send + Sync + 'static,
     {
-        self.core.open::<K, V>(name)
+        // ...check open map, else read declaration + physically open...
     }
 
-`StatesCore` is split accordingly:
+`States` is split accordingly:
 
 - `create(name, config) -> Result<()>` — write the declaration to
   `_state_catalog`, physically create the state directory, insert into the
   open map as an erased `Arc`. Void-returning.
-- `open::<K, V>(name) -> Result<StateHandle<K, V>>` — check the open map;
+- `open_state::<K, V>(name) -> Result<StateHandle<K, V>>` — check the open map;
   if present, downcast and return. Otherwise read the declaration from
   `_state_catalog`, physically open the state, insert into the open map, and
   return the typed handle.
 
-The typed `StateHandle` is obtained via `open`, not `create`. `create` only
-establishes the state; `open` lazy-loads it on demand. This mirrors the
+The typed `StateHandle` is obtained via `open_state`, not `create`. `create` only
+establishes the state; `open_state` lazy-loads it on demand. This mirrors the
 `Tables` pattern (create declares, open obtains a handle) while respecting
 the lazy-load difference (tables are always open; states are opened on
 first access).
 
-`StatesCore::peer_state::<K, V>()` (used by `Devices` bootstrap) calls
-`open::<K, V>(PEER_STATE_NAME)` after ensuring the state is declared — or
-the bootstrap path calls `create` then `open` for `_peer_state`.
+`States::peer_state::<K, V>()` (used by `Devices` bootstrap) ensures
+`_peer_state` is declared, then calls `open_state::<K, V>(PEER_STATE_NAME)`
+after ensuring the state is declared — or the bootstrap path calls `create`
+then `open_state` for `_peer_state`. Internal callers that need to write to
+`_peer_state` use `States::raw_peer_state::<K, V>()`, which returns the raw
+`Arc<RwLock<State<K, V>>>` bypassing the `is_system` check.
 
 The existing `States::list_open`, `States::close`, `States::delete`, and
 `States::config` methods remain. `States::contains` checks the catalog
@@ -612,10 +618,10 @@ explicitly requested.
 
 ### Phase 1: storage API change
 
-- Change `InsertOutcome` to `Applied(Change)` / `Ignored`.
+- Change `InsertOutcome` to `Applied(Box<Change>)` / `Ignored`.
 - Update `Table::insert` to move the constructed `Change` into the outcome.
 - Update all call sites (`TableHandle::insert`, `Devices::insert_application`,
-  `TablesCore::write_entry`, `Devices::write_record`, tests).
+  `Tables::write_entry`, `Devices::write_record`, tests).
 
 ### Phase 2: ChangeListener trait and TableEntry
 
@@ -628,7 +634,7 @@ explicitly requested.
 
 ### Phase 3: ReceiptListener
 
-- Implement `ReceiptListener` holding `Weak<DevicesInner>`.
+- Implement `ReceiptListener` holding `Weak<Devices>`.
 - Register it on every table during bootstrap.
 - Remove `TableEntry::receipt`, `RECEIPT_CONSUMER`, `replay_receipts`.
 - Remove inline `observe` calls from `Devices::insert_application` and
@@ -637,12 +643,12 @@ explicitly requested.
 
 ### Phase 4: CatalogSyncListener and system-handle protection
 
-- Implement `CatalogSyncListener` holding `Weak<TablesCore>` + shared
+- Implement `CatalogSyncListener` holding `Weak<Tables>` + shared
   `Arc<dyn ChangeListener>` (the receipt listener).
 - Register it on `_table_catalog`.
-- Move table-open logic from `create_table` into the callback.
-- Move table-close + rmdir logic from `delete_table` into the callback.
-- `create_table` / `delete_table` become validate + publish.
+- Move table-open logic from `Tables::create` into the callback.
+- Move table-close + rmdir logic from `Tables::delete` into the callback.
+- `Tables::create` / `Tables::delete` become validate + publish.
 - `Tables::create` becomes void-returning; callers use `Tables::open` to
   obtain a handle.
 - Remove `UpdateOutcome`; `Tables::update` returns `Result<bool>`.
@@ -655,29 +661,29 @@ explicitly requested.
 
 ### Phase 5: DeviceSyncListener, States split, and system-state protection
 
-- Implement `DeviceSyncListener` holding `Weak<DevicesInner>`.
+- Implement `DeviceSyncListener` holding `Weak<Devices>`.
 - Register it on `_devices`.
 - Move in-memory `records` map update from `write_record` into the callback.
 - `write_record` becomes mint + publish.
 - `reload` stays for initial load.
-- Split `StatesCore::state` into `create(name, config) -> Result<()>`
-  (declare + physically create, void) and `open::<K, V>(name) ->
+- Split `States` into `create(name, config) -> Result<()>`
+  (declare + physically create, void) and `open_state::<K, V>(name) ->
   Result<StateHandle<K, V>>` (lazy-load: check open map, else read declaration
   + physically open + return typed handle).
-- `States::create` is void-returning; `States::open` returns the typed
+- `States::create` is void-returning; `States::open_state` returns the typed
   `StateHandle` (lazy-loading on first access, including for system states).
 - Add `is_system: bool` to `StateHandle`; `write()` returns `Result` and
   refuses if true. `read()` is unaffected.
-- `States::open` no longer refuses system states; it returns a handle with
+- `States::open_state` no longer refuses system states; it returns a handle with
   `is_system` set.
 - Internal workspace code (`PeerStore`) holds the raw `Arc<RwLock<State>>`
   directly for system-state writes, bypassing `StateHandle`.
-- Update `StatesCore::peer_state` to use `create` + `open` (or raw `Arc`
+- Update `States::peer_state` to use `create` + `open_state` (or `raw_peer_state`
   accessor for internal writes).
 
 ### Phase 6: bootstrap restructure
 
-- `TablesCore::create` opens system tables but writes no catalog rows.
+- `Tables::build` opens system tables but writes no catalog rows.
 - After `Devices` is constructed and listeners are registered, write the
   bootstrap catalog rows via `TableEntry::insert`.
 - `bootstrap_local` publishes via `TableEntry::insert`.
@@ -712,7 +718,7 @@ explicitly requested.
    premature. The callback model is designed so that whatever the ingestion
    API turns out to be, it will converge on `TableEntry::insert(event)`,
    triggering the same listeners as local mutations.
-8. `Table::insert` returns `InsertOutcome::Applied(Change)` so callbacks
+8. `Table::insert` returns `InsertOutcome::Applied(Box<Change>)` so callbacks
    receive the change without re-reading the topic.
 9. Bootstrap writes go through the callback path. System tables are
    pre-opened before their catalog rows are written.
@@ -721,12 +727,12 @@ explicitly requested.
 11. `Tables::create` is void-returning. Callers obtain a handle via
     `Tables::open(name)` separately. This removes the ordering dependency
     between the callback opening the table and `create` returning.
-12. `States::create` is void-returning (declare a new state). `States::open`
+12. `States::create` is void-returning (declare a new state). `States::open_state`
     returns a typed `StateHandle` and lazy-loads: if the state is already in
     the open map, return it; otherwise read the declaration from
     `_state_catalog`, physically open the state, and return the handle.
-    `StatesCore` is split into `create(name, config)` (void) and
-    `open::<K, V>(name)` (returns `StateHandle<K, V>`). This mirrors the
+    `States` is split into `create(name, config)` (void) and
+    `open_state::<K, V>(name)` (returns `StateHandle<K, V>`). This mirrors the
     `Tables` pattern (create declares, open obtains a handle) while
     respecting the lazy-load difference (tables are always open; states are
     opened on first access).
@@ -744,7 +750,7 @@ explicitly requested.
 16. System states follow the same model: `StateHandle` stores `is_system: bool`;
     `write()` returns `Result` and refuses if true; `read()` is unaffected.
     Internal workspace code (`PeerStore`) holds the raw `Arc<RwLock<State>>`
-    directly for system-state writes. `States::open` returns handles to system
+    directly for system-state writes. `States::open_state` returns handles to system
     states with `is_system` set; `States::create` and `States::delete` refuse
     system states.
 
@@ -754,7 +760,7 @@ Iteration 0004 is complete when:
 
 - `ChangeListener` is a trait on `TableEntry`, with listeners registered at
   open time and dispatched synchronously on every `TableEntry::insert`;
-- `Table::insert` returns `InsertOutcome::Applied(Change)`;
+- `Table::insert` returns `InsertOutcome::Applied(Box<Change>)`;
 - `TableEntry::receipt`, `RECEIPT_CONSUMER`, and `replay_receipts` are gone;
 - `ReceiptListener` is registered on every table and replaces inline
   `observe` calls;
@@ -763,22 +769,22 @@ Iteration 0004 is complete when:
   `Delete`);
 - `DeviceSyncListener` is registered on `_devices` and is the single owner
   of in-memory device-record mutation after `reload`;
-- `TablesCore` CRUD methods validate and publish; they no longer open/close
+- `Tables` CRUD methods validate and publish; they no longer open/close
   tables or mutate the handle map directly;
 - `Devices::write_record` mints and publishes; it no longer updates the
   in-memory map or calls `observe` directly;
 - `Devices::insert_application` is gone;
 - `Tables::create` is void-returning; callers use `Tables::open` to obtain a
   handle;
-- `States::create` is void-returning; `States::open` returns a typed
-  `StateHandle` and lazy-loads on first access; `StatesCore` is split into
-  `create` and `open::<K, V>`;
+- `States::create` is void-returning; `States::open_state` returns a typed
+  `StateHandle` and lazy-loads on first access; `States` is split into
+  `create` and `open_state::<K, V>`;
 - `UpdateOutcome` is removed; `Tables::update` returns `Result<bool>`;
 - `TableHandle` stores `is_system: bool` and refuses `insert` on system tables;
   `Tables::open` returns handles to system tables; `Tables::update` works on
   system tables; `Tables::delete` refuses system tables;
 - `StateHandle` stores `is_system: bool` and refuses `write()` on system
-  states; `States::open` returns handles to system states; `States::create`
+  states; `States::open_state` returns handles to system states; `States::create`
   and `States::delete` refuse system states;
 - `ChangeListener` is `pub` and `TableHandle::add_listener` is `pub`, so
   applications can register custom listeners;

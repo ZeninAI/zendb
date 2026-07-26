@@ -1,6 +1,6 @@
-//! Shared Table ownership, change listeners, and streaming consumers.
+//! Shared Table ownership, guarded mutation, and change listeners.
 
-use std::{io, ops::Deref, sync::Arc};
+use std::sync::{Arc, Weak};
 
 use parking_lot::{RwLock, RwLockReadGuard};
 use zendb_storage::{Change, InsertOutcome, Table, TopicConsumer};
@@ -8,13 +8,12 @@ use zendb_types::{Event, Op, Path, PrimaryKey};
 
 use crate::{devices::Devices, Error, Result};
 
-/// Reacts to a successful insert on a [`TableEntry`].
+/// Reacts to a successful insert on a [`TableHandle`].
 ///
 /// `on_change` is fire-and-forget: the insert that triggered it has already
-/// succeeded and is durable. A failing callback leaves in-memory state stale
-/// but never corrupts the durable state; on restart the in-memory state is
-/// rebuilt from durable state. Callback errors are swallowed now; when logging
-/// is added they will be logged.
+/// succeeded. A failing internal callback may leave derived in-memory state
+/// stale; on restart it is rebuilt from the stored Table. Callback errors are
+/// swallowed now; when logging is added they will be logged.
 ///
 /// The trait is `pub` so applications can implement custom listeners and
 /// register them via [`TableHandle::add_listener`].
@@ -22,59 +21,32 @@ pub trait ChangeListener: Send + Sync {
     fn on_change(&self, change: &Change);
 }
 
-pub(crate) struct TableEntry {
-    pub(crate) table: Arc<RwLock<Table>>,
-    listeners: RwLock<Vec<Arc<dyn ChangeListener>>>,
-}
-
-impl TableEntry {
-    pub(crate) fn build(table: Table) -> Result<Arc<Self>> {
-        Ok(Arc::new(Self {
-            table: Arc::new(RwLock::new(table)),
-            listeners: RwLock::new(Vec::new()),
-        }))
-    }
-
-    /// Insert an event and synchronously dispatch the resulting `Change` to
-    /// all registered listeners. This is the single insert path for both
-    /// local and (eventually) remote mutations; both converge here so that
-    /// listeners always fire.
-    pub(crate) fn insert(&self, event: Event) -> Result<InsertOutcome> {
-        let outcome = self.table.write().insert(event)?;
-        if let InsertOutcome::Applied(ref change) = outcome {
-            for listener in self.listeners.read().iter() {
-                listener.on_change(change);
-            }
-        }
-        Ok(outcome)
-    }
-
-    pub(crate) fn add_listener(&self, listener: Arc<dyn ChangeListener>) {
-        self.listeners.write().push(listener);
-    }
-}
-
-#[derive(Clone)]
+/// A shared handle to an open [`Table`].
+///
+/// System tables are readable and consumable through public handles, but
+/// [`TableHandle::insert`] refuses them.
 pub struct TableHandle {
     name: String,
-    entry: Arc<TableEntry>,
-    devices: Arc<Devices>,
+    table: RwLock<Table>,
+    listeners: RwLock<Vec<Arc<dyn ChangeListener>>>,
+    devices: Weak<Devices>,
     is_system: bool,
 }
 
 impl TableHandle {
     pub(crate) fn new(
         name: String,
-        entry: Arc<TableEntry>,
-        devices: Arc<Devices>,
+        table: Table,
+        devices: Weak<Devices>,
         is_system: bool,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        Arc::new(Self {
             name,
-            entry,
+            table: RwLock::new(table),
+            listeners: RwLock::new(Vec::new()),
             devices,
             is_system,
-        }
+        })
     }
 
     pub fn name(&self) -> &str {
@@ -91,11 +63,12 @@ impl TableHandle {
 
     pub fn insert(&self, primary_key: PrimaryKey, path: Path, op: Op) -> Result<InsertOutcome> {
         if self.is_system {
-            return Err(Error::PermissionDenied);
+            return Err(Error::SystemTableReadOnly(self.name.clone()));
         }
-        self.devices.authorize(zendb_types::Roles::Contributor)?;
-        let stamp = self.devices.mint()?;
-        self.entry.insert(Event {
+        let devices = self.devices.upgrade().ok_or(Error::WorkspaceClosed)?;
+        devices.authorize(zendb_types::Roles::Contributor)?;
+        let stamp = devices.mint()?;
+        self.insert_internal(Event {
             primary_key,
             path,
             op,
@@ -103,18 +76,12 @@ impl TableHandle {
         })
     }
 
-    pub fn read(&self) -> TableReadGuard<'_> {
-        TableReadGuard {
-            table: self.entry.table.read(),
-        }
+    pub fn read(&self) -> RwLockReadGuard<'_, Table> {
+        self.table.read()
     }
 
-    pub fn consumer(&self, name: &str) -> Result<TableConsumer> {
-        let changes = self.entry.table.read().consumer(name)?;
-        Ok(TableConsumer {
-            table: self.entry.table.clone(),
-            changes,
-        })
+    pub fn consumer(&self, name: &str) -> Result<TopicConsumer<Change>> {
+        Ok(self.table.read().consumer(name)?)
     }
 
     /// Register a custom [`ChangeListener`] on this table.
@@ -123,39 +90,17 @@ impl TableHandle {
     /// this table. Application listeners and internal workspace listeners
     /// share the same listener list.
     pub fn add_listener(&self, listener: Arc<dyn ChangeListener>) {
-        self.entry.add_listener(listener);
-    }
-}
-
-pub struct TableReadGuard<'a> {
-    table: RwLockReadGuard<'a, Table>,
-}
-
-impl Deref for TableReadGuard<'_> {
-    type Target = Table;
-
-    fn deref(&self) -> &Self::Target {
-        &self.table
-    }
-}
-
-pub struct TableConsumer {
-    table: Arc<RwLock<Table>>,
-    changes: TopicConsumer<Change>,
-}
-
-impl TableConsumer {
-    pub fn next_change(&mut self) -> io::Result<Option<Change>> {
-        self.changes.next().transpose()
+        self.listeners.write().push(listener);
     }
 
-    pub fn read(&self) -> TableReadGuard<'_> {
-        TableReadGuard {
-            table: self.table.read(),
+    /// Workspace-managed mutation path for system and replicated events.
+    pub(crate) fn insert_internal(&self, event: Event) -> Result<InsertOutcome> {
+        let outcome = { self.table.write().insert(event)? };
+        if let InsertOutcome::Applied(ref change) = outcome {
+            for listener in self.listeners.read().iter() {
+                listener.on_change(change);
+            }
         }
-    }
-
-    pub fn commit(&self) -> io::Result<()> {
-        self.changes.commit()
+        Ok(outcome)
     }
 }

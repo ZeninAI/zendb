@@ -8,12 +8,12 @@ use std::{
 
 use arc_swap::ArcSwap;
 use bincode::{Decode, Encode};
-use parking_lot::{Mutex, RwLock};
-use zendb_storage::{DurableStorage, ReadBackend, State, WriteBackend};
+use parking_lot::Mutex;
+use zendb_storage::{DurableStorage, ReadBackend, WriteBackend};
 use zendb_types::{utils::time::physical_ms, EventId, EventStamp, EventTime, PeerId, PeerIdentity};
 
 use super::receipts::{ObserveOutcome, ReceiptWindow};
-use crate::{Error, Result};
+use crate::{states::StateHandle, Error, Result};
 
 type PeerMap = BTreeMap<PeerId, PeerRecord>;
 
@@ -39,14 +39,14 @@ pub(crate) struct PeerStore {
     #[allow(dead_code)]
     peer: Arc<dyn PeerIdentity>,
     local_peer_id: PeerId,
-    state: Arc<RwLock<State<PeerId, PeerRecord>>>,
+    state: Arc<StateHandle<PeerId, PeerRecord>>,
     snapshot: ArcSwap<PeerMap>,
     writer: Mutex<PeerMutationState>,
 }
 
 impl PeerStore {
     pub(crate) fn create(
-        state: Arc<RwLock<State<PeerId, PeerRecord>>>,
+        state: Arc<StateHandle<PeerId, PeerRecord>>,
         peer: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
         let local_peer_id = peer.peer_id();
@@ -58,7 +58,7 @@ impl PeerStore {
             }),
         };
         {
-            let mut storage = state.write();
+            let mut storage = state.write_internal();
             storage.put(local_peer_id, record.clone())?;
             storage.sync()?;
         }
@@ -74,7 +74,7 @@ impl PeerStore {
     }
 
     pub(crate) fn open(
-        state: Arc<RwLock<State<PeerId, PeerRecord>>>,
+        state: Arc<StateHandle<PeerId, PeerRecord>>,
         peer: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
         let local_peer_id = peer.peer_id();
@@ -145,7 +145,7 @@ impl PeerStore {
         checkpoint.time = time;
 
         {
-            let mut state = self.state.write();
+            let mut state = self.state.write_internal();
             state.put(self.local_peer_id, record.clone())?;
             state.sync()?;
         }
@@ -207,7 +207,7 @@ impl PeerStore {
             return Ok(());
         }
         let snapshot = self.snapshot.load_full();
-        let mut state = self.state.write();
+        let mut state = self.state.write_internal();
         for peer in &writer.dirty {
             if let Some(record) = snapshot.get(peer) {
                 state.put(*peer, record.clone())?;

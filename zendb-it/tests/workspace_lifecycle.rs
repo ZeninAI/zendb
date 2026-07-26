@@ -29,9 +29,9 @@ fn workspace_create_tables_states_and_cleanup() {
 
         // ---- create a table and insert rows ----
         ws.tables()
-            .create("users", TableConfig::default())
+            .upsert("users", TableConfig::default())
             .expect("failed to create table");
-        let table = ws.tables().open("users").expect("failed to open table");
+        let table = ws.tables().get("users").expect("failed to open table");
 
         table
             .insert(
@@ -63,15 +63,15 @@ fn workspace_create_tables_states_and_cleanup() {
 
         // verify table listing
         let tables = ws.tables().list();
-        assert!(tables.iter().any(|t| t.name == "users"));
+        assert!(tables.iter().any(|name| name == "users"));
 
         // ---- initialize a state and write to it ----
         ws.states()
-            .create("greetings", StateConfig::default())
+            .upsert("greetings", StateConfig::default())
             .expect("failed to create state");
         let state = ws
             .states()
-            .open::<String, Greeting>("greetings")
+            .get::<String, Greeting>("greetings")
             .expect("failed to open state");
 
         state

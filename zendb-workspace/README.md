@@ -25,15 +25,16 @@ support:
 an impl backed by a persistent key store (OS keychain, HSM, KMS) without
 workspace changes.
 
-`Bootstrap` (pub(crate)) owns the workspace lock file and the `WorkspaceId`
-blob. The identity file is write-once; there is no `flush`. The file lock is
-inlined in `Bootstrap` via `std::fs::File::try_lock` (no separate utility).
-Wall-clock reads go through `zendb-types::utils::time::physical_ms()`.
+`Workspace` owns the persisted `WorkspaceId` and keeps the workspace lock file
+open for its lifetime. The narrow identity read/write and lock acquisition
+logic lives directly in `workspace.rs`; there is no separate bootstrap type.
+Persisted file, directory, and system-resource names are centralized in
+`consts.rs`. Wall-clock reads go through
+`zendb-types::utils::time::physical_ms()`.
 
 ## Public Surface
 
-`Workspace` exposes three handlers, each a cheaply-cloneable owning facade over
-a shared `Arc`-backed core:
+`Workspace` exposes three shared handlers:
 
 - `Workspace::devices()` — peer registry, hybrid clock, roles, and
   duplicate-event tracking.
@@ -51,7 +52,7 @@ through the exact same code path.
 
 ### Change listeners
 
-`ChangeListener` is a `pub` trait on `TableEntry`:
+`ChangeListener` is a `pub` trait owned by `TableHandle`:
 
 ```rust
 pub trait ChangeListener: Send + Sync {
@@ -60,9 +61,10 @@ pub trait ChangeListener: Send + Sync {
 ```
 
 Listeners are registered at open time and dispatched synchronously on every
-`TableEntry::insert`. `TableHandle::add_listener` is `pub`, so applications can
-register custom listeners on tables they hold handles to. Internal listeners
-and application listeners share the same listener list.
+`TableHandle::insert_internal`, after the storage-table write guard has been
+released. `TableHandle::add_listener` is `pub`, so applications can register
+custom listeners on tables they hold handles to. Internal listeners and
+application listeners share the same listener list.
 
 ### Internal listeners
 
@@ -78,7 +80,7 @@ the receipt listener.
 
 ### CRUD methods publish; callbacks react
 
-`TablesCore` CRUD methods validate a precondition and publish a catalog event.
+`Tables` CRUD methods validate a precondition and publish a catalog event.
 They do not open/close tables or mutate the handle map directly — the
 `CatalogSync` callback does. `Devices::write_record` mints and publishes; the
 `DeviceSync` callback updates the in-memory map and the `Receipt` callback
@@ -86,54 +88,74 @@ observes the stamp.
 
 ## Tables
 
-`Tables` is the table catalog management surface. `TablesCore` owns the
-`_table_catalog` Table and the in-memory map of opened `TableEntry` handles.
-The `_table_catalog` Table is the source of truth for declarations; only opened
-handles are cached in memory.
+`Tables` owns the `_table_catalog` handle and the in-memory map of opened
+`Arc<TableHandle>` values. The `_table_catalog` Table is the source of truth for
+declarations, and every declared table is eagerly represented in the handle
+map. The typed catalog field and its map entry share the same `Arc<TableHandle>`;
+the devices registry follows the same ownership model.
 
-- `Tables::create(name, config) -> Result<()>` — declare a new table
-  (void-returning). The `CatalogSync` callback opens it synchronously.
-- `Tables::open(name) -> Result<TableHandle>` — obtain a handle to an existing
-  table. Returns handles to system tables too; system handles refuse `insert`.
-- `Tables::update(name, config) -> Result<bool>` — update a table's config.
-  Works on system tables. Returns `true` if the config changed.
+- `Tables::upsert(name, config) -> Result<bool>` — declare a table or update
+  its config. The `CatalogSync` callback opens new tables synchronously.
+- `Tables::get(name) -> Result<Arc<TableHandle>>` — obtain the stored handle
+  for an existing table. Returns handles to system tables too; system handles
+  refuse `insert`.
+- `Tables::contains(name)` and `Tables::list()` include system and application
+  tables; `list()` returns the eager map's natural iteration order.
 - `Tables::delete(name) -> Result<bool>` — delete a table. Refuses system
   tables with `ResourceBusy`.
 
 ### System tables
 
-System tables (`_table_catalog`, `_devices`) are openable and updatable but
-not deletable and not directly writable via `TableHandle`. `TableHandle`
-stores `is_system: bool` set at construction; `insert` refuses if true.
-Internal workspace code calls `TableEntry::insert` directly, bypassing the
-check.
+System tables (`_table_catalog`, `_devices`) are openable but cannot be
+upserted, deleted, or directly written via `TableHandle`. `TableHandle` stores
+`is_system: bool` set at construction; public mutation returns
+`SystemTableReadOnly`. Internal workspace code calls
+`TableHandle::insert_internal`.
 
 ### Table operations
 
 `TableHandle::insert` is the single local mutation path for application tables:
-authorize, mint, `TableEntry::insert` (which dispatches callbacks). `read`
-returns a guard dereferencing to the storage `Table`. `consumer` returns a
-streaming `TableConsumer`.
+authorize, mint, and delegate to `TableHandle::insert_internal`, which inserts
+and dispatches callbacks. `read` returns the storage table's
+`RwLockReadGuard` directly. `consumer` returns
+`zendb_storage::TopicConsumer<Change>` directly; the storage consumer already
+owns its topic state and cursor.
+
+`Tables::create/open` owns table and device bootstrap: it creates or opens both
+system table handles, constructs `Devices`, builds the eager handle map,
+registers listeners, and writes the self-referencing system catalog rows on
+creation. The constructors return `Arc<Tables>`; `Workspace::assemble` obtains
+its device handle by cloning the crate-visible `Tables::devices` field.
 
 ## States
 
-`States` is the state catalog management surface. States are **lazy**: a state
-may be declared in `_state_catalog` but not currently open.
+`States` is the state catalog management surface. States are **lazy** after
+creation: a state may be declared in `_state_catalog` but not currently open.
+Catalog lifecycle remains in `states/mod.rs`; the typed `StateHandle` runtime
+API lives in `states/runtime.rs`.
+The catalog itself is bootstrapped into the open-state registry; its typed
+catalog field and erased registry entry share the same `Arc<StateHandle<_, _>>`.
+Opening `_state_catalog` therefore returns the existing guarded state instead
+of opening the same backend a second time.
 
-- `States::create(name, config) -> Result<()>` — declare a new state
-  (void-returning). Writes the declaration only; the physical state is created
-  on first `open`.
-- `States::open::<K, V>(name) -> Result<StateHandle<K, V>>` — obtain a typed
-  handle. Lazy-loads: if already open, downcast and return; otherwise read the
-  declaration, physically create or open the state, and return the handle.
-  Returns handles to system states too; system handles refuse `write()`.
+- `States::upsert(name, config) -> Result<bool>` — declare and physically
+  create a state, or update an existing declaration's config. System states
+  are visible but cannot be upserted.
+- `States::get::<K, V>(name) -> Result<Arc<StateHandle<K, V>>>` — obtain a
+  shared typed handle. Lazy-loads by downcasting an open handle or opening the
+  declared physical state.
+- `contains`, `list`, `list_open`, and `close` treat system and
+  application states uniformly.
+- `delete` refuses `_state_catalog` and `_peer_state` with `ResourceBusy`.
 
 ### System states
 
-`StateHandle` stores `is_system: bool`; `write()` returns `Result` and refuses
-if true. `read()` is unaffected. Internal workspace code (`PeerStore` writing
-`_peer_state`) holds the raw `Arc<RwLock<State>>` directly via
-`StatesCore::raw_peer_state`, bypassing the `StateHandle` check.
+`StateHandle` stores `is_system: bool`; public `write()` returns
+`SystemStateReadOnly` for system states, while `read()` is unaffected.
+`PeerStore` owns the `_peer_state` handle and uses its crate-internal
+`write_internal()` method for workspace-managed updates. Workspace creation
+uses `States::upsert_internal()` to bootstrap that system declaration without
+exposing the bypass publicly.
 
 ## Peers And Roles
 

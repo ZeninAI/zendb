@@ -8,8 +8,8 @@ use std::{
 use zendb_storage::{DurableStorage, Table, TableConfig};
 use zendb_types::{Op, PrimaryKey, Value};
 
-use super::runtime::{ChangeListener, TableEntry};
-use crate::{devices::Devices, tables::TablesCore};
+use super::runtime::{ChangeListener, TableHandle};
+use crate::{devices::Devices, tables::Tables};
 
 /// Observes every successful insert on every table. Replaces the one-shot
 /// `replay_receipts` consumer: receipts are now live-observed via callback
@@ -41,17 +41,17 @@ impl ChangeListener for ReceiptListener {
 /// tables, so every table — bootstrap-opened or callback-opened — has the
 /// receipt listener.
 pub(crate) struct CatalogSyncListener {
-    core: Weak<TablesCore>,
+    tables: Weak<Tables>,
     receipt_listener: Arc<dyn ChangeListener>,
 }
 
 impl CatalogSyncListener {
     pub(crate) fn build(
-        core: Weak<TablesCore>,
+        tables: Weak<Tables>,
         receipt_listener: Arc<dyn ChangeListener>,
     ) -> Arc<dyn ChangeListener> {
         Arc::new(Self {
-            core,
+            tables,
             receipt_listener,
         })
     }
@@ -59,7 +59,7 @@ impl CatalogSyncListener {
 
 impl ChangeListener for CatalogSyncListener {
     fn on_change(&self, change: &zendb_storage::Change) {
-        let Some(core) = self.core.upgrade() else {
+        let Some(tables) = self.tables.upgrade() else {
             return;
         };
         let PrimaryKey::String(name) = &change.event.primary_key else {
@@ -71,14 +71,14 @@ impl ChangeListener for CatalogSyncListener {
             } => {
                 // Already open (update case or bootstrap no-op). A future
                 // iteration may migrate on config change; for now, no-op.
-                if core.tables.read().contains_key(name) {
+                if tables.tables.read().contains_key(name) {
                     return;
                 }
                 let config: TableConfig = match blob.decode() {
                     Ok(c) => c,
                     Err(_) => return,
                 };
-                let path = core.root.join("tables").join(name);
+                let path = tables.root.join(name);
                 // Create the physical table if the directory doesn't exist yet
                 // (local create or remote create); otherwise open it (workspace
                 // reopen after restart, or remote update of an existing table).
@@ -93,18 +93,16 @@ impl ChangeListener for CatalogSyncListener {
                         Err(_) => return,
                     }
                 };
-                let entry = match TableEntry::build(table) {
-                    Ok(e) => e,
-                    Err(_) => return,
-                };
-                entry.add_listener(self.receipt_listener.clone());
-                core.tables.write().insert(name.clone(), entry);
+                let handle =
+                    TableHandle::new(name.clone(), table, Arc::downgrade(&tables.devices), false);
+                handle.add_listener(self.receipt_listener.clone());
+                tables.tables.write().insert(name.clone(), handle);
             }
             Op::Delete => {
-                let mut tables = core.tables.write();
-                if let Some(entry) = tables.remove(name) {
+                let mut tables_map = tables.tables.write();
+                if let Some(entry) = tables_map.remove(name) {
                     drop(entry);
-                    let path = core.root.join("tables").join(name);
+                    let path = tables.root.join(name);
                     if path.exists() {
                         let _ = fs::remove_dir_all(path);
                     }
@@ -142,11 +140,11 @@ impl ChangeListener for DeviceSyncListener {
                 value: Value::Blob(blob),
             } => {
                 if let Ok(record) = blob.decode::<DeviceRecord>() {
-                    devices.inner().records.write().insert(*peer, record);
+                    devices.records.write().insert(*peer, record);
                 }
             }
             Op::Delete => {
-                devices.inner().records.write().remove(peer);
+                devices.records.write().remove(peer);
             }
             _ => {}
         }

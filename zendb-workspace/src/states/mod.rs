@@ -49,19 +49,24 @@ impl States {
         fs::create_dir_all(&root)?;
         let mut catalog =
             State::create(&root.join(STATE_CATALOG_NAME), SYSTEM_STATE_CONFIG.clone())?;
+        // Create the directory and catalog entry for the peer state
+        let _ = State::<(), ()>::create(&root.join(PEER_STATE_NAME), SYSTEM_STATE_CONFIG.clone())?;
         catalog.put(STATE_CATALOG_NAME.to_owned(), SYSTEM_STATE_CONFIG.clone())?;
+        catalog.put(PEER_STATE_NAME.to_owned(), SYSTEM_STATE_CONFIG.clone())?;
         let catalog = Arc::new(StateHandle {
             name: STATE_CATALOG_NAME.to_owned(),
             state: RwLock::new(catalog),
             is_system: true,
         });
-        let erased: ErasedStateHandle = catalog.clone();
+        let erased_catalog: ErasedStateHandle = catalog.clone();
         let states = Arc::new(Self {
             root,
             catalog,
-            states: RwLock::new(HashMap::from([(STATE_CATALOG_NAME.to_owned(), erased)])),
+            states: RwLock::new(HashMap::from([(
+                STATE_CATALOG_NAME.to_owned(),
+                erased_catalog,
+            )])),
         });
-        states.upsert_internal(PEER_STATE_NAME, SYSTEM_STATE_CONFIG.clone())?;
         Ok(states)
     }
 
@@ -123,9 +128,7 @@ impl States {
         catalog.put(name.to_owned(), config.clone())?;
         drop(catalog);
         let path = self.root.join(name);
-        if !path.exists() {
-            State::<(), ()>::create(&path, config)?;
-        }
+        State::<(), ()>::create(&path, config)?;
         Ok(true)
     }
 
@@ -200,9 +203,7 @@ impl States {
         drop(open);
 
         let path = self.root.join(name);
-        if path.exists() {
-            fs::remove_dir_all(path)?;
-        }
+        fs::remove_dir_all(path)?;
         Ok(true)
     }
 }

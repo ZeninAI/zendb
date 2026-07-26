@@ -1,15 +1,11 @@
-//! Unified in-memory peer state with Catalog-backed durability.
+//! Durable peer clock, receipt snapshots, and mutation bookkeeping.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    ops::RangeInclusive,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use arc_swap::ArcSwap;
 use bincode::{Decode, Encode};
 use parking_lot::Mutex;
-use zendb_storage::{DurableStorage, ReadBackend, WriteBackend};
+use zendb_storage::{ReadBackend, WriteBackend};
 use zendb_types::{utils::time::physical_ms, EventId, EventStamp, EventTime, PeerId, PeerIdentity};
 
 use super::receipts::{ObserveOutcome, ReceiptWindow};
@@ -18,19 +14,15 @@ use crate::{states::StateHandle, Error, Result};
 type PeerMap = BTreeMap<PeerId, PeerRecord>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub struct ClockCheckpoint {
+pub(crate) struct ClockCheckpoint {
     pub next_sequence: u64,
     pub time: EventTime,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Encode, Decode)]
-pub struct PeerRecord {
+pub(crate) struct PeerRecord {
     pub receipts: ReceiptWindow,
     pub clock: Option<ClockCheckpoint>,
-}
-
-struct PeerMutationState {
-    dirty: BTreeSet<PeerId>,
 }
 
 pub(crate) struct PeerStore {
@@ -41,7 +33,7 @@ pub(crate) struct PeerStore {
     local_peer_id: PeerId,
     state: Arc<StateHandle<PeerId, PeerRecord>>,
     snapshot: ArcSwap<PeerMap>,
-    writer: Mutex<PeerMutationState>,
+    writer: Mutex<()>,
 }
 
 impl PeerStore {
@@ -60,16 +52,13 @@ impl PeerStore {
         {
             let mut storage = state.write_internal();
             storage.put(local_peer_id, record.clone())?;
-            storage.sync()?;
         }
         Ok(Arc::new(Self {
             peer,
             local_peer_id,
             state,
             snapshot: ArcSwap::from_pointee(BTreeMap::from([(local_peer_id, record)])),
-            writer: Mutex::new(PeerMutationState {
-                dirty: BTreeSet::new(),
-            }),
+            writer: Mutex::new(()),
         }))
     }
 
@@ -97,9 +86,7 @@ impl PeerStore {
             local_peer_id,
             state,
             snapshot: ArcSwap::from_pointee(peers),
-            writer: Mutex::new(PeerMutationState {
-                dirty: BTreeSet::new(),
-            }),
+            writer: Mutex::new(()),
         }))
     }
 
@@ -108,11 +95,11 @@ impl PeerStore {
     }
 
     pub(crate) fn mint(&self) -> Result<EventStamp> {
-        let mut writer = self.writer.lock();
+        let _writer = self.writer.lock();
         let mut peers = (*self.snapshot.load_full()).clone();
         let record = peers
             .get_mut(&self.local_peer_id)
-            .expect("the local PeerRecord is established during bootstrap");
+            .expect("the local PeerRecord is established during device initialization");
         let checkpoint = record
             .clock
             .as_mut()
@@ -147,26 +134,22 @@ impl PeerStore {
         {
             let mut state = self.state.write_internal();
             state.put(self.local_peer_id, record.clone())?;
-            state.sync()?;
         }
-        writer.dirty.remove(&self.local_peer_id);
         self.snapshot.store(Arc::new(peers));
         Ok(stamp)
     }
 
     pub(crate) fn observe(&self, stamp: EventStamp) -> Result<ObserveOutcome> {
-        let mut writer = self.writer.lock();
+        let _writer = self.writer.lock();
         let mut peers = (*self.snapshot.load_full()).clone();
         let outcome = peers
             .entry(stamp.id.peer_id)
             .or_default()
             .receipts
             .observe(stamp.id.sequence)?;
-        writer.dirty.insert(stamp.id.peer_id);
-
         let local = peers
             .get_mut(&self.local_peer_id)
-            .expect("the local PeerRecord is established during bootstrap");
+            .expect("the local PeerRecord is established during device initialization");
         let checkpoint = local
             .clock
             .as_mut()
@@ -181,47 +164,20 @@ impl PeerStore {
                     .ok_or(Error::ClockExhausted)?,
             );
         }
-        writer.dirty.insert(self.local_peer_id);
-        self.snapshot.store(Arc::new(peers));
-        Ok(outcome)
-    }
-
-    pub(crate) fn has_received(&self, id: EventId) -> bool {
-        self.snapshot
-            .load()
-            .get(&id.peer_id)
-            .is_some_and(|record| record.receipts.has_received(id.sequence))
-    }
-
-    pub(crate) fn missing(&self, peer: PeerId) -> Vec<RangeInclusive<u64>> {
-        self.snapshot
-            .load()
-            .get(&peer)
-            .map(|record| record.receipts.missing.clone())
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn flush(&self) -> Result<()> {
-        let mut writer = self.writer.lock();
-        if writer.dirty.is_empty() {
-            return Ok(());
-        }
-        let snapshot = self.snapshot.load_full();
-        let mut state = self.state.write_internal();
-        for peer in &writer.dirty {
-            if let Some(record) = snapshot.get(peer) {
-                state.put(*peer, record.clone())?;
+        let local_record = local.clone();
+        let observed_record = peers
+            .get(&stamp.id.peer_id)
+            .cloned()
+            .expect("the observed PeerRecord was just inserted");
+        {
+            let mut state = self.state.write_internal();
+            state.put(stamp.id.peer_id, observed_record)?;
+            if stamp.id.peer_id != self.local_peer_id {
+                state.put(self.local_peer_id, local_record)?;
             }
         }
-        state.sync()?;
-        writer.dirty.clear();
-        Ok(())
-    }
-}
-
-impl Drop for PeerStore {
-    fn drop(&mut self) {
-        let _ = self.flush();
+        self.snapshot.store(Arc::new(peers));
+        Ok(outcome)
     }
 }
 

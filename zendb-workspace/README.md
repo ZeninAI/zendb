@@ -73,7 +73,7 @@ application listeners share the same listener list.
 | --- | --- | --- |
 | `ReceiptListener` | every table | `Devices::observe(stamp)` — replaces the one-shot replay consumer |
 | `CatalogSyncListener` | `_table_catalog` | open tables on `Upsert`, close + rmdir on `Delete` — single owner of the handle map |
-| `DeviceSyncListener` | `_devices` | upsert/remove in the in-memory device records map — single owner after `reload` |
+| `DeviceSyncListener` | `_devices` | upsert/remove in the in-memory device records map after the initial open-time load |
 
 `CatalogSyncListener` holds a shared `Arc<dyn ChangeListener>` (the receipt
 listener) to register on newly opened application tables, so every table has
@@ -83,7 +83,7 @@ the receipt listener.
 
 `Tables` CRUD methods validate a precondition and publish a catalog event.
 They do not open/close tables or mutate the handle map directly — the
-`CatalogSync` callback does. `Devices::write_record` mints and publishes; the
+`CatalogSync` callback does. `Devices::upsert_internal` mints and publishes; the
 `DeviceSync` callback updates the in-memory map and the `Receipt` callback
 observes the stamp.
 
@@ -125,9 +125,10 @@ owns its topic state and cursor.
 `Tables::create/open` owns table runtime initialization: it creates or opens
 both system table handles, constructs `Devices`, builds the eager handle map,
 registers listeners, and (on create) writes the self-referencing system
-catalog rows. The constructors return `Arc<Tables>`; `Workspace::assemble`
-obtains its device handle by cloning the crate-visible `Tables::devices` field,
-and bootstraps the local device on create. `Devices::open` reloads the durable
+catalog rows. On create, it registers the local peer as an operator; on open,
+it requires the current peer to already be registered. The constructors return
+`Arc<Tables>`; `Workspace::assemble` only clones the device handle from the
+crate-visible `Tables::devices` field. `Devices::open` loads the durable
 device registry as part of opening.
 
 ## States
@@ -165,6 +166,18 @@ declares and materializes the `_peer_state` system state before returning;
 `_devices` stores `PeerId -> DeviceRecord`, where each record has a display
 name and a set of `Roles`.
 
+The public `Devices` facade is intentionally small:
+
+- `local_peer_id()` returns the identity used for local mutations.
+- `list()` returns the cached device records.
+- `get(peer)` reads one cached device record.
+- `upsert(peer, record)` authorizes and publishes a device-record change,
+  returning whether the record changed.
+
+On create, `Tables` registers the local peer as an `Operator` after listeners
+are installed. On open, `Tables` requires the current peer to already have a
+device record; opening never silently promotes an unknown peer.
+
 - `Contributor` writes existing application Tables and may update its own
   metadata without changing roles.
 - `Operator` includes Contributor behavior and may manage Tables and peer
@@ -173,10 +186,12 @@ name and a set of `Roles`.
 
 `_peer_state` stores `PeerRecord { receipts, clock }`. Only the local peer has
 a clock checkpoint. The module loads all records into an `ArcSwap` snapshot
-for lock-free reads, serializes mutations, and tracks dirty peers for flush.
+for lock-free reads and serializes mutations. Peer snapshots are updated in
+the state backend in-memory; durability coordination is outside the workspace.
 Minting persists the local sequence high-water mark before returning, so a
 failed mutation burns a sequence rather than risking reuse.
 
 Local mutations are linear: authorize, mint, insert, then observe (via
 callback). There is no callback-based mutation API, reconciliation poison
-state, or event journal outside each Table's Topic.
+state, or event journal outside each Table's Topic. Durability is coordinated
+outside the workspace and is not triggered by workspace operations.

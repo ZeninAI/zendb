@@ -7,9 +7,7 @@ mod states;
 mod tables;
 mod workspace;
 
-pub use devices::{
-    ClockCheckpoint, DeviceRecord, Devices, ObserveOutcome, PeerRecord, ReceiptWindow,
-};
+pub use devices::{DeviceRecord, Devices};
 pub use error::{Error, Result};
 pub use states::{StateHandle, States};
 pub use tables::{ChangeListener, TableHandle};

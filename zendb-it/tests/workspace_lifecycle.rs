@@ -97,9 +97,6 @@ fn workspace_create_tables_states_and_cleanup() {
         let states = ws.states().list();
         assert!(states.contains(&"greetings".to_owned()));
 
-        // ---- explicit flush before drop ----
-        ws.flush().expect("flush failed");
-
         // ---- verify the workspace left files on disk ----
         assert!(root.exists());
         let entries: Vec<_> = fs::read_dir(&root)

@@ -1,9 +1,8 @@
-//! Peer registry, hybrid clock, roles, and duplicate-event tracking.
+//! Device registry, peer bookkeeping, and receipt tracking.
 
-mod clock;
+mod peer;
 mod receipts;
-mod registry;
+mod runtime;
 
-pub use clock::{ClockCheckpoint, PeerRecord};
-pub use receipts::{ObserveOutcome, ReceiptWindow};
-pub use registry::{DeviceRecord, Devices};
+pub(crate) use peer::PeerRecord;
+pub use runtime::{DeviceRecord, Devices};

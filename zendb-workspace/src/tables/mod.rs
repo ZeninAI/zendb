@@ -79,6 +79,7 @@ impl Tables {
 
         tables.write_entry(TABLE_CATALOG_NAME, &SYSTEM_TABLE_CONFIG, devices.mint()?)?;
         tables.write_entry(DEVICES_TABLE_NAME, &SYSTEM_TABLE_CONFIG, devices.mint()?)?;
+        devices.register_local_device()?;
 
         Ok(tables)
     }
@@ -144,6 +145,7 @@ impl Tables {
             devices: devices.clone(),
         });
         tables.register_listeners();
+        devices.require_local_device()?;
         Ok(tables)
     }
 

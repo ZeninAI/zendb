@@ -1,8 +1,7 @@
-//! Peer metadata, centralized role checks, and stamped Table mutations.
+//! Device registry runtime, role checks, and stamped table mutations.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ops::RangeInclusive,
     sync::Arc,
 };
 
@@ -10,11 +9,11 @@ use bincode::{Decode, Encode};
 use parking_lot::RwLock;
 use zendb_storage::{ReadBackend, Table};
 use zendb_types::{
-    Blob, Event, EventId, EventStamp, Op, Path, PeerId, PeerIdentity, PrimaryKey, Roles, Value,
+    Blob, Event, EventStamp, Op, Path, PeerId, PeerIdentity, PrimaryKey, Roles, Value,
 };
 
 use super::{
-    clock::{PeerRecord, PeerStore},
+    peer::{PeerRecord, PeerStore},
     receipts::ObserveOutcome,
 };
 use crate::{consts::DEVICES_TABLE_NAME, states::StateHandle, tables::TableHandle, Error, Result};
@@ -28,12 +27,12 @@ pub struct DeviceRecord {
 /// Peer registry, hybrid clock, roles, and duplicate-event tracking.
 ///
 /// Owns the `_devices` table handle, the `PeerStore` (clock + receipts), and
-/// the in-memory device records map. The records map is updated reactively by
-/// the `DeviceSync` listener after `reload` performs the initial cold-start
-/// load.
+/// the in-memory device records map. The records map is populated from durable
+/// storage during `open` and then updated reactively by the `DeviceSync`
+/// listener.
 pub struct Devices {
     pub(crate) registry: Arc<TableHandle>,
-    pub(crate) peers: Arc<PeerStore>,
+    peer_store: Arc<PeerStore>,
     pub(crate) records: RwLock<BTreeMap<PeerId, DeviceRecord>>,
 }
 
@@ -52,7 +51,7 @@ impl Devices {
         peer: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
         let devices = Self::bind(table, PeerStore::open(peer_state, peer)?)?;
-        devices.reload()?;
+        devices.load_records()?;
         Ok(devices)
     }
 
@@ -64,16 +63,16 @@ impl Devices {
                 devices_weak.clone(),
                 true,
             ),
-            peers,
+            peer_store: peers,
             records: RwLock::new(BTreeMap::new()),
         }))
     }
 
-    pub(crate) fn bootstrap_local(&self) -> Result<()> {
+    pub(crate) fn register_local_device(&self) -> Result<()> {
         if self.records.read().contains_key(&self.local_peer_id()) {
             return Ok(());
         }
-        self.write_record(
+        self.upsert_internal(
             self.local_peer_id(),
             DeviceRecord {
                 name: String::new(),
@@ -82,8 +81,16 @@ impl Devices {
         )
     }
 
+    pub(crate) fn require_local_device(&self) -> Result<()> {
+        if self.records.read().contains_key(&self.local_peer_id()) {
+            Ok(())
+        } else {
+            Err(Error::DeviceNotRegistered(self.local_peer_id()))
+        }
+    }
+
     pub fn local_peer_id(&self) -> PeerId {
-        self.peers.local_peer_id()
+        self.peer_store.local_peer_id()
     }
 
     pub fn list(&self) -> Vec<(PeerId, DeviceRecord)> {
@@ -94,43 +101,34 @@ impl Devices {
             .collect()
     }
 
-    pub fn record(&self, peer: PeerId) -> Option<DeviceRecord> {
+    pub fn get(&self, peer: PeerId) -> Option<DeviceRecord> {
         self.records.read().get(&peer).cloned()
     }
 
-    pub fn upsert(&self, peer: PeerId, record: DeviceRecord) -> Result<()> {
+    pub fn upsert(&self, peer: PeerId, record: DeviceRecord) -> Result<bool> {
+        let current = self.records.read().get(&peer).cloned();
+        if current.as_ref() == Some(&record) {
+            return Ok(false);
+        }
         let operator = self.has_role(Roles::Operator);
         let contributor_self_edit = peer == self.local_peer_id()
             && self.has_role(Roles::Contributor)
-            && self
-                .records
-                .read()
-                .get(&peer)
+            && current
+                .as_ref()
                 .is_some_and(|current| current.roles == record.roles);
         if !operator && !contributor_self_edit {
             return Err(Error::PermissionDenied);
         }
-        self.write_record(peer, record)
+        self.upsert_internal(peer, record)?;
+        Ok(true)
     }
 
-    pub fn mint(&self) -> Result<EventStamp> {
-        self.peers.mint()
+    pub(crate) fn mint(&self) -> Result<EventStamp> {
+        self.peer_store.mint()
     }
 
-    pub fn has_received(&self, id: EventId) -> bool {
-        self.peers.has_received(id)
-    }
-
-    pub fn observe(&self, stamp: EventStamp) -> Result<ObserveOutcome> {
-        self.peers.observe(stamp)
-    }
-
-    pub fn missing(&self, peer: PeerId) -> Vec<RangeInclusive<u64>> {
-        self.peers.missing(peer)
-    }
-
-    pub fn flush(&self) -> Result<()> {
-        self.peers.flush()
+    pub(crate) fn observe(&self, stamp: EventStamp) -> Result<ObserveOutcome> {
+        self.peer_store.observe(stamp)
     }
 
     pub(crate) fn authorize(&self, required: Roles) -> Result<()> {
@@ -151,7 +149,7 @@ impl Devices {
             })
     }
 
-    fn write_record(&self, peer: PeerId, record: DeviceRecord) -> Result<()> {
+    pub(crate) fn upsert_internal(&self, peer: PeerId, record: DeviceRecord) -> Result<()> {
         let stamp = self.mint()?;
         let blob = Blob::encode(&record)?;
         self.registry.insert_internal(Event {
@@ -165,7 +163,7 @@ impl Devices {
         Ok(())
     }
 
-    pub(crate) fn reload(&self) -> Result<()> {
+    fn load_records(&self) -> Result<()> {
         let table = self.registry.read();
         let mut records = BTreeMap::new();
         for (key, cell) in table.entries() {

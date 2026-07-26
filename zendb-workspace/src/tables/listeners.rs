@@ -115,7 +115,7 @@ impl ChangeListener for CatalogSyncListener {
 
 /// Reacts to `_devices` events: upserts/removes in the in-memory device
 /// records map. This is the single owner of in-memory device-record mutation
-/// after `reload`.
+/// after the initial load performed by `Devices::open`.
 pub(crate) struct DeviceSyncListener {
     devices: Weak<Devices>,
 }

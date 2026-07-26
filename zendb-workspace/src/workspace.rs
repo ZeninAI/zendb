@@ -137,12 +137,6 @@ impl Workspace {
         };
         let devices = tables.devices.clone();
 
-        // The local device row is written only after table listeners are live,
-        // so DeviceSync and ReceiptListener observe the bootstrap event.
-        if matches!(mode, Mode::Create) {
-            devices.bootstrap_local()?;
-        }
-
         Ok(Self {
             root,
             workspace_id,
@@ -180,16 +174,6 @@ impl Workspace {
 
     pub fn states(&self) -> &States {
         &self.states
-    }
-
-    pub fn flush(&self) -> Result<()> {
-        self.devices.flush()
-    }
-}
-
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        let _ = self.flush();
     }
 }
 

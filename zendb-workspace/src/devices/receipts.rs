@@ -7,23 +7,19 @@ use bincode::{Decode, Encode};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObserveOutcome {
+pub(crate) enum ObserveOutcome {
     New,
     Duplicate,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Encode, Decode)]
-pub struct ReceiptWindow {
+pub(crate) struct ReceiptWindow {
     pub max_seen: u64,
     pub missing: Vec<RangeInclusive<u64>>,
 }
 
 impl ReceiptWindow {
-    pub fn has_received(&self, sequence: u64) -> bool {
-        sequence != 0 && sequence <= self.max_seen && self.missing_index(sequence).is_err()
-    }
-
-    pub fn observe(&mut self, sequence: u64) -> Result<ObserveOutcome> {
+    pub(crate) fn observe(&mut self, sequence: u64) -> Result<ObserveOutcome> {
         if sequence == 0 {
             return Err(Error::InvalidEventSequence);
         }

@@ -1,5 +1,7 @@
 //! Public workspace errors and crate-local result alias.
 
+use zendb_types::PeerId;
+
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
@@ -15,6 +17,7 @@ pub enum Error {
     InvalidEventSequence,
     ClockExhausted,
     WorkspaceClosed,
+    DeviceNotRegistered(PeerId),
     ResourceBusy(String),
 }
 
@@ -48,6 +51,12 @@ impl std::fmt::Display for Error {
             Self::InvalidEventSequence => formatter.write_str("event sequence zero is reserved"),
             Self::ClockExhausted => formatter.write_str("device clock exhausted"),
             Self::WorkspaceClosed => formatter.write_str("workspace is closed"),
+            Self::DeviceNotRegistered(peer) => {
+                write!(
+                    formatter,
+                    "local peer {peer:?} is not registered as a device"
+                )
+            }
             Self::ResourceBusy(name) => write!(formatter, "{name:?} is still in use"),
         }
     }

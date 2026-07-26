@@ -186,13 +186,13 @@ impl Type for Text {
 
     fn apply(&mut self, op: &TextOp, stamps: crate::MergeStamps) -> Result<bool, TextError> {
         let stamps = stamps.incoming;
-        if stamps == EventStamp::zero() {
+        if stamps == EventStamp::default() {
             return Err(TextError::ZeroClock);
         }
 
         match op {
             TextOp::Insert { after, text } => {
-                if after.is_some_and(|id| id.0 == EventStamp::zero()) {
+                if after.is_some_and(|id| id.0 == EventStamp::default()) {
                     return Err(TextError::ZeroId);
                 }
                 if after.is_some_and(|id| id.0 == stamps) {
@@ -244,12 +244,12 @@ impl Type for Text {
                 Ok(changed)
             }
             TextOp::Delete { ids } => {
-                if ids.iter().any(|id| id.0 == EventStamp::zero()) {
+                if ids.iter().any(|id| id.0 == EventStamp::default()) {
                     return Err(TextError::ZeroId);
                 }
                 let mut changed = false;
                 for id in ids {
-                    if !stamps.beats(id.0) {
+                    if stamps <= id.0 {
                         continue;
                     }
                     match self.entries.get_mut(id) {
@@ -268,7 +268,7 @@ impl Type for Text {
                 Ok(changed)
             }
             TextOp::Format { ids, key, value } => {
-                if ids.iter().any(|id| id.0 == EventStamp::zero()) {
+                if ids.iter().any(|id| id.0 == EventStamp::default()) {
                     return Err(TextError::ZeroId);
                 }
                 let mut changed = false;
@@ -280,7 +280,7 @@ impl Type for Text {
                     match value {
                         Some(v) => {
                             let should_update = match entry.attrs.get(key) {
-                                Some((_, existing_stamp)) => stamps.beats(*existing_stamp),
+                                Some((_, existing_stamp)) => stamps > *existing_stamp,
                                 None => true,
                             };
                             if should_update {
@@ -291,7 +291,7 @@ impl Type for Text {
                         None => {
                             // Remove only if this op's HLC beats the existing attr's HLC.
                             let should_remove = match entry.attrs.get(key) {
-                                Some((_, existing_stamp)) => stamps.beats(*existing_stamp),
+                                Some((_, existing_stamp)) => stamps > *existing_stamp,
                                 None => true,
                             };
                             if should_remove {
@@ -331,7 +331,7 @@ impl Type for Text {
                     }
                     for (key, (remote_value, remote_stamp)) in &remote_entry.attrs {
                         match local_entry.attrs.get(key) {
-                            Some((_, local_stamp)) if !remote_stamp.beats(*local_stamp) => {}
+                            Some((_, local_stamp)) if remote_stamp <= local_stamp => {}
                             _ => {
                                 local_entry
                                     .attrs
@@ -354,16 +354,16 @@ impl Type for Text {
     fn max_stamp(&self) -> EventStamp {
         self.entries
             .iter()
-            .fold(EventStamp::zero(), |max, (id, entry)| {
+            .fold(EventStamp::default(), |max, (id, entry)| {
                 let entry_max = entry
                     .attrs
                     .values()
                     .map(|(_, h)| *h)
-                    .fold(EventStamp::zero(), EventStamp::max);
+                    .fold(EventStamp::default(), EventStamp::max);
                 std::cmp::max(
                     max,
                     std::cmp::max(
-                        std::cmp::max(id.0, entry.deleted_at.unwrap_or_else(EventStamp::zero)),
+                        std::cmp::max(id.0, entry.deleted_at.unwrap_or_else(EventStamp::default)),
                         entry_max,
                     ),
                 )
@@ -375,7 +375,7 @@ fn merge_clock(local: &mut Option<EventStamp>, remote: Option<EventStamp>) -> bo
     let Some(remote) = remote else {
         return false;
     };
-    if local.is_none_or(|current| remote.beats(current)) {
+    if local.is_none_or(|current| remote > current) {
         *local = Some(remote);
         true
     } else {
@@ -401,7 +401,7 @@ fn walk_visible(
         let Some(entry) = text.entries.get(id) else {
             continue;
         };
-        if entry.content.is_some() && entry.deleted_at.is_none_or(|deleted| id.0.beats(deleted)) {
+        if entry.content.is_some() && entry.deleted_at.is_none_or(|deleted| id.0 > deleted) {
             visible.push(*id);
         }
         walk_visible(Some(*id), text, children, visited, visible);

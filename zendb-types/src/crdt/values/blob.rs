@@ -112,7 +112,7 @@ impl Type for Blob {
     }
 
     fn merge(&mut self, remote: &Blob, stamps: crate::MergeStamps) -> Result<bool, BlobError> {
-        if stamps.incoming.beats(stamps.current) {
+        if stamps.incoming > stamps.current {
             *self = remote.clone();
             Ok(true)
         } else {

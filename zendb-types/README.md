@@ -6,9 +6,18 @@ replication protocol.
 
 ## Identity And Time
 
-`PeerId` and `WorkspaceId` are distinct domain newtypes backed by
-`libp2p-identity::PeerId`. Both use the same libp2p Ed25519-derived generator,
-canonical PeerId bytes, ordering, and explicit bincode encoding.
+`PeerId` is a ZenDB-owned wrapper around `libp2p-identity::PeerId`. It preserves
+the canonical PeerId byte encoding while providing native bincode traits. Its
+constructors and representation methods mirror the useful libp2p surface:
+`from_public_key`, `from_bytes`, `random`, `to_bytes`, and `to_base58`.
+`PrimaryKey::PeerId` is intentionally key-only; primary keys do not need to
+implement the CRDT `Type` trait.
+
+`WorkspaceId` is an independent random 128-bit identifier stored as a fixed
+16-byte array. Its canonical display form is 26-character uppercase Crockford
+Base32; parsing is case-insensitive and accepts the standard `O`/`I`/`L`
+aliases. A workspace identifier identifies a workspace but does not authorize
+joining it.
 
 ```rust
 pub struct EventId {
@@ -23,8 +32,9 @@ pub struct EventTime {
 ```
 
 `EventStamp` orders by
-`(physical_ms, logical, peer_id, sequence)`. `Roles` is inert persisted data
-with `Contributor`, `Operator`, and `Dispatcher` variants; workspace owns all
+`(physical_ms, logical, peer_id, sequence)`. `Role` is persisted progressive
+access data with `Contributor`, `Operator`, and `Admin` variants. No role means
+Reader. `Role::has_at_least` expresses the hierarchy; workspace owns
 authorization behavior.
 
 ### PeerIdentity
@@ -42,10 +52,10 @@ The workspace uses `peer_id()` for minting `EventId`s and `sign()` for future
 event signatures. It never sees private key material directly; the
 implementation decides where the key lives (in-memory, OS keychain, HSM, KMS).
 
-`LocalPeerIdentity` is a default in-memory implementation backed by an
-Ed25519 `Keypair`, suitable for tests, examples, and local-only deployments.
-Application-supplied impls may back the same trait by a persistent key store
-without workspace changes.
+Applications supply the implementation and may back it with an in-memory key,
+an OS keychain, HSM, KMS, or another persistent key store. Test-only
+implementations belong in the consuming crate rather than the portable type
+model.
 
 `Signature` is an opaque owned byte container, `Encode`/`Decode` so future
 event envelopes can carry it. `SigningError` is a distinct error type because

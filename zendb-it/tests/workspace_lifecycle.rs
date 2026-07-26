@@ -1,12 +1,39 @@
 //! End-to-end test exercising workspace create → table/state ops → cleanup.
-//! Validates the iter-0003 identity boundary (LocalPeerIdentity passed in).
+//! Validates the application-supplied peer identity boundary.
 
-use std::fs;
+use std::{fs, sync::Arc};
 
 use bincode::{Decode, Encode};
+use libp2p_identity::Keypair;
 use zendb_storage::{ReadBackend, StateConfig, TableConfig, WriteBackend};
-use zendb_types::{LocalPeerIdentity, Op, Path, PrimaryKey, Value};
+use zendb_types::{Op, Path, PeerId, PeerIdentity, PrimaryKey, Signature, SigningError, Value};
 use zendb_workspace::{Workspace, WorkspaceConfig};
+
+struct TestPeerIdentity {
+    keypair: Keypair,
+    peer_id: PeerId,
+}
+
+impl TestPeerIdentity {
+    fn generate() -> Self {
+        let keypair = Keypair::generate_ed25519();
+        let peer_id = PeerId::from_public_key(&keypair.public());
+        Self { keypair, peer_id }
+    }
+}
+
+impl PeerIdentity for TestPeerIdentity {
+    fn peer_id(&self) -> PeerId {
+        self.peer_id
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Signature, SigningError> {
+        self.keypair
+            .sign(message)
+            .map(Signature)
+            .map_err(Into::into)
+    }
+}
 
 /// A test value type used for state storage.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
@@ -22,7 +49,7 @@ fn workspace_create_tables_states_and_cleanup() {
         let root = temp.path().to_path_buf();
 
         // ---- create workspace ----
-        let peer = std::sync::Arc::new(LocalPeerIdentity::generate());
+        let peer = Arc::new(TestPeerIdentity::generate());
         let ws = Workspace::create(&root, peer.clone(), WorkspaceConfig::default())
             .expect("failed to create workspace");
         assert!(!ws.id().to_string().is_empty());

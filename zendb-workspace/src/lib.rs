@@ -12,4 +12,4 @@ pub use error::{Error, Result};
 pub use states::{StateHandle, States};
 pub use tables::{ChangeListener, TableHandle};
 pub use workspace::{JoinHints, Workspace, WorkspaceConfig};
-pub use zendb_types::Roles;
+pub use zendb_types::Role;

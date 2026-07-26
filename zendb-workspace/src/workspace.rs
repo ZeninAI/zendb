@@ -12,8 +12,8 @@ use zendb_types::{
 };
 
 use crate::{
-    consts::{IDENTITY_FILE, LOCK_FILE, PEER_STATE_NAME},
-    devices::{Devices, PeerRecord},
+    consts::{IDENTITY_FILE, LOCK_FILE, PEERS_STATE_NAME},
+    devices::{Devices, PeerState},
     states::States,
     tables::Tables,
     Error, Result,
@@ -45,7 +45,7 @@ enum Mode {
 pub struct Workspace {
     root: PathBuf,
     workspace_id: WorkspaceId,
-    peer: Arc<dyn PeerIdentity>,
+    identity: Arc<dyn PeerIdentity>,
     tables: Arc<Tables>,
     states: Arc<States>,
     devices: Arc<Devices>,
@@ -56,12 +56,12 @@ pub struct Workspace {
 impl Workspace {
     /// Create a new workspace at `path`.
     ///
-    /// `peer` supplies the local device identity (`PeerId` + private key).
+    /// `identity` supplies the local device identity (`PeerId` + private key).
     /// The workspace stores the `WorkspaceId` it generates but never stores
     /// the private key.
     pub fn create(
         path: impl AsRef<Path>,
-        peer: Arc<dyn PeerIdentity>,
+        identity: Arc<dyn PeerIdentity>,
         _config: WorkspaceConfig,
     ) -> Result<Self> {
         let root = path.as_ref().to_path_buf();
@@ -73,25 +73,25 @@ impl Workspace {
         }
         let workspace_id = WorkspaceId::generate();
         fs::write(identity_path, serialize_to_vec(&workspace_id)?)?;
-        Self::assemble(root, workspace_id, lock, peer, Mode::Create)
+        Self::assemble(root, workspace_id, lock, identity, Mode::Create)
     }
 
     /// Open an existing workspace at `path`.
     ///
-    /// `peer` supplies the local device identity. It must be the same device
+    /// `identity` supplies the local device identity. It must be the same device
     /// that previously created or joined this workspace (its `PeerId` must
     /// match a record in `_devices`).
-    pub fn open(path: impl AsRef<Path>, peer: Arc<dyn PeerIdentity>) -> Result<Self> {
+    pub fn open(path: impl AsRef<Path>, identity: Arc<dyn PeerIdentity>) -> Result<Self> {
         let root = path.as_ref().to_path_buf();
         let lock = acquire_lock(&root)?;
         let bytes = fs::read(root.join(IDENTITY_FILE))?;
         let workspace_id = deserialize_from(&bytes)?;
-        Self::assemble(root, workspace_id, lock, peer, Mode::Open)
+        Self::assemble(root, workspace_id, lock, identity, Mode::Open)
     }
 
     /// Join an existing workspace by its known `WorkspaceId`.
     ///
-    /// `peer` is the joining device's identity (a fresh `PeerIdentity` for
+    /// `identity` is the joining device's identity (a fresh `PeerIdentity` for
     /// this joiner). `hints` carries connection bootstrap data; it is
     /// forwarded to the networking layer in a future iteration and not
     /// persisted by the workspace.
@@ -102,7 +102,7 @@ impl Workspace {
     pub fn join(
         path: impl AsRef<Path>,
         workspace_id: WorkspaceId,
-        peer: Arc<dyn PeerIdentity>,
+        identity: Arc<dyn PeerIdentity>,
         hints: JoinHints,
         _config: WorkspaceConfig,
     ) -> Result<Self> {
@@ -111,14 +111,14 @@ impl Workspace {
         fs::create_dir_all(&root)?;
         let lock = acquire_lock(&root)?;
         fs::write(root.join(IDENTITY_FILE), serialize_to_vec(&workspace_id)?)?;
-        Self::assemble(root, workspace_id, lock, peer, Mode::Create)
+        Self::assemble(root, workspace_id, lock, identity, Mode::Create)
     }
 
     fn assemble(
         root: PathBuf,
         workspace_id: WorkspaceId,
         lock: File,
-        peer: Arc<dyn PeerIdentity>,
+        identity: Arc<dyn PeerIdentity>,
         mode: Mode,
     ) -> Result<Self> {
         // States owns the system catalog and materializes _peers during create;
@@ -127,25 +127,37 @@ impl Workspace {
             Mode::Create => States::create(&root)?,
             Mode::Open => States::open(&root)?,
         };
-        let peer_state = states.get::<PeerId, PeerRecord>(PEER_STATE_NAME)?;
+        let peer_state = states.get::<PeerId, PeerState>(PEERS_STATE_NAME)?;
 
         // Tables creates or opens the system tables, constructs Devices, opens
         // application tables, and installs listeners before returning.
         let tables = match mode {
-            Mode::Create => Tables::create(&root, peer_state, peer.clone())?,
-            Mode::Open => Tables::open(&root, peer_state, peer.clone())?,
+            Mode::Create => Tables::create(&root, peer_state, identity.clone())?,
+            Mode::Open => Tables::open(&root, peer_state, identity.clone())?,
         };
         let devices = tables.devices.clone();
 
         Ok(Self {
             root,
             workspace_id,
-            peer,
+            identity,
             tables,
             states,
             devices,
             _lock: lock,
         })
+    }
+
+    pub fn flush(&self) -> Result<()> {
+        self.devices.flush()?;
+        self.tables.flush()?;
+        self.states.flush()
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        self.devices.sync()?;
+        self.tables.sync()?;
+        self.states.sync()
     }
 
     pub fn id(&self) -> WorkspaceId {
@@ -161,7 +173,7 @@ impl Workspace {
     /// Exposed so callers can sign messages on behalf of the local device
     /// without the workspace ever holding private key material directly.
     pub fn peer_identity(&self) -> &Arc<dyn PeerIdentity> {
-        &self.peer
+        &self.identity
     }
 
     pub fn devices(&self) -> &Devices {
@@ -174,6 +186,12 @@ impl Workspace {
 
     pub fn states(&self) -> &States {
         &self.states
+    }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 

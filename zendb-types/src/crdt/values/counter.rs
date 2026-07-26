@@ -64,7 +64,7 @@ impl Type for Counter {
         if *delta == 0 {
             return Ok(false);
         }
-        let peer = stamps.peer_id();
+        let peer = stamps.id.peer_id;
         let entry = self.entries.entry(peer).or_default();
         if *delta > 0 {
             entry.0 = entry

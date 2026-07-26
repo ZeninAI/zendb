@@ -64,7 +64,7 @@ pub trait Type: Sized + Encode + Decode<()> {
     fn merge(&mut self, incoming: &Self, stamps: MergeStamps) -> Result<bool, Self::Error>;
 
     fn max_stamp(&self) -> EventStamp {
-        EventStamp::zero()
+        EventStamp::default()
     }
 }
 

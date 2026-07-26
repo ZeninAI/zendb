@@ -1,7 +1,7 @@
-//! Libp2p-compatible peer and workspace identities plus persisted roles.
+//! Peer identity, independent workspace identity, and persisted roles.
 
-pub mod ids;
 pub mod peer;
+pub mod workspace;
 
-pub use ids::{IdParseError, PeerId, Roles, WorkspaceId};
-pub use peer::{LocalPeerIdentity, PeerIdentity, Signature, SigningError};
+pub use peer::{IdParseError, PeerId, PeerIdentity, Role, Signature, SigningError};
+pub use workspace::{WorkspaceId, WorkspaceIdParseError};

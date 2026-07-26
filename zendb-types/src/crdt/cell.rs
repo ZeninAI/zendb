@@ -16,7 +16,7 @@ impl Cell {
     pub fn dummy(value: Option<Value>) -> Self {
         Self {
             value,
-            stamp: EventStamp::zero(),
+            stamp: EventStamp::default(),
         }
     }
 
@@ -32,7 +32,7 @@ impl Cell {
         if self.type_tag() == Some(expected) {
             return true;
         }
-        if incoming.beats(self.max_stamp()) {
+        if incoming > self.max_stamp() {
             self.value = Some(expected.empty_value());
             self.stamp = incoming;
             return true;
@@ -58,13 +58,13 @@ impl Type for Cell {
                     .as_mut()
                     .expect("ensure_type must leave the cell live");
                 let changed = value.apply(type_op, MergeStamps::new(self.stamp, incoming))?;
-                if changed && incoming.beats(self.stamp) {
+                if changed && incoming > self.stamp {
                     self.stamp = incoming;
                 }
                 Ok(changed)
             }
             Op::Delete => {
-                if !incoming.beats(self.stamp) {
+                if incoming <= self.stamp {
                     return Ok(false);
                 }
                 self.value = None;
@@ -72,7 +72,7 @@ impl Type for Cell {
                 Ok(true)
             }
             Op::Upsert { value } => {
-                if !incoming.beats(self.stamp) {
+                if incoming <= self.stamp {
                     return Ok(false);
                 }
                 self.value = Some(value.clone());
@@ -86,7 +86,7 @@ impl Type for Cell {
     fn merge(&mut self, incoming: &Cell, stamps: MergeStamps) -> Result<bool, TypeError> {
         match (&mut self.value, &incoming.value) {
             (None, None) => {
-                if stamps.incoming.beats(stamps.current) {
+                if stamps.incoming > stamps.current {
                     self.stamp = incoming.stamp;
                     Ok(true)
                 } else {
@@ -94,7 +94,7 @@ impl Type for Cell {
                 }
             }
             (None, Some(_)) | (Some(_), None) => {
-                if stamps.incoming.beats(stamps.current) {
+                if stamps.incoming > stamps.current {
                     *self = incoming.clone();
                     Ok(true)
                 } else {
@@ -103,14 +103,14 @@ impl Type for Cell {
             }
             (Some(current), Some(incoming_value)) => {
                 if current.type_tag() != incoming_value.type_tag() {
-                    if stamps.incoming.beats(stamps.current) {
+                    if stamps.incoming > stamps.current {
                         *self = incoming.clone();
                         return Ok(true);
                     }
                     return Ok(false);
                 }
                 let mut changed = current.merge(incoming_value, stamps)?;
-                if stamps.incoming.beats(stamps.current) {
+                if stamps.incoming > stamps.current {
                     self.stamp = incoming.stamp;
                     changed = true;
                 }

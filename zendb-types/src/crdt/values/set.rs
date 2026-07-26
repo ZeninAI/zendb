@@ -27,8 +27,8 @@ impl Meta {
 impl Default for Meta {
     fn default() -> Self {
         Self {
-            updated: EventStamp::zero(),
-            deleted: EventStamp::zero(),
+            updated: EventStamp::default(),
+            deleted: EventStamp::default(),
         }
     }
 }
@@ -76,7 +76,7 @@ impl Type for Set {
         match op {
             SetOp::Add { key } => {
                 let meta = self.entries.entry(key.clone()).or_default();
-                if stamps.beats(meta.updated) {
+                if stamps > meta.updated {
                     meta.updated = stamps;
                     Ok(true)
                 } else {
@@ -85,7 +85,7 @@ impl Type for Set {
             }
             SetOp::Remove { key } => {
                 let meta = self.entries.entry(key.clone()).or_default();
-                if stamps.beats(meta.deleted) {
+                if stamps > meta.deleted {
                     meta.deleted = stamps;
                     Ok(true)
                 } else {
@@ -101,11 +101,11 @@ impl Type for Set {
         for (key, remote_meta) in &remote.entries {
             match self.entries.get_mut(key) {
                 Some(local_meta) => {
-                    if remote_meta.updated.beats(local_meta.updated) {
+                    if remote_meta.updated > local_meta.updated {
                         local_meta.updated = remote_meta.updated;
                         changed = true;
                     }
-                    if remote_meta.deleted.beats(local_meta.deleted) {
+                    if remote_meta.deleted > local_meta.deleted {
                         local_meta.deleted = remote_meta.deleted;
                         changed = true;
                     }
@@ -121,8 +121,10 @@ impl Type for Set {
     }
 
     fn max_stamp(&self) -> EventStamp {
-        self.entries.values().fold(EventStamp::zero(), |max, meta| {
-            max.max(meta.updated).max(meta.deleted)
-        })
+        self.entries
+            .values()
+            .fold(EventStamp::default(), |max, meta| {
+                max.max(meta.updated).max(meta.deleted)
+            })
     }
 }

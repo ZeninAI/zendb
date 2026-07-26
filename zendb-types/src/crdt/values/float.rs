@@ -110,7 +110,7 @@ impl Type for Float32 {
     }
 
     fn merge(&mut self, remote: &Self, stamps: crate::MergeStamps) -> Result<bool, Self::Error> {
-        if stamps.incoming.beats(stamps.current) {
+        if stamps.incoming > stamps.current {
             *self = *remote;
             Ok(true)
         } else {
@@ -142,7 +142,7 @@ impl Type for Float64 {
     }
 
     fn merge(&mut self, remote: &Self, stamps: crate::MergeStamps) -> Result<bool, Self::Error> {
-        if stamps.incoming.beats(stamps.current) {
+        if stamps.incoming > stamps.current {
             *self = *remote;
             Ok(true)
         } else {

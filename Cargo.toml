@@ -23,6 +23,7 @@ hashbrown = "0.15"
 bincode = { version = "2", features = ["derive"] }
 
 libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand"] }
+rand = "0.8"
 
 parking_lot = "0.12"
 arc-swap = "1"

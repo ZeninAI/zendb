@@ -154,7 +154,7 @@ impl Type for List {
         let stamps = stamps.incoming;
         match op {
             ListOp::Insert { after, value } => {
-                if stamps == EventStamp::zero() {
+                if stamps == EventStamp::default() {
                     return Err(ListError::ZeroId);
                 }
 
@@ -180,7 +180,7 @@ impl Type for List {
                 }
             }
             ListOp::Delete { id } => {
-                if *id == EventStamp::zero() {
+                if *id == EventStamp::default() {
                     return Err(ListError::ZeroId);
                 }
 
@@ -237,7 +237,7 @@ impl Type for List {
     fn max_stamp(&self) -> EventStamp {
         self.entries
             .values()
-            .fold(EventStamp::zero(), |max, entry| {
+            .fold(EventStamp::default(), |max, entry| {
                 std::cmp::max(max, entry.cell.max_stamp())
             })
     }
@@ -272,7 +272,7 @@ impl ContainerType for List {
             return Ok(false);
         };
         let id = *id;
-        if id == EventStamp::zero() {
+        if id == EventStamp::default() {
             return Err(ListError::ZeroId);
         }
         let child_tag = remaining
@@ -284,7 +284,7 @@ impl ContainerType for List {
                 .map(|tag| Cell::dummy(Some(tag.empty_value())))
                 .unwrap_or(Cell {
                     value: None,
-                    stamp: EventStamp::zero(),
+                    stamp: EventStamp::default(),
                 });
             ListEntry::placeholder(cell)
         });

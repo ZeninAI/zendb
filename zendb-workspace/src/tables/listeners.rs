@@ -1,4 +1,4 @@
-//! Internal workspace listeners: receipts, catalog sync, and device sync.
+//! Internal workspace listeners for receipts, the table catalog, and devices.
 
 use std::{
     fs,
@@ -13,7 +13,7 @@ use crate::{devices::Devices, tables::Tables};
 
 /// Observes every successful insert on every table. Replaces the one-shot
 /// `replay_receipts` consumer: receipts are now live-observed via callback
-/// and persisted in `_peer_state`.
+/// and written to `_peers` at the next durability barrier.
 pub(crate) struct ReceiptListener {
     devices: Weak<Devices>,
 }
@@ -33,19 +33,19 @@ impl ChangeListener for ReceiptListener {
     }
 }
 
-/// Reacts to `_table_catalog` events: opens tables on `Upsert`, closes +
+/// Reacts to `_catalog` events: opens tables on `Upsert`, closes +
 /// removes the physical directory on `Delete`. This is the single owner of
 /// the in-memory table-handle map after bootstrap.
 ///
 /// Holds a shared receipt listener to register on newly opened application
 /// tables, so every table — bootstrap-opened or callback-opened — has the
 /// receipt listener.
-pub(crate) struct CatalogSyncListener {
+pub(crate) struct TableCatalogListener {
     tables: Weak<Tables>,
     receipt_listener: Arc<dyn ChangeListener>,
 }
 
-impl CatalogSyncListener {
+impl TableCatalogListener {
     pub(crate) fn build(
         tables: Weak<Tables>,
         receipt_listener: Arc<dyn ChangeListener>,
@@ -57,7 +57,7 @@ impl CatalogSyncListener {
     }
 }
 
-impl ChangeListener for CatalogSyncListener {
+impl ChangeListener for TableCatalogListener {
     fn on_change(&self, change: &zendb_storage::Change) {
         let Some(tables) = self.tables.upgrade() else {
             return;
@@ -113,38 +113,45 @@ impl ChangeListener for CatalogSyncListener {
     }
 }
 
-/// Reacts to `_devices` events: upserts/removes in the in-memory device
-/// records map. This is the single owner of in-memory device-record mutation
+/// Reacts to `_devices` events: upserts/removes in the device registry cache.
+/// This is the single owner of in-memory device-record mutation
 /// after the initial load performed by `Devices::open`.
-pub(crate) struct DeviceSyncListener {
+pub(crate) struct DeviceRegistryListener {
     devices: Weak<Devices>,
 }
 
-impl DeviceSyncListener {
+impl DeviceRegistryListener {
     pub(crate) fn build(devices: Weak<Devices>) -> Arc<dyn ChangeListener> {
         Arc::new(Self { devices })
     }
 }
 
-impl ChangeListener for DeviceSyncListener {
+impl ChangeListener for DeviceRegistryListener {
     fn on_change(&self, change: &zendb_storage::Change) {
         use crate::devices::DeviceRecord;
         let Some(devices) = self.devices.upgrade() else {
             return;
         };
-        let PrimaryKey::PeerId(peer) = &change.event.primary_key else {
+        let PrimaryKey::PeerId(peer_id) = &change.event.primary_key else {
             return;
         };
+        let mut cache = devices.registry_cache.write();
         match &change.event.op {
             Op::Upsert {
                 value: Value::Blob(blob),
             } => {
                 if let Ok(record) = blob.decode::<DeviceRecord>() {
-                    devices.records.write().insert(*peer, record);
+                    if *peer_id == devices.local_peer_id() {
+                        cache.local_role = record.role;
+                    }
+                    cache.entries.insert(*peer_id, record);
                 }
             }
             Op::Delete => {
-                devices.records.write().remove(peer);
+                if *peer_id == devices.local_peer_id() {
+                    cache.local_role = None;
+                }
+                cache.entries.remove(peer_id);
             }
             _ => {}
         }

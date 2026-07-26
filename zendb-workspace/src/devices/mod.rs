@@ -1,8 +1,7 @@
-//! Device registry, peer bookkeeping, and receipt tracking.
+//! Device registry, cached peer bookkeeping, and receipt tracking.
 
-mod peer;
 mod receipts;
 mod runtime;
 
-pub(crate) use peer::PeerRecord;
+pub(crate) use runtime::PeerState;
 pub use runtime::{DeviceRecord, Devices};

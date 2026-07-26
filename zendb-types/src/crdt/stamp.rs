@@ -10,30 +10,10 @@ pub struct EventId {
     pub sequence: u64,
 }
 
-impl EventId {
-    pub fn new(peer_id: PeerId, sequence: u64) -> Self {
-        Self { peer_id, sequence }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct EventTime {
     pub physical_ms: u64,
     pub logical: u32,
-}
-
-impl EventTime {
-    pub const ZERO: Self = Self {
-        physical_ms: 0,
-        logical: 0,
-    };
-
-    pub const fn new(physical_ms: u64, logical: u32) -> Self {
-        Self {
-            physical_ms,
-            logical,
-        }
-    }
 }
 
 /// A globally ordered event stamp.
@@ -44,36 +24,6 @@ impl EventTime {
 pub struct EventStamp {
     pub id: EventId,
     pub time: EventTime,
-}
-
-impl EventStamp {
-    pub const fn new(id: EventId, time: EventTime) -> Self {
-        Self { id, time }
-    }
-
-    pub fn zero() -> Self {
-        Self::default()
-    }
-
-    pub const fn physical_ms(self) -> u64 {
-        self.time.physical_ms
-    }
-
-    pub const fn logical(self) -> u32 {
-        self.time.logical
-    }
-
-    pub const fn peer_id(self) -> PeerId {
-        self.id.peer_id
-    }
-
-    pub const fn sequence(self) -> u64 {
-        self.id.sequence
-    }
-
-    pub fn beats(self, other: Self) -> bool {
-        self > other
-    }
 }
 
 impl PartialOrd for EventStamp {

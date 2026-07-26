@@ -93,7 +93,7 @@ impl Type for Timestamp {
         remote: &Timestamp,
         stamps: crate::MergeStamps,
     ) -> Result<bool, TimestampError> {
-        if stamps.incoming.beats(stamps.current) {
+        if stamps.incoming > stamps.current {
             *self = *remote;
             Ok(true)
         } else {

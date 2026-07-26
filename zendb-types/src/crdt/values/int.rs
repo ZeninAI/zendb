@@ -196,7 +196,7 @@ impl Type for Int {
     }
 
     fn merge(&mut self, remote: &Int, stamps: crate::MergeStamps) -> Result<bool, IntError> {
-        if stamps.incoming.beats(stamps.current) {
+        if stamps.incoming > stamps.current {
             *self = *remote;
             Ok(true)
         } else {

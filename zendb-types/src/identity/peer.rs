@@ -1,11 +1,121 @@
-//! Abstract peer identity trait and a default in-memory implementation.
+//! Network peer identifiers, progressive roles, and signing abstractions.
 
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use bincode::{de::Decoder, enc::Encoder, Decode, Encode};
-use libp2p_identity::{Keypair, SigningError as Libp2pSigningError};
+use libp2p_identity::{PeerId as Libp2pPeerId, PublicKey, SigningError as Libp2pSigningError};
 
-use crate::PeerId;
+pub type IdParseError = libp2p_identity::ParseError;
+
+/// A network peer identity encoded as canonical libp2p PeerId bytes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PeerId(Libp2pPeerId);
+
+impl PeerId {
+    pub fn from_public_key(key: &PublicKey) -> Self {
+        Self(Libp2pPeerId::from_public_key(key))
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, IdParseError> {
+        Libp2pPeerId::from_bytes(data).map(Self)
+    }
+
+    pub fn random() -> Self {
+        Self(Libp2pPeerId::random())
+    }
+
+    pub fn to_bytes(self) -> Vec<u8> {
+        self.0.to_bytes()
+    }
+
+    pub fn to_base58(self) -> String {
+        self.0.to_base58()
+    }
+
+    pub const fn as_libp2p(&self) -> &Libp2pPeerId {
+        &self.0
+    }
+}
+
+impl Default for PeerId {
+    fn default() -> Self {
+        // A valid identity-multihash with a zero digest is the CRDT sentinel.
+        Self::from_bytes(&[
+            0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+        ])
+        .expect("the zero PeerId sentinel is a valid identity multihash")
+    }
+}
+
+impl fmt::Display for PeerId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Debug for PeerId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("PeerId").field(&self.0).finish()
+    }
+}
+
+impl FromStr for PeerId {
+    type Err = IdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse().map(Self)
+    }
+}
+
+impl From<Libp2pPeerId> for PeerId {
+    fn from(value: Libp2pPeerId) -> Self {
+        Self(value)
+    }
+}
+
+impl From<PeerId> for Libp2pPeerId {
+    fn from(value: PeerId) -> Self {
+        value.0
+    }
+}
+
+impl Encode for PeerId {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), bincode::error::EncodeError> {
+        self.0.to_bytes().encode(encoder)
+    }
+}
+
+impl<Context> Decode<Context> for PeerId {
+    fn decode<D: Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let bytes = Vec::<u8>::decode(decoder)?;
+        Self::from_bytes(&bytes).map_err(|error| {
+            bincode::error::DecodeError::OtherString(format!("invalid PeerId: {error}"))
+        })
+    }
+}
+
+bincode::impl_borrow_decode!(PeerId);
+
+/// Persisted workspace capabilities. Enforcement belongs to zendb-workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
+pub enum Role {
+    Contributor,
+    Operator,
+    Admin,
+}
+
+impl Role {
+    pub const fn has_at_least(self, required: Self) -> bool {
+        match required {
+            Self::Contributor => true,
+            Self::Operator => matches!(self, Self::Operator | Self::Admin),
+            Self::Admin => matches!(self, Self::Admin),
+        }
+    }
+}
 
 /// A device's cryptographic identity.
 ///
@@ -88,46 +198,5 @@ impl std::error::Error for SigningError {}
 impl From<Libp2pSigningError> for SigningError {
     fn from(value: Libp2pSigningError) -> Self {
         Self::Backend(value.to_string())
-    }
-}
-
-/// A default in-memory `PeerIdentity` backed by an ed25519 `Keypair`.
-///
-/// Suitable for tests, examples, and local-only deployments. The keypair
-/// lives in process memory and is lost when the process exits; production
-/// deployments should supply an impl backed by a persistent key store.
-pub struct LocalPeerIdentity {
-    keypair: Keypair,
-    peer_id: PeerId,
-}
-
-impl LocalPeerIdentity {
-    /// Generate a fresh ed25519 identity.
-    pub fn generate() -> Self {
-        let keypair = Keypair::generate_ed25519();
-        let peer_id = PeerId::from(libp2p_identity::PeerId::from_public_key(&keypair.public()));
-        Self { keypair, peer_id }
-    }
-}
-
-impl fmt::Debug for LocalPeerIdentity {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("LocalPeerIdentity")
-            .field("peer_id", &self.peer_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PeerIdentity for LocalPeerIdentity {
-    fn peer_id(&self) -> PeerId {
-        self.peer_id
-    }
-
-    fn sign(&self, message: &[u8]) -> Result<Signature, SigningError> {
-        self.keypair
-            .sign(message)
-            .map(Signature)
-            .map_err(Into::into)
     }
 }

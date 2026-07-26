@@ -1050,6 +1050,7 @@ name = "zendb-it"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "libp2p-identity",
  "tempfile",
  "zendb-storage",
  "zendb-types",
@@ -1076,13 +1077,13 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "libp2p-identity",
+ "rand",
 ]
 
 [[package]]
 name = "zendb-workspace"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "bincode",
  "parking_lot",
  "zendb-storage",

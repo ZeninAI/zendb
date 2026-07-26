@@ -13,7 +13,8 @@ use std::{
 use parking_lot::RwLock;
 use zendb_storage::{DurableStorage, ReadBackend, Table, TableConfig};
 use zendb_types::{
-    Blob, Cell, Event, EventStamp, Op, Path as CrdtPath, PeerId, PeerIdentity, PrimaryKey, Value,
+    Blob, Cell, Event, EventStamp, Op, Path as CrdtPath, PeerId, PeerIdentity, PrimaryKey, Role,
+    Value,
 };
 
 pub use runtime::{ChangeListener, TableHandle};
@@ -22,22 +23,23 @@ use crate::{
     consts::{
         is_system_table, DEVICES_TABLE_NAME, SYSTEM_TABLE_CONFIG, TABLES_DIR, TABLE_CATALOG_NAME,
     },
-    devices::{Devices, PeerRecord},
+    devices::{Devices, PeerState},
     states::StateHandle,
     Error, Result,
 };
 
-/// Table catalog management: owns the `_table_catalog` handle and the
+/// Table catalog management: owns the `_catalog` handle and the
 /// in-memory map of opened [`TableHandle`]s.
 ///
-/// The `_table_catalog` Table is the source of truth for table declarations.
+/// The `_catalog` Table is the source of truth for table declarations.
 /// Every declared table is eagerly opened and stored in the handle map.
-/// Handle-map mutation after bootstrap is owned by the `CatalogSync` listener;
-/// the lifecycle methods here only validate and publish catalog events.
+/// Handle-map mutation after bootstrap is owned by `TableCatalogListener`;
+/// listener; the lifecycle methods here only validate and publish catalog
+/// events.
 ///
-/// Exposes lifecycle operations (upsert/get/delete/list/contains). Table
-/// operations themselves are performed through the handle, not on this
-/// handler.
+/// Exposes lifecycle operations (upsert/get/delete/list/contains) and
+/// durability barriers. Table operations themselves are performed through the
+/// handle, not on this handler.
 pub struct Tables {
     pub(crate) root: PathBuf,
     catalog: Arc<TableHandle>,
@@ -48,8 +50,8 @@ pub struct Tables {
 impl Tables {
     pub(crate) fn create(
         root: &Path,
-        peer_state: Arc<StateHandle<PeerId, PeerRecord>>,
-        peer: Arc<dyn PeerIdentity>,
+        peer_state: Arc<StateHandle<PeerId, PeerState>>,
+        identity: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
         let root = root.join(TABLES_DIR);
         fs::create_dir_all(&root)?;
@@ -57,8 +59,8 @@ impl Tables {
         let devices = Devices::create(
             Table::create(&root.join(DEVICES_TABLE_NAME), SYSTEM_TABLE_CONFIG.clone())?,
             peer_state,
-            peer,
-        )?;
+            identity,
+        );
         let catalog = TableHandle::new(
             TABLE_CATALOG_NAME.to_owned(),
             Table::create(&root.join(TABLE_CATALOG_NAME), SYSTEM_TABLE_CONFIG.clone())?,
@@ -77,17 +79,17 @@ impl Tables {
         });
         tables.register_listeners();
 
+        devices.register_local()?;
         tables.write_entry(TABLE_CATALOG_NAME, &SYSTEM_TABLE_CONFIG, devices.mint()?)?;
         tables.write_entry(DEVICES_TABLE_NAME, &SYSTEM_TABLE_CONFIG, devices.mint()?)?;
-        devices.register_local_device()?;
 
         Ok(tables)
     }
 
     pub(crate) fn open(
         root: &Path,
-        peer_state: Arc<StateHandle<PeerId, PeerRecord>>,
-        peer: Arc<dyn PeerIdentity>,
+        peer_state: Arc<StateHandle<PeerId, PeerState>>,
+        identity: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
         let tables_dir = root.join(TABLES_DIR);
         let devices = Devices::open(
@@ -96,7 +98,7 @@ impl Tables {
                 SYSTEM_TABLE_CONFIG.clone(),
             )?,
             peer_state,
-            peer,
+            identity,
         )?;
         let devices_weak = Arc::downgrade(&devices);
         let catalog = TableHandle::new(
@@ -145,7 +147,7 @@ impl Tables {
             devices: devices.clone(),
         });
         tables.register_listeners();
-        devices.require_local_device()?;
+        devices.require_local()?;
         Ok(tables)
     }
 
@@ -157,18 +159,35 @@ impl Tables {
         self.tables.read().keys().cloned().collect()
     }
 
+    pub fn flush(&self) -> Result<()> {
+        let tables = self.tables.read().values().cloned().collect::<Vec<_>>();
+        for table in tables {
+            table.table.write().flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        let tables = self.tables.read().values().cloned().collect::<Vec<_>>();
+        for table in tables {
+            table.table.write().sync()?;
+        }
+        Ok(())
+    }
+
     /// Declare a new table or update its config. Creates the table declaration
     /// if it does not exist; if it already exists, updates the config only
     /// when it differs. Returns `true` if a change was made (created or config
     /// changed), `false` if the declaration was already present with the same
-    /// config. The table is opened synchronously by the `CatalogSync` callback
+    /// config. The table is opened synchronously by `TableCatalogListener`
     /// during the catalog write. The caller obtains a handle separately via
     /// [`Tables::get`]. Refuses system tables.
     pub fn upsert(&self, name: &str, config: TableConfig) -> Result<bool> {
         if is_system_table(name) {
             return Err(Error::SystemTableReadOnly(name.to_owned()));
         }
-        self.devices.authorize(zendb_types::Roles::Operator)?;
+        self.devices
+            .require_access(self.devices.local_peer_id(), Role::Admin)?;
         let key = PrimaryKey::String(name.to_owned());
         let current = {
             let catalog = self.catalog.read();
@@ -202,7 +221,8 @@ impl Tables {
         if is_system_table(name) {
             return Err(Error::ResourceBusy(name.to_owned()));
         }
-        self.devices.authorize(zendb_types::Roles::Operator)?;
+        self.devices
+            .require_access(self.devices.local_peer_id(), Role::Admin)?;
         if let Some(entry) = self.tables.read().get(name) {
             if Arc::strong_count(entry) > 1 {
                 return Err(Error::ResourceBusy(name.to_owned()));
@@ -236,15 +256,15 @@ impl Tables {
     fn register_listeners(self: &Arc<Self>) {
         let devices = Arc::downgrade(&self.devices);
         let receipt_listener = listeners::ReceiptListener::build(devices.clone());
-        let catalog_sync =
-            listeners::CatalogSyncListener::build(Arc::downgrade(self), receipt_listener.clone());
-        let device_sync = listeners::DeviceSyncListener::build(devices);
+        let catalog_listener =
+            listeners::TableCatalogListener::build(Arc::downgrade(self), receipt_listener.clone());
+        let registry_listener = listeners::DeviceRegistryListener::build(devices);
 
         for table in self.tables.read().values() {
             table.add_listener(receipt_listener.clone());
         }
-        self.catalog.add_listener(catalog_sync);
-        self.devices.registry.add_listener(device_sync);
+        self.catalog.add_listener(catalog_listener);
+        self.devices.registry.add_listener(registry_listener);
     }
 }
 

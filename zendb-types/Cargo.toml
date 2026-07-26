@@ -10,3 +10,4 @@ description = "Portable identifiers, event stamps, and CRDT values for ZenDB"
 [dependencies]
 bincode.workspace = true
 libp2p-identity.workspace = true
+rand.workspace = true

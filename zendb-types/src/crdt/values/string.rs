@@ -45,7 +45,7 @@ impl Type for String {
     }
 
     fn merge(&mut self, remote: &String, stamps: crate::MergeStamps) -> Result<bool, StringError> {
-        if stamps.incoming.beats(stamps.current) {
+        if stamps.incoming > stamps.current {
             *self = remote.clone();
             Ok(true)
         } else {

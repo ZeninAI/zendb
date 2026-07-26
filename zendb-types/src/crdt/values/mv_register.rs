@@ -91,7 +91,7 @@ impl Type for MvRegister {
                     if self
                         .removed
                         .get(replaced)
-                        .is_none_or(|existing| stamps.beats(*existing))
+                        .is_none_or(|existing| stamps > *existing)
                     {
                         self.removed.insert(*replaced, stamps);
                         changed = true;
@@ -119,7 +119,7 @@ impl Type for MvRegister {
             if self
                 .removed
                 .get(&id)
-                .is_none_or(|existing| removed_at.beats(*existing))
+                .is_none_or(|existing| removed_at > *existing)
             {
                 self.removed.insert(id, removed_at);
                 changed = true;
@@ -152,7 +152,9 @@ impl Type for MvRegister {
         let entries = self
             .entries
             .keys()
-            .fold(EventStamp::zero(), |max, &stamp| std::cmp::max(max, stamp));
+            .fold(EventStamp::default(), |max, &stamp| {
+                std::cmp::max(max, stamp)
+            });
         self.removed
             .values()
             .fold(entries, |max, &stamp| std::cmp::max(max, stamp))

@@ -19,29 +19,50 @@ pub use runtime::StateHandle;
 
 use crate::{
     consts::{
-        is_system_state, PEER_STATE_NAME, STATES_DIR, STATE_CATALOG_NAME, SYSTEM_STATE_CONFIG,
+        is_system_state, PEERS_STATE_NAME, STATES_DIR, STATE_CATALOG_NAME, SYSTEM_STATE_CONFIG,
     },
     Error, Result,
 };
 
-/// State catalog management: owns the `_state_catalog` State and the in-memory
+/// State catalog management: owns the `_catalog` State and the in-memory
 /// map of opened (erased) `State` handles. The typed catalog field and its
 /// erased map entry share one `Arc<StateHandle<_, _>>`, so every catalog access is
 /// synchronized by the same lock.
 ///
-/// States are **lazy**: a state may be declared in `_state_catalog` but not
+/// States are **lazy**: a state may be declared in `_catalog` but not
 /// currently open. `get` lazy-loads on first access.
 ///
-/// Exposes lifecycle operations (upsert/get/list/contains/close/delete) and
-/// returns typed [`StateHandle`]s via [`States::get`]. State reads and writes are
-/// performed through the handle, not on this handler.
+/// Exposes lifecycle operations (upsert/get/list/contains/close/delete),
+/// durability barriers, and typed [`StateHandle`]s via [`States::get`]. State
+/// reads and writes are performed through the handle, not on this handler.
 pub struct States {
     root: PathBuf,
     catalog: Arc<StateHandle<String, StateConfig>>,
     states: RwLock<HashMap<String, ErasedStateHandle>>,
 }
 
-type ErasedStateHandle = Arc<dyn Any + Send + Sync>;
+trait ErasedState: Any + Send + Sync {
+    fn flush(&self) -> Result<()>;
+    fn sync(&self) -> Result<()>;
+}
+
+impl<K, V> ErasedState for StateHandle<K, V>
+where
+    K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
+    V: Encode + Decode<()> + Clone + Send + Sync + 'static,
+{
+    fn flush(&self) -> Result<()> {
+        self.state.write().flush()?;
+        Ok(())
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.state.write().sync()?;
+        Ok(())
+    }
+}
+
+type ErasedStateHandle = Arc<dyn ErasedState>;
 
 impl States {
     pub(crate) fn create(root: &Path) -> Result<Arc<Self>> {
@@ -50,9 +71,9 @@ impl States {
         let mut catalog =
             State::create(&root.join(STATE_CATALOG_NAME), SYSTEM_STATE_CONFIG.clone())?;
         // Create the directory and catalog entry for the peer state
-        let _ = State::<(), ()>::create(&root.join(PEER_STATE_NAME), SYSTEM_STATE_CONFIG.clone())?;
+        let _ = State::<(), ()>::create(&root.join(PEERS_STATE_NAME), SYSTEM_STATE_CONFIG.clone())?;
         catalog.put(STATE_CATALOG_NAME.to_owned(), SYSTEM_STATE_CONFIG.clone())?;
-        catalog.put(PEER_STATE_NAME.to_owned(), SYSTEM_STATE_CONFIG.clone())?;
+        catalog.put(PEERS_STATE_NAME.to_owned(), SYSTEM_STATE_CONFIG.clone())?;
         let catalog = Arc::new(StateHandle {
             name: STATE_CATALOG_NAME.to_owned(),
             state: RwLock::new(catalog),
@@ -100,6 +121,22 @@ impl States {
             .collect()
     }
 
+    pub fn flush(&self) -> Result<()> {
+        let states = self.states.read().values().cloned().collect::<Vec<_>>();
+        for state in states {
+            state.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        let states = self.states.read().values().cloned().collect::<Vec<_>>();
+        for state in states {
+            state.sync()?;
+        }
+        Ok(())
+    }
+
     /// Declare a new state or update its config. Creates the declaration and
     /// the physical state if it does not exist; if it already exists, updates
     /// the config only when it differs. Returns `true` if a change was made
@@ -134,7 +171,7 @@ impl States {
 
     /// Obtain a typed handle to an existing state. Returns the handle if the
     /// state is already open, or opens the physical state declared in
-    /// `_state_catalog` and returns it. Returns an error if the state is not
+    /// `_catalog` and returns it. Returns an error if the state is not
     /// declared (neither open nor in the catalog). `get` never creates a state;
     /// declaration and physical creation are the job of [`States::upsert`].
     /// Returns handles to system states too.
@@ -145,6 +182,7 @@ impl States {
     {
         let mut open = self.states.write();
         if let Some(erased) = open.get(name).cloned() {
+            let erased: Arc<dyn Any + Send + Sync> = erased;
             return Arc::downcast::<StateHandle<K, V>>(erased)
                 .map_err(|_| Error::TypeMismatch(name.to_owned()));
         }

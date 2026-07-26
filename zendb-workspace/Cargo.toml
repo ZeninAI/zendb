@@ -10,6 +10,5 @@ description = "Catalog, device, and local state lifecycle for ZenDB"
 [dependencies]
 bincode.workspace = true
 parking_lot.workspace = true
-arc-swap.workspace = true
 zendb-storage = { path = "../zendb-storage" }
 zendb-types = { path = "../zendb-types" }

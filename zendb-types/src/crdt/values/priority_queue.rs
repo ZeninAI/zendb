@@ -139,7 +139,7 @@ impl Type for PriorityQueue {
                 }
             },
             PqOp::Pop { id } => {
-                if !stamps.beats(*id) {
+                if stamps <= *id {
                     return Ok(false);
                 }
                 match self.entries.get_mut(id) {
@@ -181,11 +181,11 @@ impl Type for PriorityQueue {
     fn max_stamp(&self) -> EventStamp {
         self.entries
             .iter()
-            .fold(EventStamp::zero(), |max, (&id, entry)| {
+            .fold(EventStamp::default(), |max, (&id, entry)| {
                 let deleted_at = match entry {
                     PqEntry::PendingPop { deleted_at } => *deleted_at,
                     PqEntry::Present { deleted_at, .. } => {
-                        deleted_at.unwrap_or_else(EventStamp::zero)
+                        deleted_at.unwrap_or_else(EventStamp::default)
                     }
                 };
                 max.max(id).max(deleted_at)
@@ -248,7 +248,7 @@ fn merge_clock(local: &mut Option<EventStamp>, remote: Option<EventStamp>) -> bo
     let Some(remote) = remote else {
         return false;
     };
-    if local.is_none_or(|current| remote.beats(current)) {
+    if local.is_none_or(|current| remote > current) {
         *local = Some(remote);
         true
     } else {
@@ -257,7 +257,7 @@ fn merge_clock(local: &mut Option<EventStamp>, remote: Option<EventStamp>) -> bo
 }
 
 fn merge_required_clock(current: &mut EventStamp, incoming: EventStamp) -> bool {
-    if incoming.beats(*current) {
+    if incoming > *current {
         *current = incoming;
         true
     } else {

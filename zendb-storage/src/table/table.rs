@@ -70,7 +70,7 @@ impl Table {
         let mut current = previous.clone().unwrap_or_else(|| Cell::dummy(None));
         let current_stamp = previous
             .as_ref()
-            .map_or_else(EventStamp::zero, |cell| cell.stamp);
+            .map_or_else(EventStamp::default, |cell| cell.stamp);
         let changed = current
             .apply_walk(
                 &event.op,

@@ -4,7 +4,7 @@ use std::sync::{Arc, Weak};
 
 use parking_lot::{RwLock, RwLockReadGuard};
 use zendb_storage::{Change, InsertOutcome, Table, TopicConsumer};
-use zendb_types::{Event, Op, Path, PrimaryKey};
+use zendb_types::{Event, Op, Path, PrimaryKey, Role};
 
 use crate::{devices::Devices, Error, Result};
 
@@ -27,7 +27,7 @@ pub trait ChangeListener: Send + Sync {
 /// [`TableHandle::insert`] refuses them.
 pub struct TableHandle {
     name: String,
-    table: RwLock<Table>,
+    pub(super) table: RwLock<Table>,
     listeners: RwLock<Vec<Arc<dyn ChangeListener>>>,
     devices: Weak<Devices>,
     is_system: bool,
@@ -66,7 +66,7 @@ impl TableHandle {
             return Err(Error::SystemTableReadOnly(self.name.clone()));
         }
         let devices = self.devices.upgrade().ok_or(Error::WorkspaceClosed)?;
-        devices.authorize(zendb_types::Roles::Contributor)?;
+        devices.require_access(devices.local_peer_id(), Role::Contributor)?;
         let stamp = devices.mint()?;
         self.insert_internal(Event {
             primary_key,
@@ -93,8 +93,24 @@ impl TableHandle {
         self.listeners.write().push(listener);
     }
 
-    /// Workspace-managed mutation path for system and replicated events.
+    /// Authorized workspace mutation path for internal and admitted events.
     pub(crate) fn insert_internal(&self, event: Event) -> Result<InsertOutcome> {
+        let devices = self.devices.upgrade().ok_or(Error::WorkspaceClosed)?;
+        let required = if self.is_system {
+            Role::Admin
+        } else {
+            Role::Contributor
+        };
+        devices.require_access(event.stamp.id.peer_id, required)?;
+        self.insert_unchecked(event)
+    }
+
+    /// Initial Admin insertion before an authorization record exists.
+    pub(crate) fn insert_bootstrap(&self, event: Event) -> Result<InsertOutcome> {
+        self.insert_unchecked(event)
+    }
+
+    fn insert_unchecked(&self, event: Event) -> Result<InsertOutcome> {
         let outcome = { self.table.write().insert(event)? };
         if let InsertOutcome::Applied(ref change) = outcome {
             for listener in self.listeners.read().iter() {

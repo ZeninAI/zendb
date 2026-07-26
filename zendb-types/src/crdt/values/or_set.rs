@@ -108,7 +108,7 @@ impl Type for OrSet {
                     if entry
                         .rems
                         .get(tag)
-                        .is_none_or(|removed_at| stamps.beats(*removed_at))
+                        .is_none_or(|removed_at| stamps > *removed_at)
                     {
                         entry.rems.insert(*tag, stamps);
                         changed = true;
@@ -131,7 +131,7 @@ impl Type for OrSet {
                         if local_entry
                             .rems
                             .get(&tag)
-                            .is_none_or(|existing| removed_at.beats(*existing))
+                            .is_none_or(|existing| removed_at > *existing)
                         {
                             local_entry.rems.insert(tag, removed_at);
                             changed = true;
@@ -154,15 +154,15 @@ impl Type for OrSet {
     fn max_stamp(&self) -> EventStamp {
         self.entries
             .values()
-            .fold(EventStamp::zero(), |max, entry| {
+            .fold(EventStamp::default(), |max, entry| {
                 let adds_max = entry
                     .adds
                     .iter()
-                    .fold(EventStamp::zero(), |a, &b| std::cmp::max(a, b));
+                    .fold(EventStamp::default(), |a, &b| std::cmp::max(a, b));
                 let rems_max = entry
                     .rems
                     .values()
-                    .fold(EventStamp::zero(), |a, &b| std::cmp::max(a, b));
+                    .fold(EventStamp::default(), |a, &b| std::cmp::max(a, b));
                 std::cmp::max(max, std::cmp::max(adds_max, rems_max))
             })
     }

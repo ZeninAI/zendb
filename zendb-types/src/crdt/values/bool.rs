@@ -45,7 +45,7 @@ impl Type for Bool {
     }
 
     fn merge(&mut self, remote: &Bool, stamps: crate::MergeStamps) -> Result<bool, BoolError> {
-        if stamps.incoming.beats(stamps.current) {
+        if stamps.incoming > stamps.current {
             *self = *remote;
             Ok(true)
         } else {

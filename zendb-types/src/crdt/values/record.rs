@@ -88,9 +88,11 @@ impl Type for Record {
     }
 
     fn max_stamp(&self) -> EventStamp {
-        self.fields.values().fold(EventStamp::zero(), |max, cell| {
-            std::cmp::max(max, cell.max_stamp())
-        })
+        self.fields
+            .values()
+            .fold(EventStamp::default(), |max, cell| {
+                std::cmp::max(max, cell.max_stamp())
+            })
     }
 }
 
@@ -131,7 +133,7 @@ impl ContainerType for Record {
                 .map(|tag| Cell::dummy(Some(tag.empty_value())))
                 .unwrap_or(Cell {
                     value: None,
-                    stamp: EventStamp::zero(),
+                    stamp: EventStamp::default(),
                 })
         });
         if child_tag.is_some_and(|tag| !child.ensure_type(tag, incoming)) {

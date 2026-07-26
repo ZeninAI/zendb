@@ -9,7 +9,7 @@ snapshots, operator host, or networking implementation.
 
 | Crate | Responsibility |
 |---|---|
-| `zendb-types` | Libp2p-compatible identities, event stamps, cells, operations, CRDT values, and shared binary utilities |
+| `zendb-types` | Peer and workspace identities, event stamps, cells, operations, CRDT values, and shared binary utilities |
 | `zendb-storage` | B+ tree, KeyDir, SkipList, generic State, Topic, and the invariant-preserving Table facade |
 | `zendb-workspace` | Catalog-owned Table and State lifecycle, peer metadata and roles, hybrid time, and duplicate detection |
 
@@ -47,14 +47,18 @@ types when opening a handle.
 
 ## Workspace
 
-Catalog is the only workspace module that creates or opens storage or chooses
-physical paths. `_table_catalog` is a self-registering Table of table name to
-`TableConfig`. `_state_catalog` is a State of state name to `StateConfig`.
+The workspace lifecycle modules create and open storage under fixed physical
+paths. `tables/_catalog` is a self-registering Table of table name to
+`TableConfig`. `states/_catalog` is a State of state name to `StateConfig`.
 All declared Tables are eagerly open; typed States can be opened and closed.
 
-`_devices` stores peer display metadata and `Roles`. `_peer_state` stores
-receipt windows plus the local clock checkpoint. The latter is loaded into a
-lock-free read snapshot and flushed through its Catalog-provided State handle.
+`tables/_devices` stores device display metadata and a progressive optional
+`Role`. `states/_peers` stores receipt windows plus the local event clock.
+`Devices` keeps a read-oriented registry cache and a separate write-back peer
+cache, so minting does not search the registry or write storage.
+`Workspace::flush()` and `Workspace::sync()` coordinate device writeback with
+every open Table and State; dropping the workspace performs a best-effort
+flush.
 
 ```rust
 use zendb_storage::TableConfig;
@@ -81,12 +85,12 @@ workspace-root/
   _identity
   _lock
   tables/
-    _table_catalog/
+    _catalog/
     _devices/
     <table-name>/
   states/
-    _state_catalog/
-    _peer_state/
+    _catalog/
+    _peers/
     <state-name>/
 ```
 

@@ -34,8 +34,7 @@ use crate::{
 /// The `_catalog` Table is the source of truth for table declarations.
 /// Every declared table is eagerly opened and stored in the handle map.
 /// Handle-map mutation after bootstrap is owned by `TableCatalogListener`;
-/// listener; the lifecycle methods here only validate and publish catalog
-/// events.
+/// the lifecycle methods here only validate and publish catalog events.
 ///
 /// Exposes lifecycle operations (upsert/get/delete/list/contains) and
 /// durability barriers. Table operations themselves are performed through the
@@ -60,7 +59,7 @@ impl Tables {
             Table::create(&root.join(DEVICES_TABLE_NAME), SYSTEM_TABLE_CONFIG.clone())?,
             peer_state,
             identity,
-        );
+        )?;
         let catalog = TableHandle::new(
             TABLE_CATALOG_NAME.to_owned(),
             Table::create(&root.join(TABLE_CATALOG_NAME), SYSTEM_TABLE_CONFIG.clone())?,
@@ -79,7 +78,6 @@ impl Tables {
         });
         tables.register_listeners();
 
-        devices.register_local()?;
         tables.write_entry(TABLE_CATALOG_NAME, &SYSTEM_TABLE_CONFIG, devices.mint()?)?;
         tables.write_entry(DEVICES_TABLE_NAME, &SYSTEM_TABLE_CONFIG, devices.mint()?)?;
 
@@ -147,7 +145,6 @@ impl Tables {
             devices: devices.clone(),
         });
         tables.register_listeners();
-        devices.require_local()?;
         Ok(tables)
     }
 

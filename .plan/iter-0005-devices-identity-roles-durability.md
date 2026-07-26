@@ -27,14 +27,17 @@ maintenance is an independent algorithm; `devices/mod.rs` only declares
 modules and exports the public device types plus the crate-internal
 `PeerState`.
 
-`Devices::create/open` construct the runtime directly and load durable
-records before returning. `Tables::create/open` owns table-runtime
-initialization; after listeners are registered, table creation registers the
-initial local device and table open requires the current peer to already be
-registered. `Workspace::assemble` only composes the state and table handlers.
+`Devices::create/open` construct the runtime directly. Create receives the raw
+device registry Table, inserts the initial local Admin event before wrapping
+the Table in a handle, and initializes both caches. Open loads durable records
+and validates local membership before returning. `Tables::create/open` owns
+the surrounding table-runtime initialization, while `Workspace::assemble`
+only composes the state and table handlers.
 
-The create path registers the creator as an `Admin` exactly once through
-`register_local`. The open path uses `require_local`; opening a
+The create path inserts the creator as an `Admin` exactly once with event
+sequence `1`. The initial `PeerState` records receipt `1` and owns an
+`EventClock` whose `next_sequence` is `2`. The open path validates the local
+registry entry inline alongside the local peer-state checks; opening a
 workspace never silently promotes an unknown peer. A future join/enrollment
 flow must explicitly establish both the peer's `_devices` record and its
 `_peers` clock record before that peer can open the workspace.
@@ -158,9 +161,9 @@ a local sequence number.
 `event.stamp.id.peer_id`: application tables require Contributor, system
 tables require Admin. Both checks are intentionally present — the public check
 protects the local sequence before minting; the internal check is the final
-guard for a future admitted replicated event. The shared storage insertion and
-listener dispatch remain a private implementation used by authorized and
-bootstrap paths.
+guard for a future admitted replicated event. Shared storage insertion and
+listener dispatch remain private implementation details of authorized handle
+paths.
 
 `Tables::upsert` and `Tables::delete` retain their signatures and require
 Admin before minting catalog events. System tables are returned by `get` and
@@ -173,22 +176,20 @@ unguarded.
 
 `Tables::create` uses this order:
 
-1. Receive the peer-state handle from `States`, then create the device table,
-   catalog table, handles, and `Tables` ownership graph.
-2. Register receipt, catalog, and device listeners.
-3. Insert the creator's `DeviceRecord { role: Some(Role::Admin), .. }` through
-   a narrowly scoped bootstrap insertion path.
-4. Allow `DeviceRegistryListener` to populate both `RegistryCache::entries`
-   and `RegistryCache::local_role` synchronously.
+1. Receive the peer-state handle from `States` and create the raw device Table.
+2. Let `Devices::create` insert the creator's Admin record directly as event
+   sequence `1`, seed the registry cache, initialize the local receipt at `1`,
+   set `next_sequence` to `2`, and wrap the registry in `TableHandle`.
+3. Create the catalog handle and the `Tables` ownership graph.
+4. Register receipt, catalog, and device listeners.
 5. Write the `_catalog` and `_devices` self-referencing catalog entries through
    the normal Admin-authorized internal insertion path.
 6. Return the assembled `Tables`.
 
-The bootstrap insertion bypasses role authorization only; it still performs the
-normal storage insert and listener dispatch, and must not be used after the
-initial local Admin record. `Tables::open` loads device records and the cached
-local role, registers listeners, and continues to require an existing local
-device record; it does not create, promote, or repair roles.
+There is no bootstrap method on `TableHandle`: only `Devices::create` can reach
+the raw registry Table. `Devices::open` loads device records and the cached
+local role and validates that the current peer exists before `Tables::open`
+continues; it does not create, promote, or repair roles.
 
 ### 3.5 Replication Boundary
 

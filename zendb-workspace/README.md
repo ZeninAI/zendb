@@ -66,10 +66,10 @@ pub trait ChangeListener: Send + Sync {
 ```
 
 Listeners are registered at open time and dispatched synchronously after every
-successful authorized or bootstrap insertion, once the storage-table write
-guard has been released. `TableHandle::add_listener` is `pub`, so applications
-can register custom listeners on tables they hold handles to. Internal
-listeners and application listeners share the same listener list.
+successful authorized handle insertion, once the storage-table write guard has
+been released. `TableHandle::add_listener` is `pub`, so applications can
+register custom listeners on tables they hold handles to. Internal listeners
+and application listeners share the same listener list.
 
 ### Internal listeners
 
@@ -132,14 +132,14 @@ table's `RwLockReadGuard` directly. `consumer` returns
 owns its topic state and cursor.
 
 `Tables::create/open` owns table runtime initialization: it creates or opens
-both system table handles, constructs `Devices`, builds the eager handle map,
-registers listeners, and (on create) writes the self-referencing system
-catalog rows. On create, it first registers the local peer as Admin through the
-sole bootstrap insertion path, then writes the catalog rows through normal
-Admin-authorized insertion. On open, it requires the current peer to already
-be registered. The constructors return `Arc<Tables>`; `Workspace::assemble`
-only clones the device handle from the crate-visible `Tables::devices` field.
-`Devices::open` loads the durable device registry as part of opening.
+both system tables, constructs `Devices`, builds the eager handle map,
+registers listeners, and (on create) writes the self-referencing system catalog
+rows. `Devices::create` inserts the initial Admin row directly into the raw
+registry Table before wrapping it in `TableHandle`; subsequent catalog writes
+use normal Admin-authorized insertion. `Devices::open` loads the durable
+registry and rejects an unregistered local peer before returning. The
+constructors return `Arc<Tables>`; `Workspace::assemble` only clones the device
+handle from the crate-visible `Tables::devices` field.
 
 ## States
 
@@ -180,10 +180,10 @@ declares and materializes the `_peers` system state before returning;
 
 The public `Devices` facade is intentionally small:
 
-- `local_peer_id()` returns the identity used for local mutations.
+- `local_peer_id()` borrows the identity used for local mutations.
 - `list()` returns the cached device records.
-- `get(peer_id)` reads one cached device record.
-- `has_access(peer_id, role)` checks any peer against the progressive
+- `get(&peer_id)` reads one cached device record.
+- `has_access(&peer_id, role)` checks any peer against the progressive
   hierarchy.
 - `upsert(peer_id, record)` requires Admin and publishes a registry change,
   returning whether the record changed.
@@ -193,10 +193,13 @@ The registry's read-oriented cache is one
 local record and its fast authorization value atomically. Event bookkeeping is
 kept separately in `peer_cache`.
 
-On create, `Tables` registers the local peer as an Admin after listeners are
-installed. On open, `Tables` requires the current peer to already have a
-device record; opening never silently promotes an unknown peer. Only Admin may
-upsert device records or manage application table declarations.
+On create, `Devices` directly establishes the local Admin record as registry
+event sequence `1`, seeds the registry cache, and records that receipt in the
+initial peer state. Its clock starts with `next_sequence = 2`, so subsequent
+events cannot reuse the bootstrap event ID. On open, `Devices` requires the
+current peer to already have a registry entry; opening never silently promotes
+an unknown peer. Only Admin may upsert device records or manage application
+table declarations.
 
 - Reader can read tables and is represented by no role.
 - `Contributor` writes existing application tables.

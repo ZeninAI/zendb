@@ -101,12 +101,7 @@ impl TableHandle {
         } else {
             Role::Contributor
         };
-        devices.require_access(event.stamp.id.peer_id, required)?;
-        self.insert_unchecked(event)
-    }
-
-    /// Initial Admin insertion before an authorization record exists.
-    pub(crate) fn insert_bootstrap(&self, event: Event) -> Result<InsertOutcome> {
+        devices.require_access(&event.stamp.id.peer_id, required)?;
         self.insert_unchecked(event)
     }
 

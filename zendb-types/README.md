@@ -43,14 +43,15 @@ authorization behavior.
 
 ```rust
 pub trait PeerIdentity: Send + Sync {
-    fn peer_id(&self) -> PeerId;
+    fn peer_id(&self) -> &PeerId;
     fn sign(&self, message: &[u8]) -> Result<Signature, SigningError>;
 }
 ```
 
-The workspace uses `peer_id()` for minting `EventId`s and `sign()` for future
-event signatures. It never sees private key material directly; the
-implementation decides where the key lives (in-memory, OS keychain, HSM, KMS).
+The workspace borrows `peer_id()` during initialization and keeps that stable
+value for minting `EventId`s; `sign()` supports future event signatures. It
+never sees private key material directly; the implementation decides where the
+key lives (in-memory, OS keychain, HSM, KMS).
 
 Applications supply the implementation and may back it with an in-memory key,
 an OS keychain, HSM, KMS, or another persistent key store. Test-only

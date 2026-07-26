@@ -125,7 +125,7 @@ impl Role {
 /// lives (in-memory, OS keychain, HSM, KMS).
 pub trait PeerIdentity: Send + Sync {
     /// The public peer identity of this device.
-    fn peer_id(&self) -> PeerId;
+    fn peer_id(&self) -> &PeerId;
 
     /// Cryptographically sign `message` with this device's private key.
     fn sign(&self, message: &[u8]) -> Result<Signature, SigningError>;

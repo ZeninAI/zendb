@@ -57,12 +57,35 @@ pub struct Devices {
 
 impl Devices {
     pub(crate) fn create(
-        registry: Table,
+        mut registry: Table,
         peer_state: Arc<StateHandle<PeerId, PeerState>>,
         identity: Arc<dyn PeerIdentity>,
-    ) -> Arc<Self> {
-        let local_peer_id = identity.peer_id();
-        Arc::new_cyclic(|devices_weak| Self {
+    ) -> Result<Arc<Self>> {
+        let local_peer_id = *identity.peer_id();
+        let record = DeviceRecord {
+            display_name: String::new(),
+            role: Some(Role::Admin),
+        };
+        let time = EventTime {
+            physical_ms: physical_ms().ok_or(Error::ClockExhausted)?,
+            logical: 0,
+        };
+        registry.insert(Event {
+            primary_key: PrimaryKey::PeerId(local_peer_id),
+            path: Path::new(),
+            op: Op::Upsert {
+                value: Value::Blob(Blob::encode(&record)?),
+            },
+            stamp: EventStamp {
+                id: EventId {
+                    peer_id: local_peer_id,
+                    sequence: 1,
+                },
+                time,
+            },
+        })?;
+
+        Ok(Arc::new_cyclic(|devices_weak| Self {
             local_peer_id,
             registry: TableHandle::new(
                 DEVICES_TABLE_NAME.to_owned(),
@@ -71,23 +94,26 @@ impl Devices {
                 true,
             ),
             registry_cache: RwLock::new(RegistryCache {
-                entries: BTreeMap::new(),
-                local_role: None,
+                entries: BTreeMap::from([(local_peer_id, record)]),
+                local_role: Some(Role::Admin),
             }),
             peer_state,
             peer_cache: Mutex::new(PeerCache {
                 local: PeerState {
-                    receipts: ReceiptWindow::default(),
+                    receipts: ReceiptWindow {
+                        max_seen: 1,
+                        missing: Vec::new(),
+                    },
                     clock: Some(EventClock {
-                        next_sequence: 1,
-                        last_time: EventTime::default(),
+                        next_sequence: 2,
+                        last_time: time,
                     }),
                 },
                 local_dirty: true,
                 others: BTreeMap::new(),
                 dirty_others: BTreeSet::new(),
             }),
-        })
+        }))
     }
 
     pub(crate) fn open(
@@ -95,7 +121,7 @@ impl Devices {
         peer_state: Arc<StateHandle<PeerId, PeerState>>,
         identity: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
-        let local_peer_id = identity.peer_id();
+        let local_peer_id = *identity.peer_id();
         let mut peer_states = peer_state
             .read()
             .entries()
@@ -131,7 +157,10 @@ impl Devices {
             })?;
             entries.insert(peer_id, record);
         }
-        let local_role = entries.get(&local_peer_id).and_then(|record| record.role);
+        let local_role = entries
+            .get(&local_peer_id)
+            .ok_or(Error::DeviceNotRegistered(local_peer_id))?
+            .role;
 
         Ok(Arc::new_cyclic(|devices_weak| Self {
             local_peer_id,
@@ -155,46 +184,8 @@ impl Devices {
         }))
     }
 
-    pub(crate) fn register_local(&self) -> Result<()> {
-        if self
-            .registry_cache
-            .read()
-            .entries
-            .contains_key(&self.local_peer_id)
-        {
-            return Ok(());
-        }
-        let record = DeviceRecord {
-            display_name: String::new(),
-            role: Some(Role::Admin),
-        };
-        let stamp = self.mint()?;
-        self.registry.insert_bootstrap(Event {
-            primary_key: PrimaryKey::PeerId(self.local_peer_id),
-            path: Path::new(),
-            op: Op::Upsert {
-                value: Value::Blob(Blob::encode(&record)?),
-            },
-            stamp,
-        })?;
-        Ok(())
-    }
-
-    pub(crate) fn require_local(&self) -> Result<()> {
-        if self
-            .registry_cache
-            .read()
-            .entries
-            .contains_key(&self.local_peer_id)
-        {
-            Ok(())
-        } else {
-            Err(Error::DeviceNotRegistered(self.local_peer_id))
-        }
-    }
-
-    pub fn local_peer_id(&self) -> PeerId {
-        self.local_peer_id
+    pub fn local_peer_id(&self) -> &PeerId {
+        &self.local_peer_id
     }
 
     pub fn list(&self) -> Vec<(PeerId, DeviceRecord)> {
@@ -206,12 +197,12 @@ impl Devices {
             .collect()
     }
 
-    pub fn get(&self, peer_id: PeerId) -> Option<DeviceRecord> {
-        self.registry_cache.read().entries.get(&peer_id).cloned()
+    pub fn get(&self, peer_id: &PeerId) -> Option<DeviceRecord> {
+        self.registry_cache.read().entries.get(peer_id).cloned()
     }
 
     pub fn upsert(&self, peer_id: PeerId, record: DeviceRecord) -> Result<bool> {
-        self.require_access(self.local_peer_id, Role::Admin)?;
+        self.require_access(&self.local_peer_id, Role::Admin)?;
         if self.registry_cache.read().entries.get(&peer_id) == Some(&record) {
             return Ok(false);
         }
@@ -227,12 +218,12 @@ impl Devices {
         Ok(true)
     }
 
-    pub fn has_access(&self, peer_id: PeerId, required: Role) -> bool {
+    pub fn has_access(&self, peer_id: &PeerId, required: Role) -> bool {
         let cache = self.registry_cache.read();
-        let role = if peer_id == self.local_peer_id {
+        let role = if peer_id == &self.local_peer_id {
             cache.local_role
         } else {
-            cache.entries.get(&peer_id).and_then(|record| record.role)
+            cache.entries.get(peer_id).and_then(|record| record.role)
         };
         role.is_some_and(|role| role.has_at_least(required))
     }
@@ -374,7 +365,7 @@ impl Devices {
         Ok(outcome)
     }
 
-    pub(crate) fn require_access(&self, peer_id: PeerId, required: Role) -> Result<()> {
+    pub(crate) fn require_access(&self, peer_id: &PeerId, required: Role) -> Result<()> {
         if self.has_access(peer_id, required) {
             Ok(())
         } else {

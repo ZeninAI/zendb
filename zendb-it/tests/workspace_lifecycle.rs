@@ -23,8 +23,8 @@ impl TestPeerIdentity {
 }
 
 impl PeerIdentity for TestPeerIdentity {
-    fn peer_id(&self) -> PeerId {
-        self.peer_id
+    fn peer_id(&self) -> &PeerId {
+        &self.peer_id
     }
 
     fn sign(&self, message: &[u8]) -> Result<Signature, SigningError> {

@@ -141,14 +141,14 @@ impl ChangeListener for DeviceRegistryListener {
                 value: Value::Blob(blob),
             } => {
                 if let Ok(record) = blob.decode::<DeviceRecord>() {
-                    if *peer_id == devices.local_peer_id() {
+                    if peer_id == devices.local_peer_id() {
                         cache.local_role = record.role;
                     }
                     cache.entries.insert(*peer_id, record);
                 }
             }
             Op::Delete => {
-                if *peer_id == devices.local_peer_id() {
+                if peer_id == devices.local_peer_id() {
                     cache.local_role = None;
                 }
                 cache.entries.remove(peer_id);

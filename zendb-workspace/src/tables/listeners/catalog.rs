@@ -1,37 +1,15 @@
-//! Internal workspace listeners for receipts, the table catalog, and devices.
+//! Table catalog listener: opens/closes tables in response to catalog events.
 
 use std::{
     fs,
     sync::{Arc, Weak},
 };
 
-use zendb_storage::{DurableStorage, Table, TableConfig};
+use zendb_storage::{Change, DurableStorage, Table, TableConfig};
 use zendb_types::{Op, PrimaryKey, Value};
 
-use super::runtime::{ChangeListener, TableHandle};
-use crate::{devices::Devices, tables::Tables};
-
-/// Observes every successful insert on every table. Replaces the one-shot
-/// `replay_receipts` consumer: receipts are now live-observed via callback
-/// and written to `_peers` at the next durability barrier.
-pub(crate) struct ReceiptListener {
-    devices: Weak<Devices>,
-}
-
-impl ReceiptListener {
-    pub(crate) fn build(devices: Weak<Devices>) -> Arc<dyn ChangeListener> {
-        Arc::new(Self { devices })
-    }
-}
-
-impl ChangeListener for ReceiptListener {
-    fn on_change(&self, change: &zendb_storage::Change) {
-        let Some(devices) = self.devices.upgrade() else {
-            return;
-        };
-        let _ = devices.observe(change.event.stamp);
-    }
-}
+use super::super::runtime::{ChangeListener, TableHandle};
+use crate::tables::Tables;
 
 /// Reacts to `_catalog` events: opens tables on `Upsert`, closes +
 /// removes the physical directory on `Delete`. This is the single owner of
@@ -58,7 +36,7 @@ impl TableCatalogListener {
 }
 
 impl ChangeListener for TableCatalogListener {
-    fn on_change(&self, change: &zendb_storage::Change) {
+    fn on_change(&self, change: &Change) {
         let Some(tables) = self.tables.upgrade() else {
             return;
         };
@@ -107,51 +85,6 @@ impl ChangeListener for TableCatalogListener {
                         let _ = fs::remove_dir_all(path);
                     }
                 }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Reacts to `_devices` events: upserts/removes in the device registry cache.
-/// This is the single owner of in-memory device-record mutation
-/// after the initial load performed by `Devices::open`.
-pub(crate) struct DeviceRegistryListener {
-    devices: Weak<Devices>,
-}
-
-impl DeviceRegistryListener {
-    pub(crate) fn build(devices: Weak<Devices>) -> Arc<dyn ChangeListener> {
-        Arc::new(Self { devices })
-    }
-}
-
-impl ChangeListener for DeviceRegistryListener {
-    fn on_change(&self, change: &zendb_storage::Change) {
-        use crate::devices::DeviceRecord;
-        let Some(devices) = self.devices.upgrade() else {
-            return;
-        };
-        let PrimaryKey::PeerId(peer_id) = &change.event.primary_key else {
-            return;
-        };
-        let mut cache = devices.registry_cache.write();
-        match &change.event.op {
-            Op::Upsert {
-                value: Value::Blob(blob),
-            } => {
-                if let Ok(record) = blob.decode::<DeviceRecord>() {
-                    if peer_id == devices.local_peer_id() {
-                        cache.local_role = record.role;
-                    }
-                    cache.entries.insert(*peer_id, record);
-                }
-            }
-            Op::Delete => {
-                if peer_id == devices.local_peer_id() {
-                    cache.local_role = None;
-                }
-                cache.entries.remove(peer_id);
             }
             _ => {}
         }

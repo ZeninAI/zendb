@@ -9,12 +9,12 @@ use bincode::{Decode, Encode};
 use parking_lot::{Mutex, RwLock};
 use zendb_storage::{DurableStorage, ReadBackend, Table, WriteBackend};
 use zendb_types::{
-    utils::time::physical_ms, Blob, Event, EventId, EventStamp, EventTime, Op, Path, PeerId,
-    PeerIdentity, PrimaryKey, Role, Value,
+    Blob, Event, EventId, EventStamp, EventTime, Op, Path, PeerId, PeerIdentity, PrimaryKey, Role,
+    Value, utils::time::physical_ms,
 };
 
 use super::receipts::{ObserveOutcome, ReceiptWindow};
-use crate::{consts::DEVICES_TABLE_NAME, states::StateHandle, tables::TableHandle, Error, Result};
+use crate::{Error, Result, consts::DEVICES_TABLE_NAME, states::StateHandle, tables::TableHandle};
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct DeviceRecord {
@@ -63,7 +63,7 @@ impl Devices {
     ) -> Result<Arc<Self>> {
         let local_peer_id = *identity.peer_id();
         let record = DeviceRecord {
-            display_name: String::new(),
+            display_name: identity.display_name().to_owned(),
             role: Some(Role::Admin),
         };
         let time = EventTime {
@@ -122,20 +122,10 @@ impl Devices {
         identity: Arc<dyn PeerIdentity>,
     ) -> Result<Arc<Self>> {
         let local_peer_id = *identity.peer_id();
-        let mut peer_states = peer_state
-            .read()
-            .entries()
-            .map(|(peer_id, state)| (peer_id.into_owned(), state.into_owned()))
-            .collect::<BTreeMap<_, _>>();
-        let local = peer_states.remove(&local_peer_id).ok_or_else(|| {
-            Error::CorruptLocalState("local peer has no clock checkpoint".to_owned())
-        })?;
-        if local.clock.is_none() {
-            return Err(Error::CorruptLocalState(
-                "local peer has no clock checkpoint".to_owned(),
-            ));
-        }
 
+        // The registry — not the clock checkpoint — is the authorization gate:
+        // only an enrolled device may open the workspace. Load and validate it
+        // first so an unenrolled peer fails before any clock bookkeeping.
         let mut entries = BTreeMap::new();
         for (key, cell) in registry.entries() {
             let PrimaryKey::PeerId(peer_id) = key.into_owned() else {
@@ -162,6 +152,44 @@ impl Devices {
             .ok_or(Error::DeviceNotRegistered(local_peer_id))?
             .role;
 
+        // Load clock checkpoints for every peer that has written to this
+        // workspace. The local peer may be absent: a device can be enrolled in
+        // the registry yet have never minted from this on-disk state (e.g. it
+        // opened the workspace from a different machine, or joined but has not
+        // written yet). In that case we seed a fresh starting clock rather than
+        // refusing to open.
+        let mut peer_states = peer_state
+            .read()
+            .entries()
+            .map(|(peer_id, state)| (peer_id.into_owned(), state.into_owned()))
+            .collect::<BTreeMap<_, _>>();
+        let (local, seeded) = match peer_states.remove(&local_peer_id) {
+            Some(state) => {
+                if state.clock.is_none() {
+                    return Err(Error::CorruptLocalState(
+                        "local peer has no clock checkpoint".to_owned(),
+                    ));
+                }
+                (state, false)
+            }
+            None => {
+                let time = EventTime {
+                    physical_ms: physical_ms().ok_or(Error::ClockExhausted)?,
+                    logical: 0,
+                };
+                (
+                    PeerState {
+                        receipts: ReceiptWindow::default(),
+                        clock: Some(EventClock {
+                            next_sequence: 1,
+                            last_time: time,
+                        }),
+                    },
+                    true,
+                )
+            }
+        };
+
         Ok(Arc::new_cyclic(|devices_weak| Self {
             local_peer_id,
             registry: TableHandle::new(
@@ -177,7 +205,7 @@ impl Devices {
             peer_state,
             peer_cache: Mutex::new(PeerCache {
                 local,
-                local_dirty: false,
+                local_dirty: seeded,
                 others: peer_states,
                 dirty_others: BTreeSet::new(),
             }),

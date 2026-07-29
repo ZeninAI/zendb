@@ -12,19 +12,28 @@ use zendb_workspace::{Workspace, WorkspaceConfig};
 struct TestPeerIdentity {
     keypair: Keypair,
     peer_id: PeerId,
+    display_name: String,
 }
 
 impl TestPeerIdentity {
     fn generate() -> Self {
         let keypair = Keypair::generate_ed25519();
         let peer_id = PeerId::from_public_key(&keypair.public());
-        Self { keypair, peer_id }
+        Self {
+            keypair,
+            peer_id,
+            display_name: "test-device".to_owned(),
+        }
     }
 }
 
 impl PeerIdentity for TestPeerIdentity {
     fn peer_id(&self) -> &PeerId {
         &self.peer_id
+    }
+
+    fn display_name(&self) -> &str {
+        &self.display_name
     }
 
     fn sign(&self, message: &[u8]) -> Result<Signature, SigningError> {

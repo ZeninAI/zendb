@@ -127,6 +127,13 @@ pub trait PeerIdentity: Send + Sync {
     /// The public peer identity of this device.
     fn peer_id(&self) -> &PeerId;
 
+    /// The human-readable display name for this device.
+    ///
+    /// Used to seed the local device's `_devices` record when a workspace is
+    /// created. The workspace never overwrites it after the initial seed;
+    /// later renames go through `Devices::upsert`.
+    fn display_name(&self) -> &str;
+
     /// Cryptographically sign `message` with this device's private key.
     fn sign(&self, message: &[u8]) -> Result<Signature, SigningError>;
 }

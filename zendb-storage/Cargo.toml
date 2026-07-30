@@ -3,7 +3,7 @@ name = "zendb-storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Storage subsystem for ZeninDB: KeyDir, B+Tree, SkipList, compaction"
+description = "Storage backends, topics, and invariant-preserving tables for ZenDB"
 
 [dependencies]
 memmap2.workspace = true

@@ -4,13 +4,13 @@ resolver = "2"
 members = [
     "zendb-types",
     "zendb-storage",
-    "zendb-engine",
-    "zendb-testing",
+    "zendb-workspace",
+    "zendb-it",
 ]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zenin/zendb"
 authors = ["ZeninDB Contributors"]
@@ -20,17 +20,10 @@ authors = ["ZeninDB Contributors"]
 memmap2 = "0.9"
 hashbrown = "0.15"
 
-# serialization
 bincode = { version = "2", features = ["derive"] }
-rkyv = "0.8"
 
-# zendb-types
-machine-uid = "0.5"
+libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand"] }
+rand = "0.8"
 
-# zendb-engine
-blake3 = "1"
-
-# concurrency
 parking_lot = "0.12"
-log = "0.4"
 arc-swap = "1"

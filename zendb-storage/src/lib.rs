@@ -1,20 +1,19 @@
-//! # zendb-storage
+//! Generic persistent and in-memory storage mechanics for ZenDB.
 //!
-//! Storage subsystem for ZeninDB.
-//!
-//! Layer 1 — general-purpose data structures:
-//! - **KeyDir** — persistent KV store with in-memory hash index + mmap'd data file (Bitcask model)
-//! - **BPlusTree** — persistent ordered KV store (mmap, in-place mutation, bulk-merge)
-//! - **SkipList** — entirely in-memory ordered KV store
-//! - **Topic** — persistent segmented append-only log with consumer cursors
-//!
-//! Frontend - ZeninDB-aware storage facades:
-//! - **State** - runtime-selected materialized-state backend
-//! - **Table** - resolved table cache over State plus Topic-backed changes
+//! The crate contains raw key/value backends, a runtime-selected materialized
+//! state backend, and a segmented append-only topic. It has no CRDT, device,
+//! authorization, workspace, or networking policy.
 
-pub mod core;
-pub mod frontend;
-pub mod utils;
+pub mod backend;
+pub mod table;
+pub mod topic;
 
-#[cfg(test)]
-mod benchmark;
+pub use backend::{
+    BPlusTree, BPlusTreeConfig, BPlusTreeStats, DurableStorage, KeyDir, KeyDirConfig, KeyDirStats,
+    OrderedReadBackend, ReadBackend, SkipList, SkipListCapacity, SkipListConfig, SkipListStats,
+    State, StateConfig, StateStats, Storage, WriteBackend,
+};
+pub use table::{
+    Change, InsertOutcome, Table, TableConfig, TableStats, DEFAULT_MAX_BUFFERED_RECORDS,
+};
+pub use topic::{Topic, TopicConfig, TopicConsumer, TopicOffset, TopicStats};

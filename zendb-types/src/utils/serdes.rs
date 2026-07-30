@@ -1,0 +1,180 @@
+//! Shared serialization and deserialization helpers backed by bincode 2.
+//!
+//! Three needs covered:
+//!
+//! 1. **Sizing** without allocating — [`serialized_size`] uses
+//!    [`bincode::enc::write::SizeWriter`] to count bytes that would be
+//!    written, no allocation, no I/O.
+//! 2. **Direct-to-buffer writes** — [`serialize_into`] writes the encoded
+//!    archive straight into a caller-supplied `&mut [u8]` (typically a
+//!    slice of a memory-mapped file). One pass, no temporary buffer.
+//! 3. **Owned roundtrip** — [`serialize_to_vec`] and [`deserialize_from`]
+//!    for the cases that need a free-standing `Vec<u8>` or to materialize
+//!    a typed value from raw bytes.
+//!
+//! All helpers use a single shared configuration ([`cfg()`]) — little-endian,
+//! fixed-int encoding, no decode limit — tuned for the hot inner loops of
+//! the storage backends. Byte-level page helpers (`rd_u*` / `wr_u*` /
+//! `read_u32_le`) live here too so the page-based formats share one
+//! definition.
+
+use std::io;
+
+use bincode::{
+    config::{Configuration, Fixint, LittleEndian, NoLimit},
+    enc::write::SizeWriter,
+    error::{DecodeError, EncodeError},
+    Decode, Encode,
+};
+
+use crate::utils::reusables::PooledBuf;
+
+// ---------------------------------------------------------------------------
+// Shared bincode configuration — chosen for fastest encode/decode loops.
+// Fixed-int encoding skips varint decoding cost; LE matches native; NoLimit
+// avoids per-byte bounds checks on trusted internal data.
+// ---------------------------------------------------------------------------
+
+/// Bincode configuration used everywhere in storage. Returned as a typed
+/// value (rather than a const) because `Configuration` builder methods
+/// aren't const in bincode 2. Constructing it is free — the type itself
+/// is zero-sized.
+#[inline(always)]
+pub fn cfg() -> Configuration<LittleEndian, Fixint, NoLimit> {
+    bincode::config::standard()
+        .with_little_endian()
+        .with_fixed_int_encoding()
+}
+
+// ---------------------------------------------------------------------------
+// Sizing / writing / reading helpers
+// ---------------------------------------------------------------------------
+
+/// Measure the byte length of `value`'s bincode encoding without
+/// allocating. Uses [`SizeWriter`] — every byte that would be written is
+/// counted and discarded.
+pub fn serialized_size<T: Encode>(value: &T) -> io::Result<usize> {
+    let mut sw = SizeWriter::default();
+    bincode::encode_into_writer(value, &mut sw, cfg()).map_err(encode_err)?;
+    Ok(sw.bytes_written)
+}
+
+/// Serialize `value` directly into `dst`, returning the number of bytes
+/// written. Caller is responsible for sizing `dst` correctly — call
+/// [`serialized_size`] first when the length isn't already known.
+///
+/// Used by backends to write straight into `mmap`, eliminating the
+/// intermediate `Vec<u8>` + `copy_from_slice` step.
+pub fn serialize_into<T: Encode>(value: &T, dst: &mut [u8]) -> io::Result<usize> {
+    bincode::encode_into_slice(value, dst, cfg()).map_err(encode_err)
+}
+
+/// Serialize `value` into any [`io::Write`] destination, returning the
+/// number of bytes written. Unlike [`serialize_into`], the destination
+/// grows or streams as needed.
+pub fn serialize_into_std<T: Encode, W: io::Write>(value: &T, dst: &mut W) -> io::Result<usize> {
+    bincode::encode_into_std_write(value, dst, cfg()).map_err(encode_err)
+}
+
+/// Serialize `value` into a freshly-allocated `Vec<u8>`. Used when a
+/// stand-alone byte buffer is needed (e.g., BPlusTree key navigation
+/// scratch where the buffer's lifetime outlives the encode).
+pub fn serialize_to_vec<T: Encode>(value: &T) -> io::Result<Vec<u8>> {
+    bincode::encode_to_vec(value, cfg()).map_err(encode_err)
+}
+
+/// Encode a value into a recycled scratch buffer and pass the resulting
+/// byte slice to `f`. The buffer is acquired from the thread-local pool
+/// in [`crate::utils::reusables`], so the hot path
+/// (`get`/`put`/`delete`/`contains`/`update`) avoids allocating a fresh
+/// `Vec<u8>` on every invocation.
+///
+/// Unlike the earlier `RefCell` version, recursion is safe:
+/// a nested `with_scratch` call acquires a separate buffer from the pool
+/// rather than re-borrowing the same one.
+pub fn with_scratch<T, F, R>(value: &T, f: F) -> io::Result<R>
+where
+    T: Encode,
+    F: FnOnce(&[u8]) -> io::Result<R>,
+{
+    let mut buf = PooledBuf::acquire();
+    let written = serialize_into_std(value, &mut *buf)?;
+    f(&buf[..written])
+}
+
+/// Encode two values into independent pooled scratch buffers and hand
+/// both slices to `f`. Avoids the double-encode that `serialized_size` +
+/// `serialize_into` pays on every keyed write — the encode is the only
+/// pass, and `len()` is the size.
+pub fn with_two_scratches<A, B, F, R>(a: &A, b: &B, f: F) -> io::Result<R>
+where
+    A: Encode,
+    B: Encode,
+    F: FnOnce(&[u8], &[u8]) -> io::Result<R>,
+{
+    let mut buf_a = PooledBuf::acquire();
+    let written_a = serialize_into_std(a, &mut *buf_a)?;
+    let mut buf_b = PooledBuf::acquire();
+    let written_b = serialize_into_std(b, &mut *buf_b)?;
+    f(&buf_a[..written_a], &buf_b[..written_b])
+}
+
+/// Decode a value from `src`. Discards the trailing byte count.
+pub fn deserialize_from<T: Decode<()>>(src: &[u8]) -> io::Result<T> {
+    bincode::decode_from_slice(src, cfg())
+        .map(|(value, _bytes_read)| value)
+        .map_err(decode_err)
+}
+
+#[inline]
+fn encode_err(e: EncodeError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
+#[inline]
+fn decode_err(e: DecodeError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Byte-level read/write helpers — shared across page-based formats.
+// ---------------------------------------------------------------------------
+
+#[inline]
+pub fn rd_u16(b: &[u8]) -> u16 {
+    u16::from_le_bytes([b[0], b[1]])
+}
+
+#[inline]
+pub fn rd_u32(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+#[inline]
+pub fn rd_u64(b: &[u8]) -> u64 {
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+#[inline]
+pub fn wr_u16(b: &mut [u8], v: u16) {
+    b[..2].copy_from_slice(&v.to_le_bytes());
+}
+
+#[inline]
+pub fn wr_u32(b: &mut [u8], v: u32) {
+    b[..4].copy_from_slice(&v.to_le_bytes());
+}
+
+#[inline]
+pub fn wr_u64(b: &mut [u8], v: u64) {
+    b[..8].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Read a little-endian u32 from `slice` at `pos`, returning `None` if the
+/// slice doesn't have four bytes available at that offset.
+#[inline]
+pub fn read_u32_le(slice: &[u8], pos: usize) -> Option<u32> {
+    slice
+        .get(pos..pos + 4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+}

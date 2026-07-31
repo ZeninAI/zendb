@@ -9,6 +9,10 @@ description = "Catalog, device, and local state lifecycle for ZenDB"
 
 [dependencies]
 bincode.workspace = true
+futures.workspace = true
+libp2p.workspace = true
+libp2p-identity.workspace = true
 parking_lot.workspace = true
+tokio.workspace = true
 zendb-storage = { path = "../zendb-storage" }
 zendb-types = { path = "../zendb-types" }

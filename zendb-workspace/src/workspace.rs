@@ -6,46 +6,92 @@ use std::{
     sync::Arc,
 };
 
+use bincode::{Decode, Encode};
+use libp2p_identity::Keypair;
 use zendb_types::{
+    Envelope, InstallationId, PeerIdentity, PublicKey, WorkspaceId,
     utils::{deserialize_from, serialize_to_vec},
-    PeerId, PeerIdentity, WorkspaceId,
 };
 
 use crate::{
+    AdmitError, Error, Result,
     consts::{IDENTITY_FILE, LOCK_FILE, PEERS_STATE_NAME},
     devices::{Devices, PeerState},
+    replication::{ReplicationConfig, ReplicationController},
     states::States,
     tables::Tables,
-    Error, Result,
 };
 
-/// Placeholder for future workspace-level configuration.
-///
-/// Carries no fields in this iteration. The local device display name is not
-/// a workspace concern; fields are added when concrete workspace-level config
-/// is needed.
-#[derive(Debug, Clone, Default)]
-pub struct WorkspaceConfig {}
+const WORKSPACE_KEY_DOMAIN: &[u8] = b"zendb/workspace-transport-key/v1\0";
 
-/// Connection hints for `Workspace::join`.
-///
-/// This is a placeholder type. Fields (multiaddrs, bootstrap peer list, dial
-/// timeout) are added in the replication iteration. `Workspace::join` in this
-/// iteration persists the caller-provided `WorkspaceId` and otherwise behaves
-/// like `create` minus `WorkspaceId` generation; it does not yet contact any
-/// network.
+#[derive(Debug, Clone, Encode, Decode)]
+struct LocalIdentity {
+    workspace_id: WorkspaceId,
+    installation_id: InstallationId,
+}
+
+struct WorkspaceIdentity {
+    installation_id: InstallationId,
+    keypair: Keypair,
+}
+
+impl WorkspaceIdentity {
+    fn derive(
+        identity: &dyn PeerIdentity,
+        workspace_id: WorkspaceId,
+        installation_id: InstallationId,
+    ) -> Result<Self> {
+        Ok(Self {
+            installation_id,
+            keypair: derive_workspace_keypair(identity, workspace_id, installation_id)?,
+        })
+    }
+}
+
+/// Derive the public transport key an Admin stores for an installation.
+pub fn derive_workspace_public_key(
+    identity: &dyn PeerIdentity,
+    workspace_id: WorkspaceId,
+    installation_id: InstallationId,
+) -> Result<PublicKey> {
+    derive_workspace_keypair(identity, workspace_id, installation_id)
+        .map(|keypair| PublicKey::from_libp2p(keypair.public()))
+}
+
+/// Workspace-level runtime configuration.
 #[derive(Debug, Clone, Default)]
-pub struct JoinHints {}
+pub struct WorkspaceConfig {
+    pub replication: ReplicationConfig,
+}
+
+/// Connection hints assigned by an Admin before joining.
+#[derive(Debug, Clone)]
+pub struct JoinHints {
+    pub bootstrap_peers: Vec<String>,
+    pub installation_id: InstallationId,
+}
 
 enum Mode {
     Create,
+    Join,
     Open,
+}
+
+struct WorkspaceAssembly {
+    root: PathBuf,
+    workspace_id: WorkspaceId,
+    workspace_identity: WorkspaceIdentity,
+    display_name: String,
+    lock: File,
+    mode: Mode,
+    replication_config: ReplicationConfig,
+    bootstrap_peers: Vec<String>,
 }
 
 pub struct Workspace {
     root: PathBuf,
     workspace_id: WorkspaceId,
-    identity: Arc<dyn PeerIdentity>,
+    replication: Arc<ReplicationController>,
     tables: Arc<Tables>,
     states: Arc<States>,
     devices: Arc<Devices>,
@@ -54,15 +100,10 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// Create a new workspace at `path`.
-    ///
-    /// `identity` supplies the local device identity (`PeerId` + private key).
-    /// The workspace stores the `WorkspaceId` it generates but never stores
-    /// the private key.
     pub fn create(
         path: impl AsRef<Path>,
         identity: Arc<dyn PeerIdentity>,
-        _config: WorkspaceConfig,
+        config: WorkspaceConfig,
     ) -> Result<Self> {
         let root = path.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
@@ -71,76 +112,141 @@ impl Workspace {
         if identity_path.exists() {
             return Err(Error::AlreadyExists("workspace identity".to_owned()));
         }
-        let workspace_id = WorkspaceId::generate();
-        fs::write(identity_path, serialize_to_vec(&workspace_id)?)?;
-        Self::assemble(root, workspace_id, lock, identity, Mode::Create)
+        let local_identity = LocalIdentity {
+            workspace_id: WorkspaceId::generate(),
+            installation_id: InstallationId::generate(),
+        };
+        let workspace_identity = WorkspaceIdentity::derive(
+            identity.as_ref(),
+            local_identity.workspace_id,
+            local_identity.installation_id,
+        )?;
+        fs::write(identity_path, serialize_to_vec(&local_identity)?)?;
+        Self::assemble(WorkspaceAssembly {
+            root,
+            workspace_id: local_identity.workspace_id,
+            workspace_identity,
+            display_name: identity.display_name().to_owned(),
+            lock,
+            mode: Mode::Create,
+            replication_config: config.replication,
+            bootstrap_peers: Vec::new(),
+        })
     }
 
-    /// Open an existing workspace at `path`.
-    ///
-    /// `identity` supplies the local device identity. It must be the same device
-    /// that previously created or joined this workspace (its `PeerId` must
-    /// match a record in `_devices`).
-    pub fn open(path: impl AsRef<Path>, identity: Arc<dyn PeerIdentity>) -> Result<Self> {
+    pub fn open(
+        path: impl AsRef<Path>,
+        identity: Arc<dyn PeerIdentity>,
+        config: WorkspaceConfig,
+    ) -> Result<Self> {
         let root = path.as_ref().to_path_buf();
         let lock = acquire_lock(&root)?;
         let bytes = fs::read(root.join(IDENTITY_FILE))?;
-        let workspace_id = deserialize_from(&bytes)?;
-        Self::assemble(root, workspace_id, lock, identity, Mode::Open)
+        let local_identity: LocalIdentity = deserialize_from(&bytes)?;
+        let workspace_identity = WorkspaceIdentity::derive(
+            identity.as_ref(),
+            local_identity.workspace_id,
+            local_identity.installation_id,
+        )?;
+        Self::assemble(WorkspaceAssembly {
+            root,
+            workspace_id: local_identity.workspace_id,
+            workspace_identity,
+            display_name: identity.display_name().to_owned(),
+            lock,
+            mode: Mode::Open,
+            replication_config: config.replication,
+            bootstrap_peers: Vec::new(),
+        })
     }
 
-    /// Join an existing workspace by its known `WorkspaceId`.
+    /// Stage an assigned installation for the future initial-sync protocol.
     ///
-    /// `identity` is the joining device's identity (a fresh `PeerIdentity` for
-    /// this joiner). `hints` carries connection bootstrap data; it is
-    /// forwarded to the networking layer in a future iteration and not
-    /// persisted by the workspace.
-    ///
-    /// In this iteration `join` persists the provided `WorkspaceId` and
-    /// otherwise behaves like `create` minus `WorkspaceId` generation. It
-    /// does not yet contact any network.
+    /// Iteration 0006 does not transfer the existing device registry, so the
+    /// newly created local storage cannot authenticate or join the mesh yet.
     pub fn join(
         path: impl AsRef<Path>,
         workspace_id: WorkspaceId,
         identity: Arc<dyn PeerIdentity>,
         hints: JoinHints,
-        _config: WorkspaceConfig,
+        config: WorkspaceConfig,
     ) -> Result<Self> {
-        let _ = hints; // forwarded to networking in a future iteration
         let root = path.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         let lock = acquire_lock(&root)?;
-        fs::write(root.join(IDENTITY_FILE), serialize_to_vec(&workspace_id)?)?;
-        Self::assemble(root, workspace_id, lock, identity, Mode::Create)
+        if root.join(IDENTITY_FILE).exists() {
+            return Err(Error::AlreadyExists("workspace identity".to_owned()));
+        }
+        let local_identity = LocalIdentity {
+            workspace_id,
+            installation_id: hints.installation_id,
+        };
+        let workspace_identity =
+            WorkspaceIdentity::derive(identity.as_ref(), workspace_id, hints.installation_id)?;
+        fs::write(root.join(IDENTITY_FILE), serialize_to_vec(&local_identity)?)?;
+        let bootstrap_peers = hints.bootstrap_peers;
+        Self::assemble(WorkspaceAssembly {
+            root,
+            workspace_id,
+            workspace_identity,
+            display_name: identity.display_name().to_owned(),
+            lock,
+            mode: Mode::Join,
+            replication_config: config.replication,
+            bootstrap_peers,
+        })
     }
 
-    fn assemble(
-        root: PathBuf,
-        workspace_id: WorkspaceId,
-        lock: File,
-        identity: Arc<dyn PeerIdentity>,
-        mode: Mode,
-    ) -> Result<Self> {
-        // States owns the system catalog and materializes _peers during create;
-        // Devices needs that typed handle to build its clock and receipt store.
+    fn assemble(assembly: WorkspaceAssembly) -> Result<Self> {
+        let WorkspaceAssembly {
+            root,
+            workspace_id,
+            workspace_identity,
+            display_name,
+            lock,
+            mode,
+            replication_config,
+            bootstrap_peers,
+        } = assembly;
         let states = match mode {
-            Mode::Create => States::create(&root)?,
+            Mode::Create | Mode::Join => States::create(&root)?,
             Mode::Open => States::open(&root)?,
         };
-        let peer_state = states.get::<PeerId, PeerState>(PEERS_STATE_NAME)?;
-
-        // Tables creates or opens the system tables, constructs Devices, opens
-        // application tables, and installs listeners before returning.
+        let peer_state = states.get::<InstallationId, PeerState>(PEERS_STATE_NAME)?;
+        let public_key = PublicKey::from_libp2p(workspace_identity.keypair.public());
         let tables = match mode {
-            Mode::Create => Tables::create(&root, peer_state, identity.clone())?,
-            Mode::Open => Tables::open(&root, peer_state, identity.clone())?,
+            Mode::Create => Tables::create(
+                &root,
+                peer_state,
+                workspace_identity.installation_id,
+                display_name,
+                public_key,
+            )?,
+            Mode::Open => Tables::open(
+                &root,
+                peer_state,
+                workspace_identity.installation_id,
+                &public_key,
+            )?,
+            Mode::Join => Tables::join(&root, peer_state, workspace_identity.installation_id)?,
         };
         let devices = tables.devices.clone();
+        let replication = ReplicationController::build(
+            workspace_id,
+            workspace_identity.installation_id,
+            workspace_identity.keypair,
+            tables.clone(),
+            devices.clone(),
+            replication_config,
+            bootstrap_peers,
+        )?;
+        tables.set_device_observer(replication.observer());
+        tables.add_internal_listener_factory(replication.listener_factory());
 
         Ok(Self {
             root,
             workspace_id,
-            identity,
+            replication,
             tables,
             states,
             devices,
@@ -160,20 +266,12 @@ impl Workspace {
         self.states.sync()
     }
 
-    pub fn id(&self) -> WorkspaceId {
+    pub const fn id(&self) -> WorkspaceId {
         self.workspace_id
     }
 
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    /// The local device identity backing this workspace session.
-    ///
-    /// Exposed so callers can sign messages on behalf of the local device
-    /// without the workspace ever holding private key material directly.
-    pub fn peer_identity(&self) -> &Arc<dyn PeerIdentity> {
-        &self.identity
     }
 
     pub fn devices(&self) -> &Devices {
@@ -187,10 +285,19 @@ impl Workspace {
     pub fn states(&self) -> &States {
         &self.states
     }
+
+    pub fn admit_event(
+        &self,
+        envelope: Envelope,
+        gossipsub_source: libp2p_identity::PeerId,
+    ) -> std::result::Result<(), AdmitError> {
+        crate::admission::admit_event(&self.tables, &self.devices, envelope, gossipsub_source)
+    }
 }
 
 impl Drop for Workspace {
     fn drop(&mut self) {
+        self.replication.shutdown();
         let _ = self.flush();
     }
 }
@@ -205,4 +312,26 @@ fn acquire_lock(root: &Path) -> Result<File> {
     file.try_lock()
         .map_err(|_| Error::AlreadyExists("workspace is already open".to_owned()))?;
     Ok(file)
+}
+
+fn derive_workspace_keypair(
+    identity: &dyn PeerIdentity,
+    workspace_id: WorkspaceId,
+    installation_id: InstallationId,
+) -> Result<Keypair> {
+    let mut domain = Vec::with_capacity(
+        WORKSPACE_KEY_DOMAIN.len()
+            + workspace_id.as_bytes().len()
+            + installation_id.as_bytes().len(),
+    );
+    domain.extend_from_slice(WORKSPACE_KEY_DOMAIN);
+    domain.extend_from_slice(workspace_id.as_bytes());
+    domain.extend_from_slice(installation_id.as_bytes());
+    let seed = identity
+        .keypair()
+        .derive_secret(&domain)
+        .ok_or(Error::KeyDerivationUnsupported)?;
+    Keypair::ed25519_from_bytes(seed).map_err(|error| {
+        Error::CorruptLocalState(format!("derived workspace key is invalid: {error}"))
+    })
 }

@@ -5,5 +5,5 @@ mod devices;
 mod receipts;
 
 pub(crate) use catalog::TableCatalogListener;
-pub(crate) use devices::DeviceRegistryListener;
+pub(crate) use devices::{DeviceChangeObserver, DeviceRegistryListener};
 pub(crate) use receipts::ReceiptListener;

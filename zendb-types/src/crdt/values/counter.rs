@@ -17,11 +17,11 @@ use std::collections::BTreeMap;
 
 use bincode::{Decode, Encode};
 
-use crate::{PeerId, Type};
+use crate::{InstallationId, Type};
 
 #[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
 pub struct Counter {
-    entries: BTreeMap<PeerId, (u64, u64)>,
+    entries: BTreeMap<InstallationId, (u64, u64)>,
 }
 
 impl Counter {
@@ -64,7 +64,7 @@ impl Type for Counter {
         if *delta == 0 {
             return Ok(false);
         }
-        let peer = stamps.id.peer_id;
+        let peer = stamps.id.author;
         let entry = self.entries.entry(peer).or_default();
         if *delta > 0 {
             entry.0 = entry

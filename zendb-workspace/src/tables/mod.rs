@@ -13,19 +13,20 @@ use std::{
 use parking_lot::RwLock;
 use zendb_storage::{DurableStorage, ReadBackend, Table, TableConfig};
 use zendb_types::{
-    Blob, Cell, Event, EventStamp, Op, Path as CrdtPath, PeerId, PeerIdentity, PrimaryKey, Role,
-    Value,
+    Blob, Cell, Event, EventStamp, InstallationId, Op, Path as CrdtPath, PrimaryKey, PublicKey,
+    Role, Value,
 };
 
+pub(crate) use runtime::ChangeListenerFactory;
 pub use runtime::{ChangeListener, TableHandle};
 
 use crate::{
+    Error, Result,
     consts::{
-        is_system_table, DEVICES_TABLE_NAME, SYSTEM_TABLE_CONFIG, TABLES_DIR, TABLE_CATALOG_NAME,
+        DEVICES_TABLE_NAME, SYSTEM_TABLE_CONFIG, TABLE_CATALOG_NAME, TABLES_DIR, is_system_table,
     },
     devices::{Devices, PeerState},
     states::StateHandle,
-    Error, Result,
 };
 
 /// Table catalog management: owns the `_catalog` handle and the
@@ -44,13 +45,18 @@ pub struct Tables {
     catalog: Arc<TableHandle>,
     pub(crate) tables: RwLock<HashMap<String, Arc<TableHandle>>>,
     pub(crate) devices: Arc<Devices>,
+    table_listeners: Arc<RwLock<Vec<Arc<dyn ChangeListener>>>>,
+    listener_factories: Arc<RwLock<Vec<Arc<dyn ChangeListenerFactory>>>>,
+    device_listener: Arc<listeners::DeviceRegistryListener>,
 }
 
 impl Tables {
     pub(crate) fn create(
         root: &Path,
-        peer_state: Arc<StateHandle<PeerId, PeerState>>,
-        identity: Arc<dyn PeerIdentity>,
+        peer_state: Arc<StateHandle<InstallationId, PeerState>>,
+        local_installation_id: InstallationId,
+        display_name: String,
+        public_key: PublicKey,
     ) -> Result<Arc<Self>> {
         let root = root.join(TABLES_DIR);
         fs::create_dir_all(&root)?;
@@ -58,7 +64,9 @@ impl Tables {
         let devices = Devices::create(
             Table::create(&root.join(DEVICES_TABLE_NAME), SYSTEM_TABLE_CONFIG.clone())?,
             peer_state,
-            identity,
+            local_installation_id,
+            display_name,
+            public_key,
         )?;
         let catalog = TableHandle::new(
             TABLE_CATALOG_NAME.to_owned(),
@@ -70,11 +78,17 @@ impl Tables {
             (TABLE_CATALOG_NAME.to_owned(), catalog.clone()),
             (DEVICES_TABLE_NAME.to_owned(), devices.registry.clone()),
         ]);
+        let receipt_listener = listeners::ReceiptListener::build(Arc::downgrade(&devices));
+        let table_listeners = Arc::new(RwLock::new(vec![receipt_listener]));
+        let device_listener = listeners::DeviceRegistryListener::build(Arc::downgrade(&devices));
         let tables = Arc::new(Self {
             root,
             catalog,
             tables: RwLock::new(tables),
             devices: devices.clone(),
+            table_listeners,
+            listener_factories: Arc::new(RwLock::new(Vec::new())),
+            device_listener,
         });
         tables.register_listeners();
 
@@ -86,8 +100,9 @@ impl Tables {
 
     pub(crate) fn open(
         root: &Path,
-        peer_state: Arc<StateHandle<PeerId, PeerState>>,
-        identity: Arc<dyn PeerIdentity>,
+        peer_state: Arc<StateHandle<InstallationId, PeerState>>,
+        local_installation_id: InstallationId,
+        expected_public_key: &PublicKey,
     ) -> Result<Arc<Self>> {
         let tables_dir = root.join(TABLES_DIR);
         let devices = Devices::open(
@@ -96,7 +111,8 @@ impl Tables {
                 SYSTEM_TABLE_CONFIG.clone(),
             )?,
             peer_state,
-            identity,
+            local_installation_id,
+            expected_public_key,
         )?;
         let devices_weak = Arc::downgrade(&devices);
         let catalog = TableHandle::new(
@@ -138,11 +154,55 @@ impl Tables {
                 );
             }
         }
+        let receipt_listener = listeners::ReceiptListener::build(Arc::downgrade(&devices));
+        let table_listeners = Arc::new(RwLock::new(vec![receipt_listener]));
+        let device_listener = listeners::DeviceRegistryListener::build(Arc::downgrade(&devices));
         let tables = Arc::new(Self {
             root: tables_dir,
             catalog,
             tables: RwLock::new(tables),
             devices: devices.clone(),
+            table_listeners,
+            listener_factories: Arc::new(RwLock::new(Vec::new())),
+            device_listener,
+        });
+        tables.register_listeners();
+        Ok(tables)
+    }
+
+    pub(crate) fn join(
+        root: &Path,
+        peer_state: Arc<StateHandle<InstallationId, PeerState>>,
+        local_installation_id: InstallationId,
+    ) -> Result<Arc<Self>> {
+        let root = root.join(TABLES_DIR);
+        fs::create_dir_all(&root)?;
+        let devices = Devices::join(
+            Table::create(&root.join(DEVICES_TABLE_NAME), SYSTEM_TABLE_CONFIG.clone())?,
+            peer_state,
+            local_installation_id,
+        )?;
+        let catalog = TableHandle::new(
+            TABLE_CATALOG_NAME.to_owned(),
+            Table::create(&root.join(TABLE_CATALOG_NAME), SYSTEM_TABLE_CONFIG.clone())?,
+            Arc::downgrade(&devices),
+            true,
+        );
+        let tables = HashMap::from([
+            (TABLE_CATALOG_NAME.to_owned(), catalog.clone()),
+            (DEVICES_TABLE_NAME.to_owned(), devices.registry.clone()),
+        ]);
+        let receipt_listener = listeners::ReceiptListener::build(Arc::downgrade(&devices));
+        let table_listeners = Arc::new(RwLock::new(vec![receipt_listener]));
+        let device_listener = listeners::DeviceRegistryListener::build(Arc::downgrade(&devices));
+        let tables = Arc::new(Self {
+            root,
+            catalog,
+            tables: RwLock::new(tables),
+            devices,
+            table_listeners,
+            listener_factories: Arc::new(RwLock::new(Vec::new())),
+            device_listener,
         });
         tables.register_listeners();
         Ok(tables)
@@ -184,7 +244,7 @@ impl Tables {
             return Err(Error::SystemTableReadOnly(name.to_owned()));
         }
         self.devices
-            .require_access(self.devices.local_peer_id(), Role::Admin)?;
+            .require_access(&self.devices.local_installation_id(), Role::Admin)?;
         let key = PrimaryKey::String(name.to_owned());
         let current = {
             let catalog = self.catalog.read();
@@ -219,7 +279,7 @@ impl Tables {
             return Err(Error::ResourceBusy(name.to_owned()));
         }
         self.devices
-            .require_access(self.devices.local_peer_id(), Role::Admin)?;
+            .require_access(&self.devices.local_installation_id(), Role::Admin)?;
         if let Some(entry) = self.tables.read().get(name) {
             if Arc::strong_count(entry) > 1 {
                 return Err(Error::ResourceBusy(name.to_owned()));
@@ -251,17 +311,34 @@ impl Tables {
     }
 
     fn register_listeners(self: &Arc<Self>) {
-        let devices = Arc::downgrade(&self.devices);
-        let receipt_listener = listeners::ReceiptListener::build(devices.clone());
-        let catalog_listener =
-            listeners::TableCatalogListener::build(Arc::downgrade(self), receipt_listener.clone());
-        let registry_listener = listeners::DeviceRegistryListener::build(devices);
-
         for table in self.tables.read().values() {
-            table.add_listener(receipt_listener.clone());
+            for listener in self.table_listeners.read().iter() {
+                table.add_listener(listener.clone());
+            }
         }
+        let catalog_listener = listeners::TableCatalogListener::build(
+            Arc::downgrade(self),
+            self.table_listeners.clone(),
+            self.listener_factories.clone(),
+        );
         self.catalog.add_listener(catalog_listener);
-        self.devices.registry.add_listener(registry_listener);
+        self.devices
+            .registry
+            .add_listener(self.device_listener.clone());
+    }
+
+    pub(crate) fn add_internal_listener_factory(&self, factory: Arc<dyn ChangeListenerFactory>) {
+        for (name, table) in self.tables.read().iter() {
+            table.add_listener(factory.build(name));
+        }
+        self.listener_factories.write().push(factory);
+    }
+
+    pub(crate) fn set_device_observer(
+        &self,
+        observer: std::sync::Weak<dyn listeners::DeviceChangeObserver>,
+    ) {
+        self.device_listener.set_observer(observer);
     }
 }
 

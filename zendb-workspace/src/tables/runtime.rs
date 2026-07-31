@@ -6,7 +6,7 @@ use parking_lot::{RwLock, RwLockReadGuard};
 use zendb_storage::{Change, InsertOutcome, Table, TopicConsumer};
 use zendb_types::{Event, Op, Path, PrimaryKey, Role};
 
-use crate::{devices::Devices, Error, Result};
+use crate::{Error, Result, devices::Devices};
 
 /// Reacts to a successful insert on a [`TableHandle`].
 ///
@@ -19,6 +19,10 @@ use crate::{devices::Devices, Error, Result};
 /// register them via [`TableHandle::add_listener`].
 pub trait ChangeListener: Send + Sync {
     fn on_change(&self, change: &Change);
+}
+
+pub(crate) trait ChangeListenerFactory: Send + Sync {
+    fn build(&self, table: &str) -> Arc<dyn ChangeListener>;
 }
 
 /// A shared handle to an open [`Table`].
@@ -66,7 +70,7 @@ impl TableHandle {
             return Err(Error::SystemTableReadOnly(self.name.clone()));
         }
         let devices = self.devices.upgrade().ok_or(Error::WorkspaceClosed)?;
-        devices.require_access(devices.local_peer_id(), Role::Contributor)?;
+        devices.require_access(&devices.local_installation_id(), Role::Contributor)?;
         let stamp = devices.mint()?;
         self.insert_internal(Event {
             primary_key,
@@ -101,7 +105,7 @@ impl TableHandle {
         } else {
             Role::Contributor
         };
-        devices.require_access(&event.stamp.id.peer_id, required)?;
+        devices.require_access(&event.stamp.id.author, required)?;
         self.insert_unchecked(event)
     }
 

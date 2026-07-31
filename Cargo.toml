@@ -23,6 +23,21 @@ hashbrown = "0.15"
 bincode = { version = "2", features = ["derive"] }
 
 libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand"] }
+libp2p = { version = "0.56", features = [
+    "dns",
+    "ed25519",
+    "gossipsub",
+    "identify",
+    "macros",
+    "mdns",
+    "noise",
+    "ping",
+    "tcp",
+    "tokio",
+    "yamux",
+] }
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 rand = "0.8"
 
 parking_lot = "0.12"

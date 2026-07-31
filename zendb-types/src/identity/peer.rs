@@ -1,103 +1,40 @@
-//! Network peer identifiers, progressive roles, and signing abstractions.
+//! Persisted device keys, progressive roles, and application identity input.
 
-use std::{fmt, str::FromStr};
+use bincode::{Decode, Encode, de::Decoder, enc::Encoder};
+use libp2p_identity::{Keypair, PublicKey as Libp2pPublicKey};
 
-use bincode::{de::Decoder, enc::Encoder, Decode, Encode};
-use libp2p_identity::{PeerId as Libp2pPeerId, PublicKey, SigningError as Libp2pSigningError};
+/// A bincode-capable wrapper around libp2p's generic public key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicKey(Libp2pPublicKey);
 
-pub type IdParseError = libp2p_identity::ParseError;
-
-/// A network peer identity encoded as canonical libp2p PeerId bytes.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PeerId(Libp2pPeerId);
-
-impl PeerId {
-    pub fn from_public_key(key: &PublicKey) -> Self {
-        Self(Libp2pPeerId::from_public_key(key))
+impl PublicKey {
+    pub fn from_libp2p(key: Libp2pPublicKey) -> Self {
+        Self(key)
     }
 
-    pub fn from_bytes(data: &[u8]) -> Result<Self, IdParseError> {
-        Libp2pPeerId::from_bytes(data).map(Self)
-    }
-
-    pub fn random() -> Self {
-        Self(Libp2pPeerId::random())
-    }
-
-    pub fn to_bytes(self) -> Vec<u8> {
-        self.0.to_bytes()
-    }
-
-    pub fn to_base58(self) -> String {
-        self.0.to_base58()
-    }
-
-    pub const fn as_libp2p(&self) -> &Libp2pPeerId {
+    pub const fn as_libp2p(&self) -> &Libp2pPublicKey {
         &self.0
     }
 }
 
-impl Default for PeerId {
-    fn default() -> Self {
-        // A valid identity-multihash with a zero digest is the CRDT sentinel.
-        Self::from_bytes(&[
-            0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0,
-        ])
-        .expect("the zero PeerId sentinel is a valid identity multihash")
-    }
-}
-
-impl fmt::Display for PeerId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl fmt::Debug for PeerId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("PeerId").field(&self.0).finish()
-    }
-}
-
-impl FromStr for PeerId {
-    type Err = IdParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        value.parse().map(Self)
-    }
-}
-
-impl From<Libp2pPeerId> for PeerId {
-    fn from(value: Libp2pPeerId) -> Self {
-        Self(value)
-    }
-}
-
-impl From<PeerId> for Libp2pPeerId {
-    fn from(value: PeerId) -> Self {
-        value.0
-    }
-}
-
-impl Encode for PeerId {
+impl Encode for PublicKey {
     fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), bincode::error::EncodeError> {
-        self.0.to_bytes().encode(encoder)
+        self.0.encode_protobuf().encode(encoder)
     }
 }
 
-impl<Context> Decode<Context> for PeerId {
+impl<Context> Decode<Context> for PublicKey {
     fn decode<D: Decoder<Context = Context>>(
         decoder: &mut D,
     ) -> Result<Self, bincode::error::DecodeError> {
         let bytes = Vec::<u8>::decode(decoder)?;
-        Self::from_bytes(&bytes).map_err(|error| {
-            bincode::error::DecodeError::OtherString(format!("invalid PeerId: {error}"))
-        })
+        Libp2pPublicKey::try_decode_protobuf(&bytes)
+            .map(Self)
+            .map_err(|error| bincode::error::DecodeError::OtherString(error.to_string()))
     }
 }
 
-bincode::impl_borrow_decode!(PeerId);
+bincode::impl_borrow_decode!(PublicKey);
 
 /// Persisted workspace capabilities. Enforcement belongs to zendb-workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
@@ -117,93 +54,9 @@ impl Role {
     }
 }
 
-/// A device's cryptographic identity.
-///
-/// The workspace uses this trait to obtain the local [`PeerId`] for minting
-/// `EventId`s and to sign messages for future replication. It never sees the
-/// private key material directly; the implementation decides where the key
-/// lives (in-memory, OS keychain, HSM, KMS).
+/// Application-owned account identity used to derive workspace-scoped keys.
 pub trait PeerIdentity: Send + Sync {
-    /// The public peer identity of this device.
-    fn peer_id(&self) -> &PeerId;
+    fn keypair(&self) -> &Keypair;
 
-    /// The human-readable display name for this device.
-    ///
-    /// Used to seed the local device's `_devices` record when a workspace is
-    /// created. The workspace never overwrites it after the initial seed;
-    /// later renames go through `Devices::upsert`.
     fn display_name(&self) -> &str;
-
-    /// Cryptographically sign `message` with this device's private key.
-    fn sign(&self, message: &[u8]) -> Result<Signature, SigningError>;
-}
-
-/// An opaque owned signature produced by a [`PeerIdentity`].
-///
-/// The bytes are backend-specific (ed25519, secp256k1, etc.). The type is
-/// `Encode`/`Decode` so future event envelopes can carry signatures, but
-/// iteration 0003 does not yet attach signatures to events.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Signature(pub Vec<u8>);
-
-impl Signature {
-    /// The raw signature bytes.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl fmt::Debug for Signature {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("Signature")
-            .field(&self.0.len())
-            .finish()
-    }
-}
-
-impl Encode for Signature {
-    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), bincode::error::EncodeError> {
-        self.0.encode(encoder)
-    }
-}
-
-impl<Context> Decode<Context> for Signature {
-    fn decode<D: Decoder<Context = Context>>(
-        decoder: &mut D,
-    ) -> Result<Self, bincode::error::DecodeError> {
-        Vec::<u8>::decode(decoder).map(Self)
-    }
-}
-
-bincode::impl_borrow_decode!(Signature);
-
-/// Failures produced by [`PeerIdentity::sign`].
-///
-/// This is a distinct error type from `zendb_workspace::Error` because
-/// signing can occur outside the workspace (e.g. an account layer signing a
-/// join request).
-#[derive(Debug)]
-pub enum SigningError {
-    /// The backing key is not available (e.g. keychain locked, HSM offline).
-    KeyUnavailable,
-    /// The signing backend reported a failure.
-    Backend(String),
-}
-
-impl fmt::Display for SigningError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::KeyUnavailable => formatter.write_str("signing key is unavailable"),
-            Self::Backend(message) => write!(formatter, "signing backend failure: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for SigningError {}
-
-impl From<Libp2pSigningError> for SigningError {
-    fn from(value: Libp2pSigningError) -> Self {
-        Self::Backend(value.to_string())
-    }
 }

@@ -4,10 +4,10 @@
 pub mod crdt;
 
 pub mod identity;
+pub mod replication;
 pub mod utils;
 
 register_types! {
-    key PeerId => crate::PeerId,
     key Bool => crate::crdt::values::bool::Bool,
     key Int => crate::crdt::values::int::Int,
     key String => crate::crdt::values::string::String,
@@ -32,6 +32,7 @@ register_types! {
 
 pub use crdt::*;
 pub use identity::{
-    IdParseError, PeerId, PeerIdentity, Role, Signature, SigningError, WorkspaceId,
+    InstallationId, InstallationIdParseError, PeerIdentity, PublicKey, Role, WorkspaceId,
     WorkspaceIdParseError,
 };
+pub use replication::{CompactEvent, Envelope};

@@ -1,6 +1,6 @@
 //! Public workspace errors and crate-local result alias.
 
-use zendb_types::PeerId;
+use zendb_types::InstallationId;
 
 #[derive(Debug)]
 pub enum Error {
@@ -17,7 +17,10 @@ pub enum Error {
     InvalidEventSequence,
     ClockExhausted,
     WorkspaceClosed,
-    DeviceNotRegistered(PeerId),
+    DeviceNotRegistered(InstallationId),
+    LocalDeviceKeyMismatch,
+    KeyDerivationUnsupported,
+    Replication(String),
     ResourceBusy(String),
 }
 
@@ -51,12 +54,19 @@ impl std::fmt::Display for Error {
             Self::InvalidEventSequence => formatter.write_str("event sequence zero is reserved"),
             Self::ClockExhausted => formatter.write_str("device clock exhausted"),
             Self::WorkspaceClosed => formatter.write_str("workspace is closed"),
-            Self::DeviceNotRegistered(peer) => {
+            Self::DeviceNotRegistered(installation_id) => {
                 write!(
                     formatter,
-                    "local peer {peer:?} is not registered as a device"
+                    "local installation {installation_id:?} is not registered as a device"
                 )
             }
+            Self::LocalDeviceKeyMismatch => {
+                formatter.write_str("the supplied identity does not match the local device key")
+            }
+            Self::KeyDerivationUnsupported => {
+                formatter.write_str("the supplied keypair does not support secret derivation")
+            }
+            Self::Replication(message) => write!(formatter, "replication error: {message}"),
             Self::ResourceBusy(name) => write!(formatter, "{name:?} is still in use"),
         }
     }

@@ -5,10 +5,11 @@ use std::{
     sync::{Arc, Weak},
 };
 
+use parking_lot::RwLock;
 use zendb_storage::{Change, DurableStorage, Table, TableConfig};
 use zendb_types::{Op, PrimaryKey, Value};
 
-use super::super::runtime::{ChangeListener, TableHandle};
+use super::super::runtime::{ChangeListener, ChangeListenerFactory, TableHandle};
 use crate::tables::Tables;
 
 /// Reacts to `_catalog` events: opens tables on `Upsert`, closes +
@@ -16,21 +17,24 @@ use crate::tables::Tables;
 /// the in-memory table-handle map after bootstrap.
 ///
 /// Holds a shared receipt listener to register on newly opened application
-/// tables, so every table — bootstrap-opened or callback-opened — has the
-/// receipt listener.
+/// tables, so every table, whether bootstrap-opened or callback-opened, has
+/// the receipt listener.
 pub(crate) struct TableCatalogListener {
     tables: Weak<Tables>,
-    receipt_listener: Arc<dyn ChangeListener>,
+    table_listeners: Arc<RwLock<Vec<Arc<dyn ChangeListener>>>>,
+    listener_factories: Arc<RwLock<Vec<Arc<dyn ChangeListenerFactory>>>>,
 }
 
 impl TableCatalogListener {
     pub(crate) fn build(
         tables: Weak<Tables>,
-        receipt_listener: Arc<dyn ChangeListener>,
+        table_listeners: Arc<RwLock<Vec<Arc<dyn ChangeListener>>>>,
+        listener_factories: Arc<RwLock<Vec<Arc<dyn ChangeListenerFactory>>>>,
     ) -> Arc<dyn ChangeListener> {
         Arc::new(Self {
             tables,
-            receipt_listener,
+            table_listeners,
+            listener_factories,
         })
     }
 }
@@ -73,7 +77,12 @@ impl ChangeListener for TableCatalogListener {
                 };
                 let handle =
                     TableHandle::new(name.clone(), table, Arc::downgrade(&tables.devices), false);
-                handle.add_listener(self.receipt_listener.clone());
+                for listener in self.table_listeners.read().iter() {
+                    handle.add_listener(listener.clone());
+                }
+                for factory in self.listener_factories.read().iter() {
+                    handle.add_listener(factory.build(name));
+                }
                 tables.tables.write().insert(name.clone(), handle);
             }
             Op::Delete => {

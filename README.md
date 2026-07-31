@@ -1,25 +1,29 @@
 # ZenDB
 
-ZenDB is a small, synchronous embedded database foundation. The current phase
-contains portable CRDT values, storage mechanics, and local workspace
-orchestration. It intentionally has no transport, replication runtime,
-snapshots, operator host, or networking implementation.
+ZenDB is a synchronous embedded database foundation with portable CRDT values,
+durable storage mechanics, workspace authorization, and workspace-owned
+peer-to-peer replication.
 
 ## Crates
 
 | Crate | Responsibility |
 |---|---|
-| `zendb-types` | Peer and workspace identities, event stamps, cells, operations, CRDT values, and shared binary utilities |
+| `zendb-types` | Installation and workspace IDs, persisted libp2p public keys, event stamps, envelopes, cells, operations, CRDT values, and binary utilities |
 | `zendb-storage` | B+ tree, KeyDir, SkipList, generic State, Topic, and the invariant-preserving Table facade |
-| `zendb-workspace` | Catalog-owned Table and State lifecycle, peer metadata and roles, hybrid time, and duplicate detection |
+| `zendb-workspace` | Catalog and device policy, local HLC and receipts, authenticated admission, and the private Tokio/libp2p replication runtime |
 
-## Event Model
+## Identity And Events
 
-Every Table mutation is a fully stamped `Event`:
+Applications provide an account-root libp2p keypair through `PeerIdentity`.
+ZenDB derives a distinct Ed25519 transport key for every
+`(WorkspaceId, InstallationId)` pair. Only that derived public key is stored in
+the workspace device registry; private keys are never serialized.
+
+Every table mutation is a fully stamped `Event`:
 
 ```rust
 pub struct EventId {
-    pub peer_id: PeerId,
+    pub author: InstallationId,
     pub sequence: u64,
 }
 
@@ -29,54 +33,45 @@ pub struct EventStamp {
 }
 ```
 
-`Path` is `Vec<Segment>`. `Op::Upsert` creates or replaces a value, while
-`Op::Delete`, `Op::Merge`, and type-specific operations cover the other
-cell-level mutations. Cells contain only an optional CRDT value and their
-event stamp.
+`InstallationId` and `WorkspaceId` are currently random eight-byte values with
+thirteen-character Crockford Base32 display forms.
 
 ## Tables And States
 
-A Table has a fixed `PrimaryKey -> Cell` shape backed by a materialized State,
-a bounded in-memory cache, and a durable `Topic<Change>`. Its only mutation
-entry point is `Table::insert(Event)`. Normal and ordered reads stream through
-the storage traits; the Table lazily merges materialized and cached rows.
+A Table has a fixed `PrimaryKey -> Cell` shape backed by materialized state, a
+bounded write cache, and a durable `Topic<Change>`. Local application writes
+require Contributor access. System tables are publicly readable but writable
+only through workspace-owned APIs.
 
 A State is caller-typed local storage, `State<K, V>`, with no Event or Topic.
-Catalog persists its `StateConfig`, while callers choose concrete key and value
-types when opening a handle.
+Catalog declarations are durable while typed handles are opened lazily.
 
-## Workspace
+## Replication
 
-The workspace lifecycle modules create and open storage under fixed physical
-paths. `tables/_catalog` is a self-registering Table of table name to
-`TableConfig`. `states/_catalog` is a State of state name to `StateConfig`.
-All declared Tables are eagerly open; typed States can be opened and closed.
+`Workspace` privately owns a Tokio worker and a libp2p Gossipsub swarm. The
+runtime starts when `_devices` contains another installation and drains then
+stops when the last remote installation is removed. Applications do not create
+a replication link or supply an async runtime.
 
-`tables/_devices` stores device display metadata and a progressive optional
-`Role`. `states/_peers` stores receipt windows plus the local event clock.
-`Devices` keeps a read-oriented registry cache and a separate write-back peer
-cache, so minting does not search the registry or write storage.
-`Workspace::flush()` and `Workspace::sync()` coordinate device writeback with
-every open Table and State; dropping the workspace performs a best-effort
-flush.
+Gossipsub signs each bincode `Envelope` with the derived workspace key and uses
+strict signature validation. `Workspace::admit_event` then binds the signed
+libp2p source to the envelope's enrolled `InstallationId`, checks its role, and
+applies events through the normal convergence path.
 
-```rust
-use zendb_storage::TableConfig;
-use zendb_types::{Op, Path, PrimaryKey, Value};
-use zendb_workspace::{Workspace, WorkspaceConfig};
+Publishing batches per table. `BatchConfig::max_bytes` is a flush threshold,
+not an event-size admission limit; Gossipsub's transport limit defaults to
+100 MiB.
 
-let workspace = Workspace::create("./data", WorkspaceConfig::default())?;
-let documents = workspace.create_table("documents", TableConfig::default())?;
+## Enrollment
 
-documents.insert(
-    PrimaryKey::String("doc-1".into()),
-    Path::new(),
-    Op::Upsert {
-        value: Value::String("hello".into()),
-    },
-)?;
-# Ok::<(), zendb_workspace::Error>(())
-```
+Only an Admin writes `_devices`. The Admin assigns an `InstallationId`, the
+joining application derives its workspace public key with
+`derive_workspace_public_key`, and the Admin stores that key in a
+`DeviceRecord`.
+
+`Workspace::join` currently persists the assigned local identity and creates
+empty staged system storage. Initial registry/history synchronization is
+deferred, so a staged join does not start replication or grant itself a role.
 
 ## Durable Layout
 

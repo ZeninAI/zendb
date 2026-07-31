@@ -1,6 +1,6 @@
 # Iteration 0006: Replication Foundation - Trust, Identity, Direct Enrollment, And The Gossipsub Mesh
 
-Status: draft (not yet implemented).
+Status: implemented.
 
 This iteration establishes the trust boundary and identity model used by
 replication, the direct Admin enrollment model, and a Tokio plus Gossipsub
@@ -186,6 +186,9 @@ This gives each installation a distinct network identity in each workspace,
 even when several installations or workspaces use one account-root keypair.
 It makes Gossipsub source authentication map one-to-one to an enrolled device,
 so role checks, revocation, and per-installation event ordering remain sound.
+`zendb-workspace` exposes `derive_workspace_public_key` so a joining
+application can return the correct derived public key to the Admin without
+duplicating the versioned derivation domain or exposing the derived private key.
 
 ### 2.6 PeerId Leaves The ZenDB Data Model
 
@@ -331,8 +334,8 @@ application.
 `zendb_workspace::replication` owns the publisher, listener, Gossipsub swarm,
 and worker. Its `ReplicationListener` observes successful local table changes
 and submits only events authored by the local installation. It must not
-republish admitted remote events. The internal publisher groups pending events
-per table and submits completed batches to the internal network worker.
+republish admitted remote events. The worker's internal publisher logic groups
+pending events per table and publishes completed batches through Gossipsub.
 
 The outbound channel remains bounded and uses blocking send. A saturated network
 therefore applies honest backpressure to the synchronous writer instead of
@@ -349,7 +352,7 @@ dropping locally committed events.
 | Create | first device | no | local device becomes Admin |
 | Open | enrolled device | no | local installation must be in `_devices` |
 | Direct enrollment | Admin | no | only Admin writes the new `_devices` row |
-| Join | enrolled device | yes | uses assigned ID and bootstrap peers |
+| Join | enrolled device | deferred | stages assigned ID; initial sync starts future mesh participation |
 
 There are no invitation links, bearer tokens, invite nonces, invitation state,
 or join request-response protocol in this iteration.
@@ -389,12 +392,12 @@ pub struct JoinHints {
 ```
 
 `Workspace::join` persists the local `(WorkspaceId, InstallationId)` identity
-pair and derives its workspace key before starting replication. The initial
-joiner synchronization that transfers existing registry and table history is a
-future replication feature. Until it exists, direct enrollment and joining only
-establish identity and future mesh participation; they do not promise historical
-state delivery. That later synchronization also advances the HLC through normal
-receipt observation.
+pair, derives its workspace key, and creates empty staged system storage. It
+does not grant the joiner a local role or start replication because it has no
+trusted copy of the existing registry yet. The initial synchronization that
+transfers registry and table history is a future replication feature. That
+later synchronization starts mesh participation and advances the HLC through
+normal receipt observation.
 
 ### 5.4 Joiner HLC
 
@@ -410,7 +413,8 @@ naturally before the joiner writes after synchronization.
 Replication is an internal `zendb_workspace::replication` subsystem, not an
 application-created link and not a separate crate. `zendb-workspace` directly
 owns Tokio, libp2p, and Gossipsub dependencies. Its public API remains fully
-synchronous: the subsystem creates and owns a private Tokio worker thread.
+synchronous: the subsystem owns a private Tokio network thread and a sequential
+admission bridge thread.
 
 The module contains the publisher, table listener, swarm construction, event
 loop, and a private `ReplicationController` held by `Workspace`:
@@ -422,7 +426,7 @@ struct ReplicationController {
 }
 ```
 
-`RunningReplication` owns the worker control channel and its thread handle.
+`RunningReplication` owns the worker control channel and both thread handles.
 It is never exposed through the public workspace API. The worker constructs
 Gossipsub with `MessageAuthenticity::Signed(workspace_identity.keypair.clone())`
 and strict validation. It publishes completed envelopes to the workspace topic;
@@ -431,12 +435,17 @@ for an incoming message it calls
 original signed Gossipsub author, not `propagation_source`, which is only the
 immediate forwarding peer.
 
+Incoming envelopes cross a bounded bridge to the sequential admission thread.
+This preserves arrival order and keeps synchronous storage insertion off the
+Tokio event loop.
+
 ### 6.1 Device Listener Controls Runtime Lifecycle
 
-Replication runs exactly while the registry contains at least one device other
-than the local installation. The local device itself never starts the runtime.
-Readers count as remote devices: they participate in the mesh even though they
-cannot author application-table writes.
+Replication runs exactly while the local installation remains enrolled with
+its expected workspace public key and the registry contains at least one other
+device. The local device itself never starts the runtime. Readers count as
+remote devices: they participate in the mesh even though they cannot author
+application-table writes.
 
 On `Workspace::open`, after the registry has been loaded, the controller is
 initialized from `Devices::list`. `Workspace::create` starts with only its
@@ -447,7 +456,10 @@ local Admin row, so its runtime remains stopped. The existing
 - further non-local upserts leave it running;
 - removing a non-local device removes and disconnects that peer;
 - deleting the final non-local device drains the current outbound work and
-  stops the runtime.
+  stops the runtime;
+- deleting the local device, clearing its role, or replacing its workspace
+  public key stops its runtime after the triggering registry event completes
+  the listener chain.
 
 Listener registration order is part of the invariant. For the first remote
 device upsert, `DeviceRegistryListener` starts the runtime before
@@ -593,7 +605,8 @@ currently started.
 - `Workspace` owns a private replication worker; applications neither create a
   replication link nor supply an async runtime.
 - The existing device listener starts replication on the first remote device
-  and stops it, after outbound drain, when the final remote device is removed.
+  and stops it, after outbound drain, when the final remote device or the local
+  device is removed.
 - Only an Admin writes `_devices` for enrollment; invitation links and nonce
   tracking do not exist.
 - Joiners start their HLC at now; initial historical synchronization remains

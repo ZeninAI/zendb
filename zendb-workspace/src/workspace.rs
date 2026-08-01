@@ -16,7 +16,7 @@ use zendb_types::{
 use crate::{
     AdmitError, Error, Result,
     consts::{IDENTITY_FILE, LOCK_FILE, PEERS_STATE_NAME},
-    devices::{Devices, PeerState},
+    installations::{Installations, PeerState},
     replication::{ReplicationConfig, ReplicationController},
     states::States,
     tables::Tables,
@@ -93,7 +93,7 @@ pub struct Workspace {
     replication: Arc<ReplicationController>,
     tables: Arc<Tables>,
     states: Arc<States>,
-    devices: Arc<Devices>,
+    installations: Arc<Installations>,
     // Declared last so the lock outlives every storage-owning field.
     _lock: File,
 }
@@ -159,7 +159,7 @@ impl Workspace {
 
     /// Stage an assigned installation for the future initial-sync protocol.
     ///
-    /// Iteration 0006 does not transfer the existing device registry, so the
+    /// Iteration 0006 does not transfer the existing installation registry, so the
     /// newly created local storage cannot authenticate or join the mesh yet.
     pub fn join(
         path: impl AsRef<Path>,
@@ -224,13 +224,13 @@ impl Workspace {
             )?,
             Mode::Join => Tables::join(&root, peer_state, workspace_identity.installation_id)?,
         };
-        let devices = tables.devices.clone();
+        let installations = tables.installations.clone();
         let replication = ReplicationController::build(
             workspace_id,
             workspace_identity.installation_id,
             workspace_identity.keypair,
             tables.clone(),
-            devices.clone(),
+            installations.clone(),
             replication_config,
         )?;
 
@@ -240,19 +240,19 @@ impl Workspace {
             replication,
             tables,
             states,
-            devices,
+            installations,
             _lock: lock,
         })
     }
 
     pub fn flush(&self) -> Result<()> {
-        self.devices.flush()?;
+        self.installations.flush()?;
         self.tables.flush()?;
         self.states.flush()
     }
 
     pub fn sync(&self) -> Result<()> {
-        self.devices.sync()?;
+        self.installations.sync()?;
         self.tables.sync()?;
         self.states.sync()
     }
@@ -265,8 +265,8 @@ impl Workspace {
         &self.root
     }
 
-    pub fn devices(&self) -> &Devices {
-        &self.devices
+    pub fn installations(&self) -> &Installations {
+        &self.installations
     }
 
     pub fn tables(&self) -> &Tables {
@@ -282,7 +282,12 @@ impl Workspace {
         envelope: Envelope,
         gossipsub_source: libp2p_identity::PeerId,
     ) -> std::result::Result<(), AdmitError> {
-        crate::admission::admit_event(&self.tables, &self.devices, envelope, gossipsub_source)
+        crate::admission::admit_event(
+            &self.tables,
+            &self.installations,
+            envelope,
+            gossipsub_source,
+        )
     }
 }
 

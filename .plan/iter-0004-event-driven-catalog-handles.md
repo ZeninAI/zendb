@@ -11,7 +11,7 @@ advisory and were consolidated here once the work landed.
 
 This iteration covers three coupled concerns:
 
-1. **Event-driven maintenance** — table and device side effects react to
+1. **Event-driven maintenance** — table and installation side effects react to
    catalog events through listeners, so local edits and (future) remote events
    share one code path.
 2. **Lean catalog APIs** — both `Tables` and `States` expose a small, uniform
@@ -19,7 +19,7 @@ This iteration covers three coupled concerns:
    routing-only helpers and no per-mutation durability.
 3. **Single table handle** — `TableHandle` is the one in-memory
    representation of an open table; there is no `TableEntry`/`TableHandle`
-   split, and `Tables` owns the entire table/device dependency graph.
+   split, and `Tables` owns the entire table/installation dependency graph.
 
 ## 1. Problem
 
@@ -28,7 +28,7 @@ the events:
 
 - `Tables::create` both wrote the catalog row AND opened the table + inserted
   the handle into the in-memory map.
-- `Devices::write_record` both wrote the device row AND updated the in-memory
+- `Installations::write_record` both wrote the installation row AND updated the in-memory
   `records` map AND called `observe`.
 - Receipts were drained by a one-shot consumer at startup, duplicating the
   authority of the `_peer_state` table.
@@ -37,7 +37,7 @@ Two costs followed: local and remote mutations took different code paths (a
 remote catalog event only wrote the row; nothing opened the table locally), and
 the in-memory maps were updated inline rather than reactively.
 
-The goal is to make table and device maintenance **react to catalog events**,
+The goal is to make table and installation maintenance **react to catalog events**,
 so that local edits and remote events go through the exact same code path. The
 CRUD method's job becomes: validate a precondition, publish an event. The side
 effect (open/close a table, sync an in-memory map, record a receipt) becomes a
@@ -49,9 +49,9 @@ listener's job.
 | --- | --- |
 | `Tables` / `States` lifecycle methods | Validate a precondition (read), publish an event to the catalog, return. No side effects on the handle map. |
 | `CatalogSync` listener (on `_table_catalog`) | React to catalog events: open tables on `Upsert`, close + rmdir on `Delete`. Single owner of table-handle-map mutation after bootstrap. |
-| `Devices::upsert` / `bootstrap_local` | Validate authorization, mint, publish an event to `_devices`. No side effects on the in-memory map. |
-| `DeviceSync` listener (on `_devices`) | React to device events: upsert/remove in the in-memory `records` map. Single owner of in-memory device-record mutation after `reload`. |
-| `Receipt` listener (on every table) | React to any insert: `Devices::observe(stamp)`. Replaces the one-shot startup replay and the inline `observe` calls. |
+| `Installations::upsert` / `bootstrap_local` | Validate authorization, mint, publish an event to `_installations`. No side effects on the in-memory map. |
+| `InstallationSync` listener (on `_installations`) | React to installation events: upsert/remove in the in-memory `records` map. Single owner of in-memory installation-record mutation after `reload`. |
+| `Receipt` listener (on every table) | React to any insert: `Installations::observe(stamp)`. Replaces the one-shot startup replay and the inline `observe` calls. |
 
 The CRUD method and the listener are decoupled: the method writes the event,
 the listener reacts. A remote event skips the method entirely and goes through
@@ -102,18 +102,18 @@ is the source of truth; the in-memory handle map is a cache.
 
 `TableHandle` is the single in-memory representation of an open table. It owns
 the guarded storage `Table`, the listener collection, the table name, a
-system-table flag, and a weak reference to `Devices`. There is no
+system-table flag, and a weak reference to `Installations`. There is no
 `TableEntry`/`TableHandle` split.
 
 `Tables` stores `Arc<TableHandle>` values in an eager map and also keeps the
 `_table_catalog` handle as a dedicated `catalog: Arc<TableHandle>` field. The
-catalog field and the map entry are the same `Arc`. `Devices` owns the
-`_devices` handle, which is the same `Arc` as the `_devices` map entry.
+catalog field and the map entry are the same `Arc`. `Installations` owns the
+`_installations` handle, which is the same `Arc` as the `_installations` map entry.
 
-System tables are created before `Devices` exists, so their handles use an
-empty weak device reference (`Weak::new()`). The public `TableHandle::insert`
-checks the system flag before resolving the device reference; application
-handles use `Arc::downgrade(&devices)` and return `WorkspaceClosed` if retained
+System tables are created before `Installations` exists, so their handles use an
+empty weak installation reference (`Weak::new()`). The public `TableHandle::insert`
+checks the system flag before resolving the installation reference; application
+handles use `Arc::downgrade(&installations)` and return `WorkspaceClosed` if retained
 after their workspace has closed.
 
 ### 3.1 The `ChangeListener` trait
@@ -137,7 +137,7 @@ them via `TableHandle::add_listener`.
         name: String,
         table: RwLock<Table>,
         listeners: RwLock<Vec<Arc<dyn ChangeListener>>>,
-        devices: Weak<Devices>,
+        installations: Weak<Installations>,
         is_system: bool,
     }
 
@@ -148,7 +148,7 @@ HashMap is consulted per insert — each handle owns its listeners directly.
 ### 3.3 The two insert paths
 
 `TableHandle::insert` is the public application path. It rejects system
-tables, authorizes the local device, mints an event stamp, and delegates to
+tables, authorizes the local installation, mints an event stamp, and delegates to
 `insert_internal`:
 
     impl TableHandle {
@@ -158,9 +158,9 @@ tables, authorizes the local device, mints an event stamp, and delegates to
             if self.is_system {
                 return Err(Error::SystemTableReadOnly(self.name.clone()));
             }
-            let devices = self.devices.upgrade().ok_or(Error::WorkspaceClosed)?;
-            devices.authorize(zendb_types::Roles::Contributor)?;
-            let stamp = devices.mint()?;
+            let installations = self.installations.upgrade().ok_or(Error::WorkspaceClosed)?;
+            installations.authorize(zendb_types::Roles::Contributor)?;
+            let stamp = installations.mint()?;
             self.insert_internal(Event { primary_key, path, op, stamp })
         }
 
@@ -177,7 +177,7 @@ tables, authorizes the local device, mints an event stamp, and delegates to
 
 `insert_internal` is crate-internal and accepts a complete `Event`. It inserts
 into storage, releases the table write guard, and then dispatches listeners.
-Catalog, device, bootstrap, and future replicated events use this path. Both
+Catalog, installation, bootstrap, and future replicated events use this path. Both
 the local path (`TableHandle::insert`) and the remote path
 (`Workspace::apply_event`, deferred) converge on `insert_internal`. There is no
 separate dispatch helper to forget to call.
@@ -202,12 +202,12 @@ remote). Application listeners and internal workspace listeners share the same
 Registered on every table, including system tables and application tables
 opened by `CatalogSync`.
 
-    struct ReceiptListener { devices: Weak<Devices> }
+    struct ReceiptListener { installations: Weak<Installations> }
 
     impl ChangeListener for ReceiptListener {
         fn on_change(&self, change: &Change) {
-            let Some(devices) = self.devices.upgrade() else { return; };
-            let _ = devices.observe(change.event.stamp);
+            let Some(installations) = self.installations.upgrade() else { return; };
+            let _ = installations.observe(change.event.stamp);
         }
     }
 
@@ -233,17 +233,17 @@ bootstrap no-op) it returns early. On `Delete` it removes the handle from the
 map and removes the physical directory if it still exists. This is the single
 owner of table-handle-map mutation after bootstrap.
 
-### 4.3 DeviceSyncListener (on `_devices` only)
+### 4.3 InstallationSyncListener (on `_installations` only)
 
-    struct DeviceSyncListener { devices: Weak<Devices> }
+    struct InstallationSyncListener { installations: Weak<Installations> }
 
-On `Upsert` it decodes the `DeviceRecord` and inserts it into the in-memory
+On `Upsert` it decodes the `Installation` and inserts it into the in-memory
 `records` map; on `Delete` it removes it. This replaces the inline
-`records.insert()` in `Devices::write_record`. The in-memory map is now updated
-reactively, whether the device record was written locally or by a remote peer.
+`records.insert()` in `Installations::write_record`. The in-memory map is now updated
+reactively, whether the installation record was written locally or by a remote peer.
 
-`Devices::reload` stays for the initial cold-start load (it reads the merged
-state of the `_devices` table, which is faster than replaying the event log).
+`Installations::reload` stays for the initial cold-start load (it reads the merged
+state of the `_installations` table, which is faster than replaying the event log).
 The listener handles subsequent deltas. `reload` and the listener share the
 "apply a record to the map" operation.
 
@@ -261,8 +261,8 @@ The listener handles subsequent deltas. `reload` and the listener share the
 
 The `Weak` means `CatalogSyncListener::on_change` must `upgrade()` before use;
 if `Tables` has been dropped (workspace shutting down), the callback no-ops.
-The same pattern applies to `ReceiptListener` and `DeviceSyncListener` holding
-`Weak<Devices>`.
+The same pattern applies to `ReceiptListener` and `InstallationSyncListener` holding
+`Weak<Installations>`.
 
 No `Arc` cycles exist. The listeners are registered after their owners are
 constructed and hold only `Weak` back-references.
@@ -306,7 +306,7 @@ and physical creation are the job of `upsert`.
 
 `Tables` owns the typed `_catalog` handle and an eager map containing every
 declared table. The catalog field and map entry share one `Arc<TableHandle>`;
-`_devices` similarly shares the handle owned by `Devices`.
+`_installations` similarly shares the handle owned by `Installations`.
 
 The public surface is:
 
@@ -346,25 +346,25 @@ mutations. A later iteration will coordinate durability centrally.
 
 ## 7. Bootstrap And The Dependency Graph
 
-`Tables::create` / `Tables::open` own the complete table/device dependency
+`Tables::create` / `Tables::open` own the complete table/installation dependency
 graph:
 
-- create or open the `_devices` handle (with an empty weak device reference,
-  since `Devices` does not yet exist);
-- create or open `Devices` (passing the `_devices` handle and the peer-state
+- create or open the `_installations` handle (with an empty weak installation reference,
+  since `Installations` does not yet exist);
+- create or open `Installations` (passing the `_installations` handle and the peer-state
   handle);
 - create or open the `_table_catalog` handle (with a weak reference to
-  `Devices`);
+  `Installations`);
 - eagerly open every declared application-table handle by reading the catalog
   rows;
-- construct the shared `Tables` registry (which holds `Arc<Devices>`);
-- register the receipt, catalog, and device listeners via
+- construct the shared `Tables` registry (which holds `Arc<Installations>`);
+- register the receipt, catalog, and installation listeners via
   `Tables::register_listeners`;
 - on create, write both self-referencing system catalog rows (`_catalog`,
-  `_devices`) and bootstrap the local device.
+  `_installations`) and bootstrap the local installation.
 
 Both constructors return only `Arc<Tables>`. `Workspace::assemble` clones
-`tables.devices` after table construction.
+`tables.installations` after table construction.
 
 `Workspace::assemble` itself establishes the state subsystem first: it creates
 or opens `States`, in create mode calls `States::upsert_internal` for the
@@ -402,7 +402,7 @@ replication iteration.
    listener) to register on newly opened application tables.
 4. Precondition checks (system resource, busy) stay in the lifecycle methods.
    Side effects (open, close, rmdir, map sync) move to listeners.
-5. `Devices::reload` stays for cold-start; the `DeviceSync` listener handles
+5. `Installations::reload` stays for cold-start; the `InstallationSync` listener handles
    deltas.
 6. Remote deletes with outstanding handles log and leave the handle in the
    map; the directory is not removed until the handle count drops. The durable
@@ -427,10 +427,10 @@ replication iteration.
     listeners share the same `Vec`.
 14. `TableHandle` is the single in-memory representation of an open table; there
     is no `TableEntry`/`TableHandle` split. `Tables` stores `Arc<TableHandle>`
-    and owns the full table/device dependency graph in `create`/`open`.
+    and owns the full table/installation dependency graph in `create`/`open`.
 15. `TableHandle::insert` is the public application path (rejects system tables,
     authorizes, mints); `insert_internal` is the crate-internal path used by
-    catalog, device, bootstrap, and future replicated events.
+    catalog, installation, bootstrap, and future replicated events.
 16. `TableHandle::read` returns `RwLockReadGuard<Table>` directly and
     `TableHandle::consumer` returns `zendb_storage::TopicConsumer<Change>`
     directly; the former workspace `TableReadGuard` / `TableConsumer` wrappers
@@ -444,7 +444,7 @@ replication iteration.
     (`tables/` and `states/` respectively). The catalog is a `catalog` field;
     the open-handle map is `tables` / `states`. Directory and system-resource
     names live in a shared `consts` module (`is_system_table`,
-    `is_system_state`, `TABLE_CATALOG_NAME`, `DEVICES_TABLE_NAME`,
+    `is_system_state`, `TABLE_CATALOG_NAME`, `INSTALLATIONS_TABLE_NAME`,
     `STATE_CATALOG_NAME`, `PEER_STATE_NAME`, `TABLES_DIR`, `STATES_DIR`).
 
 ## 10. Completion Criteria
@@ -459,11 +459,11 @@ Iteration 0004 is complete when:
 - `CatalogSyncListener` is registered on `_table_catalog` and is the single
   owner of table-handle-map mutation (open on `Upsert`, close + rmdir on
   `Delete`);
-- `DeviceSyncListener` is registered on `_devices` and is the single owner of
-  in-memory device-record mutation after `reload`;
+- `InstallationSyncListener` is registered on `_installations` and is the single owner of
+  in-memory installation-record mutation after `reload`;
 - `Tables` lifecycle methods validate and publish; they no longer open/close
   tables or mutate the handle map directly;
-- `Devices::write_record` mints and publishes; it no longer updates the
+- `Installations::write_record` mints and publishes; it no longer updates the
   in-memory map or calls `observe` directly;
 - `Tables` and `States` expose the lean surface (`contains` / `list` /
   `upsert` / `get` / `delete`, States also `list_open` / `close`); `upsert`
@@ -472,7 +472,7 @@ Iteration 0004 is complete when:
   map;
 - `TableHandle` is the single in-memory representation of an open table; there
   is no `TableEntry`/`TableHandle` split;
-- `Tables::create` / `Tables::open` own the full table/device dependency graph
+- `Tables::create` / `Tables::open` own the full table/installation dependency graph
   and register listeners; `Workspace::assemble` only establishes the state
   subsystem and passes the peer-state handle to `Tables`;
 - `TableHandle::insert` is the public application path and `insert_internal` is

@@ -1,4 +1,4 @@
-//! Persistable libp2p routes advertised for enrolled devices.
+//! Persistable libp2p routes advertised for enrolled installations.
 
 use std::{fmt, str::FromStr};
 
@@ -16,7 +16,7 @@ impl fmt::Display for MultiaddrError {
 
 impl std::error::Error for MultiaddrError {}
 
-/// A durable route to a device whose identity is stored separately.
+/// A durable route to an installation whose identity is stored separately.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Multiaddr(Libp2pMultiaddr);
 
@@ -24,7 +24,7 @@ impl Multiaddr {
     pub fn from_libp2p(address: Libp2pMultiaddr) -> Result<Self, MultiaddrError> {
         if matches!(address.iter().last(), Some(Protocol::P2p(_))) {
             return Err(MultiaddrError(
-                "device addresses must not end with a destination PeerId".to_owned(),
+                "installation addresses must not end with a destination PeerId".to_owned(),
             ));
         }
         Ok(Self(address))

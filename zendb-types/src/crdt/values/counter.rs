@@ -88,8 +88,8 @@ impl Type for Counter {
     ) -> Result<bool, CounterError> {
         let mut changed = false;
 
-        for (device, (remote_pos, remote_neg)) in &remote.entries {
-            match self.entries.get_mut(device) {
+        for (installation, (remote_pos, remote_neg)) in &remote.entries {
+            match self.entries.get_mut(installation) {
                 Some((local_pos, local_neg)) => {
                     if remote_pos > local_pos {
                         *local_pos = *remote_pos;
@@ -101,7 +101,8 @@ impl Type for Counter {
                     }
                 }
                 None => {
-                    self.entries.insert(*device, (*remote_pos, *remote_neg));
+                    self.entries
+                        .insert(*installation, (*remote_pos, *remote_neg));
                     changed = true;
                 }
             }

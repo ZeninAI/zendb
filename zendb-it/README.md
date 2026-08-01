@@ -16,7 +16,7 @@ The suite covers:
 - durable verification of replicated data after both peers stop.
 
 Initial join synchronization is not implemented yet. The two-peer fixture
-therefore enrolls both devices once, clones the synchronized durable workspace,
+therefore enrolls both installations once, clones the synchronized durable workspace,
 and replaces the private local identity record in the second copy. This seeds
 the state that a future initial-sync protocol will produce; all replication
 behavior under test then runs between normal live `Workspace` instances.

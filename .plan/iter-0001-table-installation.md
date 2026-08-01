@@ -1,4 +1,4 @@
-# Iteration 0001: Current Table and Device Architecture
+# Iteration 0001: Current Table and Installation Architecture
 
 Status: as-built documentation for the current repository
 
@@ -15,7 +15,7 @@ The Cargo workspace contains three crates:
 | --- | --- |
 | `zendb-types` | Portable identifiers, event stamps, Cells, operations, paths, and CRDT value types |
 | `zendb-storage` | B+ tree, KeyDir, SkipList, generic State, Topic, and the invariant-preserving Table facade |
-| `zendb-workspace` | Workspace lifecycle, catalog, application Table handles, local typed State lifecycle, device registry, local clock, and receipt tracking |
+| `zendb-workspace` | Workspace lifecycle, catalog, application Table handles, local typed State lifecycle, installation registry, local clock, and receipt tracking |
 
 The removed crates and concepts are not part of the current workspace:
 
@@ -65,13 +65,13 @@ zendb-workspace/src/
   error.rs
   catalog/
     mod.rs model.rs names.rs runtime.rs states.rs
-  devices/
+  installations/
     mod.rs clock.rs receipts.rs registry.rs
 ```
 
-The smaller catalog and device files are internal components. The public
+The smaller catalog and installation files are internal components. The public
 workspace concepts remain the Workspace, Catalog-facing table and State
-handles, and Devices.
+handles, and Installations.
 
 ## 3. Event And CRDT Model
 
@@ -81,7 +81,7 @@ handles, and Devices.
 
 ```rust
 pub struct EventId {
-    pub device_id: DeviceId,
+    pub installation_id: InstallationId,
     pub sequence: u64,
 }
 
@@ -106,7 +106,7 @@ pub struct Event {
 `EventStamp` has total ordering by:
 
 ```text
-(physical_ms, logical, device_id, sequence)
+(physical_ms, logical, installation_id, sequence)
 ```
 
 `EventId::ZERO`, `EventTime::ZERO`, and `EventStamp::ZERO` are sentinels.
@@ -164,7 +164,7 @@ Blob::decode<T: Decode<()>>(&self) -> Result<T, BlobCodecError>
 ```
 
 Decode requires complete input consumption and rejects trailing bytes. Catalog
-and device metadata use this mechanism instead of representing every config
+and installation metadata use this mechanism instead of representing every config
 field as separate Cells. There is no catalog Blob size limit.
 
 ## 4. Storage Contracts
@@ -306,7 +306,7 @@ and its Drop path provide eventual durability.
 root: PathBuf
 format: WorkspaceFormat
 catalog: Catalog
-devices: Devices
+installations: Installations
 _lock: WorkspaceLock
 ```
 
@@ -323,19 +323,19 @@ mutating the same root.
 1. create the root and acquire `_lock`;
 2. reject an existing format manifest;
 3. write a new workspace ID and format manifest;
-4. create local device clock and receipt storage;
+4. create local installation clock and receipt storage;
 5. create the fixed `system/catalog` Table;
 6. write the `_catalog` declaration as a normal catalog Table row;
-7. create the `_devices` Table declaration and runtime;
+7. create the `_installations` Table declaration and runtime;
 8. replay catalog and Table receipt consumers;
-9. bind Devices to `_devices` and local device state;
-10. write the initial local DeviceRecord with all three permissions.
+9. bind Installations to `_installations` and local installation state;
+10. write the initial local Installation with all three permissions.
 
 ### 6.3 Open
 
 `Workspace::open` acquires the lock, reads and validates `_format`, opens the
-local device state and Catalog, reconciles catalog rows into live Table
-runtimes, replays catalog and table receipt consumers, and binds Devices. It
+local installation state and Catalog, reconciles catalog rows into live Table
+runtimes, replays catalog and table receipt consumers, and binds Installations. It
 does not start background maintenance.
 
 ### 6.4 Public Workspace API
@@ -344,7 +344,7 @@ The public methods are:
 
 ```text
 create / open
-id / root / devices
+id / root / installations
 create_table / table / contains_table / list_tables
 update_table / delete_table
 state / contains_state / list_states / list_open_states
@@ -353,8 +353,8 @@ state_config / close_state / delete_state
 
 Application names are validated before lookup or mutation. Names may not be
 empty, path separators, control characters, platform-invalid punctuation,
-trailing spaces/dots, `.`/`..`, or Windows reserved device names. Application
-names may not start with `_`; `_catalog` and `_devices` are reserved system
+trailing spaces/dots, `.`/`..`, or Windows reserved installation names. Application
+names may not start with `_`; `_catalog` and `_installations` are reserved system
 names.
 
 ## 7. Catalog And Table Runtime
@@ -383,7 +383,7 @@ create_table, table, contains_table, list_tables,
 update_table, delete_table
 ```
 
-`list_tables` hides `_catalog` and `_devices`. A catalog update changes the
+`list_tables` hides `_catalog` and `_installations`. A catalog update changes the
 persisted declaration; an already-open Table is not reconfigured in place and
 uses the new config on a later open. Deleting a table writes a tombstone to
 `_catalog`, invalidates its loaded runtime, removes it from the in-memory
@@ -401,8 +401,8 @@ live: AtomicBool
 ```
 
 The runtime, not the storage Table, owns the table name and stale-handle state.
-`TableHandle` combines a runtime with Devices. Its insert path delegates to
-Devices for permission checks, stamp minting, storage insertion, durability,
+`TableHandle` combines a runtime with Installations. Its insert path delegates to
+Installations for permission checks, stamp minting, storage insertion, durability,
 and receipt recording.
 
 `TableHandle::read()` returns a `TableReadGuard` that holds the read lock and
@@ -438,17 +438,17 @@ owns a strong State reference. Deleting a busy State returns `ResourceBusy`,
 otherwise removes its declaration and data directory.
 
 State is not a Table: it has caller-provided generic key/value types, no Event,
-no Device permission check, no receipt index, and no Topic Change history.
+no Installation permission check, no receipt index, and no Topic Change history.
 
-## 9. Devices, Clock, And Receipts
+## 9. Installations, Clock, And Receipts
 
-### 9.1 Device registry and permissions
+### 9.1 Installation registry and permissions
 
-`_devices` is a normal Table whose primary keys are `PrimaryKey::DeviceId` and
-whose values are Blob-encoded `DeviceRecord` values:
+`_installations` is a normal Table whose primary keys are `PrimaryKey::InstallationId` and
+whose values are Blob-encoded `Installation` values:
 
 ```rust
-pub struct DeviceRecord {
+pub struct Installation {
     pub name: String,
     pub permissions: BTreeSet<WorkspacePermission>,
 }
@@ -456,22 +456,22 @@ pub struct DeviceRecord {
 enum WorkspacePermission {
     Write,
     ManageCatalog,
-    ManageDevices,
+    ManageInstallations,
 }
 ```
 
-The first local device receives all permissions. Devices reload and cache
-records from `_devices`; the cache is not the durable source of truth. Upserts
-require `ManageDevices`. Catalog operations require `ManageCatalog`, and
+The first local installation receives all permissions. Installations reload and cache
+records from `_installations`; the cache is not the durable source of truth. Upserts
+require `ManageInstallations`. Catalog operations require `ManageCatalog`, and
 application Table inserts require `Write`.
 
 ### 9.2 Local clock
 
-The local device checkpoint is persisted in `_local/device/clock` as a KeyDir
+The local installation checkpoint is persisted in `_local/installation/clock` as a KeyDir
 entry containing:
 
 ```text
-device_id
+installation_id
 next_sequence
 last EventTime
 ```
@@ -480,19 +480,19 @@ Clock access is mutex-protected. A candidate local stamp uses current wall time:
 wall-clock advancement resets logical time to zero; otherwise logical time is
 incremented. Sequence and logical overflow return `ClockExhausted`.
 
-`LocalDevice::perform` serializes a provisional stamp around a caller-provided
+`LocalInstallation::perform` serializes a provisional stamp around a caller-provided
 write. `Mutation::Applied` and `Mutation::Ignored` both record the stamp in
 the receipt index and persist the next sequence/checkpoint. `Mutation::NoOp`
 returns without consuming or recording a stamp. An ambiguous I/O error poisons
-the local device with `ReconciliationRequired` until the Workspace is reopened.
+the local installation with `ReconciliationRequired` until the Workspace is reopened.
 
 Remote observation updates the hybrid time using the maximum of wall, local,
 and remote physical times, records the remote receipt, and advances the local
-sequence if the observed event belongs to this device.
+sequence if the observed event belongs to this installation.
 
 ### 9.3 Receipt windows
 
-Receipt data is persisted per device in `_local/device/receipts` as:
+Receipt data is persisted per installation in `_local/installation/receipts` as:
 
 ```rust
 pub struct ReceiptWindow {
@@ -509,7 +509,7 @@ duplicate. Membership and gap lookup use binary search. Arithmetic at the
 Applied Table Changes are replayed through each runtime's reserved receipt
 consumer. The consumer observes the event stamp and commits its cursor. An
 ignored operation has no Change record; the direct mutation path records its
-receipt through `LocalDevice::perform` instead. `Devices` exposes
+receipt through `LocalInstallation::perform` instead. `Installations` exposes
 `has_received`, `observe`, and `missing` for this local bookkeeping; it does
 not expose a replication transport or remote-ingestion pipeline.
 
@@ -532,11 +532,11 @@ TableHandle::insert
 The low-level storage API accepts only a complete Event. Workspace is the
 layer that mints local identity and time.
 
-### Catalog and device updates
+### Catalog and installation updates
 
-Catalog and device mutations use the same local clock and permission path.
+Catalog and installation mutations use the same local clock and permission path.
 Their payloads are Blob-encoded metadata stored in ordinary Tables. Catalog
-updates trigger synchronous runtime/index reconciliation; device updates
+updates trigger synchronous runtime/index reconciliation; installation updates
 refresh the in-memory permission cache after the Table mutation.
 
 ### No-op operations
@@ -554,7 +554,7 @@ workspace-root/
   _format
   _lock
   _local/
-    device/
+    installation/
       clock/
       receipts/
     states/
@@ -565,7 +565,7 @@ workspace-root/
       state/
       topic/
   tables/
-    _devices/
+    _installations/
       state/
       topic/
     <table-name>/
@@ -585,13 +585,13 @@ The implementation uses explicit synchronous locks:
 - workspace file lock for one open Workspace per root;
 - mutex-protected local clock and receipt persistence;
 - `RwLock<Table>` inside each TableRuntime;
-- short-lived Catalog index and Devices record locks;
+- short-lived Catalog index and Installations record locks;
 - `TableReadGuard` for borrowed read iteration.
 
 No application callback is invoked under a Table or registry lock. Storage
 backend methods retain `io::Result`. Workspace maps failures into its custom
 `Error` type, including I/O, encoding, invalid names, permissions, stale or
-busy resources, corrupt workspace/catalog/device state, clock exhaustion,
+busy resources, corrupt workspace/catalog/installation state, clock exhaustion,
 reconciliation-required state, and closed-State migration conflicts.
 
 ## 13. Settled Decisions
@@ -628,7 +628,7 @@ cargo check --workspace
 ```
 
 The retained test modules are the storage backends and Topic only; no new
-workspace, Table, device, clock, receipt, or CRDT test suite is currently
+workspace, Table, installation, clock, receipt, or CRDT test suite is currently
 maintained.
 
 The main intentionally unfinished lifecycle item is physical cleanup of a

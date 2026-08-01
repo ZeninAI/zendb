@@ -1,7 +1,7 @@
 //! Generic persistent and in-memory storage mechanics for ZenDB.
 //!
 //! The crate contains raw key/value backends, a runtime-selected materialized
-//! state backend, and a segmented append-only topic. It has no CRDT, device,
+//! state backend, and a segmented append-only topic. It has no CRDT, installation,
 //! authorization, workspace, or networking policy.
 
 pub mod backend;

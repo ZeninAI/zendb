@@ -2,7 +2,7 @@
 
 Status: requirements capture and architecture proposal
 
-Priority: this document supersedes iter-0001-table-device.md where the two
+Priority: this document supersedes iter-0001-table-installation.md where the two
 documents disagree. It records the new direction; it does not implement any
 of these changes yet.
 
@@ -23,11 +23,11 @@ and background workers remain out of scope.
 | Roles | Move workspace permissions into identity data and rename them Roles: Contributor, Operator, Dispatcher. |
 | Configuration | Do not reject State config changes with migration errors in this phase. |
 | Identity | Use libp2p's identity generation/encoding primitive for both distinct PeerId and WorkspaceId types. |
-| Device state | Use one Catalog-owned system State<PeerId, PeerRecord>, physically backed by one unordered PeerId -> PeerRecord store. |
-| Device API | Replace callback-based perform and reconciliation poisoning with simple stamp minting and observation. |
+| Installation state | Use one Catalog-owned system State<PeerId, PeerRecord>, physically backed by one unordered PeerId -> PeerRecord store. |
+| Installation API | Replace callback-based perform and reconciliation poisoning with simple stamp minting and observation. |
 | Table runtime | Remove live/invalidation and avoid materializing consumer iteration into intermediate collections. |
 | Consumers | Expose direct Table access to a consumer through a read guard while preserving one-record-at-a-time Topic consumption. |
-| Workspace boundaries | Catalog is the only workspace submodule allowed to open storage Tables/States or manipulate storage paths. Devices obtains state handles from Catalog. |
+| Workspace boundaries | Catalog is the only workspace submodule allowed to open storage Tables/States or manipulate storage paths. Installations obtains state handles from Catalog. |
 | System resources | Catalog owns the always-present _table_catalog Table and _state_catalog State. Tables are eagerly opened; typed application States retain open/close semantics. |
 
 These requirements favor a small, understandable core over defensive validation
@@ -41,11 +41,11 @@ The current implementation has several overlapping authorities:
       -> Catalog
            -> CatalogIndex
                 -> TableRuntime { name, Table lock, receipt consumer, live flag }
-      -> Devices
-           -> LocalDevice
+      -> Installations
+           -> LocalInstallation
                 -> ClockStore KeyDir
                 -> ReceiptIndex KeyDir
-           -> cached DeviceRecord map
+           -> cached Installation map
       -> StateCatalog
            -> StateConfig KeyDir
 
@@ -55,7 +55,7 @@ The resulting issues are:
    TableRuntime.
 2. Clock and receipt persistence use separate stores and separate locks even
    though they are keyed by the same participant.
-3. LocalDevice::perform combines stamp minting, an arbitrary mutation callback,
+3. LocalInstallation::perform combines stamp minting, an arbitrary mutation callback,
    receipt recording, checkpointing, ambiguity detection, and a reconciliation
    state machine.
 4. Workspace errors and metadata contain format/version/name policy that is not
@@ -149,7 +149,7 @@ configuration used by storage.
 
     pub fn cfg() -> Configuration<LittleEndian, Fixint, NoLimit>;
 
-Blob, catalog metadata, device records, State backends, and Topic records all use
+Blob, catalog metadata, installation records, State backends, and Topic records all use
 this configuration. The format is intentionally allowed to change while the
 project is pre-production.
 
@@ -174,7 +174,7 @@ Rename the Op variant Replace { value } to Upsert { value }.
 
 Semantics remain last-writer-wins replacement at the operation stamp. The new
 name communicates that the operation creates a missing Cell as well as updating
-an existing one. Update all CRDT matches, workspace catalog/device writes,
+an existing one. Update all CRDT matches, workspace catalog/installation writes,
 examples, and documentation. No compatibility alias is required.
 
 ## 7. Identity And Roles
@@ -225,7 +225,7 @@ Move the serializable role value into zendb-types::identity and name it Roles:
         Dispatcher,
     }
 
-Device metadata stores a set of Roles, not WorkspacePermission. Role semantics
+Installation metadata stores a set of Roles, not WorkspacePermission. Role semantics
 are workspace policy, but the enum is inert data so it can be persisted and
 later replicated without coupling types to Catalog implementation.
 
@@ -233,17 +233,17 @@ Capability table:
 
 | Role | Current capability |
 | --- | --- |
-| Contributor | Write existing application Tables; cannot create/delete Tables or create devices; may update fields of its own peer/device record but cannot change the PeerId key or grant roles. |
-| Operator | Includes Contributor capabilities; may create/update/delete application Tables and create peer/device records. System Tables remain internal. |
+| Contributor | Write existing application Tables; cannot create/delete Tables or create installations; may update fields of its own peer/installation record but cannot change the PeerId key or grant roles. |
+| Operator | Includes Contributor capabilities; may create/update/delete application Tables and create peer/installation records. System Tables remain internal. |
 | Dispatcher | Defined and persisted only; no behavior is attached in this iteration. |
 
-The phrase “modify the primary key in the devices catalog belonging to its own
-device” is interpreted conservatively as modifying the row belonging to the
+The phrase “modify the primary key in the installations catalog belonging to its own
+installation” is interpreted conservatively as modifying the row belonging to the
 current PeerId. Changing that row's PeerId key is identity transfer and is not
 permitted. This interpretation must be confirmed before implementation.
 
 Role checks belong to one workspace authorization function. Do not scatter role
-checks across Table, Catalog, and Devices.
+checks across Table, Catalog, and Installations.
 
 ## 8. Lean Workspace Metadata
 
@@ -268,11 +268,11 @@ A catalog row that cannot decode as CatalogEntry remains an ordinary storage
 failure. It does not need a format-version decision tree.
 
 There is still one structural reservation: Catalog must keep _catalog and
-_devices from colliding with application rows. This is not general name
+_installations from colliding with application rows. This is not general name
 validation. The public application API should reject those two exact reserved
 names, or expose system Tables only through internal methods.
 
-No cross-platform punctuation, length, reserved-device-name, or trailing-space
+No cross-platform punctuation, length, reserved-installation-name, or trailing-space
 checks are performed. The caller owns those requirements.
 
 ### 8.2 Bootstrap without a versioned manifest
@@ -284,16 +284,16 @@ Preferred lean layout:
       _identity                 unversioned WorkspaceId/local-peer metadata
       tables/
         _table_catalog/         Catalog's self-registering Table
-        _devices/               device metadata Table
+        _installations/               installation metadata Table
         <table-name>/           application Tables
       states/
         _state_catalog/         Catalog's String -> StateConfig State
-        _peer_state/             Devices' PeerId -> PeerRecord State
+        _peer_state/             Installations' PeerId -> PeerRecord State
         <state-name>/            application States
 
 Remove the versioned _format manifest. The logical system names and physical
-paths are separate: _table_catalog, _devices, _state_catalog, and _peer_state
-are Catalog-owned resources, not arbitrary directories created by Devices or
+paths are separate: _table_catalog, _installations, _state_catalog, and _peer_state
+are Catalog-owned resources, not arbitrary directories created by Installations or
 other workspace submodules. The Catalog opens _table_catalog and
 _state_catalog with fixed bootstrap configurations, then stores their
 declarations in themselves. The unified peer-state State keeps the local
@@ -353,7 +353,7 @@ Catalog is the only workspace component that may:
 - open the catalog Table and catalog State;
 - translate catalog declarations into TableRuntime objects.
 
-Devices and any future workspace submodule must not import or construct
+Installations and any future workspace submodule must not import or construct
 KeyDir, BPlusTree, SkipList, State, Topic, or backend configuration directly.
 They obtain storage through Catalog methods such as:
 
@@ -364,9 +364,9 @@ The Catalog API is therefore the workspace-internal storage boundary. This
 prevents every submodule from inventing its own directory layout and ensures
 that state declarations, paths, and lifecycle rules remain in one place.
 
-Catalog may use storage traits internally, but Devices should depend only on
+Catalog may use storage traits internally, but Installations should depend only on
 Catalog-provided handles and workspace-level operations. A direct storage
-backend import in Devices is an architectural violation for this iteration.
+backend import in Installations is an architectural violation for this iteration.
 
 ### 9.2 Bootstrap order
 
@@ -381,7 +381,7 @@ The bootstrap sequence is deliberately non-recursive:
    the state catalog using their fixed bootstrap declarations.
 5. Catalog reconciles all remaining table declarations and eagerly opens every
    Table runtime.
-6. Devices asks Catalog for its declared State and Table handles; it performs
+6. Installations asks Catalog for its declared State and Table handles; it performs
    no path or backend initialization itself.
 
 Tables have no open/close API at the workspace level. Catalog opens every
@@ -405,17 +405,17 @@ may select KeyDir internally):
     State<PeerId, PeerRecord>
 
 clock is Some only for the local PeerId. Remote peers retain receipt windows
-without a local minting checkpoint. The _devices Table remains the place for
+without a local minting checkpoint. The _installations Table remains the place for
 display name and Roles; this State is operational peer state, not a second
-device catalog.
+installation catalog.
 
-Devices never constructs this State or its underlying KeyDir. It asks Catalog
+Installations never constructs this State or its underlying KeyDir. It asks Catalog
 for a typed StateHandle<PeerId, PeerRecord> for _peer_state. The physical
-backend choice is a Catalog concern and can change without changing Devices.
+backend choice is a Catalog concern and can change without changing Installations.
 
 ### 10.2 In-memory representation
 
-On open, Catalog opens _peer_state and the Devices module loads its rows into
+On open, Catalog opens _peer_state and the Installations module loads its rows into
 an immutable in-memory snapshot. Use
 ArcSwap<PeerMap> for lock-free reads of receipt membership, missing ranges, and
 peer checkpoints. Mutations are serialized through one small writer gate, which
@@ -435,7 +435,7 @@ workspace code.
 
 ### 10.3 Clock and receipt authority
 
-Devices becomes the single public facade over PeerStore and the _devices Table.
+Installations becomes the single public facade over PeerStore and the _installations Table.
 Internal files can still separate role-table code from peer-state code, but
 there is one authority for local identity, clock, receipts, and persistence.
 
@@ -449,7 +449,7 @@ Reduced API:
     flush() -> io::Result<()>
     list / record / upsert peer metadata
 
-There is no LocalDevice public concept, no callback-taking perform, and no
+There is no LocalInstallation public concept, no callback-taking perform, and no
 Mutation enum.
 
 ### 10.4 Sequence durability trade-off
@@ -472,17 +472,17 @@ mint() only mints and advances the local clock. It does not call application
 code, inspect Table outcomes, or attempt rollback. A failed Table write may burn
 a sequence; it must not reuse one.
 
-## 11. Simple Device Mutation Flow
+## 11. Simple Installation Mutation Flow
 
 Workspace mutation code becomes linear:
 
     authorize role
-      -> stamp = devices.mint()
+      -> stamp = installations.mint()
       -> build Event
       -> table.insert(Event)
-      -> if accepted, devices.observe(stamp)
+      -> if accepted, installations.observe(stamp)
       -> sync affected Table when caller requests durability
-      -> devices.flush() at the workspace durability boundary
+      -> installations.flush() at the workspace durability boundary
 
 The exact receipt timing is not coupled to a callback. An ignored CRDT operation
 is still an accepted event and is recorded as received; it simply produces no
@@ -570,7 +570,7 @@ consumer borrows a TableHandle. If an owning consumer is required, use an
 Arc-owned read guard or reacquire the read lock per operation; do not introduce
 a Vec-backed consumer snapshot merely to avoid a lifetime design problem.
 
-Receipt replay loops process one Change at a time and call Devices::observe
+Receipt replay loops process one Change at a time and call Installations::observe
 directly. No replay helper materializes a collection.
 
 ### 12.4 Iteration performance target
@@ -635,7 +635,7 @@ Retain only errors needed for current behavior:
     PermissionDenied
     ResourceBusy
     CorruptCatalog
-    CorruptDeviceRegistry
+    CorruptInstallationRegistry
     CorruptLocalState
     InvalidEventSequence
     ClockExhausted
@@ -647,13 +647,13 @@ defensive categories for hypothetical network or migration paths.
 
 The workspace public API is split into three handlers, each a cheaply
 cloneable owning facade over a shared `Arc`-backed core. `Workspace` exposes
-`devices()`, `tables()`, and `states()` accessors and retains only identity,
+`installations()`, `tables()`, and `states()` accessors and retains only identity,
 bootstrap, lock, root, and flush responsibilities. It no longer hosts table or
 state management methods directly.
 
 ### 15.1 Three handlers
 
-- `Devices` — peer registry, hybrid clock, roles, and duplicate-event tracking.
+- `Installations` — peer registry, hybrid clock, roles, and duplicate-event tracking.
   Unchanged from the unified peer state design in section 10.
 - `Tables` — table catalog management. Owns the renamed `TablesCore` (the
   former `Catalog` minus state methods) and exposes `contains`, `list`,
@@ -690,34 +690,34 @@ new top-level modules:
 - `tables/` — `Tables` (public handler), `TablesCore` (internal storage
   boundary for tables), `TableEntry`, `TableHandle`, `TableConsumer`,
   `TableReadGuard`, `CatalogEntry`, `TableInfo`, `UpdateOutcome`, and the
-  table system-name constants (`_table_catalog`, `_devices`).
+  table system-name constants (`_table_catalog`, `_installations`).
 - `states/` — `States` (public handler), `StatesCore` (internal storage
   boundary for states), `StateHandle`, and the state system-name constants
   (`_state_catalog`, `_peer_state`).
 
 `TablesCore` remains the only workspace component that opens storage Tables or
 chooses physical table paths. `StatesCore` is the only component that opens
-storage States or chooses physical state paths. `Devices` depends on
+storage States or chooses physical state paths. `Installations` depends on
 `TablesCore`-provided table entries and `StatesCore`-provided state handles;
 it never imports storage backends directly.
 
 ### 15.4 Two-phase construction
 
-`TablesCore` and `Devices` have a construction dependency: `Devices` needs the
-`_devices` table entry and the `_peer_state` state handle, both of which come
+`TablesCore` and `Installations` have a construction dependency: `Installations` needs the
+`_installations` table entry and the `_peer_state` state handle, both of which come
 from the cores. The bootstrap sequence is therefore staged:
 
 1. `TablesCore::create(...)` returns `Arc<TablesCore>` with `_table_catalog`
-   and `_devices` opened and self-registered.
+   and `_installations` opened and self-registered.
 2. `StatesCore::create(...)` returns `Arc<StatesCore>` with `_state_catalog`
    self-registered.
-3. `Devices::create(core.table_entry(DEVICES_NAME)?, states.peer_state()?,
-   ...)` returns `Arc<Devices>`.
-4. Assemble `Tables { core, devices }` and `States { core }`.
-5. `core.replay_receipts(&devices)`.
-6. `devices.bootstrap_local(...)`.
+3. `Installations::create(core.table_entry(INSTALLATIONS_NAME)?, states.peer_state()?,
+   ...)` returns `Arc<Installations>`.
+4. Assemble `Tables { core, installations }` and `States { core }`.
+5. `core.replay_receipts(&installations)`.
+6. `installations.bootstrap_local(...)`.
 
-This mirrors how `Devices` already receives Catalog-provided handles at
+This mirrors how `Installations` already receives Catalog-provided handles at
 construction time. No new pattern is introduced.
 
 ### 15.5 System-name reservation
@@ -725,7 +725,7 @@ construction time. No new pattern is introduced.
 System-name filtering (`is_system_table`, `is_system_state`) moves into the
 respective handler modules and is applied at the public API boundary. The
 cores do not filter; they serve all declared names so that internal callers
-such as `Devices` can reach `_devices` and `_peer_state`.
+such as `Installations` can reach `_installations` and `_peer_state`.
 
 ## 16. Implementation Sequence
 
@@ -754,10 +754,10 @@ explicitly requested.
 ### Phase 3: identity and roles
 
 - Add the libp2p identity dependency.
-- Replace DeviceId with PeerId while retaining WorkspaceId as a distinct type.
+- Replace InstallationId with PeerId while retaining WorkspaceId as a distinct type.
 - Make PeerId and WorkspaceId use the same libp2p-derived generator and codec.
 - Implement explicit PeerId byte encoding/decoding and deterministic ordering.
-- Move inert Roles into identity and update DeviceRecord persistence.
+- Move inert Roles into identity and update Installation persistence.
 - Centralize role capability checks in workspace.
 
 ### Phase 4: lean workspace metadata
@@ -773,8 +773,8 @@ explicitly requested.
 - Introduce PeerRecord and the Catalog-owned _peer_state State.
 - Load it into an ArcSwap read snapshot.
 - Implement serialized writes, dirty tracking, and shared flush/Drop.
-- Replace LocalDevice, ClockStore, ReceiptIndex, Mutation, and callback perform
-  paths with Devices mint/observe/flush methods.
+- Replace LocalInstallation, ClockStore, ReceiptIndex, Mutation, and callback perform
+  paths with Installations mint/observe/flush methods.
 - Persist the local clock high-water mark before returning mint().
 
 ### Phase 6: direct Table handles and consumers
@@ -794,7 +794,7 @@ explicitly requested.
 - Move table/state management methods off `Workspace` and onto the handlers.
 - Keep `TableHandle` as the table operation surface; `Tables` exposes only
   catalog management.
-- Update `Workspace` to expose `devices()`, `tables()`, and `states()`.
+- Update `Workspace` to expose `installations()`, `tables()`, and `states()`.
 - Update integration tests and READMEs to the new API.
 
 ### Phase 8: documentation and static verification
@@ -809,21 +809,21 @@ explicitly requested.
 
 1. Identity uses the narrow `libp2p-identity` crate. Local `PeerId` and
    `WorkspaceId` newtypes wrap its `PeerId` and encode canonical PeerId bytes.
-2. `_table_catalog`, `_devices`, and `_state_catalog` use fixed default
+2. `_table_catalog`, `_installations`, and `_state_catalog` use fixed default
    bootstrap configurations. No bootstrap configuration manifest is stored.
 3. Contributor self-edit means editing the current peer's metadata row without
    changing its key or Roles.
-4. Device metadata stores `BTreeSet<Roles>`.
+4. Installation metadata stores `BTreeSet<Roles>`.
 5. `mint()` persists the local clock high-water mark before returning.
 6. `TableConsumer` owns the Table `Arc` and reacquires a borrowed read guard;
    it never creates a row snapshot.
-7. The public workspace API is split into `Devices`, `Tables`, and `States`
+7. The public workspace API is split into `Installations`, `Tables`, and `States`
    handlers. `Tables` exposes only catalog management; table operations are
    performed through `TableHandle` obtained from `Tables::open`.
 8. `TablesCore` (the renamed `Catalog` minus state methods) is the only
    workspace component that opens storage Tables; `StatesCore` is the only one
-   that opens storage States. `Devices` depends on handles from both.
-9. `Workspace` exposes `devices()`, `tables()`, and `states()` accessors and
+   that opens storage States. `Installations` depends on handles from both.
+9. `Workspace` exposes `installations()`, `tables()`, and `states()` accessors and
    hosts no table or state management methods itself.
 
 ## 18. Completion Criteria
@@ -843,9 +843,9 @@ Iteration 0002 is complete when:
   reconciliation machinery;
 - one Catalog-owned _peer_state State owns receipts and optional local clock state;
 - TablesCore is the only workspace module that opens storage Tables and
-  StatesCore is the only module that opens storage States; Devices uses
+  StatesCore is the only module that opens storage States; Installations uses
   core-provided handles;
-- the public API is split into `Devices`, `Tables`, and `States` handlers;
+- the public API is split into `Installations`, `Tables`, and `States` handlers;
   `Tables` exposes only catalog management and table operations are performed
   through `TableHandle` obtained from `Tables::open`;
 - read paths use lock-free snapshots while writes are flushed through one peer

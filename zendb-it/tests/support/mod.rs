@@ -11,7 +11,7 @@ use bincode::Encode;
 use zendb_it::{TestPeerIdentity, offline_workspace_config};
 use zendb_storage::TableConfig;
 use zendb_types::{InstallationId, Multiaddr, WorkspaceId, utils::serialize_to_vec};
-use zendb_workspace::{DeviceRecord, Role, Workspace, derive_workspace_public_key};
+use zendb_workspace::{Installation, Role, Workspace, derive_workspace_public_key};
 
 #[derive(Encode)]
 struct LocalIdentity {
@@ -35,41 +35,41 @@ impl WorkspacePair {
         let a_root = temp.path().join("workspace-a");
         let b_root = temp.path().join("workspace-b");
         let [a_port, b_port] = available_ports();
-        let a_identity = Arc::new(TestPeerIdentity::generate("device-a"));
-        let b_identity = Arc::new(TestPeerIdentity::generate("device-b"));
+        let a_identity = Arc::new(TestPeerIdentity::generate("installation-a"));
+        let b_identity = Arc::new(TestPeerIdentity::generate("installation-b"));
 
         let workspace = Workspace::create(&a_root, a_identity.clone(), offline_workspace_config())
             .expect("failed to create seed workspace");
         let workspace_id = workspace.id();
-        let installation_a = workspace.devices().local_installation_id();
+        let installation_a = workspace.installations().local_installation_id();
         let installation_b = InstallationId::generate();
 
-        let mut record_a = workspace
-            .devices()
+        let mut installation_a_value = workspace
+            .installations()
             .get(&installation_a)
-            .expect("local device is enrolled");
-        record_a.addresses = vec![loopback_address(a_port)];
+            .expect("local installation is enrolled");
+        installation_a_value.addresses = vec![loopback_address(a_port)];
         workspace
-            .devices()
-            .upsert(installation_a, record_a)
-            .expect("failed to store device A route");
+            .installations()
+            .upsert(installation_a, installation_a_value)
+            .expect("failed to store installation A route");
         workspace
-            .devices()
+            .installations()
             .upsert(
                 installation_b,
-                DeviceRecord {
-                    display_name: "device-b".to_owned(),
+                Installation {
+                    display_name: "installation-b".to_owned(),
                     role: Some(Role::Contributor),
                     public_key: derive_workspace_public_key(
                         b_identity.as_ref(),
                         workspace_id,
                         installation_b,
                     )
-                    .expect("failed to derive device B workspace key"),
+                    .expect("failed to derive installation B workspace key"),
                     addresses: vec![loopback_address(b_port)],
                 },
             )
-            .expect("failed to enroll device B");
+            .expect("failed to enroll installation B");
         for name in table_names {
             workspace
                 .tables()
@@ -81,7 +81,7 @@ impl WorkspacePair {
 
         // Initial join synchronization is intentionally deferred in ZenDB.
         // Seed the second root with the already trusted history, then give it
-        // the installation identity assigned to device B.
+        // installation B's assigned identity.
         copy_directory(&a_root, &b_root);
         fs::write(
             b_root.join("_identity"),
@@ -89,9 +89,9 @@ impl WorkspacePair {
                 workspace_id,
                 installation_id: installation_b,
             })
-            .expect("failed to encode device B identity"),
+            .expect("failed to encode installation B identity"),
         )
-        .expect("failed to write device B identity");
+        .expect("failed to write installation B identity");
 
         Self {
             _temp: temp,

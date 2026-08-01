@@ -17,22 +17,22 @@ support:
   behavior.
 - **Open**: read both from disk. Current behavior.
 - **Join**: the caller already knows the target `WorkspaceId` and is minting a
-  new device identity (`PeerId` + private key) for this joiner. The workspace
+  new installation identity (`PeerId` + private key) for this joiner. The workspace
   must store the provided `WorkspaceId` but must not generate the peer
   identity.
-- **Account**: one user owns several devices and is a member of several
-  workspaces. A single device identity (`PeerId` + private key) is reused
-  across every workspace that device participates in. If the workspace owned
+- **Account**: one user owns several installations and is a member of several
+  workspaces. A single installation identity (`PeerId` + private key) is reused
+  across every workspace that installation participates in. If the workspace owned
   the private key, the same key would be copied into every workspace
-  directory that device touches.
+  directory that installation touches.
 
 The common thread is that **peer identity has a different lifecycle than
 workspace identity**. `WorkspaceId` is 1:1 with a workspace directory. A
-device identity is 1:1 with a device and spans every workspace that device
-participates in. The workspace must not own device identity.
+installation identity is 1:1 with a installation and spans every workspace that installation
+participates in. The workspace must not own installation identity.
 
 A second concern is future cryptographic event signing. Events will
-eventually be signed by the producing device's private key. The workspace
+eventually be signed by the producing installation's private key. The workspace
 must be able to sign without ever holding private key material directly, so
 that key storage (plaintext file, OS keychain, HSM, KMS) remains an
 application deployment decision.
@@ -42,9 +42,9 @@ application deployment decision.
 | Concern | Owner | Location | Lifecycle |
 | --- | --- | --- | --- |
 | `WorkspaceId` | Workspace | `zendb-workspace::Bootstrap` (`_identity` file) | 1:1 with workspace directory |
-| `PeerId` + private key | Application | `PeerIdentity` trait in `zendb-types`, impl chosen by the application | 1:1 with a device; spans workspaces |
+| `PeerId` + private key | Application | `PeerIdentity` trait in `zendb-types`, impl chosen by the application | 1:1 with a installation; spans workspaces |
 | Connection hints | Application (ephemeral) | Passed to `Workspace::join`, forwarded to networking | Used once at join time |
-| Account → devices and workspaces | Application / future `zendb-account` | Above the workspace | The workspace is unaware of accounts |
+| Account → installations and workspaces | Application / future `zendb-account` | Above the workspace | The workspace is unaware of accounts |
 
 The workspace identity blob is intentionally small and stable: a single
 `WorkspaceId`. It does not grow as the system adds accounts, key stores, or
@@ -64,7 +64,7 @@ may live in `zendb-types::utils` if other crates need it. The identity-aware
 
 ## 3. PeerIdentity Trait
 
-Introduce a trait in `zendb-types::identity` that abstracts a device's
+Introduce a trait in `zendb-types::identity` that abstracts a installation's
 cryptographic identity:
 
     pub trait PeerIdentity: Send + Sync {
@@ -167,7 +167,7 @@ target `WorkspaceId` plus connection hints:
     ) -> Result<Self>;
 
 `Arc<dyn PeerIdentity>` is stored on the `Workspace` and cloned into
-`Devices` so that minting and (future) signing reach the same identity. The
+`Installations` so that minting and (future) signing reach the same identity. The
 workspace never stores the private key.
 
 ### 5.1 JoinHints placeholder
@@ -188,12 +188,12 @@ minus `WorkspaceId` generation. It does not yet contact any network.
 
 `WorkspaceConfig` is an empty placeholder struct retained for future
 workspace-level configuration. It carries no fields in this iteration; the
-local device display name is not a workspace concern and is omitted. Fields
+local installation display name is not a workspace concern and is omitted. Fields
 are added when concrete workspace-level config is needed.
 
-## 6. Devices Construction
+## 6. Installations Construction
 
-`Devices::create` and `Devices::open` currently take `local_peer_id: PeerId`.
+`Installations::create` and `Installations::open` currently take `local_peer_id: PeerId`.
 They change to take `peer: Arc<dyn PeerIdentity>`:
 
     pub(crate) fn create(
@@ -204,12 +204,12 @@ They change to take `peer: Arc<dyn PeerIdentity>`:
 
     pub(crate) fn open(...) -> Result<Arc<Self>>;
 
-`Devices` stores the `Arc<dyn PeerIdentity>` and uses `peer.peer_id()` where
+`Installations` stores the `Arc<dyn PeerIdentity>` and uses `peer.peer_id()` where
 it currently uses the bare `PeerId`. `local_peer_id()` continues to return
 `PeerId` for callers that only need the public identity.
 
 `bootstrap_local` continues to use `peer.peer_id()` as the row key. The local
-device display name is omitted in this iteration; `bootstrap_local` no longer
+installation display name is omitted in this iteration; `bootstrap_local` no longer
 takes a name argument.
 
 ## 7. Removed And Moved
@@ -277,16 +277,16 @@ explicitly requested.
   `Arc<dyn PeerIdentity>`.
 - Add `Workspace::join` taking `WorkspaceId`, `Arc<dyn PeerIdentity>`, and
   `JoinHints`.
-- Store `Arc<dyn PeerIdentity>` on `Workspace`; pass it into `Devices`.
+- Store `Arc<dyn PeerIdentity>` on `Workspace`; pass it into `Installations`.
 - Remove `PeerId::generate()` and `WorkspaceId::generate()` calls from
   `workspace.rs`.
 
-### Phase 5: Devices constructor update
+### Phase 5: Installations constructor update
 
-- Change `Devices::create` and `Devices::open` to take
+- Change `Installations::create` and `Installations::open` to take
   `Arc<dyn PeerIdentity>`.
 - Replace bare `local_peer_id` usage with `peer.peer_id()`.
-- Keep `Devices::local_peer_id()` returning `PeerId`.
+- Keep `Installations::local_peer_id()` returning `PeerId`.
 
 ### Phase 6: integration test and documentation
 
@@ -333,7 +333,7 @@ Iteration 0003 is complete when:
 - `WorkspaceLock` and the old `WorkspaceIdentity` struct are gone;
 - `Workspace::create`, `Workspace::open`, and `Workspace::join` take
   `Arc<dyn PeerIdentity>` (and `WorkspaceId` + `JoinHints` for join);
-- `Devices` is constructed with `Arc<dyn PeerIdentity>` and uses
+- `Installations` is constructed with `Arc<dyn PeerIdentity>` and uses
   `peer.peer_id()` for minting;
 - the workspace never stores or generates a private key;
 - `Bootstrap` inlines the `std::fs::File::try_lock` call (no file-lock

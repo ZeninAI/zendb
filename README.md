@@ -8,16 +8,16 @@ peer-to-peer replication.
 
 | Crate | Responsibility |
 |---|---|
-| `zendb-types` | Installation and workspace IDs, persisted libp2p public keys and device addresses, event stamps, envelopes, cells, operations, CRDT values, and binary utilities |
+| `zendb-types` | Installation and workspace IDs, persisted libp2p public keys and installation addresses, event stamps, envelopes, cells, operations, CRDT values, and binary utilities |
 | `zendb-storage` | B+ tree, KeyDir, SkipList, generic State, Topic, and the invariant-preserving Table facade |
-| `zendb-workspace` | Catalog and device policy, local HLC and receipts, authenticated admission, and the private Tokio/libp2p replication runtime |
+| `zendb-workspace` | Catalog and installation policy, local HLC and receipts, authenticated admission, and the private Tokio/libp2p replication runtime |
 
 ## Identity And Events
 
 Applications provide an account-root libp2p keypair through `PeerIdentity`.
 ZenDB derives a distinct Ed25519 transport key for every
 `(WorkspaceId, InstallationId)` pair. Only that derived public key is stored in
-the workspace device registry; private keys are never serialized.
+the workspace installation registry; private keys are never serialized.
 
 Every table mutation is a fully stamped `Event`:
 
@@ -49,12 +49,12 @@ Catalog declarations are durable while typed handles are opened lazily.
 ## Replication
 
 `Workspace` privately owns a Tokio worker and a libp2p Gossipsub swarm. The
-runtime starts when `_devices` contains another installation and drains then
+runtime starts when `_installations` contains another installation and drains then
 stops when the last remote installation is removed. Applications do not create
 a replication link or supply an async runtime.
 
-Each `DeviceRecord` may contain Admin-managed libp2p addresses. The worker
-derives the device `PeerId` from its stored public key, dials those routes with
+Each `Installation` may contain Admin-managed libp2p addresses. The worker
+derives the installation `PeerId` from its stored public key, dials those routes with
 Noise authentication, and retries temporarily unreachable peers with capped
 backoff. mDNS and Identify can add transient routes only for enrolled peers;
 discovery never grants workspace membership.
@@ -70,10 +70,10 @@ not an event-size admission limit; Gossipsub's transport limit defaults to
 
 ## Enrollment
 
-Only an Admin writes `_devices`. The Admin assigns an `InstallationId`, the
+Only an Admin writes `_installations`. The Admin assigns an `InstallationId`, the
 joining application derives its workspace public key with
 `derive_workspace_public_key`, and the Admin stores that key in a
-`DeviceRecord` together with any stable dial addresses. Addresses are routing
+`Installation` together with any stable dial addresses. Addresses are routing
 hints rather than identities and may be empty.
 
 `Workspace::join` currently persists the assigned local identity and creates
@@ -88,7 +88,7 @@ workspace-root/
   _lock
   tables/
     _catalog/
-    _devices/
+    _installations/
     <table-name>/
   states/
     _catalog/

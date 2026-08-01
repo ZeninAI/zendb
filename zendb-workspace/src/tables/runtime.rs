@@ -6,7 +6,7 @@ use parking_lot::{RwLock, RwLockReadGuard};
 use zendb_storage::{Change, InsertOutcome, Table, TopicConsumer};
 use zendb_types::{Event, Op, Path, PrimaryKey, Role};
 
-use crate::{Error, Result, devices::Devices};
+use crate::{Error, Result, installations::Installations};
 
 /// Reacts to a successful insert on a [`TableHandle`].
 ///
@@ -21,8 +21,10 @@ pub trait ChangeListener: Send + Sync {
     fn on_change(&self, change: &Change);
 }
 
-pub(crate) type ListenerList = Vec<Arc<dyn ChangeListener>>;
-pub(crate) type ListenerGroups = (ListenerList, ListenerList);
+struct ListenerSet {
+    internal: Vec<Arc<dyn ChangeListener>>,
+    application: Vec<Arc<dyn ChangeListener>>,
+}
 
 /// A shared handle to an open [`Table`].
 ///
@@ -31,8 +33,8 @@ pub(crate) type ListenerGroups = (ListenerList, ListenerList);
 pub struct TableHandle {
     name: String,
     pub(super) table: RwLock<Table>,
-    pub(crate) listeners: RwLock<ListenerGroups>,
-    devices: Weak<Devices>,
+    listeners: RwLock<ListenerSet>,
+    installations: Weak<Installations>,
     is_system: bool,
 }
 
@@ -40,14 +42,17 @@ impl TableHandle {
     pub(crate) fn new(
         name: String,
         table: Table,
-        devices: Weak<Devices>,
+        installations: Weak<Installations>,
         is_system: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             name,
             table: RwLock::new(table),
-            listeners: RwLock::new((Vec::new(), Vec::new())),
-            devices,
+            listeners: RwLock::new(ListenerSet {
+                internal: Vec::new(),
+                application: Vec::new(),
+            }),
+            installations,
             is_system,
         })
     }
@@ -68,9 +73,9 @@ impl TableHandle {
         if self.is_system {
             return Err(Error::SystemTableReadOnly(self.name.clone()));
         }
-        let devices = self.devices.upgrade().ok_or(Error::WorkspaceClosed)?;
-        devices.require_access(&devices.local_installation_id(), Role::Contributor)?;
-        let stamp = devices.mint()?;
+        let installations = self.installations.upgrade().ok_or(Error::WorkspaceClosed)?;
+        installations.require_access(&installations.local_installation_id(), Role::Contributor)?;
+        let stamp = installations.mint()?;
         self.insert_internal(Event {
             primary_key,
             path,
@@ -92,23 +97,27 @@ impl TableHandle {
     /// The listener fires after the workspace's internal listeners on every
     /// subsequent insert through any handle to this table.
     pub fn add_listener(&self, listener: Arc<dyn ChangeListener>) {
-        self.listeners.write().1.push(listener);
+        self.listeners.write().application.push(listener);
     }
 
     /// Remove and return the most recently registered custom listener.
     pub fn pop_listener(&self) -> Option<Arc<dyn ChangeListener>> {
-        self.listeners.write().1.pop()
+        self.listeners.write().application.pop()
+    }
+
+    pub(crate) fn add_internal_listener(&self, listener: Arc<dyn ChangeListener>) {
+        self.listeners.write().internal.push(listener);
     }
 
     /// Authorized workspace mutation path for internal and admitted events.
     pub(crate) fn insert_internal(&self, event: Event) -> Result<InsertOutcome> {
-        let devices = self.devices.upgrade().ok_or(Error::WorkspaceClosed)?;
+        let installations = self.installations.upgrade().ok_or(Error::WorkspaceClosed)?;
         let required = if self.is_system {
             Role::Admin
         } else {
             Role::Contributor
         };
-        devices.require_access(&event.stamp.id.author, required)?;
+        installations.require_access(&event.stamp.id.author, required)?;
         self.insert_unchecked(event)
     }
 
@@ -116,7 +125,7 @@ impl TableHandle {
         let outcome = { self.table.write().insert(event)? };
         if let InsertOutcome::Applied(ref change) = outcome {
             let listeners = self.listeners.read();
-            for listener in listeners.0.iter().chain(listeners.1.iter()) {
+            for listener in listeners.internal.iter().chain(&listeners.application) {
                 listener.on_change(change);
             }
         }

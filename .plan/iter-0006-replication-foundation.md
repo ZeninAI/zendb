@@ -18,7 +18,7 @@ of every remote event before it reaches that internal convergence point.
 ### 1.1 Unauthenticated Remote Events
 
 `EventStamp.peer_id` is currently a claim. A remote caller that can reach the
-internal insertion path can forge another device identity. Replication needs
+internal insertion path can forge another installation identity. Replication needs
 strict Gossipsub signed-message validation and a registry lookup of the author
 before any event is applied.
 
@@ -30,10 +30,10 @@ and converges remote events without exposing `TableHandle::insert_internal`.
 
 ### 1.3 No Direct Enrollment Path
 
-An Admin must be able to explicitly add a device to `_devices`, then provide the
-new device with its assigned installation ID and connection bootstrap data. The
-new device does not request an invitation, and no other device is permitted to
-write the device registry on its behalf.
+An Admin must be able to explicitly add an installation to `_installations`, then provide the
+new installation with its assigned installation ID and connection bootstrap data. The
+new installation does not request an invitation, and no other installation is permitted to
+write the installation registry on its behalf.
 
 ---
 
@@ -42,11 +42,11 @@ write the device registry on its behalf.
 ### 2.1 InstallationId Is The Event Author
 
 `InstallationId` is the compact, random, stable installation identity. It is
-the author in `EventId`, the key in per-device CRDT data, and the key of a
-device registry row. It is not a transport peer ID and it is not a public key.
+the author in `EventId`, the key in per-installation CRDT data, and the key of a
+installation registry row. It is not a transport peer ID and it is not a public key.
 
 The identifier is eight bytes for this iteration. This is sufficient for the
-small device populations expected in a workspace, while keeping every event
+small installation populations expected in a workspace, while keeping every event
 and CRDT actor reference compact.
 
 ```rust
@@ -137,7 +137,7 @@ including its key type. It is the only libp2p key type persisted by ZenDB.
 ### 2.4 PeerIdentity Supplies The Account Root Keypair
 
 `PeerIdentity` stays in `zendb-types` and exposes precisely the application
-owned libp2p keypair and device display name:
+owned libp2p keypair and installation display name:
 
 ```rust
 pub trait PeerIdentity: Send + Sync {
@@ -149,7 +149,7 @@ pub trait PeerIdentity: Send + Sync {
 There is no `sign` method and no public-key method. Private key material stays
 inside the application implementation and is never serialized by ZenDB. This
 keypair is an application account-root keypair; a workspace never places its
-public key in `_devices` or uses it directly as its Gossipsub identity.
+public key in `_installations` or uses it directly as its Gossipsub identity.
 
 `zendb-types` depends on `libp2p-identity`. It still has no transport, async
 runtime, swarm, or replication dependency.
@@ -188,14 +188,14 @@ support libp2p secret derivation; the resulting 32-byte secret always constructs
 an Ed25519 workspace transport keypair.
 
 The derived keypair is the only keypair used by the replication worker. Its
-public key is stored in the local `DeviceRecord`, and Gossipsub signs with the
+public key is stored in the local `Installation`, and Gossipsub signs with the
 derived keypair. The derived keypair is deterministic and remains in memory;
 only the local `(WorkspaceId, InstallationId)` pair is persisted in the local
 workspace identity record so a later `Workspace::open` can derive it again.
 
 This gives each installation a distinct network identity in each workspace,
 even when several installations or workspaces use one account-root keypair.
-It makes Gossipsub source authentication map one-to-one to an enrolled device,
+It makes Gossipsub source authentication map one-to-one to an enrolled installation,
 so role checks, revocation, and per-installation event ordering remain sound.
 `zendb-workspace` exposes `derive_workspace_public_key` so a joining
 application can return the correct derived public key to the Admin without
@@ -205,22 +205,22 @@ duplicating the versioned derivation domain or exposing the derived private key.
 
 ZenDB's own `PeerId` wrapper is removed. `PeerId` is a libp2p transport address,
 not a logical author or persisted table key. The transport derives it when
-needed from a registry record:
+needed from an installation:
 
 ```rust
-fn peer_id(record: &DeviceRecord) -> libp2p_identity::PeerId {
-    record.public_key.as_libp2p().to_peer_id()
+fn peer_id(installation: &Installation) -> libp2p_identity::PeerId {
+    installation.public_key.as_libp2p().to_peer_id()
 }
 ```
 
-`PrimaryKey::PeerId` is removed. `_devices` keys use the generated conversion:
+`PrimaryKey::PeerId` is removed. `_installations` keys use the generated conversion:
 
 ```rust
 let key: PrimaryKey = installation_id.into();
 let installation_id = InstallationId::try_from(&key)?;
 ```
 
-There are no workspace-local `device_primary_key` or
+There are no workspace-local `installation_primary_key` or
 `installation_id_from_key` conversion helpers.
 
 ### 2.7 Data Model Changes
@@ -230,8 +230,8 @@ There are no workspace-local `device_primary_key` or
 | `EventId { peer_id: PeerId, sequence }` | `EventId { author: InstallationId, sequence }` |
 | `PrimaryKey::PeerId(PeerId)` | `PrimaryKey::Blob` for `InstallationId` |
 | CRDT maps keyed by `PeerId` | CRDT maps keyed by `InstallationId` |
-| `Devices.local_peer_id` | `Devices.local_installation_id` |
-| `DeviceRecord { display_name, role }` | `DeviceRecord { display_name, role, public_key }` |
+| `Installations.local_peer_id` | `Installations.local_installation_id` |
+| `Installation { display_name, role }` | `Installation { display_name, role, public_key }` |
 | `PeerIdentity::peer_id() + sign()` | `PeerIdentity::keypair() + display_name()` |
 | `WorkspaceId([u8; 16])` | `WorkspaceId([u8; 8])` |
 
@@ -244,7 +244,7 @@ any signing failure.
 `InstallationId` is not tied to a root keypair, so replacing an application
 root key does not rewrite event identities. It does change every derived
 workspace public key for that application identity. A rotation protocol would
-therefore update the relevant `DeviceRecord` values and retain prior keys for
+therefore update the relevant `Installation` values and retain prior keys for
 historic verification. That is explicitly deferred.
 
 ---
@@ -268,8 +268,8 @@ second signature verification.
 
 `Workspace::admit_event` is the only public replication admission seam. It:
 
-1. Looks up `Envelope.author` in `Devices`.
-2. Derives the expected libp2p `PeerId` from `record.public_key` and requires
+1. Looks up `Envelope.author` in `Installations`.
+2. Derives the expected libp2p `PeerId` from `installation.public_key` and requires
    it to equal the original Gossipsub message source.
 3. Requires `Admin` for system-table events and `Contributor` for application
    table events.
@@ -281,9 +281,9 @@ pub fn admit_event(
     envelope: Envelope,
     gossipsub_source: libp2p_identity::PeerId,
 ) -> Result<(), AdmitError> {
-    let record = self.devices().get(&envelope.author)
+    let installation = self.installations().get(&envelope.author)
         .ok_or(AdmitError::UnknownPeer)?;
-    if record.public_key.as_libp2p().to_peer_id() != gossipsub_source {
+    if installation.public_key.as_libp2p().to_peer_id() != gossipsub_source {
         return Err(AdmitError::AuthorMismatch);
     }
 
@@ -292,7 +292,7 @@ pub fn admit_event(
     } else {
         Role::Contributor
     };
-    if !record.role.is_some_and(|role| role.has_at_least(required)) {
+    if !installation.role.is_some_and(|role| role.has_at_least(required)) {
         return Err(AdmitError::Unauthorized);
     }
 
@@ -368,10 +368,10 @@ dropping locally committed events.
 
 | Path | Initiator | Network required | Rule |
 |---|---|---|---|
-| Create | first device | no | local device becomes Admin |
-| Open | enrolled device | no | local installation must be in `_devices` |
-| Direct enrollment | Admin | no | only Admin writes the new `_devices` row |
-| Join | enrolled device | deferred | stages assigned ID; initial sync starts future mesh participation |
+| Create | first installation | no | local installation becomes Admin |
+| Open | enrolled installation | no | local installation must be in `_installations` |
+| Direct enrollment | Admin | no | only Admin writes the new `_installations` row |
+| Join | enrolled installation | deferred | stages assigned ID; initial sync starts future mesh participation |
 
 There are no invitation links, bearer tokens, invite nonces, invitation state,
 or join request-response protocol in this iteration.
@@ -383,13 +383,13 @@ The Admin obtains the joiner's desired display name out of band, generates an
 installation ID. The joiner derives its `WorkspaceIdentity` locally and
 returns that derived public key through the same application-level setup flow.
 The Admin then publishes the registry row through the normal Admin-authorized
-device API:
+installation API:
 
 ```rust
 let installation_id = InstallationId::generate();
 let joiner_workspace_public_key = obtain_from_joiner();
 
-workspace.devices().upsert(installation_id, DeviceRecord {
+workspace.installations().upsert(installation_id, Installation {
     display_name: "new-laptop".into(),
     role: Some(Role::Contributor),
     public_key: PublicKey::from_libp2p(joiner_workspace_public_key),
@@ -420,9 +420,9 @@ normal receipt observation.
 
 ### 5.4 Joiner HLC
 
-A joining device starts its local HLC at the current physical time. It does not
+A joining installation starts its local HLC at the current physical time. It does not
 scan existing events at join time. Future initial joiner synchronization will
-feed received event stamps through `Devices::observe`, advancing the clock
+feed received event stamps through `Installations::observe`, advancing the clock
 naturally before the joiner writes after synchronization.
 
 ---
@@ -435,13 +435,15 @@ owns Tokio, libp2p, and Gossipsub dependencies. Its public API remains fully
 synchronous: the subsystem owns a private Tokio network thread and a sequential
 admission bridge thread.
 
-The module contains the publisher, swarm construction, event loop, replication
-listeners, and a private `ReplicationController` held by `Workspace`:
+The module contains batching, peer routing, swarm construction, the event loop,
+replication listeners, and a private `ReplicationController` held by
+`Workspace`. Controller state is represented by one lifecycle state machine:
 
 ```rust
-struct ReplicationController {
-    remote_devices: Mutex<BTreeSet<InstallationId>>,
-    runtime: Mutex<Option<RunningReplication>>,
+struct ControllerState {
+    lifecycle: Lifecycle,
+    registry: RegistryProjection,
+    pending_stop: Option<PendingStop>,
 }
 ```
 
@@ -463,24 +465,25 @@ Tokio event loop.
 
 Replication runs exactly while the local installation remains enrolled with
 its expected workspace public key and the registry contains at least one other
-device. The local device itself never starts the runtime. Readers count as
-remote devices: they participate in the mesh even though they cannot author
+installation. The local installation itself never starts the runtime. Readers count as
+remote installations: they participate in the mesh even though they cannot author
 application-table writes.
 
 Listener ownership follows the domain that reacts to the change:
 
-- `devices/listeners` contains receipt and device-registry listeners;
+- `installations/listeners` contains receipt and installation-registry listeners;
 - `tables/listeners` contains the table catalog listener;
 - `replication/listeners` contains `ReplicationStateListener`, the per-table
   `ReplicationListener`, and replication's catalog listener.
 
-`Devices`, `DeviceRecord`, registry caching, the local clock, and receipt state
-live directly in `devices/mod.rs`; there is no `devices/runtime.rs`. Runtime in
-this design means the private network worker owned by replication, not the
-device registry itself.
+`Installations`, registry caching, the local clock, and receipt state live directly
+in `installations/mod.rs`; there is no `installations/runtime.rs`. The portable persisted
+`Installation` lives in `zendb-types`. Runtime in this design means the private
+network worker owned by replication, not the installation registry itself.
 
-Each `TableHandle` stores two listener vectors behind one `RwLock`: internal
-listeners first and application listeners second. `TableHandle::add_listener`
+Each `TableHandle` stores a private named listener set behind one `RwLock`:
+internal listeners first and application listeners second. Crate-private
+registration methods attach internal listeners. `TableHandle::add_listener`
 and `TableHandle::pop_listener` operate only on the application vector. After a
 successful insert, the handle keeps the listener read guard and invokes the
 internal vector followed by the application vector without cloning either
@@ -492,7 +495,7 @@ order:
 
 | Table | Internal listener order |
 |---|---|
-| `_devices` | receipt, device registry, replication state, replication event |
+| `_installations` | receipt, installation registry, replication state, replication event |
 | `_catalog` | receipt, table catalog, replication event, replication catalog |
 | existing application table | receipt, replication event |
 
@@ -509,23 +512,23 @@ permanent `ReplicationListener`. It ignores ordinary config updates where the
 same table handle remains open.
 
 On `Workspace::open`, after the registry has been loaded, the controller is
-initialized from `Devices::list`. `Workspace::create` starts with only its local
+initialized from `Installations::list`. `Workspace::create` starts with only its local
 Admin row, so its runtime remains stopped. `ReplicationStateListener`, attached
-to `_devices`, owns all subsequent network lifecycle changes:
+to `_installations`, owns all subsequent network lifecycle changes:
 
-- the first non-local device upsert starts the runtime;
+- the first non-local installation upsert starts the runtime;
 - further non-local upserts leave it running;
-- removing a non-local device removes and disconnects that peer;
-- deleting the final non-local device drains the current outbound work and
+- removing a non-local installation removes and disconnects that peer;
+- deleting the final non-local installation drains the current outbound work and
   stops the runtime;
-- deleting the local device, clearing its role, or replacing its workspace
+- deleting the local installation, clearing its role, or replacing its workspace
   public key stops its runtime after the triggering registry event completes
   the listener chain.
 
-For the first remote-device upsert, the device registry listener first updates
+For the first remote-installation upsert, the installation registry listener first updates
 the cache, `ReplicationStateListener` starts the runtime, and the permanent
 `ReplicationListener` then submits that same enrollment event. For a final
-remote-device delete or local-device revocation, the state listener marks
+remote-installation delete or local-installation revocation, the state listener marks
 shutdown pending; the replication listener submits the triggering event when it
 was locally authored and then completes the stop. The worker drains its outbound
 queue before exiting. This is best-effort transport delivery, not a
@@ -535,17 +538,17 @@ The workspace Drop path requests worker shutdown before performing its existing
 best-effort flush. A future explicit close operation can expose a joinable
 shutdown if applications need that lifecycle guarantee.
 
-### 6.2 Device Revocation Removes The Peer From Gossip
+### 6.2 Installation Revocation Removes The Peer From Gossip
 
-Revocation is deletion of the device's `_devices` row, not a role change to an
-empty value. `Devices::remove(installation_id)` requires Admin and publishes
-that deletion. `DeviceRegistryListener` owns only registry-cache mutation.
+Revocation is deletion of the installation's `_installations` row, not a role change to an
+empty value. `Installations::remove(installation_id)` requires Admin and publishes
+that deletion. `InstallationRegistryListener` owns only registry-cache mutation.
 `ReplicationStateListener` independently decodes the previous and current
-`DeviceRecord` values from the applied `Change` and forwards the lifecycle
+`Installation` values from the applied `Change` and forwards the lifecycle
 transition to `ReplicationController`.
 
-The notification contains the deleted record's `PublicKey`, because the cache
-no longer contains the record. The controller derives its `PeerId`, instructs
+The notification contains the deleted installation's `PublicKey`, because the
+cache no longer contains the installation. The controller derives its `PeerId`, instructs
 the worker to call Gossipsub `blacklist_peer`, removes it as an explicit peer if
 applicable, and calls `Swarm::disconnect_peer_id`. Gossipsub neither sends to
 nor accepts messages from the revoked peer after this action. Admission
@@ -558,7 +561,7 @@ data. Connection-level gating beyond the Gossipsub mesh is deferred.
 
 `BatchConfig::max_bytes` is a batch flush threshold, not an admission or event
 size limit. The publisher accumulates events until it reaches `max_events`, the
-accumulated batch reaches `max_bytes`, or `linger_ms` expires. A first event
+accumulated batch reaches `max_bytes`, or `linger` expires. A first event
 larger than `max_bytes` is placed in its own envelope and published immediately;
 it is never rejected or split merely because of the threshold.
 
@@ -566,7 +569,7 @@ it is never rejected or split merely because of the threshold.
 pub struct BatchConfig {
     pub max_events: usize, // default: 16
     pub max_bytes: usize,  // default: 65_536; flush threshold only
-    pub linger_ms: u64,    // default: 50
+    pub linger: Duration,  // default: 50 milliseconds
 }
 ```
 
@@ -623,8 +626,8 @@ runtime is currently started.
 4. Change `PeerIdentity` to `keypair()` and `display_name()`. Persist the local
    `(WorkspaceId, InstallationId)` identity pair and derive an in-memory
    Ed25519 `WorkspaceIdentity` from the root keypair. Populate each initial
-   `DeviceRecord.public_key` from the derived workspace keypair.
-5. Migrate devices, peer state, receipt windows, and error values to
+   `Installation.public_key` from the derived workspace keypair.
+5. Migrate installations, peer state, receipt windows, and error values to
    `InstallationId`.
 6. Add `Workspace::admit_event`, which binds an envelope author to the already
    authenticated Gossipsub source and performs authorization checks.
@@ -638,13 +641,13 @@ runtime is currently started.
    TCP, Noise, Yamux, mDNS, identify, and ping.
 10. Split each `TableHandle` listener collection into deterministic internal and
     application vectors. Install the permanent listener graph and wire
-    `ReplicationStateListener` to the controller's remote-device set, including
+    `ReplicationStateListener` to the controller's remote-installation set, including
     first-remote start and final-remote drain then stop ordering.
 11. Configure signed-message authenticity, strict validation, the 100 MiB
     transmit limit, and the workspace topic.
-12. Connect device removal to Gossipsub peer blacklisting and swarm
+12. Connect installation removal to Gossipsub peer blacklisting and swarm
     disconnection.
-13. Add direct Admin device enrollment and `JoinHints`; do not add invitation
+13. Add direct Admin installation enrollment and `JoinHints`; do not add invitation
     types, invite state, or a direct-message protocol.
 14. Run `cargo check --workspace`.
 
@@ -652,19 +655,20 @@ runtime is currently started.
 
 ## 8. Completion Criteria
 
-- `InstallationId` is the primary logical device identity in events, CRDTs,
-  device lookup, and receipt tracking.
+- `InstallationId` is the primary logical installation identity in events, CRDTs,
+  installation lookup, and receipt tracking.
 - `InstallationId` and `WorkspaceId` are generated by the byte-size parameter
   macro, currently at eight bytes each.
 - Every generated opaque ID converts to `PrimaryKey::Blob` with `From` and back
   from `&PrimaryKey` with `TryFrom`; workspace code has no ID-key converter
   helpers.
-- `DeviceRecord` stores a bincode-capable wrapper around libp2p `PublicKey`.
+- `Installation` lives in `zendb-types` and stores bincode-capable `PublicKey`
+  and `Multiaddr` wrappers.
 - `PeerIdentity` exposes only `keypair()` and `display_name()`.
 - The account-root keypair deterministically derives one in-memory Ed25519
   transport keypair for every local `(WorkspaceId, InstallationId)` pair.
-- `_devices` stores those derived public keys; the root public key is never a
-  workspace device identity.
+- `_installations` stores those derived public keys; the root public key is never a
+  workspace installation identity.
 - ZenDB does not serialize private key material, define a custom signing API,
   or define a custom persisted `PeerId`.
 - Gossipsub signs every payload and applies strict validation before delivery.
@@ -677,18 +681,18 @@ runtime is currently started.
 - Every table handle separates internal and application listeners. Change
   dispatch invokes them in that order without cloning the vectors, and the
   public add/pop API changes only the application vector.
-- Receipt and device listeners live under `devices/listeners`; replication
+- Receipt and installation listeners live under `installations/listeners`; replication
   state, event, and catalog listeners live under `replication/listeners`.
 - Replication listeners are permanent and use no factory, observer, `Any`
   downcast, or dynamically maintained attachment stack.
-- `ReplicationStateListener` starts replication on the first remote device and
-  stops it, after outbound drain, when the final remote device or the local
-  device is removed or invalidated.
-- Only an Admin writes `_devices` for enrollment; invitation links and nonce
+- `ReplicationStateListener` starts replication on the first remote installation and
+  stops it, after outbound drain, when the final remote installation or the local
+  installation is removed or invalidated.
+- Only an Admin writes `_installations` for enrollment; invitation links and nonce
   tracking do not exist.
 - Joiners start their HLC at now; initial historical synchronization remains
   future work.
-- Deleting a device row removes the peer from Gossipsub and disconnects it.
+- Deleting an installation row removes the peer from Gossipsub and disconnects it.
 - `max_bytes` is a flush threshold and Gossipsub is configured for 100 MiB.
 - `cargo check --workspace` succeeds.
 - Root and crate READMEs are updated when the implementation lands.
@@ -701,7 +705,7 @@ This iteration does not implement:
 
 - anti-entropy or initial joiner synchronization;
 - historical snapshot exchange;
-- connection-level transport gating after a device revocation;
+- connection-level transport gating after an installation revocation;
 - relay or NAT traversal;
 - multi-workspace links;
 - Bluetooth transport;
@@ -719,17 +723,17 @@ joiner's HLC from those received event stamps.
 ## 10. Dependency Direction
 
 ```text
-zendb-types              (InstallationId, WorkspaceId, PublicKey, PeerIdentity,
-                           Event, Envelope, Role; libp2p-identity only)
+zendb-types              (InstallationId, WorkspaceId, PublicKey, Multiaddr,
+                           Installation, PeerIdentity, Event, Envelope, Role)
   ^
 zendb-storage            (Table, Topic, Backends)
   ^
-zendb-workspace          (Devices, admission, catalogs, local HLC,
+zendb-workspace          (Installations, admission, catalogs, local HLC,
                            internal replication worker, Tokio, libp2p,
                            Gossipsub mesh lifecycle)
 ```
 
-`zendb-types` knows the libp2p identity types because they define the persisted
-public-key representation and the application identity contract. It does not
-know networking transport or runtime concerns. Tokio and libp2p swarm code are
-private implementation details of `zendb-workspace::replication`.
+`zendb-types` knows libp2p identity and multiaddress values because they define
+persisted installation data and the application identity contract. It does not know
+network transport or runtime concerns. Tokio and libp2p swarm code are private
+implementation details of `zendb-workspace::replication`.

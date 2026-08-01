@@ -22,11 +22,12 @@ pub use runtime::{ChangeListener, TableHandle};
 use crate::{
     Error, Result,
     consts::{
-        DEVICES_TABLE_NAME, SYSTEM_TABLE_CONFIG, TABLE_CATALOG_NAME, TABLES_DIR, is_system_table,
+        INSTALLATIONS_TABLE_NAME, SYSTEM_TABLE_CONFIG, TABLE_CATALOG_NAME, TABLES_DIR,
+        is_system_table,
     },
-    devices::{
-        Devices, PeerState,
-        listeners::{DeviceRegistryListener, ReceiptListener},
+    installations::{
+        Installations, PeerState,
+        listeners::{InstallationRegistryListener, ReceiptListener},
     },
     states::StateHandle,
 };
@@ -46,7 +47,7 @@ pub struct Tables {
     pub(crate) root: PathBuf,
     catalog: Arc<TableHandle>,
     pub(crate) tables: RwLock<HashMap<String, Arc<TableHandle>>>,
-    pub(crate) devices: Arc<Devices>,
+    pub(crate) installations: Arc<Installations>,
 }
 
 impl Tables {
@@ -60,8 +61,11 @@ impl Tables {
         let root = root.join(TABLES_DIR);
         fs::create_dir_all(&root)?;
 
-        let devices = Devices::create(
-            Table::create(&root.join(DEVICES_TABLE_NAME), SYSTEM_TABLE_CONFIG.clone())?,
+        let installations = Installations::create(
+            Table::create(
+                &root.join(INSTALLATIONS_TABLE_NAME),
+                SYSTEM_TABLE_CONFIG.clone(),
+            )?,
             peer_state,
             local_installation_id,
             display_name,
@@ -70,23 +74,34 @@ impl Tables {
         let catalog = TableHandle::new(
             TABLE_CATALOG_NAME.to_owned(),
             Table::create(&root.join(TABLE_CATALOG_NAME), SYSTEM_TABLE_CONFIG.clone())?,
-            Arc::downgrade(&devices),
+            Arc::downgrade(&installations),
             true,
         );
         let tables = HashMap::from([
             (TABLE_CATALOG_NAME.to_owned(), catalog.clone()),
-            (DEVICES_TABLE_NAME.to_owned(), devices.registry.clone()),
+            (
+                INSTALLATIONS_TABLE_NAME.to_owned(),
+                installations.registry.clone(),
+            ),
         ]);
         let tables = Arc::new(Self {
             root,
             catalog,
             tables: RwLock::new(tables),
-            devices: devices.clone(),
+            installations: installations.clone(),
         });
         tables.register_listeners();
 
-        tables.write_entry(TABLE_CATALOG_NAME, &SYSTEM_TABLE_CONFIG, devices.mint()?)?;
-        tables.write_entry(DEVICES_TABLE_NAME, &SYSTEM_TABLE_CONFIG, devices.mint()?)?;
+        tables.write_entry(
+            TABLE_CATALOG_NAME,
+            &SYSTEM_TABLE_CONFIG,
+            installations.mint()?,
+        )?;
+        tables.write_entry(
+            INSTALLATIONS_TABLE_NAME,
+            &SYSTEM_TABLE_CONFIG,
+            installations.mint()?,
+        )?;
 
         Ok(tables)
     }
@@ -98,23 +113,23 @@ impl Tables {
         expected_public_key: &PublicKey,
     ) -> Result<Arc<Self>> {
         let tables_dir = root.join(TABLES_DIR);
-        let devices = Devices::open(
+        let installations = Installations::open(
             Table::open(
-                &tables_dir.join(DEVICES_TABLE_NAME),
+                &tables_dir.join(INSTALLATIONS_TABLE_NAME),
                 SYSTEM_TABLE_CONFIG.clone(),
             )?,
             peer_state,
             local_installation_id,
             expected_public_key,
         )?;
-        let devices_weak = Arc::downgrade(&devices);
+        let installations_weak = Arc::downgrade(&installations);
         let catalog = TableHandle::new(
             TABLE_CATALOG_NAME.to_owned(),
             Table::open(
                 &tables_dir.join(TABLE_CATALOG_NAME),
                 SYSTEM_TABLE_CONFIG.clone(),
             )?,
-            devices_weak.clone(),
+            installations_weak.clone(),
             true,
         );
 
@@ -131,7 +146,10 @@ impl Tables {
             .collect();
         let mut tables = HashMap::from([
             (TABLE_CATALOG_NAME.to_owned(), catalog.clone()),
-            (DEVICES_TABLE_NAME.to_owned(), devices.registry.clone()),
+            (
+                INSTALLATIONS_TABLE_NAME.to_owned(),
+                installations.registry.clone(),
+            ),
         ]);
         for (name, config) in catalog_rows {
             if !is_system_table(&name) {
@@ -141,7 +159,7 @@ impl Tables {
                     TableHandle::new(
                         name,
                         Table::open(&path, config)?,
-                        devices_weak.clone(),
+                        installations_weak.clone(),
                         false,
                     ),
                 );
@@ -151,7 +169,7 @@ impl Tables {
             root: tables_dir,
             catalog,
             tables: RwLock::new(tables),
-            devices,
+            installations,
         });
         tables.register_listeners();
         Ok(tables)
@@ -164,26 +182,32 @@ impl Tables {
     ) -> Result<Arc<Self>> {
         let root = root.join(TABLES_DIR);
         fs::create_dir_all(&root)?;
-        let devices = Devices::join(
-            Table::create(&root.join(DEVICES_TABLE_NAME), SYSTEM_TABLE_CONFIG.clone())?,
+        let installations = Installations::join(
+            Table::create(
+                &root.join(INSTALLATIONS_TABLE_NAME),
+                SYSTEM_TABLE_CONFIG.clone(),
+            )?,
             peer_state,
             local_installation_id,
         )?;
         let catalog = TableHandle::new(
             TABLE_CATALOG_NAME.to_owned(),
             Table::create(&root.join(TABLE_CATALOG_NAME), SYSTEM_TABLE_CONFIG.clone())?,
-            Arc::downgrade(&devices),
+            Arc::downgrade(&installations),
             true,
         );
         let tables = HashMap::from([
             (TABLE_CATALOG_NAME.to_owned(), catalog.clone()),
-            (DEVICES_TABLE_NAME.to_owned(), devices.registry.clone()),
+            (
+                INSTALLATIONS_TABLE_NAME.to_owned(),
+                installations.registry.clone(),
+            ),
         ]);
         let tables = Arc::new(Self {
             root,
             catalog,
             tables: RwLock::new(tables),
-            devices,
+            installations,
         });
         tables.register_listeners();
         Ok(tables)
@@ -222,8 +246,8 @@ impl Tables {
         if is_system_table(name) {
             return Err(Error::SystemTableReadOnly(name.to_owned()));
         }
-        self.devices
-            .require_access(&self.devices.local_installation_id(), Role::Admin)?;
+        self.installations
+            .require_access(&self.installations.local_installation_id(), Role::Admin)?;
         let key = PrimaryKey::String(name.to_owned());
         let current = {
             let catalog = self.catalog.read();
@@ -236,7 +260,7 @@ impl Tables {
         if current.as_ref() == Some(&config) {
             return Ok(false);
         }
-        let stamp = self.devices.mint()?;
+        let stamp = self.installations.mint()?;
         self.write_entry(name, &config, stamp)?;
         Ok(true)
     }
@@ -257,8 +281,8 @@ impl Tables {
         if is_system_table(name) {
             return Err(Error::ResourceBusy(name.to_owned()));
         }
-        self.devices
-            .require_access(&self.devices.local_installation_id(), Role::Admin)?;
+        self.installations
+            .require_access(&self.installations.local_installation_id(), Role::Admin)?;
         if let Some(entry) = self.tables.read().get(name) {
             if Arc::strong_count(entry) > 1 {
                 return Err(Error::ResourceBusy(name.to_owned()));
@@ -266,7 +290,7 @@ impl Tables {
         } else {
             return Ok(false);
         }
-        let stamp = self.devices.mint()?;
+        let stamp = self.installations.mint()?;
         self.catalog.insert_internal(Event {
             primary_key: PrimaryKey::String(name.to_owned()),
             path: CrdtPath::new(),
@@ -290,19 +314,18 @@ impl Tables {
     }
 
     fn register_listeners(self: &Arc<Self>) {
-        let receipt_listener = ReceiptListener::build(Arc::downgrade(&self.devices));
+        let receipt_listener = ReceiptListener::build(Arc::downgrade(&self.installations));
         for table in self.tables.read().values() {
-            table.listeners.write().0.push(receipt_listener.clone());
+            table.add_internal_listener(receipt_listener.clone());
         }
-        self.devices
+        self.installations
             .registry
-            .listeners
-            .write()
-            .0
-            .push(DeviceRegistryListener::build(Arc::downgrade(&self.devices)));
+            .add_internal_listener(InstallationRegistryListener::build(Arc::downgrade(
+                &self.installations,
+            )));
         let catalog_listener =
             listeners::CatalogListener::build(Arc::downgrade(self), receipt_listener);
-        self.catalog.listeners.write().0.push(catalog_listener);
+        self.catalog.add_internal_listener(catalog_listener);
     }
 }
 

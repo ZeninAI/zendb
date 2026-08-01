@@ -31,6 +31,7 @@ register_types! {
 
 pub use crdt::*;
 pub use replication::{
-    CompactEvent, Envelope, IdFromPrimaryKeyError, InstallationId, InstallationIdParseError,
-    Multiaddr, MultiaddrError, PeerIdentity, PublicKey, Role, WorkspaceId, WorkspaceIdParseError,
+    CompactEvent, Envelope, IdFromPrimaryKeyError, Installation, InstallationId,
+    InstallationIdParseError, Multiaddr, MultiaddrError, PeerIdentity, PublicKey, Role,
+    WorkspaceId, WorkspaceIdParseError,
 };

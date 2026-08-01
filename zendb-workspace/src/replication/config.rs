@@ -1,12 +1,14 @@
 //! Public tuning values for workspace-owned replication.
 
-use libp2p::Multiaddr;
+use std::time::Duration;
+
+use zendb_types::Multiaddr;
 
 #[derive(Debug, Clone)]
 pub struct BatchConfig {
     pub max_events: usize,
     pub max_bytes: usize,
-    pub linger_ms: u64,
+    pub linger: Duration,
 }
 
 impl Default for BatchConfig {
@@ -14,7 +16,7 @@ impl Default for BatchConfig {
         Self {
             max_events: 16,
             max_bytes: 65_536,
-            linger_ms: 50,
+            linger: Duration::from_millis(50),
         }
     }
 }
@@ -38,15 +40,15 @@ impl Default for TopologyConfig {
 
 #[derive(Debug, Clone)]
 pub struct DialConfig {
-    pub initial_backoff_ms: u64,
-    pub max_backoff_ms: u64,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
 }
 
 impl Default for DialConfig {
     fn default() -> Self {
         Self {
-            initial_backoff_ms: 1_000,
-            max_backoff_ms: 60_000,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(60),
         }
     }
 }

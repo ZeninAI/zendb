@@ -1,4 +1,4 @@
-//! Device-table listener that controls replication membership and lifecycle.
+//! Installation-table listener that controls replication membership and lifecycle.
 
 use std::sync::{Arc, Weak};
 
@@ -24,6 +24,6 @@ impl ChangeListener for ReplicationStateListener {
         let Some(controller) = self.controller.upgrade() else {
             return;
         };
-        controller.device_changed(change);
+        controller.installation_changed(change);
     }
 }

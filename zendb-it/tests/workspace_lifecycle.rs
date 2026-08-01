@@ -17,7 +17,7 @@ struct Greeting {
 fn workspace_data_survives_reopen_and_lifecycle_deletions() {
     let temp = tempfile::tempdir().expect("failed to create workspace directory");
     let root = temp.path();
-    let identity = Arc::new(TestPeerIdentity::generate("test-device"));
+    let identity = Arc::new(TestPeerIdentity::generate("test-installation"));
 
     let workspace = Workspace::create(root, identity.clone(), WorkspaceConfig::default())
         .expect("failed to create workspace");

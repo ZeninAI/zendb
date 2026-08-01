@@ -1,5 +1,7 @@
 //! Shared identities and workspace configuration for ZenDB integration tests.
 
+use std::time::Duration;
+
 use libp2p_identity::Keypair;
 use zendb_types::PeerIdentity;
 use zendb_workspace::WorkspaceConfig;
@@ -35,17 +37,17 @@ pub fn loopback_workspace_config(port: u16) -> WorkspaceConfig {
             .parse()
             .expect("the loopback test address is valid"),
     ];
-    config.replication.dial.initial_backoff_ms = 100;
-    config.replication.dial.max_backoff_ms = 500;
-    config.replication.batch.linger_ms = 10;
+    config.replication.dial.initial_backoff = Duration::from_millis(100);
+    config.replication.dial.max_backoff = Duration::from_millis(500);
+    config.replication.batch.linger = Duration::from_millis(10);
     config
 }
 
 pub fn offline_workspace_config() -> WorkspaceConfig {
     let mut config = WorkspaceConfig::default();
     config.replication.listen_addresses.clear();
-    config.replication.dial.initial_backoff_ms = 100;
-    config.replication.dial.max_backoff_ms = 500;
-    config.replication.batch.linger_ms = 10;
+    config.replication.dial.initial_backoff = Duration::from_millis(100);
+    config.replication.dial.max_backoff = Duration::from_millis(500);
+    config.replication.batch.linger = Duration::from_millis(10);
     config
 }

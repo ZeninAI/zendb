@@ -13,12 +13,12 @@ pub enum Error {
     TypeMismatch(String),
     CorruptCatalog(String),
     CorruptLocalState(String),
-    CorruptDeviceRegistry(String),
+    CorruptInstallationRegistry(String),
     InvalidEventSequence,
     ClockExhausted,
     WorkspaceClosed,
-    DeviceNotRegistered(InstallationId),
-    LocalDeviceKeyMismatch,
+    InstallationNotRegistered(InstallationId),
+    LocalInstallationKeyMismatch,
     KeyDerivationUnsupported,
     Replication(String),
     ResourceBusy(String),
@@ -48,21 +48,20 @@ impl std::fmt::Display for Error {
             Self::CorruptLocalState(message) => {
                 write!(formatter, "corrupt local state: {message}")
             }
-            Self::CorruptDeviceRegistry(message) => {
-                write!(formatter, "corrupt device registry: {message}")
+            Self::CorruptInstallationRegistry(message) => {
+                write!(formatter, "corrupt installation registry: {message}")
             }
             Self::InvalidEventSequence => formatter.write_str("event sequence zero is reserved"),
-            Self::ClockExhausted => formatter.write_str("device clock exhausted"),
+            Self::ClockExhausted => formatter.write_str("installation clock exhausted"),
             Self::WorkspaceClosed => formatter.write_str("workspace is closed"),
-            Self::DeviceNotRegistered(installation_id) => {
+            Self::InstallationNotRegistered(installation_id) => {
                 write!(
                     formatter,
-                    "local installation {installation_id:?} is not registered as a device"
+                    "local installation {installation_id:?} is not registered"
                 )
             }
-            Self::LocalDeviceKeyMismatch => {
-                formatter.write_str("the supplied identity does not match the local device key")
-            }
+            Self::LocalInstallationKeyMismatch => formatter
+                .write_str("the supplied identity does not match the local installation key"),
             Self::KeyDerivationUnsupported => {
                 formatter.write_str("the supplied keypair does not support secret derivation")
             }

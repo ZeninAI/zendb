@@ -420,7 +420,7 @@ Cut scope in this order if velocity or architecture risk requires it:
 
 1. M1 search
 2. M1 folders/tags beyond a single simple organization model
-3. M3 `EveryDevice` scheduling if eligible-single-peer scheduling is retained
+3. M3 `EveryInstallation` scheduling if eligible-single-peer scheduling is retained
 4. Secondary operator dashboard polish
 5. Three-peer demonstration breadth, while retaining two-peer failure coverage
 
@@ -566,7 +566,7 @@ operators.
 **Acceptance criteria**
 
 - The record documents crate boundaries, CRDT/Event semantics, Table/Topic/
-  State behavior, workspace identity, devices, roles, receipts, durability,
+  State behavior, workspace identity, installations, roles, receipts, durability,
   and current failure semantics.
 - Conflicts between historical plan iterations are resolved in favor of the
   latest accepted decision.
@@ -716,7 +716,7 @@ silent runtime/catalog divergence that can put note data at risk.
 
 **Description**
 
-Internal receipt, table-catalog, and device-registry listeners currently
+Internal receipt, table-catalog, and installation-registry listeners currently
 discard errors after an Event is accepted. Define and implement a recovery
 path so durable catalog changes cannot silently leave runtime state stale.
 Application listeners may remain fire-and-forget.
@@ -724,7 +724,7 @@ Application listeners may remain fire-and-forget.
 **Acceptance criteria**
 
 - Receipt observation, config decoding, physical table open/create/delete, and
-  device record decoding failures are no longer silently ignored.
+  installation record decoding failures are no longer silently ignored.
 - A failure is observable through a workspace operation or durability barrier.
 - Runtime state can reconcile from the durable Table without deleting user
   data.
@@ -773,7 +773,7 @@ Align code and documentation with one precise guarantee.
 **Acceptance criteria**
 
 - `flush`, `sync`, and Drop behavior are defined separately.
-- Workspace, Devices, Tables, States, Table, Topic, and each durable backend
+- Workspace, Installations, Tables, States, Table, Topic, and each durable backend
   have an explicit ordering and ownership description.
 - Drop-time best-effort failures are distinguishable from explicit sync errors.
 - Restart recovery cannot reuse a local event sequence or omit acknowledged
@@ -1111,7 +1111,7 @@ and application-visible synchronization states.
 - It defines initial snapshot plus incremental synchronization and the
   snapshot-to-Topic watermark.
 - It defines missing-range exchange using receipt windows and event lookup.
-- It defines how device enrollment establishes both `_devices` and `_peers`
+- It defines how installation enrollment establishes both `_installations` and `_peers`
   state without self-promotion.
 - It states that local States are not replicated.
 - It defines behavior for offline edits, reconnect, partial transfer,
@@ -1159,7 +1159,7 @@ application events arrive in different orders.
 
 **Acceptance criteria**
 
-- Passive observers, unauthorized peers, replay, event forgery, stale devices,
+- Passive observers, unauthorized peers, replay, event forgery, stale installations,
   and partition/reconnect are covered.
 - The required transport encryption and peer authentication are explicit.
 - Arrival-time role lookup is either rejected or justified with deterministic
@@ -1231,7 +1231,7 @@ listener dispatch.
 - Claimed actor identity alone is never treated as authentication.
 - Duplicate EventIds are rejected without reapplying side effects.
 - Authorization uses the deterministic rule accepted by the ZDR.
-- System catalog and device events have additional invariant checks.
+- System catalog and installation events have additional invariant checks.
 - Admitted events converge on the same internal insertion/listener path as
   local events.
 - Rejected events produce a protocol reason without leaking secrets.
@@ -1275,7 +1275,7 @@ switch to incremental events at a defined watermark.
 
 **Acceptance criteria**
 
-- System catalogs and device metadata are installed in the required order.
+- System catalogs and installation metadata are installed in the required order.
 - Application Table state and the corresponding incremental watermark are
   consistent.
 - Local States are excluded.
@@ -1372,7 +1372,7 @@ address fallback for environments where discovery is unavailable.
 - Manual address entry has validation and clear failure feedback.
 - Discovery can be disabled.
 
-#### M2-NET-03: Implement Admin-Approved Device Enrollment And Join
+#### M2-NET-03: Implement Admin-Approved Installation Enrollment And Join
 
 - Type: Story
 - Priority: Highest
@@ -1391,10 +1391,10 @@ Admin.
 
 - A join request proves possession of the joining PeerIdentity.
 - An Admin explicitly approves and assigns display metadata and role.
-- WorkspaceId, `_devices`, and the joining peer's clock/receipt state are
+- WorkspaceId, `_installations`, and the joining peer's clock/receipt state are
   established consistently.
 - Rejected or expired enrollment leaves no openable partial workspace.
-- Rejoining an already enrolled device has defined behavior.
+- Rejoining an already enrolled installation has defined behavior.
 
 #### M2-NET-04: Implement Replication Session Coordination
 
@@ -1419,7 +1419,7 @@ same peer.
 - Session state distinguishes discovery, connecting, enrolling, snapshot,
   catching up, current, offline, and error.
 
-### Epic M2-E4: Device And Synchronization UX
+### Epic M2-E4: Installation And Synchronization UX
 
 - Type: Epic
 - Priority: High
@@ -1428,7 +1428,7 @@ same peer.
 
 **Epic outcome**
 
-Users can understand and control device trust, enrollment, roles, offline
+Users can understand and control installation trust, enrollment, roles, offline
 state, initial synchronization, recovery, and peer removal without needing
 protocol knowledge.
 
@@ -1440,7 +1440,7 @@ protocol knowledge.
 - Errors expose only valid recovery actions.
 - The product never implies WAN or cloud backup behavior.
 
-#### M2-UX-01: Design Device, Enrollment, And Sync Status Flows
+#### M2-UX-01: Design Installation, Enrollment, And Sync Status Flows
 
 - Type: Task
 - Priority: High
@@ -1453,7 +1453,7 @@ protocol knowledge.
 
 Design the desktop flows for discovering a peer, approving enrollment,
 selecting a role, observing synchronization, recovering from errors, and
-removing a device.
+removing a installation.
 
 **Acceptance criteria**
 
@@ -1463,7 +1463,7 @@ removing a device.
 - Rejected, disconnected, incompatible, and unauthorized states are covered.
 - The UI never implies cloud backup or WAN availability.
 
-#### M2-APP-01: Implement Device Management And Enrollment UI
+#### M2-APP-01: Implement Installation Management And Enrollment UI
 
 - Type: Story
 - Priority: High
@@ -1475,14 +1475,14 @@ removing a device.
 **Description**
 
 As an Admin, I can discover or address a peer, review its identity, approve it
-with a role, and see it in the workspace device list.
+with a role, and see it in the workspace installation list.
 
 **Acceptance criteria**
 
-- Pending and enrolled devices are visually distinct.
+- Pending and enrolled installations are visually distinct.
 - Role assignment follows ZenDB's Reader/Contributor/Operator/Admin hierarchy.
 - Non-Admins cannot approve enrollment.
-- Removing or changing a device role requires confirmation.
+- Removing or changing a installation role requires confirmation.
 
 #### M2-APP-02: Implement Synchronization Status And Recovery UI
 
@@ -1657,7 +1657,7 @@ and run observability.
 - One dynamic language is selected for the MVP using explicit criteria.
 - Operator definition, revision, activation, trigger, placement, capability,
   and run-status models are specified.
-- The MVP supports only `EveryDevice` and one documented eligible-peer/
+- The MVP supports only `EveryInstallation` and one documented eligible-peer/
   singleton mode.
 - Partition behavior, duplicate execution, idempotency, and lease/fencing
   limits are explicit; exactly-once is not claimed.
@@ -1845,7 +1845,7 @@ bounded local run history for diagnosis.
 **Epic outcome**
 
 Operators are placed only on enrolled, authorized, capable peers using the
-MVP's accepted every-device and eligible-single-peer semantics, with visible
+MVP's accepted every-installation and eligible-single-peer semantics, with visible
 partition and state limitations.
 
 **Epic acceptance**
@@ -1854,7 +1854,7 @@ partition and state limitations.
 - Eligible-single-peer placement handles normal failover without skipped input.
 - Duplicate work follows the documented deduplication contract.
 - Stateful placement cannot silently discard local State.
-- `EveryDevice` is delivered only if critical single-peer scheduling and
+- `EveryInstallation` is delivered only if critical single-peer scheduling and
   safety work remain on track.
 
 #### M3-SCH-01: Advertise Peer Capabilities
@@ -1869,7 +1869,7 @@ partition and state limitations.
 **Description**
 
 Allow peers to advertise the small, versioned capability set needed for MVP
-operator placement without turning device metadata into an unrestricted
+operator placement without turning installation metadata into an unrestricted
 machine inventory.
 
 **Acceptance criteria**
@@ -1879,7 +1879,7 @@ machine inventory.
 - Stale/offline capability information has a defined expiry or status.
 - Capability advertisement does not expose local files or secrets.
 
-#### M3-SCH-02: Schedule Every-Device Operators
+#### M3-SCH-02: Schedule Every-Installation Operators
 
 - Type: Story
 - Priority: High
@@ -1890,7 +1890,7 @@ machine inventory.
 
 **Description**
 
-Run an active `EveryDevice` operator independently on every enrolled,
+Run an active `EveryInstallation` operator independently on every enrolled,
 authorized peer that satisfies its capabilities.
 
 **Acceptance criteria**
@@ -2058,7 +2058,7 @@ capabilities, approves activation, and monitors or pauses executions.
 
 **Acceptance criteria**
 
-- The UI communicates that generated code will run on selected devices.
+- The UI communicates that generated code will run on selected installations.
 - Code, trigger, placement, state, and capabilities are reviewable before
   activation.
 - Validation errors, generation errors, runtime failures, and unavailable
@@ -2261,7 +2261,7 @@ active Sprint until promoted by an accepted ZDR.
 | Add strong singleton coordination | Decision | Medium | Evaluate consensus, authority, fencing, and partition trade-offs |
 | Add cron and calendar schedules | Epic | Medium | Trigger operators independently of Table Events |
 | Add event-time windows and watermarks | Epic | Low | Introduce bounded stream-processing semantics after basic Topics are proven |
-| Add backpressure and resource admission | Epic | Medium | Protect devices when operator input exceeds execution capacity |
+| Add backpressure and resource admission | Epic | Medium | Protect installations when operator input exceeds execution capacity |
 | Add operator DAGs and composed workflows | Epic | Low | Connect typed outputs and inputs after single operators are stable |
 | Add WASM or a second dynamic runtime | Decision | Low | Avoid multiple runtimes until one host API and sandbox have matured |
 | Add operator package signing and marketplace | Epic | Low | Distribute trusted, versioned operator packages with provenance |

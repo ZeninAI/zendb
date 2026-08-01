@@ -3,7 +3,7 @@
 use libp2p_identity::PeerId;
 use zendb_types::{Envelope, Event, EventId, EventStamp, Role};
 
-use crate::{Error, consts::is_system_table, devices::Devices, tables::Tables};
+use crate::{Error, consts::is_system_table, installations::Installations, tables::Tables};
 
 #[derive(Debug)]
 pub enum AdmitError {
@@ -41,20 +41,24 @@ impl std::error::Error for AdmitError {
 
 pub(crate) fn admit_event(
     tables: &Tables,
-    devices: &Devices,
+    installations: &Installations,
     envelope: Envelope,
     gossipsub_source: PeerId,
 ) -> Result<(), AdmitError> {
-    let record = devices
+    let installation = installations
         .get(&envelope.author)
         .ok_or(AdmitError::UnknownPeer)?;
-    if record.public_key.as_libp2p().to_peer_id() != gossipsub_source {
+    if installation.public_key.as_libp2p().to_peer_id() != gossipsub_source {
         return Err(AdmitError::AuthorMismatch);
     }
-    if devices.list().into_iter().any(|(installation_id, record)| {
-        installation_id != envelope.author
-            && record.public_key.as_libp2p().to_peer_id() == gossipsub_source
-    }) {
+    if installations
+        .list()
+        .into_iter()
+        .any(|(installation_id, installation)| {
+            installation_id != envelope.author
+                && installation.public_key.as_libp2p().to_peer_id() == gossipsub_source
+        })
+    {
         return Err(AdmitError::AmbiguousPeer);
     }
 
@@ -63,7 +67,10 @@ pub(crate) fn admit_event(
     } else {
         Role::Contributor
     };
-    if !record.role.is_some_and(|role| role.has_at_least(required)) {
+    if !installation
+        .role
+        .is_some_and(|role| role.has_at_least(required))
+    {
         return Err(AdmitError::Unauthorized);
     }
 

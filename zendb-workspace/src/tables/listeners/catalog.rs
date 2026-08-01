@@ -74,13 +74,13 @@ impl ChangeListener for CatalogListener {
                         Err(_) => return,
                     }
                 };
-                let handle =
-                    TableHandle::new(name.clone(), table, Arc::downgrade(&tables.devices), false);
-                handle
-                    .listeners
-                    .write()
-                    .0
-                    .push(self.receipt_listener.clone());
+                let handle = TableHandle::new(
+                    name.clone(),
+                    table,
+                    Arc::downgrade(&tables.installations),
+                    false,
+                );
+                handle.add_internal_listener(self.receipt_listener.clone());
                 tables.tables.write().insert(name.clone(), handle);
             }
             Op::Delete => {

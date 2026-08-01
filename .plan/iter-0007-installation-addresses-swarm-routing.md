@@ -1,29 +1,29 @@
-# Iteration 0007: Device Addresses And Swarm Routing
+# Iteration 0007: Installation Addresses And Swarm Routing
 
 Status: implemented.
 
-Iteration 0006 made `_devices` the source of truth for workspace membership and
+Iteration 0006 made `_installations` the source of truth for workspace membership and
 made `ReplicationStateListener` project membership changes into the private
-libp2p runtime. The runtime still has no durable route from an enrolled device
+libp2p runtime. The runtime still has no durable route from an enrolled installation
 to a network endpoint. It dials staged bootstrap strings and mDNS discoveries,
-but it does not dial the devices already present in the registry.
+but it does not dial the installations already present in the registry.
 
-This iteration adds Admin-managed device addresses, projects the complete
-device registry into the Swarm, and adds retry behavior for temporarily
-unreachable devices. Addresses remain routing hints. The device public key is
+This iteration adds Admin-managed installation addresses, projects the complete
+installation registry into the Swarm, and adds retry behavior for temporarily
+unreachable installations. Addresses remain routing hints. The installation public key is
 the identity, the derived `PeerId` is the Swarm key, and Noise authenticates the
 peer reached at an address.
 
 This iteration does not implement initial joiner synchronization, relays, NAT
-traversal, automatic external-address discovery, or device-authored presence.
+traversal, automatic external-address discovery, or installation-authored presence.
 
 ---
 
 ## 1. Problems
 
-### 1.1 Enrolled Devices Have No Durable Route
+### 1.1 Enrolled Installations Have No Durable Route
 
-`DeviceRecord` currently stores the display name, role, and workspace public
+`Installation` currently stores the display name, role, and workspace public
 key. On workspace open, `ReplicationController` knows which installations are
 remote, but the worker has no address at which to dial them. Replication works
 only when mDNS happens to find the peer or an unrelated bootstrap hint is
@@ -33,13 +33,13 @@ available.
 
 The runtime's membership state is currently split between a set of remote
 installation IDs and a live-only blacklist. After a worker restart, a removed
-device is simply unknown rather than explicitly revoked. mDNS can also cause
+installation is simply unknown rather than explicitly revoked. mDNS can also cause
 the worker to dial peers that are not enrolled in the workspace.
 
 The worker needs a complete projection of the current registry:
 
 ```text
-InstallationId -> DeviceRecord.public_key -> PeerId -> candidate addresses
+InstallationId -> Installation.public_key -> PeerId -> candidate addresses
 ```
 
 Only the first two values are persisted. `PeerId` and the merged runtime
@@ -54,7 +54,7 @@ because libp2p found them.
 
 ### 1.4 A Single Dial Attempt Is Insufficient
 
-Devices are routinely offline when a workspace opens. An initial failed dial
+Installations are routinely offline when a workspace opens. An initial failed dial
 must not fail `Workspace::open`, and it cannot be the final attempt. The worker
 needs bounded reconnect scheduling that is reset by a successful connection or
 new address information.
@@ -63,17 +63,17 @@ new address information.
 
 ## 2. Design Principles
 
-1. `_devices` remains the authoritative membership catalog.
-2. A public key identifies a device; an address never does.
+1. `_installations` remains the authoritative membership catalog.
+2. A public key identifies an installation; an address never does.
 3. Registry addresses are durable Admin-authorized routing hints.
 4. mDNS and Identify addresses remain transient.
-5. An empty address list is valid. Such a device may connect inbound or be
+5. An empty address list is valid. Such an installation may connect inbound or be
    discovered later.
 6. Registry changes are projected into the running worker through commands;
    the worker never reads workspace tables directly.
 7. Dial failures are runtime state, not workspace errors or replicated data.
 8. Initial joining remains a separate pre-trust flow. Its bootstrap hints are
-   not enrolled device routes.
+   not enrolled installation routes.
 
 ---
 
@@ -81,7 +81,7 @@ new address information.
 
 ### 3.1 ZenDB Multiaddr Wraps The External Multiaddr
 
-ZenDB's `Multiaddr` is part of the persisted device-record data model and
+ZenDB's `Multiaddr` is part of the persisted installation data model and
 therefore lives in `zendb-types`. That crate depends on the standalone
 `multiaddr` value crate, not the libp2p transport or Swarm runtime.
 
@@ -107,11 +107,11 @@ canonical binary multiaddr returned by `Multiaddr::to_vec`; decoding uses
 `Multiaddr::try_from(Vec<u8>)`. Text is only an application-facing form and is
 not the on-disk representation.
 
-ZenDB's `Multiaddr` represents a route to the device, not the device identity. Its
+ZenDB's `Multiaddr` represents a route to the installation, not the installation identity. Its
 terminal protocol must not be `/p2p/<peer-id>`. The destination `PeerId` is
-derived from `DeviceRecord.public_key` and supplied separately to `DialOpts`.
+derived from `Installation.public_key` and supplied separately to `DialOpts`.
 Intermediate peer components remain possible for future relay routes ending in
-`/p2p-circuit`, without duplicating the destination identity in the record.
+`/p2p-circuit`, without duplicating the destination identity in the installation.
 
 Examples:
 
@@ -121,11 +121,11 @@ Examples:
 /dns4/laptop.example.net/tcp/7400
 ```
 
-### 3.2 DeviceRecord Gains Addresses
+### 3.2 Installation Gains Addresses
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub struct DeviceRecord {
+pub struct Installation {
     pub display_name: String,
     pub role: Option<Role>,
     pub public_key: PublicKey,
@@ -138,20 +138,24 @@ addresses when building a dial attempt. The list is not capped in this
 iteration; workspace Admins are already trusted to control registry data.
 
 This is an intentional breaking bincode change. ZenDB has no migration
-requirement, so old device records do not need compatibility handling.
+requirement, so old installations do not need compatibility handling.
 
 ### 3.3 Addresses Are Admin-Owned
 
-`DeviceRecord` is still an opaque blob containing role, public key, display
+`Installation` is still an opaque blob containing role, public key, display
 name, and addresses. Only an Admin may replace it. A Contributor or Reader may
 not update just its own address list because the current event shape cannot
 prove that the privileged fields were left unchanged under concurrent writes.
 
+The bincode installation type lives in `zendb-types` beside `PublicKey`, `Multiaddr`,
+and the replication IDs. `zendb-workspace` re-exports it for API ergonomics and
+owns all registry authorization and mutation policy.
+
 For this iteration, applications provision stable addresses out of band and an
-Admin writes them through `Devices::upsert`. If later work needs devices to
+Admin writes them through `Installations::upsert`. If later work needs installations to
 publish frequently changing endpoints themselves, it should add a separate
-leased `_device_presence` table keyed by `InstallationId`. That table can have
-self-author authorization and expiry semantics without weakening `_devices`.
+leased `_installation_presence` table keyed by `InstallationId`. That table can have
+self-author authorization and expiry semantics without weakening `_installations`.
 
 ---
 
@@ -185,7 +189,7 @@ impl Default for ReplicationConfig {
 one hard-coded address. An empty vector creates an outbound-only worker.
 
 ZenDB does not automatically copy `SwarmEvent::NewListenAddr` into the local
-`DeviceRecord`. Wildcard addresses, ephemeral ports, and private interface
+`Installation`. Wildcard addresses, ephemeral ports, and private interface
 addresses are often not remotely dialable, and a non-Admin installation cannot
 rewrite its registry row. The application or Admin chooses the advertised
 addresses deliberately.
@@ -194,7 +198,7 @@ A typical stable setup is:
 
 ```text
 listen address:     /ip4/0.0.0.0/tcp/7400       (runtime config)
-advertised address: /dns4/laptop.example/tcp/7400 (DeviceRecord)
+advertised address: /dns4/laptop.example/tcp/7400 (Installation)
 ```
 
 ---
@@ -203,8 +207,8 @@ advertised address: /dns4/laptop.example/tcp/7400 (DeviceRecord)
 
 ### 5.1 Controller State
 
-`ReplicationController.remote_devices` becomes a map containing the current
-route projection rather than a set containing only installation IDs:
+The controller stores one named registry projection containing enrollment state
+and the current remote route map:
 
 ```rust
 struct PeerRoute {
@@ -212,16 +216,19 @@ struct PeerRoute {
     addresses: Vec<Multiaddr>,
 }
 
-remote_devices: Mutex<BTreeMap<InstallationId, PeerRoute>>,
+struct RegistryProjection {
+    local_is_enrolled: bool,
+    remotes: BTreeMap<InstallationId, PeerRoute>,
+}
 ```
 
-`PeerRoute` is private and derived from `DeviceRecord`. It is never persisted.
-The map still determines whether at least one remote device exists and thus
+`PeerRoute` is private and derived from `Installation`. It is never persisted.
+The map still determines whether at least one remote installation exists and thus
 whether replication should run.
 
 When the controller starts a worker, it passes a complete snapshot of all
 remote routes. This removes the startup race in which the worker exists before
-it has learned about already-enrolled devices.
+it has learned about already-enrolled installations.
 
 ### 5.2 Worker Commands
 
@@ -247,16 +254,16 @@ enum Command {
 The installation ID is included for deterministic replacement and diagnostics;
 Swarm operations use the derived `PeerId`.
 
-### 5.3 Device Change Semantics
+### 5.3 Installation Change Semantics
 
-`ReplicationStateListener` reacts after `DeviceRegistryListener` has updated
+`ReplicationStateListener` reacts after `InstallationRegistryListener` has updated
 the cache. The controller rebuilds the desired route projection from the whole
 cache and diffs it against its previous projection. Full reconciliation makes
 duplicate-key quarantine and concurrent row changes deterministic:
 
 | Registry transition | Runtime action |
 |---|---|
-| New remote record | add route, unblacklist PeerId, dial immediately |
+| New remote installation | add route, unblacklist PeerId, dial immediately |
 | Same key, addresses changed | replace catalog routes, reset retry, dial if disconnected |
 | Public key changed | remove, blacklist, and disconnect old PeerId; add and dial new PeerId |
 | Remote row deleted | remove route, blacklist, and disconnect PeerId |
@@ -264,7 +271,7 @@ duplicate-key quarantine and concurrent row changes deterministic:
 
 Changing addresses does not disconnect an already authenticated connection.
 The new list is used on the next reconnect. Removing a route stops future dial
-attempts but does not by itself revoke the device; deleting the row or changing
+attempts but does not by itself revoke the installation; deleting the row or changing
 its key performs revocation.
 
 The first-remote and final-remote listener ordering from iteration 0006 remains
@@ -277,11 +284,11 @@ stops.
 
 Workspace identity derivation includes `InstallationId` and therefore creates
 a one-to-one mapping between an installation and its workspace public key.
-`Devices::upsert` trusts the Admin-provided derived key and does not perform a
+`Installations::upsert` trusts the Admin-provided derived key and does not perform a
 redundant registry scan during enrollment.
 
 The admission path still treats a Gossipsub source as valid only when its
-`PeerId` resolves to exactly one current device record and that record is
+`PeerId` resolves to exactly one current installation and that installation is
 `Envelope.author`. This handles conflicting replicated raw state that bypassed
 the typed enrollment API: the worker neither dials nor accepts Gossipsub
 messages from the ambiguous PeerId until an Admin corrects the registry.
@@ -327,12 +334,12 @@ the current enrolled-peer map. Discovery of an unknown or ambiguous PeerId is
 ignored. An unknown established connection is disconnected and its peer is not
 admitted into Gossipsub.
 
-An enrolled device with no catalog addresses is still allowed to connect
+An enrolled installation with no catalog addresses is still allowed to connect
 inbound and can still acquire an mDNS route. Address absence therefore does not
 change authorization or runtime lifecycle.
 
-Gossipsub's explicit-peer list is not used as the device registry. Enrolled
-devices are dial targets and ordinary scored Gossipsub peers; the mesh retains
+Gossipsub's explicit-peer list is not used as the installation registry. Enrolled
+installations are dial targets and ordinary scored Gossipsub peers; the mesh retains
 control over grafting and pruning. This preserves the topology and latency
 scoring established in iteration 0006.
 
@@ -365,21 +372,21 @@ swarm.dial(options)?;
 
 The transport address selects an endpoint. The expected PeerId plus Noise
 authentication proves which peer answered. A stale or malicious address may
-cause a failed dial but cannot impersonate the enrolled device.
+cause a failed dial but cannot impersonate the enrolled installation.
 
 ### 7.2 Retry State
 
 ```rust
 pub struct DialConfig {
-    pub initial_backoff_ms: u64,
-    pub max_backoff_ms: u64,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
 }
 
 impl Default for DialConfig {
     fn default() -> Self {
         Self {
-            initial_backoff_ms: 1_000,
-            max_backoff_ms: 60_000,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(60),
         }
     }
 }
@@ -387,16 +394,16 @@ impl Default for DialConfig {
 
 The worker attempts each enrolled peer with at least one candidate address
 immediately on startup. An outgoing connection error schedules the next attempt
-with exponential backoff capped by `max_backoff_ms`. A successful connection
+with exponential backoff capped by `max_backoff`. A successful connection
 resets the backoff. When the last connection to a peer closes, reconnect is
 scheduled. A catalog or discovery address addition resets the backoff and
 permits an immediate attempt.
 
 No retry state is persisted. Restarting the workspace starts with an immediate
 dial, which is the desired recovery behavior. No random jitter is introduced in
-this iteration; workspace device sets are expected to be small.
+this iteration; workspace installation sets are expected to be small.
 
-Initial dial failures do not fail workspace open or device enrollment. Errors
+Initial dial failures do not fail workspace open or installation enrollment. Errors
 constructing the Swarm or applying an invalid listen configuration remain
 worker startup errors.
 
@@ -407,9 +414,9 @@ worker startup errors.
 Direct enrollment now includes stable address hints:
 
 ```rust
-workspace.devices().upsert(
+workspace.installations().upsert(
     installation_id,
-    DeviceRecord {
+    Installation {
         display_name: "new-laptop".to_owned(),
         role: Some(Role::Contributor),
         public_key,
@@ -419,12 +426,12 @@ workspace.devices().upsert(
 ```
 
 The list may be empty when the peer is LAN-only, inbound-only, or not yet
-provisioned. An Admin can replace the record later to add or remove routes.
+provisioned. An Admin can replace the installation later to add or remove routes.
 
 `JoinHints.bootstrap_peers` remains separate. A staged joiner has no trusted
-copy of `_devices`, so a bootstrap hint is pre-trust information used only by
-the future initial synchronization protocol. Once the device registry is
-synchronized, normal replication uses `DeviceRecord.addresses` and the
+copy of `_installations`, so a bootstrap hint is pre-trust information used only by
+the future initial synchronization protocol. Once the installation registry is
+synchronized, normal replication uses `Installation.addresses` and the
 public-key-derived PeerIds. The active replication worker must not treat raw
 join hints as enrolled peers.
 
@@ -436,7 +443,7 @@ join hints as enrolled peers.
 
 1. Add `Multiaddr` under `zendb-types` with Multiaddr byte encoding,
    parsing, display, and conversion accessors.
-2. Add `addresses: Vec<Multiaddr>` to `DeviceRecord` and update every record
+2. Add `addresses: Vec<Multiaddr>` to `Installation` and update every construction
    construction site.
 3. Re-export `Multiaddr` from `zendb-types` and, for API convenience,
    `zendb-workspace`; document that destination PeerIds are not embedded in
@@ -472,17 +479,17 @@ join hints as enrolled peers.
 
 ## 10. Completion Criteria
 
-- `DeviceRecord` stores zero or more bincode-capable `Multiaddr` values.
-- Device addresses are transport routes and do not duplicate the destination
+- `Installation` stores zero or more bincode-capable `Multiaddr` values.
+- Installation addresses are transport routes and do not duplicate the destination
   PeerId.
 - `ReplicationConfig` controls listen addresses and reconnect backoff.
 - Starting replication receives a complete snapshot of enrolled remote routes.
-- Adding a remote record with addresses causes an immediate authenticated dial.
+- Adding a remote installation with addresses causes an immediate authenticated dial.
 - Updating addresses replaces future dial candidates without disconnecting a
   valid existing connection.
 - Replacing a public key revokes the old PeerId before dialing the new PeerId.
-- Removing a device cancels retries, blacklists the PeerId, and disconnects it.
-- Empty-address devices remain enrolled and may connect inbound or through
+- Removing an installation cancels retries, blacklists the PeerId, and disconnects it.
+- Empty-address installations remain enrolled and may connect inbound or through
   trusted discovery.
 - mDNS and Identify addresses are accepted only for enrolled, unambiguous
   PeerIds and are never persisted automatically.
@@ -502,7 +509,7 @@ join hints as enrolled peers.
 This iteration does not implement:
 
 - initial joiner synchronization or a bootstrap authentication protocol;
-- device-authored or leased presence records;
+- installation-authored or leased presence records;
 - automatic persistence of observed, mDNS, Identify, or listen addresses;
 - NAT address discovery, AutoNAT, UPnP, hole punching, relay, or rendezvous;
 - address health scores or long-term address success statistics;
@@ -510,9 +517,9 @@ This iteration does not implement:
 - a public connection-status API;
 - delivery acknowledgements or anti-entropy.
 
-The likely future dynamic-address design is a separate `_device_presence`
+The likely future dynamic-address design is a separate `_installation_presence`
 system table. Its rows can be self-authored, short-lived, and merged with the
-Admin-owned stable addresses from `_devices`. It must not turn transient network
+Admin-owned stable addresses from `_installations`. It must not turn transient network
 observation into workspace membership.
 
 ---
@@ -520,14 +527,19 @@ observation into workspace membership.
 ## 12. Dependency Direction
 
 ```text
-zendb-types              (replication IDs, peer values, envelope, persisted Multiaddr)
+zendb-types              (replication IDs, Installation, peer values, envelope,
+                           persisted Multiaddr)
   ^
 zendb-storage            (durable Table and Change)
   ^
 zendb-workspace
-  devices                (DeviceRecord and device policy)
-  replication controller (registry-to-route projection)
-  replication worker     (Multiaddr address book, dial/retry, Swarm)
+  installations                (installation registry and policy)
+  replication controller (lifecycle state machine and registry projection)
+  replication batcher    (per-table envelope accumulation)
+  replication peer_book  (Multiaddr routes and dial/retry state)
+  replication swarm      (libp2p construction)
+  replication worker     (async orchestration)
+  replication runtime    (current-thread Tokio and thread ownership)
 ```
 
 The standalone `multiaddr::Multiaddr` value is a `zendb-types` concern because

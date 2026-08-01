@@ -32,7 +32,7 @@ register_types! {
 
 pub use crdt::*;
 pub use identity::{
-    InstallationId, InstallationIdParseError, PeerIdentity, PublicKey, Role, WorkspaceId,
-    WorkspaceIdParseError,
+    IdFromPrimaryKeyError, InstallationId, InstallationIdParseError, PeerIdentity, PublicKey, Role,
+    WorkspaceId, WorkspaceIdParseError,
 };
 pub use replication::{CompactEvent, Envelope};

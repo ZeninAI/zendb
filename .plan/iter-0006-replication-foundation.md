@@ -70,9 +70,20 @@ opaque_id!(WorkspaceId, WorkspaceIdParseError, 8);
 
 The macro takes the type name, its parse-error type, and its byte size. It
 generates the opaque tuple type, `generate`, byte accessors, bincode traits,
-and Crockford Base32 `Display` and `FromStr` implementations. Its codec works
-on byte arrays rather than a fixed integer primitive. Increasing the workspace
-ID to sixteen bytes is therefore a one-line macro invocation change.
+Crockford Base32 `Display` and `FromStr`, and the standard primary-key
+conversions:
+
+```rust
+impl From<InstallationId> for PrimaryKey { /* PrimaryKey::Blob */ }
+impl TryFrom<&PrimaryKey> for InstallationId { /* checked Blob length */ }
+```
+
+The fallible direction uses the shared `IdFromPrimaryKeyError`, distinguishing
+a non-Blob key from a Blob with the wrong byte length. The implementation is
+generated for every opaque ID and uses the macro's byte-size parameter. Its
+codec and key conversion work on byte arrays rather than a fixed integer
+primitive. Increasing the workspace ID to sixteen bytes is therefore a
+one-line macro invocation change.
 
 The current eight-byte IDs display as thirteen Crockford Base32 characters.
 Changing the byte count changes the display length automatically.
@@ -202,8 +213,15 @@ fn peer_id(record: &DeviceRecord) -> libp2p_identity::PeerId {
 }
 ```
 
-`PrimaryKey::PeerId` is removed. `_devices` keys are
-`PrimaryKey::Blob(installation_id.to_bytes().to_vec())`.
+`PrimaryKey::PeerId` is removed. `_devices` keys use the generated conversion:
+
+```rust
+let key: PrimaryKey = installation_id.into();
+let installation_id = InstallationId::try_from(&key)?;
+```
+
+There are no workspace-local `device_primary_key` or
+`installation_id_from_key` conversion helpers.
 
 ### 2.7 Data Model Changes
 
@@ -331,11 +349,12 @@ ordinary full `Event` values. There is no envelope signature. Gossipsub signs
 the complete encoded payload and verifies it before delivering a message to the
 application.
 
-`zendb_workspace::replication` owns the publisher, listener, Gossipsub swarm,
-and worker. Its `ReplicationListener` observes successful local table changes
-and submits only events authored by the local installation. It must not
-republish admitted remote events. The worker's internal publisher logic groups
-pending events per table and publishes completed batches through Gossipsub.
+`zendb_workspace::replication` owns the publisher, permanent replication
+listeners, Gossipsub swarm, and worker. Each table's `ReplicationListener`
+observes successful changes and submits only events authored by the local
+installation while the worker is running. It must not republish admitted remote
+events. The worker's internal publisher logic groups pending events per table
+and publishes completed batches through Gossipsub.
 
 The outbound channel remains bounded and uses blocking send. A saturated network
 therefore applies honest backpressure to the synchronous writer instead of
@@ -416,8 +435,8 @@ owns Tokio, libp2p, and Gossipsub dependencies. Its public API remains fully
 synchronous: the subsystem owns a private Tokio network thread and a sequential
 admission bridge thread.
 
-The module contains the publisher, table listener, swarm construction, event
-loop, and a private `ReplicationController` held by `Workspace`:
+The module contains the publisher, swarm construction, event loop, replication
+listeners, and a private `ReplicationController` held by `Workspace`:
 
 ```rust
 struct ReplicationController {
@@ -430,16 +449,17 @@ struct ReplicationController {
 It is never exposed through the public workspace API. The worker constructs
 Gossipsub with `MessageAuthenticity::Signed(workspace_identity.keypair.clone())`
 and strict validation. It publishes completed envelopes to the workspace topic;
-for an incoming message it calls
-`Workspace::admit_event(envelope, message.source)`. `message.source` is the
-original signed Gossipsub author, not `propagation_source`, which is only the
-immediate forwarding peer.
+for an incoming message its admission thread calls the same internal admission
+implementation exposed synchronously through `Workspace::admit_event`.
+`message.source` is passed as the authenticated source. It is the original
+signed Gossipsub author, not `propagation_source`, which is only the immediate
+forwarding peer.
 
 Incoming envelopes cross a bounded bridge to the sequential admission thread.
 This preserves arrival order and keeps synchronous storage insertion off the
 Tokio event loop.
 
-### 6.1 Device Listener Controls Runtime Lifecycle
+### 6.1 Permanent Listener Graph Controls Runtime Lifecycle
 
 Replication runs exactly while the local installation remains enrolled with
 its expected workspace public key and the registry contains at least one other
@@ -447,10 +467,51 @@ device. The local device itself never starts the runtime. Readers count as
 remote devices: they participate in the mesh even though they cannot author
 application-table writes.
 
+Listener ownership follows the domain that reacts to the change:
+
+- `devices/listeners` contains receipt and device-registry listeners;
+- `tables/listeners` contains the table catalog listener;
+- `replication/listeners` contains `ReplicationStateListener`, the per-table
+  `ReplicationListener`, and replication's catalog listener.
+
+`Devices`, `DeviceRecord`, registry caching, the local clock, and receipt state
+live directly in `devices/mod.rs`; there is no `devices/runtime.rs`. Runtime in
+this design means the private network worker owned by replication, not the
+device registry itself.
+
+Each `TableHandle` stores two listener vectors behind one `RwLock`: internal
+listeners first and application listeners second. `TableHandle::add_listener`
+and `TableHandle::pop_listener` operate only on the application vector. After a
+successful insert, the handle keeps the listener read guard and invokes the
+internal vector followed by the application vector without cloning either
+vector. A callback therefore must not add or pop a listener on the same table;
+listener registration is an operation outside that table's callback chain.
+
+Workspace bootstrap installs the permanent internal listener graph in this
+order:
+
+| Table | Internal listener order |
+|---|---|
+| `_devices` | receipt, device registry, replication state, replication event |
+| `_catalog` | receipt, table catalog, replication event, replication catalog |
+| existing application table | receipt, replication event |
+
+There is no `ListenerFactory`, listener observer, `Any` downcast, dynamically
+maintained listener stack, or replication-listener cleanup. `ChangeListener`
+requires only `Send + Sync`. A `ReplicationListener` remains attached even in
+local-only mode and forwards locally authored events only when the controller
+currently owns a running worker; otherwise submission is a no-op.
+
+The replication catalog listener is also permanent. The table catalog listener
+first creates a handle for a new or recreated application table and attaches
+its receipt listener. Replication's catalog listener then attaches that table's
+permanent `ReplicationListener`. It ignores ordinary config updates where the
+same table handle remains open.
+
 On `Workspace::open`, after the registry has been loaded, the controller is
-initialized from `Devices::list`. `Workspace::create` starts with only its
-local Admin row, so its runtime remains stopped. The existing
-`DeviceRegistryListener` owns all subsequent lifecycle changes:
+initialized from `Devices::list`. `Workspace::create` starts with only its local
+Admin row, so its runtime remains stopped. `ReplicationStateListener`, attached
+to `_devices`, owns all subsequent network lifecycle changes:
 
 - the first non-local device upsert starts the runtime;
 - further non-local upserts leave it running;
@@ -461,12 +522,14 @@ local Admin row, so its runtime remains stopped. The existing
   public key stops its runtime after the triggering registry event completes
   the listener chain.
 
-Listener registration order is part of the invariant. For the first remote
-device upsert, `DeviceRegistryListener` starts the runtime before
-`ReplicationListener` submits that enrollment event. For a final remote-device
-delete, the controller marks shutdown pending; the replication listener submits
-the deletion, then the worker drains its outbound queue before it stops. This
-is best-effort transport delivery, not a remote-delivery acknowledgement.
+For the first remote-device upsert, the device registry listener first updates
+the cache, `ReplicationStateListener` starts the runtime, and the permanent
+`ReplicationListener` then submits that same enrollment event. For a final
+remote-device delete or local-device revocation, the state listener marks
+shutdown pending; the replication listener submits the triggering event when it
+was locally authored and then completes the stop. The worker drains its outbound
+queue before exiting. This is best-effort transport delivery, not a
+remote-delivery acknowledgement.
 
 The workspace Drop path requests worker shutdown before performing its existing
 best-effort flush. A future explicit close operation can expose a joinable
@@ -476,8 +539,10 @@ shutdown if applications need that lifecycle guarantee.
 
 Revocation is deletion of the device's `_devices` row, not a role change to an
 empty value. `Devices::remove(installation_id)` requires Admin and publishes
-that deletion. `DeviceRegistryListener` remains the owner of registry cache
-mutation and forwards the removed record to `ReplicationController`.
+that deletion. `DeviceRegistryListener` owns only registry-cache mutation.
+`ReplicationStateListener` independently decodes the previous and current
+`DeviceRecord` values from the applied `Change` and forwards the lifecycle
+transition to `ReplicationController`.
 
 The notification contains the deleted record's `PublicKey`, because the cache
 no longer contains the record. The controller derives its `PeerId`, instructs
@@ -539,8 +604,8 @@ declared by the application.
 `WorkspaceConfig` contains this runtime configuration and is supplied to
 `Workspace::create`, `Workspace::open`, and `Workspace::join`. It is not
 persisted workspace data: replication tuning may change for each application
-run. The device listener alone decides whether the configured runtime is
-currently started.
+run. `ReplicationStateListener` alone decides whether the configured network
+runtime is currently started.
 
 ---
 
@@ -549,6 +614,7 @@ currently started.
 ### Phase 0 - Identity Migration And Admission
 
 1. Add `opaque_id!`, generate eight-byte `InstallationId` and `WorkspaceId`,
+   generate their `PrimaryKey` conversions from the same byte-size parameter,
    and migrate all event and CRDT actors from `PeerId` to `InstallationId`.
 2. Remove ZenDB's `PeerId`, `PrimaryKey::PeerId`, `Signature`, and
    `SigningError` types.
@@ -567,12 +633,13 @@ currently started.
 ### Phase 1 - Replication Core
 
 8. Add `Envelope` and compact events to `zendb-types`.
-9. Add `zendb_workspace::replication`: its bounded publisher, table listener,
-   private Tokio worker, and Gossipsub swarm over TCP, Noise, Yamux, mDNS,
-   identify, and ping.
-10. Add `ReplicationController` to `Workspace` and wire its remote-device set
-    to `DeviceRegistryListener`, including first-remote start and final-remote
-    drain then stop ordering.
+9. Add `zendb_workspace::replication`: its bounded publisher, permanent state,
+   event, and catalog listeners, private Tokio worker, and Gossipsub swarm over
+   TCP, Noise, Yamux, mDNS, identify, and ping.
+10. Split each `TableHandle` listener collection into deterministic internal and
+    application vectors. Install the permanent listener graph and wire
+    `ReplicationStateListener` to the controller's remote-device set, including
+    first-remote start and final-remote drain then stop ordering.
 11. Configure signed-message authenticity, strict validation, the 100 MiB
     transmit limit, and the workspace topic.
 12. Connect device removal to Gossipsub peer blacklisting and swarm
@@ -589,6 +656,9 @@ currently started.
   device lookup, and receipt tracking.
 - `InstallationId` and `WorkspaceId` are generated by the byte-size parameter
   macro, currently at eight bytes each.
+- Every generated opaque ID converts to `PrimaryKey::Blob` with `From` and back
+  from `&PrimaryKey` with `TryFrom`; workspace code has no ID-key converter
+  helpers.
 - `DeviceRecord` stores a bincode-capable wrapper around libp2p `PublicKey`.
 - `PeerIdentity` exposes only `keypair()` and `display_name()`.
 - The account-root keypair deterministically derives one in-memory Ed25519
@@ -604,9 +674,16 @@ currently started.
 - Envelopes carry no duplicate application signature.
 - `Workspace` owns a private replication worker; applications neither create a
   replication link nor supply an async runtime.
-- The existing device listener starts replication on the first remote device
-  and stops it, after outbound drain, when the final remote device or the local
-  device is removed.
+- Every table handle separates internal and application listeners. Change
+  dispatch invokes them in that order without cloning the vectors, and the
+  public add/pop API changes only the application vector.
+- Receipt and device listeners live under `devices/listeners`; replication
+  state, event, and catalog listeners live under `replication/listeners`.
+- Replication listeners are permanent and use no factory, observer, `Any`
+  downcast, or dynamically maintained attachment stack.
+- `ReplicationStateListener` starts replication on the first remote device and
+  stops it, after outbound drain, when the final remote device or the local
+  device is removed or invalidated.
 - Only an Admin writes `_devices` for enrollment; invitation links and nonce
   tracking do not exist.
 - Joiners start their HLC at now; initial historical synchronization remains

@@ -1,6 +1,6 @@
 //! Table catalog management: table lifecycle, declarations, and runtime handles.
 
-pub(crate) mod listeners;
+mod listeners;
 mod runtime;
 
 use std::{
@@ -17,7 +17,6 @@ use zendb_types::{
     Role, Value,
 };
 
-pub(crate) use runtime::ChangeListenerFactory;
 pub use runtime::{ChangeListener, TableHandle};
 
 use crate::{
@@ -25,7 +24,10 @@ use crate::{
     consts::{
         DEVICES_TABLE_NAME, SYSTEM_TABLE_CONFIG, TABLE_CATALOG_NAME, TABLES_DIR, is_system_table,
     },
-    devices::{Devices, PeerState},
+    devices::{
+        Devices, PeerState,
+        listeners::{DeviceRegistryListener, ReceiptListener},
+    },
     states::StateHandle,
 };
 
@@ -34,7 +36,7 @@ use crate::{
 ///
 /// The `_catalog` Table is the source of truth for table declarations.
 /// Every declared table is eagerly opened and stored in the handle map.
-/// Handle-map mutation after bootstrap is owned by `TableCatalogListener`;
+/// Handle-map mutation after bootstrap is owned by the table catalog listener;
 /// the lifecycle methods here only validate and publish catalog events.
 ///
 /// Exposes lifecycle operations (upsert/get/delete/list/contains) and
@@ -45,9 +47,6 @@ pub struct Tables {
     catalog: Arc<TableHandle>,
     pub(crate) tables: RwLock<HashMap<String, Arc<TableHandle>>>,
     pub(crate) devices: Arc<Devices>,
-    table_listeners: Arc<RwLock<Vec<Arc<dyn ChangeListener>>>>,
-    listener_factories: Arc<RwLock<Vec<Arc<dyn ChangeListenerFactory>>>>,
-    device_listener: Arc<listeners::DeviceRegistryListener>,
 }
 
 impl Tables {
@@ -78,17 +77,11 @@ impl Tables {
             (TABLE_CATALOG_NAME.to_owned(), catalog.clone()),
             (DEVICES_TABLE_NAME.to_owned(), devices.registry.clone()),
         ]);
-        let receipt_listener = listeners::ReceiptListener::build(Arc::downgrade(&devices));
-        let table_listeners = Arc::new(RwLock::new(vec![receipt_listener]));
-        let device_listener = listeners::DeviceRegistryListener::build(Arc::downgrade(&devices));
         let tables = Arc::new(Self {
             root,
             catalog,
             tables: RwLock::new(tables),
             devices: devices.clone(),
-            table_listeners,
-            listener_factories: Arc::new(RwLock::new(Vec::new())),
-            device_listener,
         });
         tables.register_listeners();
 
@@ -154,17 +147,11 @@ impl Tables {
                 );
             }
         }
-        let receipt_listener = listeners::ReceiptListener::build(Arc::downgrade(&devices));
-        let table_listeners = Arc::new(RwLock::new(vec![receipt_listener]));
-        let device_listener = listeners::DeviceRegistryListener::build(Arc::downgrade(&devices));
         let tables = Arc::new(Self {
             root: tables_dir,
             catalog,
             tables: RwLock::new(tables),
-            devices: devices.clone(),
-            table_listeners,
-            listener_factories: Arc::new(RwLock::new(Vec::new())),
-            device_listener,
+            devices,
         });
         tables.register_listeners();
         Ok(tables)
@@ -192,17 +179,11 @@ impl Tables {
             (TABLE_CATALOG_NAME.to_owned(), catalog.clone()),
             (DEVICES_TABLE_NAME.to_owned(), devices.registry.clone()),
         ]);
-        let receipt_listener = listeners::ReceiptListener::build(Arc::downgrade(&devices));
-        let table_listeners = Arc::new(RwLock::new(vec![receipt_listener]));
-        let device_listener = listeners::DeviceRegistryListener::build(Arc::downgrade(&devices));
         let tables = Arc::new(Self {
             root,
             catalog,
             tables: RwLock::new(tables),
             devices,
-            table_listeners,
-            listener_factories: Arc::new(RwLock::new(Vec::new())),
-            device_listener,
         });
         tables.register_listeners();
         Ok(tables)
@@ -217,16 +198,14 @@ impl Tables {
     }
 
     pub fn flush(&self) -> Result<()> {
-        let tables = self.tables.read().values().cloned().collect::<Vec<_>>();
-        for table in tables {
+        for table in self.tables.read().values() {
             table.table.write().flush()?;
         }
         Ok(())
     }
 
     pub fn sync(&self) -> Result<()> {
-        let tables = self.tables.read().values().cloned().collect::<Vec<_>>();
-        for table in tables {
+        for table in self.tables.read().values() {
             table.table.write().sync()?;
         }
         Ok(())
@@ -236,7 +215,7 @@ impl Tables {
     /// if it does not exist; if it already exists, updates the config only
     /// when it differs. Returns `true` if a change was made (created or config
     /// changed), `false` if the declaration was already present with the same
-    /// config. The table is opened synchronously by `TableCatalogListener`
+    /// config. The table is opened synchronously by the table catalog listener
     /// during the catalog write. The caller obtains a handle separately via
     /// [`Tables::get`]. Refuses system tables.
     pub fn upsert(&self, name: &str, config: TableConfig) -> Result<bool> {
@@ -311,34 +290,19 @@ impl Tables {
     }
 
     fn register_listeners(self: &Arc<Self>) {
+        let receipt_listener = ReceiptListener::build(Arc::downgrade(&self.devices));
         for table in self.tables.read().values() {
-            for listener in self.table_listeners.read().iter() {
-                table.add_listener(listener.clone());
-            }
+            table.listeners.write().0.push(receipt_listener.clone());
         }
-        let catalog_listener = listeners::TableCatalogListener::build(
-            Arc::downgrade(self),
-            self.table_listeners.clone(),
-            self.listener_factories.clone(),
-        );
-        self.catalog.add_listener(catalog_listener);
         self.devices
             .registry
-            .add_listener(self.device_listener.clone());
-    }
-
-    pub(crate) fn add_internal_listener_factory(&self, factory: Arc<dyn ChangeListenerFactory>) {
-        for (name, table) in self.tables.read().iter() {
-            table.add_listener(factory.build(name));
-        }
-        self.listener_factories.write().push(factory);
-    }
-
-    pub(crate) fn set_device_observer(
-        &self,
-        observer: std::sync::Weak<dyn listeners::DeviceChangeObserver>,
-    ) {
-        self.device_listener.set_observer(observer);
+            .listeners
+            .write()
+            .0
+            .push(DeviceRegistryListener::build(Arc::downgrade(&self.devices)));
+        let catalog_listener =
+            listeners::CatalogListener::build(Arc::downgrade(self), receipt_listener);
+        self.catalog.listeners.write().0.push(catalog_listener);
     }
 }
 

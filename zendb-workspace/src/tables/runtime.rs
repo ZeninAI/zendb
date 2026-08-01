@@ -21,9 +21,8 @@ pub trait ChangeListener: Send + Sync {
     fn on_change(&self, change: &Change);
 }
 
-pub(crate) trait ChangeListenerFactory: Send + Sync {
-    fn build(&self, table: &str) -> Arc<dyn ChangeListener>;
-}
+pub(crate) type ListenerList = Vec<Arc<dyn ChangeListener>>;
+pub(crate) type ListenerGroups = (ListenerList, ListenerList);
 
 /// A shared handle to an open [`Table`].
 ///
@@ -32,7 +31,7 @@ pub(crate) trait ChangeListenerFactory: Send + Sync {
 pub struct TableHandle {
     name: String,
     pub(super) table: RwLock<Table>,
-    listeners: RwLock<Vec<Arc<dyn ChangeListener>>>,
+    pub(crate) listeners: RwLock<ListenerGroups>,
     devices: Weak<Devices>,
     is_system: bool,
 }
@@ -47,7 +46,7 @@ impl TableHandle {
         Arc::new(Self {
             name,
             table: RwLock::new(table),
-            listeners: RwLock::new(Vec::new()),
+            listeners: RwLock::new((Vec::new(), Vec::new())),
             devices,
             is_system,
         })
@@ -90,11 +89,15 @@ impl TableHandle {
 
     /// Register a custom [`ChangeListener`] on this table.
     ///
-    /// The listener fires on every subsequent insert through any handle to
-    /// this table. Application listeners and internal workspace listeners
-    /// share the same listener list.
+    /// The listener fires after the workspace's internal listeners on every
+    /// subsequent insert through any handle to this table.
     pub fn add_listener(&self, listener: Arc<dyn ChangeListener>) {
-        self.listeners.write().push(listener);
+        self.listeners.write().1.push(listener);
+    }
+
+    /// Remove and return the most recently registered custom listener.
+    pub fn pop_listener(&self) -> Option<Arc<dyn ChangeListener>> {
+        self.listeners.write().1.pop()
     }
 
     /// Authorized workspace mutation path for internal and admitted events.
@@ -112,7 +115,8 @@ impl TableHandle {
     fn insert_unchecked(&self, event: Event) -> Result<InsertOutcome> {
         let outcome = { self.table.write().insert(event)? };
         if let InsertOutcome::Applied(ref change) = outcome {
-            for listener in self.listeners.read().iter() {
+            let listeners = self.listeners.read();
+            for listener in listeners.0.iter().chain(listeners.1.iter()) {
                 listener.on_change(change);
             }
         }

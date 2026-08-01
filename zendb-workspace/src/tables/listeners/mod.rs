@@ -1,9 +1,5 @@
-//! Internal workspace listeners for receipts, the table catalog, and devices.
+//! Internal listener that maintains table handles from catalog changes.
 
 mod catalog;
-mod devices;
-mod receipts;
 
-pub(crate) use catalog::TableCatalogListener;
-pub(crate) use devices::{DeviceChangeObserver, DeviceRegistryListener};
-pub(crate) use receipts::ReceiptListener;
+pub(super) use catalog::CatalogListener;

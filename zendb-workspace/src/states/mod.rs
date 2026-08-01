@@ -18,10 +18,10 @@ use zendb_storage::{DurableStorage, ReadBackend, State, StateConfig, WriteBacken
 pub use runtime::StateHandle;
 
 use crate::{
-    consts::{
-        is_system_state, PEERS_STATE_NAME, STATES_DIR, STATE_CATALOG_NAME, SYSTEM_STATE_CONFIG,
-    },
     Error, Result,
+    consts::{
+        PEERS_STATE_NAME, STATE_CATALOG_NAME, STATES_DIR, SYSTEM_STATE_CONFIG, is_system_state,
+    },
 };
 
 /// State catalog management: owns the `_catalog` State and the in-memory
@@ -122,16 +122,14 @@ impl States {
     }
 
     pub fn flush(&self) -> Result<()> {
-        let states = self.states.read().values().cloned().collect::<Vec<_>>();
-        for state in states {
+        for state in self.states.read().values() {
             state.flush()?;
         }
         Ok(())
     }
 
     pub fn sync(&self) -> Result<()> {
-        let states = self.states.read().values().cloned().collect::<Vec<_>>();
-        for state in states {
+        for state in self.states.read().values() {
             state.sync()?;
         }
         Ok(())
@@ -186,7 +184,7 @@ impl States {
             return Arc::downcast::<StateHandle<K, V>>(erased)
                 .map_err(|_| Error::TypeMismatch(name.to_owned()));
         }
-
+        // Not yet opened state handle
         let saved = self
             .catalog
             .read()

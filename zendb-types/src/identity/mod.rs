@@ -7,5 +7,6 @@ pub mod peer;
 pub mod workspace;
 
 pub use installation::{InstallationId, InstallationIdParseError};
+pub use opaque_id::IdFromPrimaryKeyError;
 pub use peer::{PeerIdentity, PublicKey, Role};
 pub use workspace::{WorkspaceId, WorkspaceIdParseError};

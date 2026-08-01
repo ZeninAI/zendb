@@ -15,5 +15,5 @@ pub use error::{Error, Result};
 pub use replication::{BatchConfig, ReplicationConfig, TopologyConfig};
 pub use states::{StateHandle, States};
 pub use tables::{ChangeListener, TableHandle};
-pub use workspace::{JoinHints, Workspace, WorkspaceConfig, derive_workspace_public_key};
+pub use workspace::{JoinHints, Workspace, WorkspaceConfig};
 pub use zendb_types::{PublicKey, Role};

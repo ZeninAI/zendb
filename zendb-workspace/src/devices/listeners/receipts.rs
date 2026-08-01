@@ -1,15 +1,11 @@
-//! Receipt listener: live-observes every insert and feeds the device clock.
+//! Receipt listener that observes applied events and advances the local clock.
 
 use std::sync::{Arc, Weak};
 
 use zendb_storage::Change;
 
-use super::super::runtime::ChangeListener;
-use crate::devices::Devices;
+use crate::{devices::Devices, tables::ChangeListener};
 
-/// Observes every successful insert on every table. Replaces the one-shot
-/// `replay_receipts` consumer: receipts are now live-observed via callback
-/// and written to `_peers` at the next durability barrier.
 pub(crate) struct ReceiptListener {
     devices: Weak<Devices>,
 }

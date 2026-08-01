@@ -48,16 +48,6 @@ impl WorkspaceIdentity {
     }
 }
 
-/// Derive the public transport key an Admin stores for an installation.
-pub fn derive_workspace_public_key(
-    identity: &dyn PeerIdentity,
-    workspace_id: WorkspaceId,
-    installation_id: InstallationId,
-) -> Result<PublicKey> {
-    derive_workspace_keypair(identity, workspace_id, installation_id)
-        .map(|keypair| PublicKey::from_libp2p(keypair.public()))
-}
-
 /// Workspace-level runtime configuration.
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceConfig {
@@ -240,8 +230,6 @@ impl Workspace {
             replication_config,
             bootstrap_peers,
         )?;
-        tables.set_device_observer(replication.observer());
-        tables.add_internal_listener_factory(replication.listener_factory());
 
         Ok(Self {
             root,

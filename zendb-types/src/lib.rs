@@ -3,7 +3,6 @@
 #[macro_use]
 pub mod crdt;
 
-pub mod identity;
 pub mod replication;
 pub mod utils;
 
@@ -31,8 +30,7 @@ register_types! {
 }
 
 pub use crdt::*;
-pub use identity::{
-    IdFromPrimaryKeyError, InstallationId, InstallationIdParseError, PeerIdentity, PublicKey, Role,
-    WorkspaceId, WorkspaceIdParseError,
+pub use replication::{
+    CompactEvent, Envelope, IdFromPrimaryKeyError, InstallationId, InstallationIdParseError,
+    Multiaddr, MultiaddrError, PeerIdentity, PublicKey, Role, WorkspaceId, WorkspaceIdParseError,
 };
-pub use replication::{CompactEvent, Envelope};

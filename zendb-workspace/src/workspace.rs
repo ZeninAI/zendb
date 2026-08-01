@@ -48,6 +48,16 @@ impl WorkspaceIdentity {
     }
 }
 
+/// Derive the public transport key an Admin stores for an installation.
+pub fn derive_workspace_public_key(
+    identity: &dyn PeerIdentity,
+    workspace_id: WorkspaceId,
+    installation_id: InstallationId,
+) -> Result<PublicKey> {
+    derive_workspace_keypair(identity, workspace_id, installation_id)
+        .map(|keypair| PublicKey::from_libp2p(keypair.public()))
+}
+
 /// Workspace-level runtime configuration.
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceConfig {
@@ -75,7 +85,6 @@ struct WorkspaceAssembly {
     lock: File,
     mode: Mode,
     replication_config: ReplicationConfig,
-    bootstrap_peers: Vec<String>,
 }
 
 pub struct Workspace {
@@ -120,7 +129,6 @@ impl Workspace {
             lock,
             mode: Mode::Create,
             replication_config: config.replication,
-            bootstrap_peers: Vec::new(),
         })
     }
 
@@ -146,7 +154,6 @@ impl Workspace {
             lock,
             mode: Mode::Open,
             replication_config: config.replication,
-            bootstrap_peers: Vec::new(),
         })
     }
 
@@ -174,7 +181,6 @@ impl Workspace {
         let workspace_identity =
             WorkspaceIdentity::derive(identity.as_ref(), workspace_id, hints.installation_id)?;
         fs::write(root.join(IDENTITY_FILE), serialize_to_vec(&local_identity)?)?;
-        let bootstrap_peers = hints.bootstrap_peers;
         Self::assemble(WorkspaceAssembly {
             root,
             workspace_id,
@@ -183,7 +189,6 @@ impl Workspace {
             lock,
             mode: Mode::Join,
             replication_config: config.replication,
-            bootstrap_peers,
         })
     }
 
@@ -196,7 +201,6 @@ impl Workspace {
             lock,
             mode,
             replication_config,
-            bootstrap_peers,
         } = assembly;
         let states = match mode {
             Mode::Create | Mode::Join => States::create(&root)?,
@@ -228,7 +232,6 @@ impl Workspace {
             tables.clone(),
             devices.clone(),
             replication_config,
-            bootstrap_peers,
         )?;
 
         Ok(Self {

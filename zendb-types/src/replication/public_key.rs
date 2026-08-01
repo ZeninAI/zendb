@@ -1,7 +1,7 @@
-//! Persisted device keys, progressive roles, and application identity input.
+//! Bincode-capable wrapper around libp2p public keys.
 
 use bincode::{Decode, Encode, de::Decoder, enc::Encoder};
-use libp2p_identity::{Keypair, PublicKey as Libp2pPublicKey};
+use libp2p_identity::PublicKey as Libp2pPublicKey;
 
 /// A bincode-capable wrapper around libp2p's generic public key.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,28 +35,3 @@ impl<Context> Decode<Context> for PublicKey {
 }
 
 bincode::impl_borrow_decode!(PublicKey);
-
-/// Persisted workspace capabilities. Enforcement belongs to zendb-workspace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
-pub enum Role {
-    Contributor,
-    Operator,
-    Admin,
-}
-
-impl Role {
-    pub const fn has_at_least(self, required: Self) -> bool {
-        match required {
-            Self::Contributor => true,
-            Self::Operator => matches!(self, Self::Operator | Self::Admin),
-            Self::Admin => matches!(self, Self::Admin),
-        }
-    }
-}
-
-/// Application-owned account identity used to derive workspace-scoped keys.
-pub trait PeerIdentity: Send + Sync {
-    fn keypair(&self) -> &Keypair;
-
-    fn display_name(&self) -> &str;
-}

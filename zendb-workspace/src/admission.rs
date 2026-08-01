@@ -9,6 +9,7 @@ use crate::{Error, consts::is_system_table, devices::Devices, tables::Tables};
 pub enum AdmitError {
     UnknownPeer,
     AuthorMismatch,
+    AmbiguousPeer,
     Unauthorized,
     Workspace(Error),
 }
@@ -19,6 +20,9 @@ impl std::fmt::Display for AdmitError {
             Self::UnknownPeer => formatter.write_str("the envelope author is not enrolled"),
             Self::AuthorMismatch => {
                 formatter.write_str("the envelope author does not match its signed source")
+            }
+            Self::AmbiguousPeer => {
+                formatter.write_str("the signed source belongs to multiple installations")
             }
             Self::Unauthorized => formatter.write_str("the envelope author is not authorized"),
             Self::Workspace(error) => error.fmt(formatter),
@@ -46,6 +50,12 @@ pub(crate) fn admit_event(
         .ok_or(AdmitError::UnknownPeer)?;
     if record.public_key.as_libp2p().to_peer_id() != gossipsub_source {
         return Err(AdmitError::AuthorMismatch);
+    }
+    if devices.list().into_iter().any(|(installation_id, record)| {
+        installation_id != envelope.author
+            && record.public_key.as_libp2p().to_peer_id() == gossipsub_source
+    }) {
+        return Err(AdmitError::AmbiguousPeer);
     }
 
     let required = if is_system_table(&envelope.table) {

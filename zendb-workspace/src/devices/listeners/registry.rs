@@ -28,6 +28,9 @@ impl ChangeListener for DeviceRegistryListener {
         let Ok(installation_id) = InstallationId::try_from(&change.event.primary_key) else {
             return;
         };
+        if !change.event.path.is_empty() {
+            return;
+        }
         match &change.event.op {
             Op::Upsert {
                 value: Value::Blob(blob),

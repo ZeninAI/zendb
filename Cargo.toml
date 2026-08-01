@@ -23,6 +23,7 @@ hashbrown = "0.15"
 bincode = { version = "2", features = ["derive"] }
 
 libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand"] }
+multiaddr = "0.18"
 libp2p = { version = "0.56", features = [
     "dns",
     "ed25519",

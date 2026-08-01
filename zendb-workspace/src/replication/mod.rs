@@ -5,7 +5,7 @@ mod listeners;
 mod runtime;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, HashMap},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,21 +13,23 @@ use std::{
     thread,
 };
 
+use libp2p::{Multiaddr, PeerId};
 use libp2p_identity::Keypair;
 use parking_lot::Mutex;
 use zendb_storage::Change;
 use zendb_types::{Event, EventId, InstallationId, WorkspaceId};
 
-pub use config::{BatchConfig, ReplicationConfig, TopologyConfig};
+pub use config::{BatchConfig, DialConfig, ReplicationConfig, TopologyConfig};
 use listeners::{CatalogListener, ReplicationListener, ReplicationStateListener};
 use runtime::{Command, RunningReplication};
 
-use crate::{
-    Result,
-    consts::TABLE_CATALOG_NAME,
-    devices::{DeviceRecord, Devices},
-    tables::Tables,
-};
+use crate::{Result, consts::TABLE_CATALOG_NAME, devices::Devices, tables::Tables};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PeerRoute {
+    peer_id: PeerId,
+    addresses: Vec<Multiaddr>,
+}
 
 #[derive(Clone, Copy)]
 enum PendingStop {
@@ -50,8 +52,7 @@ pub(crate) struct ReplicationController {
     tables: Arc<Tables>,
     devices: Arc<Devices>,
     config: ReplicationConfig,
-    bootstrap_peers: Vec<String>,
-    remote_devices: Mutex<BTreeSet<InstallationId>>,
+    remote_devices: Mutex<BTreeMap<InstallationId, PeerRoute>>,
     closed: AtomicBool,
     transition: Mutex<()>,
     runtime: Mutex<Option<RunningReplication>>,
@@ -67,15 +68,12 @@ impl ReplicationController {
         tables: Arc<Tables>,
         devices: Arc<Devices>,
         config: ReplicationConfig,
-        bootstrap_peers: Vec<String>,
     ) -> Result<Arc<Self>> {
-        let remote_devices = devices
-            .list()
-            .into_iter()
-            .filter_map(|(installation_id, _)| {
-                (installation_id != local_installation_id).then_some(installation_id)
-            })
-            .collect();
+        let (local_is_enrolled, remote_devices) = project_devices(
+            &devices,
+            local_installation_id,
+            keypair.public().to_peer_id(),
+        );
         let controller = Arc::new(Self {
             workspace_id,
             local_installation_id,
@@ -83,7 +81,6 @@ impl ReplicationController {
             tables,
             devices,
             config,
-            bootstrap_peers,
             remote_devices: Mutex::new(remote_devices),
             closed: AtomicBool::new(false),
             transition: Mutex::new(()),
@@ -112,18 +109,10 @@ impl ReplicationController {
                 .push(CatalogListener::build(Arc::downgrade(&controller)));
         }
 
-        let local_is_enrolled = controller
-            .devices
-            .get(&local_installation_id)
-            .is_some_and(|record| controller.local_record_allows_replication(&record));
         if local_is_enrolled && !controller.remote_devices.lock().is_empty() {
             controller.start()?;
         }
         Ok(controller)
-    }
-
-    fn local_record_allows_replication(&self, record: &DeviceRecord) -> bool {
-        record.role.is_some() && record.public_key.as_libp2p() == &self.keypair.public()
     }
 
     fn start(self: &Arc<Self>) -> Result<()> {
@@ -141,7 +130,7 @@ impl ReplicationController {
             self.tables.clone(),
             self.devices.clone(),
             self.config.clone(),
-            self.bootstrap_peers.clone(),
+            self.remote_devices.lock().clone(),
         )?);
         Ok(())
     }
@@ -156,90 +145,54 @@ impl ReplicationController {
         ));
     }
 
-    fn device_changed(
-        self: &Arc<Self>,
-        installation_id: InstallationId,
-        previous: Option<DeviceRecord>,
-        current: Option<DeviceRecord>,
-        change: &Change,
-    ) {
-        if installation_id == self.local_installation_id {
-            self.local_device_changed(current.as_ref(), change);
-        } else if let Some(current) = current {
-            self.remote_device_upserted(installation_id, previous.as_ref(), &current);
-        } else if let Some(removed) = previous {
-            self.remote_device_removed(installation_id, &removed, change.event.stamp.id);
-        }
-    }
+    fn device_changed(self: &Arc<Self>, change: &Change) {
+        let (local_is_enrolled, desired) = project_devices(
+            &self.devices,
+            self.local_installation_id,
+            self.keypair.public().to_peer_id(),
+        );
+        let previous = {
+            let mut current = self.remote_devices.lock();
+            std::mem::replace(&mut *current, desired.clone())
+        };
+        let sender = self
+            .runtime
+            .lock()
+            .as_ref()
+            .map(|runtime| runtime.tx.clone());
 
-    fn local_device_changed(self: &Arc<Self>, current: Option<&DeviceRecord>, change: &Change) {
-        if current.is_some_and(|record| self.local_record_allows_replication(record)) {
+        if let Some(sender) = sender.as_ref() {
+            for (installation_id, old) in &previous {
+                let replacement = desired.get(installation_id);
+                if replacement.is_none_or(|new| new.peer_id != old.peer_id) {
+                    let _ = sender.blocking_send(Command::RemovePeer {
+                        installation_id: *installation_id,
+                        peer_id: old.peer_id,
+                    });
+                }
+            }
+            for (installation_id, route) in &desired {
+                if previous.get(installation_id) != Some(route) {
+                    let _ = sender.blocking_send(Command::UpsertPeer {
+                        installation_id: *installation_id,
+                        peer_id: route.peer_id,
+                        addresses: route.addresses.clone(),
+                    });
+                }
+            }
+        }
+
+        if local_is_enrolled && !desired.is_empty() {
             *self.stop_after.lock() = None;
-            let has_remotes = !self.remote_devices.lock().is_empty();
-            if has_remotes {
+            if sender.is_none() {
                 let _ = self.start();
             }
-        } else if self.runtime.lock().is_some() {
-            *self.stop_after.lock() = Some(PendingStop::LocalRevoked(change.event.stamp.id));
-        }
-    }
-
-    fn remote_device_upserted(
-        self: &Arc<Self>,
-        installation_id: InstallationId,
-        previous: Option<&DeviceRecord>,
-        current: &DeviceRecord,
-    ) {
-        self.remote_devices.lock().insert(installation_id);
-        *self.stop_after.lock() = None;
-        let local_is_enrolled = self
-            .devices
-            .get(&self.local_installation_id)
-            .is_some_and(|record| self.local_record_allows_replication(&record));
-        if local_is_enrolled {
-            let _ = self.start();
-        }
-
-        if let Some(sender) = self
-            .runtime
-            .lock()
-            .as_ref()
-            .map(|runtime| runtime.tx.clone())
-        {
-            if let Some(previous) =
-                previous.filter(|previous| previous.public_key != current.public_key)
-            {
-                let _ = sender.blocking_send(Command::Revoke(
-                    previous.public_key.as_libp2p().to_peer_id(),
-                ));
-            }
-            let _ =
-                sender.blocking_send(Command::Allow(current.public_key.as_libp2p().to_peer_id()));
-        }
-    }
-
-    fn remote_device_removed(
-        &self,
-        installation_id: InstallationId,
-        removed: &DeviceRecord,
-        event_id: EventId,
-    ) {
-        if let Some(sender) = self
-            .runtime
-            .lock()
-            .as_ref()
-            .map(|runtime| runtime.tx.clone())
-        {
-            let _ =
-                sender.blocking_send(Command::Revoke(removed.public_key.as_libp2p().to_peer_id()));
-        }
-        let no_remotes = {
-            let mut remotes = self.remote_devices.lock();
-            remotes.remove(&installation_id);
-            remotes.is_empty()
-        };
-        if no_remotes && self.runtime.lock().is_some() {
-            *self.stop_after.lock() = Some(PendingStop::NoRemoteDevices(event_id));
+        } else if sender.is_some() {
+            *self.stop_after.lock() = Some(if local_is_enrolled {
+                PendingStop::NoRemoteDevices(change.event.stamp.id)
+            } else {
+                PendingStop::LocalRevoked(change.event.stamp.id)
+            });
         }
     }
 
@@ -293,6 +246,49 @@ impl ReplicationController {
             let _ = stop.join();
         }
     }
+}
+
+fn project_devices(
+    devices: &Devices,
+    local_installation_id: InstallationId,
+    local_peer_id: PeerId,
+) -> (bool, BTreeMap<InstallationId, PeerRoute>) {
+    let records = devices.list();
+    let mut owners = HashMap::<PeerId, usize>::new();
+    for (_, record) in &records {
+        *owners
+            .entry(record.public_key.as_libp2p().to_peer_id())
+            .or_default() += 1;
+    }
+
+    let local_is_enrolled = records.iter().any(|(installation_id, record)| {
+        *installation_id == local_installation_id
+            && record.role.is_some()
+            && record.public_key.as_libp2p().to_peer_id() == local_peer_id
+            && owners.get(&local_peer_id) == Some(&1)
+    });
+    let remote_devices = records
+        .into_iter()
+        .filter_map(|(installation_id, record)| {
+            let peer_id = record.public_key.as_libp2p().to_peer_id();
+            (installation_id != local_installation_id && owners.get(&peer_id) == Some(&1)).then(
+                || {
+                    (
+                        installation_id,
+                        PeerRoute {
+                            peer_id,
+                            addresses: record
+                                .addresses
+                                .into_iter()
+                                .map(|address| address.into_libp2p())
+                                .collect(),
+                        },
+                    )
+                },
+            )
+        })
+        .collect();
+    (local_is_enrolled, remote_devices)
 }
 
 impl Drop for ReplicationController {

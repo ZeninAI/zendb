@@ -8,7 +8,7 @@ peer-to-peer replication.
 
 | Crate | Responsibility |
 |---|---|
-| `zendb-types` | Installation and workspace IDs, persisted libp2p public keys, event stamps, envelopes, cells, operations, CRDT values, and binary utilities |
+| `zendb-types` | Installation and workspace IDs, persisted libp2p public keys and device addresses, event stamps, envelopes, cells, operations, CRDT values, and binary utilities |
 | `zendb-storage` | B+ tree, KeyDir, SkipList, generic State, Topic, and the invariant-preserving Table facade |
 | `zendb-workspace` | Catalog and device policy, local HLC and receipts, authenticated admission, and the private Tokio/libp2p replication runtime |
 
@@ -53,6 +53,12 @@ runtime starts when `_devices` contains another installation and drains then
 stops when the last remote installation is removed. Applications do not create
 a replication link or supply an async runtime.
 
+Each `DeviceRecord` may contain Admin-managed libp2p addresses. The worker
+derives the device `PeerId` from its stored public key, dials those routes with
+Noise authentication, and retries temporarily unreachable peers with capped
+backoff. mDNS and Identify can add transient routes only for enrolled peers;
+discovery never grants workspace membership.
+
 Gossipsub signs each bincode `Envelope` with the derived workspace key and uses
 strict signature validation. `Workspace::admit_event` then binds the signed
 libp2p source to the envelope's enrolled `InstallationId`, checks its role, and
@@ -67,7 +73,8 @@ not an event-size admission limit; Gossipsub's transport limit defaults to
 Only an Admin writes `_devices`. The Admin assigns an `InstallationId`, the
 joining application derives its workspace public key with
 `derive_workspace_public_key`, and the Admin stores that key in a
-`DeviceRecord`.
+`DeviceRecord` together with any stable dial addresses. Addresses are routing
+hints rather than identities and may be empty.
 
 `Workspace::join` currently persists the assigned local identity and creates
 empty staged system storage. Initial registry/history synchronization is
@@ -94,3 +101,7 @@ The project is not migration-stable. Compile the workspace with:
 ```text
 cargo check --workspace
 ```
+
+`zendb-it` runs two live workspaces in one process over distinct loopback TCP
+ports, covering offline-peer recovery, bidirectional events, replicated table
+lifecycle, and durable reopen.

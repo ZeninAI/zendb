@@ -78,11 +78,22 @@ transmit size defaults to 100 MiB. `max_bytes` is only a batch flush threshold.
 A first event larger than the threshold is sent immediately as a one-event
 envelope.
 
+The runtime listens on every `ReplicationConfig::listen_addresses` entry; the
+default is `/ip4/0.0.0.0/tcp/0`. Known-peer dial retries begin at one second and
+cap at sixty seconds through `DialConfig`.
+
 The private Tokio network worker uses TCP, Noise, Yamux, DNS, mDNS, ping,
-identify, and strict signed Gossipsub. Incoming envelopes cross a bounded
+Identify, and strict signed Gossipsub. Incoming envelopes cross a bounded
 bridge to a sequential admission thread, preserving arrival order without
 blocking the Tokio event loop. mDNS peers receive a LAN score bonus and ping
 latency adjusts their application score. Topics are scoped by `WorkspaceId`.
+
+`DeviceRecord.addresses` contains durable Admin-managed `zendb-types`
+`Multiaddr` values. The worker
+derives the expected `PeerId` from the record public key and uses known-peer
+`DialOpts`, so an address selects an endpoint but cannot impersonate a device.
+Catalog, mDNS, and Identify addresses remain separate in memory. Unknown peers
+are disconnected and their Gossipsub messages do not enter admission.
 
 The synchronous replication listener uses blocking bounded submission. It
 forwards only locally authored events, so admitted remote events are never
@@ -92,14 +103,15 @@ republished.
 
 Replication runs only while the local installation remains enrolled with its
 expected workspace key and `_devices` contains another installation.
-`DeviceRegistryListener` updates authorization state before notifying the
-private controller:
+`DeviceRegistryListener` first updates authorization state, then the permanent
+`ReplicationStateListener` reconciles the complete registry projection:
 
 - The first remote upsert starts the worker before the enrollment event is
   submitted.
 - Additional remote devices reuse the worker.
-- Removing a device blacklists its derived PeerId, removes it from explicit
-  Gossipsub peers, and disconnects it.
+- Address changes replace future dial candidates and reset reconnect backoff
+  without disconnecting an authenticated connection.
+- Removing a device blacklists its derived PeerId and disconnects it.
 - Removing the final remote marks shutdown pending; the replication listener
   submits the deletion, then the worker drains and stops.
 - Removing the local installation, clearing its role, or replacing its
@@ -108,6 +120,10 @@ private controller:
 
 Re-enrollment removes the peer from the blacklist. Replacing a device key
 revokes the previous transport PeerId before allowing the new one.
+Workspace key derivation includes `InstallationId`, so correctly derived device
+keys are unique without an enrollment-time registry scan. If replicated raw
+state nevertheless maps one PeerId to multiple installations, networking and
+authenticated admission quarantine that PeerId until the registry is corrected.
 
 ## Direct Enrollment
 
@@ -124,6 +140,7 @@ workspace.devices().upsert(
         display_name: "new-laptop".to_owned(),
         role: Some(Role::Contributor),
         public_key,
+        addresses: vec!["/dns4/laptop.example/tcp/7400".parse()?],
     },
 )?;
 ```
@@ -145,9 +162,11 @@ pub trait ChangeListener: Send + Sync {
 }
 ```
 
-Internal listener registration is private. A crate-private per-table factory
-captures table names for replication without widening the public callback.
-Catalog-opened tables inherit receipt and replication listeners.
+Each handle stores internal and application listeners separately. Internal
+listeners run first; `add_listener` and `pop_listener` affect only the
+application stack. Receipt and replication listeners are attached permanently,
+and replication's catalog listener instruments newly opened table handles.
+There is no listener factory, observer, or dynamic downcast.
 
 `TableHandle::insert` is the local application mutation path.
 `TableHandle::insert_internal` remains crate-private and independently checks

@@ -63,7 +63,7 @@ representation. A crate-private macro removes duplicated implementation while
 preserving type safety:
 
 ```rust
-// zendb-types/src/identity/opaque_id.rs
+// zendb-types/src/replication/_macros.rs
 opaque_id!(InstallationId, InstallationIdParseError, 8);
 opaque_id!(WorkspaceId, WorkspaceIdParseError, 8);
 ```

@@ -1,11 +1,16 @@
 # zendb-types
 
 `zendb-types` owns ZenDB's portable data model and shared binary utilities. It
-contains libp2p identity values needed by persisted device records, but no
-transport, async runtime, swarm, storage configuration, or authorization
-policy.
+contains libp2p identity and multiaddress values needed by persisted device
+records, but no transport runtime, swarm, discovery, dialing, storage
+configuration, or authorization policy.
 
-## Identity
+## Replication Identity
+
+The shared replication data model lives under `zendb_types::replication` and is
+also re-exported from the crate root. It contains IDs, peer values, persisted
+addresses, and envelope wire values; operational networking remains outside
+this crate.
 
 `InstallationId` is the logical event author and device-registry key.
 `WorkspaceId` identifies a replicated workspace. Both are distinct opaque
@@ -17,8 +22,12 @@ aliases.
 Changing either identifier's width is one macro invocation change.
 
 `PublicKey` wraps `libp2p_identity::PublicKey` and implements bincode encoding
-through libp2p's canonical protobuf key representation. It is the only libp2p
-key type persisted by ZenDB.
+through libp2p's canonical protobuf key representation.
+
+ZenDB's `Multiaddr` wraps the standalone `multiaddr::Multiaddr` value and
+encodes its canonical binary representation. It stores an Admin-provided route
+without a terminal destination PeerId; the enclosing device record owns
+identity.
 
 `PeerIdentity` is the application-owned account identity input:
 

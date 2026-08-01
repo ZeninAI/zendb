@@ -12,8 +12,8 @@ use bincode::{Decode, Encode};
 use parking_lot::{Mutex, RwLock};
 use zendb_storage::{DurableStorage, ReadBackend, Table, WriteBackend};
 use zendb_types::{
-    Blob, Event, EventId, EventStamp, EventTime, InstallationId, Op, Path, PublicKey, Role, Value,
-    utils::time::physical_ms,
+    Blob, Event, EventId, EventStamp, EventTime, InstallationId, Multiaddr, Op, Path, PublicKey,
+    Role, Value, utils::time::physical_ms,
 };
 
 use self::receipts::{ObserveOutcome, ReceiptWindow};
@@ -24,6 +24,7 @@ pub struct DeviceRecord {
     pub display_name: String,
     pub role: Option<Role>,
     pub public_key: PublicKey,
+    pub addresses: Vec<Multiaddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -71,6 +72,7 @@ impl Devices {
             display_name,
             role: Some(Role::Admin),
             public_key,
+            addresses: Vec::new(),
         };
         let time = EventTime {
             physical_ms: physical_ms().ok_or(Error::ClockExhausted)?,

@@ -3733,6 +3733,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "libp2p-identity",
+ "multiaddr",
  "rand 0.8.7",
 ]
 

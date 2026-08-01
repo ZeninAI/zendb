@@ -43,6 +43,9 @@ impl ChangeListener for CatalogListener {
         let PrimaryKey::String(name) = &change.event.primary_key else {
             return;
         };
+        if !change.event.path.is_empty() {
+            return;
+        }
         match &change.event.op {
             Op::Upsert {
                 value: Value::Blob(blob),

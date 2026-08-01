@@ -54,7 +54,7 @@ macro_rules! opaque_id {
         }
 
         impl TryFrom<&$crate::PrimaryKey> for $name {
-            type Error = $crate::identity::IdFromPrimaryKeyError;
+            type Error = $crate::replication::IdFromPrimaryKeyError;
 
             fn try_from(value: &$crate::PrimaryKey) -> Result<Self, Self::Error> {
                 let $crate::PrimaryKey::Blob(bytes) = value else {

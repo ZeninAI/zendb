@@ -1,7 +1,7 @@
 //! Tokio/libp2p worker, Gossipsub batching, discovery, and mesh control.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, mpsc as std_mpsc},
     thread,
     time::Duration,
@@ -13,8 +13,13 @@ use libp2p::{
     gossipsub::{
         self, IdentTopic, MessageAuthenticity, PeerScoreParams, PeerScoreThresholds, ValidationMode,
     },
-    identify, mdns, noise, ping,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    identify, mdns,
+    multiaddr::Protocol,
+    noise, ping,
+    swarm::{
+        NetworkBehaviour, SwarmEvent,
+        dial_opts::{DialOpts, PeerCondition},
+    },
     tcp, yamux,
 };
 use libp2p_identity::Keypair;
@@ -24,13 +29,23 @@ use zendb_types::{
     utils::{deserialize_from, serdes::serialized_size, serialize_to_vec},
 };
 
-use super::{BatchConfig, ReplicationConfig, TopologyConfig};
+use super::{BatchConfig, DialConfig, PeerRoute, ReplicationConfig, TopologyConfig};
 use crate::{Error, Result, admission, devices::Devices, tables::Tables};
 
 pub(crate) enum Command {
-    Event { table: String, event: Event },
-    Allow(PeerId),
-    Revoke(PeerId),
+    Event {
+        table: String,
+        event: Event,
+    },
+    UpsertPeer {
+        installation_id: zendb_types::InstallationId,
+        peer_id: PeerId,
+        addresses: Vec<Multiaddr>,
+    },
+    RemovePeer {
+        installation_id: zendb_types::InstallationId,
+        peer_id: PeerId,
+    },
     Stop,
 }
 
@@ -47,7 +62,7 @@ impl RunningReplication {
         tables: Arc<Tables>,
         devices: Arc<Devices>,
         config: ReplicationConfig,
-        bootstrap_peers: Vec<String>,
+        remote_devices: BTreeMap<zendb_types::InstallationId, PeerRoute>,
     ) -> Result<Self> {
         if config.outbound_capacity == 0 {
             return Err(Error::Replication(
@@ -91,7 +106,8 @@ impl RunningReplication {
                                     local_installation_id,
                                     batch_config: config.batch,
                                     topology_config: config.topology,
-                                    bootstrap_peers,
+                                    dial_config: config.dial,
+                                    remote_devices,
                                     inbound: inbound_tx,
                                 },
                             )
@@ -226,13 +242,11 @@ fn build_swarm(
         .gossipsub
         .subscribe(&topic)
         .map_err(|error| error.to_string())?;
-    swarm
-        .listen_on(
-            "/ip4/0.0.0.0/tcp/0"
-                .parse::<Multiaddr>()
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
+    for address in &config.listen_addresses {
+        swarm
+            .listen_on(address.clone())
+            .map_err(|error| error.to_string())?;
+    }
     Ok((swarm, topic))
 }
 
@@ -241,12 +255,84 @@ struct PendingBatch {
     bytes: usize,
 }
 
+struct RetryState {
+    initial: Duration,
+    maximum: Duration,
+    delay: Duration,
+    next_attempt: tokio::time::Instant,
+}
+
+impl RetryState {
+    fn new(config: &DialConfig) -> Self {
+        let initial = Duration::from_millis(config.initial_backoff_ms.max(1));
+        let maximum = Duration::from_millis(config.max_backoff_ms.max(initial.as_millis() as u64));
+        Self {
+            initial,
+            maximum,
+            delay: initial,
+            next_attempt: tokio::time::Instant::now(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.delay = self.initial;
+        self.next_attempt = tokio::time::Instant::now();
+    }
+
+    fn attempted(&mut self) {
+        self.next_attempt = tokio::time::Instant::now() + self.delay;
+    }
+
+    fn failed(&mut self) {
+        self.next_attempt = tokio::time::Instant::now() + self.delay;
+        self.delay = self.delay.saturating_mul(2).min(self.maximum);
+    }
+}
+
+struct PeerEntry {
+    installation_id: zendb_types::InstallationId,
+    catalog: Vec<Multiaddr>,
+    mdns: HashSet<Multiaddr>,
+    identified: HashSet<Multiaddr>,
+    connected: bool,
+    retry: RetryState,
+}
+
+impl PeerEntry {
+    fn new(
+        installation_id: zendb_types::InstallationId,
+        addresses: Vec<Multiaddr>,
+        dial_config: &DialConfig,
+    ) -> Self {
+        Self {
+            installation_id,
+            catalog: addresses,
+            mdns: HashSet::new(),
+            identified: HashSet::new(),
+            connected: false,
+            retry: RetryState::new(dial_config),
+        }
+    }
+
+    fn candidate_addresses(&self) -> Vec<Multiaddr> {
+        let mut seen = HashSet::new();
+        self.catalog
+            .iter()
+            .chain(&self.mdns)
+            .chain(&self.identified)
+            .filter(|address| seen.insert((*address).clone()))
+            .cloned()
+            .collect()
+    }
+}
+
 struct WorkerContext {
     topic: IdentTopic,
     local_installation_id: zendb_types::InstallationId,
     batch_config: BatchConfig,
     topology_config: TopologyConfig,
-    bootstrap_peers: Vec<String>,
+    dial_config: DialConfig,
+    remote_devices: BTreeMap<zendb_types::InstallationId, PeerRoute>,
     inbound: std_mpsc::SyncSender<(Envelope, PeerId)>,
 }
 
@@ -255,13 +341,17 @@ async fn run_worker(
     mut rx: mpsc::Receiver<Command>,
     context: WorkerContext,
 ) {
-    for address in context.bootstrap_peers {
-        if let Ok(address) = address.parse::<Multiaddr>() {
-            let _ = swarm.dial(address);
-        }
-    }
-
     let mut batches = HashMap::<String, PendingBatch>::new();
+    let mut peers = context
+        .remote_devices
+        .into_iter()
+        .map(|(installation_id, route)| {
+            (
+                route.peer_id,
+                PeerEntry::new(installation_id, route.addresses, &context.dial_config),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let mut lan_peers = HashSet::new();
     let mut revoked_peers = HashSet::new();
     let linger_duration = Duration::from_millis(context.batch_config.linger_ms.max(1));
@@ -269,6 +359,7 @@ async fn run_worker(
         tokio::time::Instant::now() + linger_duration,
         linger_duration,
     );
+    let mut dial = tokio::time::interval(Duration::from_millis(100));
     loop {
         tokio::select! {
             command = rx.recv() => {
@@ -306,18 +397,38 @@ async fn run_worker(
                             );
                         }
                     }
-                    Some(Command::Revoke(peer_id)) => {
-                        revoked_peers.insert(peer_id);
-                        swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
-                        swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                        let _ = swarm.disconnect_peer_id(peer_id);
-                    }
-                    Some(Command::Allow(peer_id)) => {
+                    Some(Command::UpsertPeer {
+                        installation_id,
+                        peer_id,
+                        addresses,
+                    }) => {
                         revoked_peers.remove(&peer_id);
                         swarm
                             .behaviour_mut()
                             .gossipsub
                             .remove_blacklisted_peer(&peer_id);
+                        let entry = peers.entry(peer_id).or_insert_with(|| {
+                            PeerEntry::new(installation_id, Vec::new(), &context.dial_config)
+                        });
+                        entry.installation_id = installation_id;
+                        entry.catalog = addresses;
+                        entry.retry.reset();
+                    }
+                    Some(Command::RemovePeer {
+                        installation_id,
+                        peer_id,
+                    }) => {
+                        if peers
+                            .get(&peer_id)
+                            .is_some_and(|entry| entry.installation_id == installation_id)
+                        {
+                            peers.remove(&peer_id);
+                        }
+                        lan_peers.remove(&peer_id);
+                        revoked_peers.insert(peer_id);
+                        swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
+                        swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                        let _ = swarm.disconnect_peer_id(peer_id);
                     }
                     Some(Command::Stop) | None => {
                         for (table, batch) in batches.drain() {
@@ -344,6 +455,31 @@ async fn run_worker(
                     );
                 }
             }
+            _ = dial.tick() => {
+                let now = tokio::time::Instant::now();
+                let due = peers
+                    .iter()
+                    .filter_map(|(peer_id, entry)| {
+                        (!entry.connected && entry.retry.next_attempt <= now).then_some(*peer_id)
+                    })
+                    .collect::<Vec<_>>();
+                for peer_id in due {
+                    let Some(entry) = peers.get_mut(&peer_id) else {
+                        continue;
+                    };
+                    let addresses = entry.candidate_addresses();
+                    if addresses.is_empty() {
+                        entry.retry.attempted();
+                        continue;
+                    }
+                    let options = DialOpts::peer_id(peer_id)
+                        .condition(PeerCondition::DisconnectedAndNotDialing)
+                        .addresses(addresses)
+                        .build();
+                    let _ = swarm.dial(options);
+                    entry.retry.attempted();
+                }
+            }
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::Behaviour(ReplBehaviourEvent::Gossipsub(
@@ -352,19 +488,25 @@ async fn run_worker(
                         if let (Some(source), Ok(envelope)) = (
                             message.source,
                             deserialize_from::<Envelope>(&message.data),
-                        ) {
+                        ) && peers.contains_key(&source)
+                            && !revoked_peers.contains(&source)
+                        {
                             let _ = context.inbound.send((envelope, source));
                         }
                     }
                     SwarmEvent::Behaviour(ReplBehaviourEvent::Mdns(
-                        mdns::Event::Discovered(peers)
+                        mdns::Event::Discovered(discovered)
                     )) => {
-                        for (peer_id, address) in peers {
-                            if revoked_peers.contains(&peer_id) {
+                        for (peer_id, address) in discovered {
+                            let Some(entry) = peers.get_mut(&peer_id) else {
                                 continue;
-                            }
+                            };
+                            let Some(address) = route_address(address, peer_id) else {
+                                continue;
+                            };
+                            entry.mdns.insert(address);
+                            entry.retry.reset();
                             lan_peers.insert(peer_id);
-                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             swarm
                                 .behaviour_mut()
                                 .gossipsub
@@ -372,15 +514,22 @@ async fn run_worker(
                                     &peer_id,
                                     context.topology_config.lan_score_bonus,
                                 );
-                            let _ = swarm.dial(address);
                         }
                     }
                     SwarmEvent::Behaviour(ReplBehaviourEvent::Mdns(
-                        mdns::Event::Expired(peers)
+                        mdns::Event::Expired(expired)
                     )) => {
-                        for (peer_id, _) in peers {
-                            lan_peers.remove(&peer_id);
-                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                        for (peer_id, address) in expired {
+                            let Some(entry) = peers.get_mut(&peer_id) else {
+                                continue;
+                            };
+                            let Some(address) = route_address(address, peer_id) else {
+                                continue;
+                            };
+                            entry.mdns.remove(&address);
+                            if entry.mdns.is_empty() {
+                                lan_peers.remove(&peer_id);
+                            }
                         }
                     }
                     SwarmEvent::Behaviour(ReplBehaviourEvent::Ping(event)) => {
@@ -401,12 +550,62 @@ async fn run_worker(
                         }
                     }
                     SwarmEvent::Behaviour(ReplBehaviourEvent::Identify(event)) => {
-                        let _ = event;
+                        if let identify::Event::Received { peer_id, info, .. } = *event
+                            && let Some(entry) = peers.get_mut(&peer_id)
+                        {
+                            let addresses = info
+                                .listen_addrs
+                                .into_iter()
+                                .filter_map(|address| route_address(address, peer_id))
+                                .collect();
+                            entry.identified = addresses;
+                            entry.retry.reset();
+                        }
+                    }
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        if let Some(entry) = peers.get_mut(&peer_id) {
+                            entry.connected = true;
+                            entry.retry.reset();
+                        } else {
+                            revoked_peers.insert(peer_id);
+                            swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
+                            let _ = swarm.disconnect_peer_id(peer_id);
+                        }
+                    }
+                    SwarmEvent::ConnectionClosed {
+                        peer_id,
+                        num_established: 0,
+                        ..
+                    } => {
+                        if let Some(entry) = peers.get_mut(&peer_id) {
+                            entry.connected = false;
+                            entry.retry.reset();
+                        }
+                    }
+                    SwarmEvent::OutgoingConnectionError {
+                        peer_id: Some(peer_id),
+                        ..
+                    } => {
+                        if let Some(entry) = peers.get_mut(&peer_id) {
+                            entry.connected = false;
+                            entry.retry.failed();
+                        }
                     }
                     _ => {}
                 }
             }
         }
+    }
+}
+
+fn route_address(mut address: Multiaddr, peer_id: PeerId) -> Option<Multiaddr> {
+    match address.iter().last() {
+        Some(Protocol::P2p(address_peer_id)) if address_peer_id == peer_id => {
+            address.pop();
+            Some(address)
+        }
+        Some(Protocol::P2p(_)) => None,
+        _ => Some(address),
     }
 }
 

@@ -1,16 +1,23 @@
-//! Typed runtime handle and guarded access for an open local State.
+//! Typed handle and guarded access for an open local State.
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use zendb_storage::State;
 
 use crate::{Error, Result};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StateKind {
+    Catalog,
+    Causal,
+    Application,
+}
+
 /// A typed handle to an open [`State`]. System states are readable through
 /// public handles, but [`StateHandle::write`] refuses them.
 pub struct StateHandle<K: Ord, V> {
     pub(super) name: String,
     pub(super) state: RwLock<State<K, V>>,
-    pub(super) is_system: bool,
+    pub(super) kind: StateKind,
 }
 
 impl<K: Ord, V> StateHandle<K, V> {
@@ -20,7 +27,7 @@ impl<K: Ord, V> StateHandle<K, V> {
 
     /// Returns `true` if this handle refers to a system state.
     pub fn is_system(&self) -> bool {
-        self.is_system
+        self.kind != StateKind::Application
     }
 
     pub fn read(&self) -> RwLockReadGuard<'_, State<K, V>> {
@@ -28,7 +35,7 @@ impl<K: Ord, V> StateHandle<K, V> {
     }
 
     pub fn write(&self) -> Result<RwLockWriteGuard<'_, State<K, V>>> {
-        if self.is_system {
+        if self.is_system() {
             return Err(Error::SystemStateReadOnly(self.name.clone()));
         }
         Ok(self.write_internal())

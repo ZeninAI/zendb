@@ -2,7 +2,7 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, mpsc as std_mpsc},
+    sync::{Weak, mpsc as std_mpsc},
     thread,
 };
 
@@ -17,40 +17,46 @@ use super::{
     swarm::build_swarm,
     worker::{WorkerContext, run_worker},
 };
-use crate::{Error, Result, admission, installations::Installations, tables::Tables};
+use crate::{Error, Result, admission, core::WorkspaceCore};
 
-pub(super) struct RunningReplication {
-    pub(super) tx: mpsc::Sender<Command>,
+pub(super) struct ReplicationRuntime {
+    pub(super) commands: mpsc::Sender<Command>,
     join: Option<thread::JoinHandle<()>>,
     admission_join: Option<thread::JoinHandle<()>>,
 }
 
-impl RunningReplication {
+impl ReplicationRuntime {
     pub(super) fn start(
         workspace_id: WorkspaceId,
+        local_installation_id: InstallationId,
         keypair: Keypair,
-        tables: Arc<Tables>,
-        installations: Arc<Installations>,
+        core: Weak<WorkspaceCore>,
         config: ReplicationConfig,
-        remote_installations: BTreeMap<InstallationId, PeerRoute>,
+        initial_routes: BTreeMap<InstallationId, PeerRoute>,
     ) -> Result<Self> {
-        if config.outbound_capacity == 0 {
+        if config.channel_capacity == 0 {
             return Err(Error::Replication(
-                "outbound_capacity must be greater than zero".to_owned(),
+                "channel_capacity must be greater than zero".to_owned(),
             ));
         }
-        let local_installation_id = installations.local_installation_id();
         let (inbound_tx, inbound_rx) =
-            std_mpsc::sync_channel::<(Envelope, PeerId)>(config.outbound_capacity);
+            std_mpsc::sync_channel::<(Envelope, PeerId)>(config.channel_capacity);
+        // Storage-backed admission runs on its own blocking thread. The bounded
+        // channel keeps workspace I/O off the async loop while applying backpressure.
         let admission_join = thread::Builder::new()
             .name(format!("zendb-admission-{workspace_id}"))
             .spawn(move || {
                 while let Ok((envelope, source)) = inbound_rx.recv() {
-                    let _ = admission::admit_event(&tables, &installations, envelope, source);
+                    let Some(core) = core.upgrade() else {
+                        break;
+                    };
+                    let _ = admission::admit_event(&core, envelope, source);
                 }
             })?;
-        let (tx, rx) = mpsc::channel(config.outbound_capacity);
+        let (commands, command_rx) = mpsc::channel(config.channel_capacity);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(0);
+        // The zero-capacity handshake makes start() return only after the
+        // runtime and swarm have either initialized or reported an error.
         let join = thread::Builder::new()
             .name(format!("zendb-replication-{workspace_id}"))
             .spawn(move || {
@@ -70,14 +76,14 @@ impl RunningReplication {
                             let _ = ready_tx.send(Ok(()));
                             run_worker(
                                 swarm,
-                                rx,
+                                command_rx,
                                 WorkerContext {
                                     topic,
                                     local_installation_id,
-                                    batch_config: config.batch,
-                                    topology_config: config.topology,
-                                    dial_config: config.dial,
-                                    remote_installations,
+                                    batch: config.batch,
+                                    topology: config.topology,
+                                    dial: config.dial,
+                                    initial_routes,
                                     inbound: inbound_tx,
                                 },
                             )
@@ -91,7 +97,7 @@ impl RunningReplication {
             })?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
-                tx,
+                commands,
                 join: Some(join),
                 admission_join: Some(admission_join),
             }),
@@ -109,7 +115,9 @@ impl RunningReplication {
     }
 
     pub(super) fn stop(mut self) {
-        let _ = self.tx.blocking_send(Command::Stop);
+        // Worker shutdown drains pending batches before its join completes;
+        // only then is it safe to stop the admission thread.
+        let _ = self.commands.blocking_send(Command::Stop);
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }

@@ -3,13 +3,12 @@
 use libp2p_identity::PeerId;
 use zendb_types::{Envelope, Event, EventId, EventStamp, Role};
 
-use crate::{Error, consts::is_system_table, installations::Installations, tables::Tables};
+use crate::{Error, core::WorkspaceCore, system::is_system_table};
 
 #[derive(Debug)]
 pub enum AdmitError {
-    UnknownPeer,
+    UnknownInstallation,
     AuthorMismatch,
-    AmbiguousPeer,
     Unauthorized,
     Workspace(Error),
 }
@@ -17,12 +16,9 @@ pub enum AdmitError {
 impl std::fmt::Display for AdmitError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnknownPeer => formatter.write_str("the envelope author is not enrolled"),
+            Self::UnknownInstallation => formatter.write_str("the envelope author is not enrolled"),
             Self::AuthorMismatch => {
                 formatter.write_str("the envelope author does not match its signed source")
-            }
-            Self::AmbiguousPeer => {
-                formatter.write_str("the signed source belongs to multiple installations")
             }
             Self::Unauthorized => formatter.write_str("the envelope author is not authorized"),
             Self::Workspace(error) => error.fmt(formatter),
@@ -40,28 +36,17 @@ impl std::error::Error for AdmitError {
 }
 
 pub(crate) fn admit_event(
-    tables: &Tables,
-    installations: &Installations,
+    core: &WorkspaceCore,
     envelope: Envelope,
     gossipsub_source: PeerId,
 ) -> Result<(), AdmitError> {
-    let installation = installations
+    let installation = core
+        .membership
         .get(&envelope.author)
-        .ok_or(AdmitError::UnknownPeer)?;
+        .ok_or(AdmitError::UnknownInstallation)?;
     if installation.public_key.as_libp2p().to_peer_id() != gossipsub_source {
         return Err(AdmitError::AuthorMismatch);
     }
-    if installations
-        .list()
-        .into_iter()
-        .any(|(installation_id, installation)| {
-            installation_id != envelope.author
-                && installation.public_key.as_libp2p().to_peer_id() == gossipsub_source
-        })
-    {
-        return Err(AdmitError::AmbiguousPeer);
-    }
-
     let required = if is_system_table(&envelope.table) {
         Role::Admin
     } else {
@@ -74,10 +59,17 @@ pub(crate) fn admit_event(
         return Err(AdmitError::Unauthorized);
     }
 
-    let table = tables.get(&envelope.table).map_err(AdmitError::Workspace)?;
+    let table = core
+        .table_store
+        .get(&envelope.table)
+        .map_err(AdmitError::Workspace)?;
+    // The envelope author and signed source are authenticated once. Each
+    // compact event then uses the shared commit path so remote projections and
+    // causal receipts follow the same ordering as local changes.
     for compact in envelope.events {
-        table
-            .insert_internal(Event {
+        core.commit_admitted_event(
+            &table,
+            Event {
                 primary_key: compact.primary_key,
                 path: compact.path,
                 op: compact.op,
@@ -88,8 +80,9 @@ pub(crate) fn admit_event(
                     },
                     time: compact.time,
                 },
-            })
-            .map_err(AdmitError::Workspace)?;
+            },
+        )
+        .map_err(AdmitError::Workspace)?;
     }
     Ok(())
 }

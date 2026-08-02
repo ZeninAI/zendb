@@ -10,9 +10,10 @@ description = "Integration tests for ZenDB"
 [dependencies]
 bincode.workspace = true
 libp2p-identity.workspace = true
-zendb-workspace = { path = "../zendb-workspace" }
+zendb-workspace = { path = "../zendb-workspace", features = ["test-support"] }
 zendb-storage = { path = "../zendb-storage" }
 zendb-types = { path = "../zendb-types" }
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber.workspace = true

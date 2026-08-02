@@ -1,5 +1,7 @@
 //! End-to-end workspace table, state, durability, and deletion lifecycle.
 
+mod common;
+
 use std::sync::Arc;
 
 use bincode::{Decode, Encode};
@@ -15,13 +17,14 @@ struct Greeting {
 
 #[test]
 fn workspace_data_survives_reopen_and_lifecycle_deletions() {
+    common::init_logging();
     let temp = tempfile::tempdir().expect("failed to create workspace directory");
     let root = temp.path();
     let identity = Arc::new(TestPeerIdentity::generate("test-installation"));
 
     let workspace = Workspace::create(root, identity.clone(), WorkspaceConfig::default())
         .expect("failed to create workspace");
-    let workspace_id = workspace.id();
+    let workspace_id = workspace.workspace_id();
     workspace
         .tables()
         .upsert("users", TableConfig::default())
@@ -66,7 +69,7 @@ fn workspace_data_survives_reopen_and_lifecycle_deletions() {
 
     let workspace = Workspace::open(root, identity.clone(), WorkspaceConfig::default())
         .expect("failed to reopen workspace");
-    assert_eq!(workspace.id(), workspace_id);
+    assert_eq!(workspace.workspace_id(), workspace_id);
     assert!(workspace.tables().list().contains(&"users".to_owned()));
     assert!(workspace.states().list().contains(&"greetings".to_owned()));
 

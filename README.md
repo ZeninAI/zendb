@@ -36,6 +36,11 @@ pub struct EventStamp {
 `InstallationId` and `WorkspaceId` are currently random eight-byte values with
 thirteen-character Crockford Base32 display forms.
 
+Workspace writes follow one explicit synchronous path: authorize, mint, apply,
+observe, project system state, publish locally authored changes, then notify
+application listeners. Minting never holds the causal lock across table I/O;
+failed writes may therefore leave sequence gaps for future anti-entropy no-ops.
+
 ## Tables And States
 
 A Table has a fixed `PrimaryKey -> Cell` shape backed by materialized state, a
@@ -70,15 +75,16 @@ not an event-size admission limit; Gossipsub's transport limit defaults to
 
 ## Enrollment
 
-Only an Admin writes `_installations`. The Admin assigns an `InstallationId`, the
-joining application derives its workspace public key with
-`derive_workspace_public_key`, and the Admin stores that key in a
-`Installation` together with any stable dial addresses. Addresses are routing
-hints rather than identities and may be empty.
+Only an Admin writes `_installations`. The Admin assigns an `InstallationId` and
+stores the joining installation's workspace public key together with any stable
+dial addresses. The workspace keypair derivation helper is currently available
+only through the `test-support` feature; the production enrollment API is
+pending.
+Addresses are routing hints rather than identities and may be empty.
 
-`Workspace::join` currently persists the assigned local identity and creates
-empty staged system storage. Initial registry/history synchronization is
-deferred, so a staged join does not start replication or grant itself a role.
+There is currently no `Workspace::join` API. Initial registry/history
+synchronization will define that lifecycle later; ZenDB does not expose an
+incomplete staged workspace in the meantime.
 
 ## Durable Layout
 
@@ -92,7 +98,7 @@ workspace-root/
     <table-name>/
   states/
     _catalog/
-    _peers/
+    _causal/
     <state-name>/
 ```
 

@@ -1,5 +1,6 @@
 //! End-to-end replication between two live workspaces on loopback TCP.
 
+mod common;
 mod support;
 
 use std::{
@@ -17,6 +18,7 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 
 #[test]
 fn workspaces_replicate_events_and_table_lifecycle() {
+    common::init_logging();
     let fixture = WorkspacePair::seeded(&["messages"]);
     let workspace_a = Workspace::open(
         &fixture.a_root,

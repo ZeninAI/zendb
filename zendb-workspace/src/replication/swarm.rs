@@ -16,42 +16,42 @@ use super::ReplicationConfig;
 
 #[derive(NetworkBehaviour)]
 #[behaviour(
-    to_swarm = "ReplBehaviourEvent",
+    to_swarm = "ReplicationBehaviourEvent",
     prelude = "libp2p::swarm::derive_prelude"
 )]
-pub(super) struct ReplBehaviour {
+pub(super) struct ReplicationBehaviour {
     pub(super) gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
     ping: ping::Behaviour,
     identify: identify::Behaviour,
 }
 
-pub(super) enum ReplBehaviourEvent {
+pub(super) enum ReplicationBehaviourEvent {
     Gossipsub(gossipsub::Event),
     Mdns(mdns::Event),
     Ping(ping::Event),
     Identify(Box<identify::Event>),
 }
 
-impl From<gossipsub::Event> for ReplBehaviourEvent {
+impl From<gossipsub::Event> for ReplicationBehaviourEvent {
     fn from(event: gossipsub::Event) -> Self {
         Self::Gossipsub(event)
     }
 }
 
-impl From<mdns::Event> for ReplBehaviourEvent {
+impl From<mdns::Event> for ReplicationBehaviourEvent {
     fn from(event: mdns::Event) -> Self {
         Self::Mdns(event)
     }
 }
 
-impl From<ping::Event> for ReplBehaviourEvent {
+impl From<ping::Event> for ReplicationBehaviourEvent {
     fn from(event: ping::Event) -> Self {
         Self::Ping(event)
     }
 }
 
-impl From<identify::Event> for ReplBehaviourEvent {
+impl From<identify::Event> for ReplicationBehaviourEvent {
     fn from(event: identify::Event) -> Self {
         Self::Identify(Box::new(event))
     }
@@ -61,8 +61,11 @@ pub(super) fn build_swarm(
     workspace_id: WorkspaceId,
     keypair: Keypair,
     config: &ReplicationConfig,
-) -> std::result::Result<(Swarm<ReplBehaviour>, IdentTopic), String> {
+) -> std::result::Result<(Swarm<ReplicationBehaviour>, IdentTopic), String> {
     let local_peer_id = keypair.public().to_peer_id();
+    // The derived workspace key signs gossipsub messages and identify data;
+    // strict validation therefore binds transport identity to installation
+    // membership checked later by admission.
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .validation_mode(ValidationMode::Strict)
         .max_transmit_size(config.gossipsub_max_transmit_size)
@@ -79,7 +82,7 @@ pub(super) fn build_swarm(
         .map_err(|error| error.to_string())?;
     let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
         .map_err(|error| error.to_string())?;
-    let behaviour = ReplBehaviour {
+    let behaviour = ReplicationBehaviour {
         gossipsub,
         mdns,
         ping: ping::Behaviour::default(),

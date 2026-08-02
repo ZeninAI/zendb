@@ -7,17 +7,10 @@ use std::{
     sync::Arc,
 };
 
-use bincode::Encode;
 use zendb_it::{TestPeerIdentity, offline_workspace_config};
 use zendb_storage::TableConfig;
-use zendb_types::{InstallationId, Multiaddr, WorkspaceId, utils::serialize_to_vec};
-use zendb_workspace::{Installation, Role, Workspace, derive_workspace_public_key};
-
-#[derive(Encode)]
-struct LocalIdentity {
-    workspace_id: WorkspaceId,
-    installation_id: InstallationId,
-}
+use zendb_types::{Multiaddr, PublicKey};
+use zendb_workspace::{Installation, Role, Workspace, derive_workspace_keypair};
 
 pub struct WorkspacePair {
     _temp: tempfile::TempDir,
@@ -40,9 +33,14 @@ impl WorkspacePair {
 
         let workspace = Workspace::create(&a_root, a_identity.clone(), offline_workspace_config())
             .expect("failed to create seed workspace");
-        let workspace_id = workspace.id();
+        let workspace_id = workspace.workspace_id();
         let installation_a = workspace.installations().local_installation_id();
-        let installation_b = InstallationId::generate();
+        let mut b_config = offline_workspace_config();
+        b_config.workspace_id = Some(workspace_id);
+        let b_workspace = Workspace::create(&b_root, b_identity.clone(), b_config)
+            .expect("failed to create workspace B fixture");
+        let installation_b = b_workspace.installations().local_installation_id();
+        drop(b_workspace);
 
         let mut installation_a_value = workspace
             .installations()
@@ -60,12 +58,11 @@ impl WorkspacePair {
                 Installation {
                     display_name: "installation-b".to_owned(),
                     role: Some(Role::Contributor),
-                    public_key: derive_workspace_public_key(
-                        b_identity.as_ref(),
-                        workspace_id,
-                        installation_b,
-                    )
-                    .expect("failed to derive installation B workspace key"),
+                    public_key: PublicKey::from_libp2p(
+                        derive_workspace_keypair(b_identity.as_ref(), workspace_id, installation_b)
+                            .expect("failed to derive installation B workspace key")
+                            .public(),
+                    ),
                     addresses: vec![loopback_address(b_port)],
                 },
             )
@@ -79,19 +76,9 @@ impl WorkspacePair {
         workspace.sync().expect("failed to sync seed workspace");
         drop(workspace);
 
-        // Initial join synchronization is intentionally deferred in ZenDB.
-        // Seed the second root with the already trusted history, then give it
-        // installation B's assigned identity.
-        copy_directory(&a_root, &b_root);
-        fs::write(
-            b_root.join("_identity"),
-            serialize_to_vec(&LocalIdentity {
-                workspace_id,
-                installation_id: installation_b,
-            })
-            .expect("failed to encode installation B identity"),
-        )
-        .expect("failed to write installation B identity");
+        // Only the trusted table history is copied from A; copying A's states
+        // would leave B without the causal row keyed by its own installation.
+        copy_directory(&a_root.join("tables"), &b_root.join("tables"));
 
         Self {
             _temp: temp,

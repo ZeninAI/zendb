@@ -19,65 +19,64 @@ use super::{
     BatchConfig, DialConfig, TopologyConfig,
     batcher::Batcher,
     command::{Command, PeerRoute},
-    peer_book::PeerBook,
-    swarm::{ReplBehaviour, ReplBehaviourEvent},
+    peers::PeerDirectory,
+    swarm::{ReplicationBehaviour, ReplicationBehaviourEvent},
 };
 
 pub(super) struct WorkerContext {
     pub(super) topic: IdentTopic,
     pub(super) local_installation_id: InstallationId,
-    pub(super) batch_config: BatchConfig,
-    pub(super) topology_config: TopologyConfig,
-    pub(super) dial_config: DialConfig,
-    pub(super) remote_installations: BTreeMap<InstallationId, PeerRoute>,
+    pub(super) batch: BatchConfig,
+    pub(super) topology: TopologyConfig,
+    pub(super) dial: DialConfig,
+    pub(super) initial_routes: BTreeMap<InstallationId, PeerRoute>,
     pub(super) inbound: std_mpsc::SyncSender<(Envelope, PeerId)>,
 }
 
 pub(super) async fn run_worker(
-    mut swarm: Swarm<ReplBehaviour>,
-    mut rx: mpsc::Receiver<Command>,
+    mut swarm: Swarm<ReplicationBehaviour>,
+    mut commands: mpsc::Receiver<Command>,
     context: WorkerContext,
 ) {
-    let linger_duration = context.batch_config.linger.max(Duration::from_millis(1));
-    let mut batches = Batcher::new(context.local_installation_id, context.batch_config);
-    let mut peers = PeerBook::new(context.remote_installations, context.dial_config);
+    let linger_duration = context.batch.linger.max(Duration::from_millis(1));
+    let mut batches = Batcher::new(context.local_installation_id, context.batch);
+    let mut peers = PeerDirectory::new(context.initial_routes, context.dial);
     let mut linger = tokio::time::interval_at(
         tokio::time::Instant::now() + linger_duration,
         linger_duration,
     );
     let mut dial = tokio::time::interval(Duration::from_millis(100));
     loop {
+        // The worker is the sole owner of swarm and peer state; controller
+        // commands and network events are serialized through this select loop.
         tokio::select! {
-            command = rx.recv() => {
+            command = commands.recv() => {
                 match command {
-                    Some(Command::Event { table, event }) => {
+                    Some(Command::PublishEvent { table, event }) => {
                         if let Some(envelope) = batches.push(table, event) {
-                            publish(&mut swarm, &context.topic, envelope);
+                            publish_envelope(&mut swarm, &context.topic, envelope);
                         }
                     }
                     Some(Command::UpsertPeer {
-                        installation_id,
                         peer_id,
                         addresses,
                     }) => {
-                        peers.upsert(installation_id, peer_id, addresses);
+                        peers.upsert(peer_id, addresses);
                         swarm
                             .behaviour_mut()
                             .gossipsub
                             .remove_blacklisted_peer(&peer_id);
                     }
-                    Some(Command::RemovePeer {
-                        installation_id,
-                        peer_id,
-                    }) => {
-                        peers.remove(installation_id, peer_id);
+                    Some(Command::RemovePeer { peer_id }) => {
+                        peers.remove(peer_id);
                         swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
                         swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                         let _ = swarm.disconnect_peer_id(peer_id);
                     }
                     Some(Command::Stop) | None => {
+                        // Publish already-batched events before the worker exits.
                         for envelope in batches.drain() {
-                            publish(&mut swarm, &context.topic, envelope);
+                            publish_envelope(&mut swarm, &context.topic, envelope);
                         }
                         break;
                     }
@@ -85,7 +84,7 @@ pub(super) async fn run_worker(
             }
             _ = linger.tick() => {
                 for envelope in batches.drain() {
-                    publish(&mut swarm, &context.topic, envelope);
+                    publish_envelope(&mut swarm, &context.topic, envelope);
                 }
             }
             _ = dial.tick() => {
@@ -99,18 +98,20 @@ pub(super) async fn run_worker(
             }
             event = swarm.select_next_some() => {
                 match event {
-                    SwarmEvent::Behaviour(ReplBehaviourEvent::Gossipsub(
+                    SwarmEvent::Behaviour(ReplicationBehaviourEvent::Gossipsub(
                         gossipsub::Event::Message { message, .. }
                     )) => {
                         if let (Some(source), Ok(envelope)) = (
                             message.source,
                             zendb_types::utils::deserialize_from::<Envelope>(&message.data),
-                        ) && peers.accepts(&source)
+                        ) && peers.is_active(&source)
                         {
+                            // Network admission performs signature, role, and
+                            // workspace checks on a separate blocking thread.
                             let _ = context.inbound.send((envelope, source));
                         }
                     }
-                    SwarmEvent::Behaviour(ReplBehaviourEvent::Mdns(
+                    SwarmEvent::Behaviour(ReplicationBehaviourEvent::Mdns(
                         mdns::Event::Discovered(discovered)
                     )) => {
                         for (peer_id, address) in discovered {
@@ -120,42 +121,42 @@ pub(super) async fn run_worker(
                                     .gossipsub
                                     .set_application_score(
                                         &peer_id,
-                                        context.topology_config.lan_score_bonus,
+                                        context.topology.lan_score_bonus,
                                     );
                             }
                         }
                     }
-                    SwarmEvent::Behaviour(ReplBehaviourEvent::Mdns(
+                    SwarmEvent::Behaviour(ReplicationBehaviourEvent::Mdns(
                         mdns::Event::Expired(expired)
                     )) => {
                         for (peer_id, address) in expired {
                             peers.expire_mdns(peer_id, address);
                         }
                     }
-                    SwarmEvent::Behaviour(ReplBehaviourEvent::Ping(event)) => {
+                    SwarmEvent::Behaviour(ReplicationBehaviourEvent::Ping(event)) => {
                         if let Ok(round_trip) = event.result {
                             let lan_bonus = if peers.is_lan(&event.peer) {
-                                context.topology_config.lan_score_bonus
+                                context.topology.lan_score_bonus
                             } else {
                                 0.0
                             };
                             let score = lan_bonus
                                 - round_trip.as_secs_f64()
                                     * 1_000.0
-                                    * context.topology_config.latency_weight;
+                                    * context.topology.latency_weight;
                             swarm
                                 .behaviour_mut()
                                 .gossipsub
                                 .set_application_score(&event.peer, score);
                         }
                     }
-                    SwarmEvent::Behaviour(ReplBehaviourEvent::Identify(event)) => {
+                    SwarmEvent::Behaviour(ReplicationBehaviourEvent::Identify(event)) => {
                         if let identify::Event::Received { peer_id, info, .. } = *event {
-                            peers.identify(peer_id, info.listen_addrs);
+                            peers.update_identified_addresses(peer_id, info.listen_addrs);
                         }
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                        if !peers.connected(peer_id) {
+                        if !peers.mark_connected(peer_id) {
                             swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
                             let _ = swarm.disconnect_peer_id(peer_id);
                         }
@@ -164,11 +165,11 @@ pub(super) async fn run_worker(
                         peer_id,
                         num_established: 0,
                         ..
-                    } => peers.disconnected(peer_id),
+                    } => peers.mark_disconnected(peer_id),
                     SwarmEvent::OutgoingConnectionError {
                         peer_id: Some(peer_id),
                         ..
-                    } => peers.dial_failed(peer_id),
+                    } => peers.record_dial_failure(peer_id),
                     _ => {}
                 }
             }
@@ -176,7 +177,11 @@ pub(super) async fn run_worker(
     }
 }
 
-fn publish(swarm: &mut Swarm<ReplBehaviour>, topic: &IdentTopic, envelope: Envelope) {
+fn publish_envelope(
+    swarm: &mut Swarm<ReplicationBehaviour>,
+    topic: &IdentTopic,
+    envelope: Envelope,
+) {
     if let Ok(payload) = serialize_to_vec(&envelope) {
         let _ = swarm
             .behaviour_mut()

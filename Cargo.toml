@@ -43,3 +43,6 @@ rand = "0.8"
 
 parking_lot = "0.12"
 arc-swap = "1"
+
+# zendb-it
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

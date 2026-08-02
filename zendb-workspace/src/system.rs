@@ -1,4 +1,4 @@
-//! Workspace paths, system resource names, classifiers, and bootstrap configs.
+//! Workspace layout, key-derivation domains, and reserved system resources.
 
 use std::sync::LazyLock;
 
@@ -7,16 +7,18 @@ use zendb_storage::{
 };
 
 pub(crate) const IDENTITY_FILE: &str = "_identity";
+pub(crate) const IDENTITY_TEMP_FILE: &str = "_identity.tmp";
 pub(crate) const LOCK_FILE: &str = "_lock";
+pub(crate) const WORKSPACE_KEY_DOMAIN: &[u8] = b"zendb/v1";
 pub(crate) const STATES_DIR: &str = "states";
 pub(crate) const TABLES_DIR: &str = "tables";
 
 pub(crate) const STATE_CATALOG_NAME: &str = "_catalog";
-pub(crate) const PEERS_STATE_NAME: &str = "_peers";
+pub(crate) const CAUSAL_STATE_NAME: &str = "_causal";
 pub(crate) const TABLE_CATALOG_NAME: &str = "_catalog";
 pub(crate) const INSTALLATIONS_TABLE_NAME: &str = "_installations";
 
-/// Shared configuration for the catalog and peer states.
+/// Shared configuration for the catalog and causal states.
 pub(crate) static SYSTEM_STATE_CONFIG: LazyLock<StateConfig> =
     LazyLock::new(|| StateConfig::Unordered(KeyDirConfig::default()));
 
@@ -28,7 +30,7 @@ pub(crate) static SYSTEM_TABLE_CONFIG: LazyLock<TableConfig> = LazyLock::new(|| 
 });
 
 pub(crate) fn is_system_state(name: &str) -> bool {
-    matches!(name, STATE_CATALOG_NAME | PEERS_STATE_NAME)
+    matches!(name, STATE_CATALOG_NAME | CAUSAL_STATE_NAME)
 }
 
 pub(crate) fn is_system_table(name: &str) -> bool {

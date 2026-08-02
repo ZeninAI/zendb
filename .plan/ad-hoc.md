@@ -10,3 +10,6 @@
 - Installations catalog listener think about what happens if the current installation gets removed
 - Table modify the before-after of the change to be the cell of the path not the entire big object
 - EG-Walker algorithm for the text edits + Check out LORO
+- Check the arc strong ref count of close, delete methods in table, state and figure out the ownership model
+- Define how post-commit causal and system-projection failures are surfaced and recovered.
+- mint() -> Table rejects as duplicate -> observe never called leaving a gap. Decide where the deduplication should happen wheather table discard should stop the observe path.

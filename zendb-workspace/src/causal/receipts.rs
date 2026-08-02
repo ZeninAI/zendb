@@ -1,4 +1,4 @@
-//! Per-peer receipt windows and missing-sequence range maintenance.
+//! Per-installation receipt windows and missing-sequence range maintenance.
 
 use std::{cmp::Ordering, ops::RangeInclusive};
 
@@ -24,6 +24,8 @@ impl ReceiptWindow {
             return Err(Error::InvalidEventSequence);
         }
         if sequence > self.max_seen {
+            // A new high-water mark records every skipped sequence as one
+            // missing range; later observations remove or split that range.
             if self.max_seen < u64::MAX && sequence > self.max_seen + 1 {
                 self.missing.push((self.max_seen + 1)..=(sequence - 1));
             }

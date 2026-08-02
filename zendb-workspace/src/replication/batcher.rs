@@ -8,7 +8,7 @@ use super::BatchConfig;
 
 struct PendingBatch {
     events: Vec<CompactEvent>,
-    bytes: usize,
+    encoded_bytes: usize,
 }
 
 pub(super) struct Batcher {
@@ -34,22 +34,25 @@ impl Batcher {
             path: event.path,
             op: event.op,
         };
-        let event_bytes = serialized_size(&compact).unwrap_or(0);
+        let encoded_event_bytes = serialized_size(&compact).unwrap_or(0);
+        // Batches are isolated per table because an Envelope carries one table
+        // name. Include the empty-envelope overhead when enforcing byte limits.
         let batch = self
             .pending
             .entry(table.clone())
             .or_insert_with(|| PendingBatch {
                 events: Vec::new(),
-                bytes: serialized_size(&Envelope {
+                encoded_bytes: serialized_size(&Envelope {
                     author: self.author,
                     table: table.clone(),
                     events: Vec::new(),
                 })
                 .unwrap_or(0),
             });
-        batch.bytes = batch.bytes.saturating_add(event_bytes);
+        batch.encoded_bytes = batch.encoded_bytes.saturating_add(encoded_event_bytes);
         batch.events.push(compact);
-        (batch.events.len() >= self.config.max_events || batch.bytes >= self.config.max_bytes)
+        (batch.events.len() >= self.config.max_events
+            || batch.encoded_bytes >= self.config.max_bytes)
             .then(|| self.pending.remove(&table))
             .flatten()
             .map(|batch| Envelope {

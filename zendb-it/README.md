@@ -30,3 +30,12 @@ Run them with:
 ```text
 cargo test -p zendb-it
 ```
+
+The tests install a `tracing-subscriber` formatter. They default to `debug` and
+honor `RUST_LOG`; use `cargo test -p zendb-it -- --nocapture` to display logs
+from passing tests. For example, in PowerShell:
+
+```powershell
+$env:RUST_LOG = "zendb_workspace=debug,libp2p_gossipsub=trace"
+cargo test -p zendb-it -- --nocapture
+```

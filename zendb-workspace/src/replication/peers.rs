@@ -6,7 +6,7 @@ use std::{
 };
 
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
-use zendb_types::InstallationId;
+use zendb_types::{InstallationId, Permission, Permissions};
 
 use super::{DialConfig, command::PeerRoute};
 
@@ -50,16 +50,18 @@ struct PeerEntry {
     identified_addresses: HashSet<Multiaddr>,
     connected: bool,
     retry: RetryState,
+    permissions: Permissions,
 }
 
 impl PeerEntry {
-    fn new(addresses: Vec<Multiaddr>, dial_config: &DialConfig) -> Self {
+    fn new(addresses: Vec<Multiaddr>, permissions: Permissions, dial_config: &DialConfig) -> Self {
         Self {
             configured_addresses: addresses,
             mdns_addresses: HashSet::new(),
             identified_addresses: HashSet::new(),
             connected: false,
             retry: RetryState::new(dial_config),
+            permissions,
         }
     }
 
@@ -91,7 +93,12 @@ impl PeerDirectory {
     ) -> Self {
         let entries = routes
             .into_values()
-            .map(|route| (route.peer_id, PeerEntry::new(route.addresses, &dial_config)))
+            .map(|route| {
+                (
+                    route.peer_id,
+                    PeerEntry::new(route.addresses, route.permissions, &dial_config),
+                )
+            })
             .collect();
         Self {
             entries,
@@ -105,13 +112,26 @@ impl PeerDirectory {
         self.entries.contains_key(peer_id) && !self.revoked.contains(peer_id)
     }
 
-    pub(super) fn upsert(&mut self, peer_id: PeerId, addresses: Vec<Multiaddr>) {
+    pub(super) fn can_read_data(&self, peer_id: &PeerId) -> bool {
+        self.entries
+            .get(peer_id)
+            .is_some_and(|entry| entry.permissions.allows(Permission::ReadData))
+            && !self.revoked.contains(peer_id)
+    }
+
+    pub(super) fn upsert(
+        &mut self,
+        peer_id: PeerId,
+        addresses: Vec<Multiaddr>,
+        permissions: Permissions,
+    ) {
         self.revoked.remove(&peer_id);
         let entry = self
             .entries
             .entry(peer_id)
-            .or_insert_with(|| PeerEntry::new(Vec::new(), &self.dial_config));
+            .or_insert_with(|| PeerEntry::new(Vec::new(), permissions, &self.dial_config));
         entry.configured_addresses = addresses;
+        entry.permissions = permissions;
         entry.retry.reset();
     }
 

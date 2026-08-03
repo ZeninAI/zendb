@@ -1,9 +1,13 @@
 //! Authenticated envelope admission shared by Workspace and its network worker.
 
 use libp2p_identity::PeerId;
-use zendb_types::{Envelope, Event, EventId, EventStamp, Role};
+use zendb_types::{Envelope, Event, EventId, EventStamp, Permission};
 
-use crate::{Error, core::WorkspaceCore, system::is_system_table};
+use crate::{
+    Error,
+    core::WorkspaceCore,
+    system::{INSTALLATIONS_TABLE_NAME, TABLE_CATALOG_NAME},
+};
 
 #[derive(Debug)]
 pub enum AdmitError {
@@ -47,14 +51,15 @@ pub(crate) fn admit_event(
     if installation.public_key.as_libp2p().to_peer_id() != gossipsub_source {
         return Err(AdmitError::AuthorMismatch);
     }
-    let required = if is_system_table(&envelope.table) {
-        Role::Admin
-    } else {
-        Role::Contributor
+    let required = match envelope.table.as_str() {
+        INSTALLATIONS_TABLE_NAME => Permission::ManageInstallations,
+        TABLE_CATALOG_NAME => Permission::ManageCatalog,
+        _ => Permission::WriteData,
     };
     if !installation
-        .role
-        .is_some_and(|role| role.has_at_least(required))
+        .state
+        .permissions()
+        .is_some_and(|permissions| permissions.allows(required))
     {
         return Err(AdmitError::Unauthorized);
     }

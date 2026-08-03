@@ -20,4 +20,7 @@ pub use tables::{ChangeListener, TableHandle, Tables};
 #[cfg(any(test, feature = "test-support"))]
 pub use workspace::derive_workspace_keypair;
 pub use workspace::{Workspace, WorkspaceConfig};
-pub use zendb_types::{Installation, Multiaddr, MultiaddrError, PublicKey, Role, WorkspaceId};
+pub use zendb_types::{
+    Installation, InstallationState, Multiaddr, MultiaddrError, Permission, Permissions, PublicKey,
+    WorkspaceId,
+};

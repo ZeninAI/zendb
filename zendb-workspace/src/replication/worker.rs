@@ -1,30 +1,33 @@
-//! Async replication loop coordinating commands, batching, peers, and swarm events.
+//! Async network loop coordinating live planes, batching, peers, and swarm events.
 
 use std::{collections::BTreeMap, sync::mpsc as std_mpsc, time::Duration};
 
 use futures::StreamExt;
 use libp2p::{
-    PeerId, Swarm,
-    gossipsub::{self, IdentTopic},
-    identify, mdns,
+    PeerId, Swarm, gossipsub, identify, mdns,
     swarm::{
         SwarmEvent,
         dial_opts::{DialOpts, PeerCondition},
     },
 };
 use tokio::sync::mpsc;
-use zendb_types::{Envelope, InstallationId, utils::serialize_to_vec};
+use zendb_types::{Envelope, InstallationId, Permission, Permissions, utils::serialize_to_vec};
 
 use super::{
     BatchConfig, DialConfig, TopologyConfig,
     batcher::Batcher,
     command::{Command, PeerRoute},
     peers::PeerDirectory,
-    swarm::{ReplicationBehaviour, ReplicationBehaviourEvent},
+    swarm::{
+        DataGossipEvent, MembershipGossipEvent, WorkspaceBehaviour, WorkspaceBehaviourEvent,
+        WorkspaceTopics,
+    },
 };
+use crate::system::INSTALLATIONS_TABLE_NAME;
 
 pub(super) struct WorkerContext {
-    pub(super) topic: IdentTopic,
+    pub(super) topics: WorkspaceTopics,
+    pub(super) local_permissions: Permissions,
     pub(super) local_installation_id: InstallationId,
     pub(super) batch: BatchConfig,
     pub(super) topology: TopologyConfig,
@@ -34,13 +37,26 @@ pub(super) struct WorkerContext {
 }
 
 pub(super) async fn run_worker(
-    mut swarm: Swarm<ReplicationBehaviour>,
+    mut swarm: Swarm<WorkspaceBehaviour>,
     mut commands: mpsc::Receiver<Command>,
     context: WorkerContext,
 ) {
-    let linger_duration = context.batch.linger.max(Duration::from_millis(1));
-    let mut batches = Batcher::new(context.local_installation_id, context.batch);
-    let mut peers = PeerDirectory::new(context.initial_routes, context.dial);
+    let WorkerContext {
+        topics,
+        mut local_permissions,
+        local_installation_id,
+        batch,
+        topology,
+        dial,
+        initial_routes,
+        inbound,
+    } = context;
+    let linger_duration = batch.linger.max(Duration::from_millis(1));
+    let mut batches = Batcher::new(local_installation_id, batch);
+    for route in initial_routes.values() {
+        apply_peer_permissions(&mut swarm, route.peer_id, route.permissions);
+    }
+    let mut peers = PeerDirectory::new(initial_routes, dial);
     let mut linger = tokio::time::interval_at(
         tokio::time::Instant::now() + linger_duration,
         linger_duration,
@@ -54,29 +70,52 @@ pub(super) async fn run_worker(
                 match command {
                     Some(Command::PublishEvent { table, event }) => {
                         if let Some(envelope) = batches.push(table, event) {
-                            publish_envelope(&mut swarm, &context.topic, envelope);
+                            publish_envelope(&mut swarm, &topics, envelope);
                         }
                     }
                     Some(Command::UpsertPeer {
                         peer_id,
                         addresses,
+                        permissions,
                     }) => {
-                        peers.upsert(peer_id, addresses);
-                        swarm
-                            .behaviour_mut()
-                            .gossipsub
-                            .remove_blacklisted_peer(&peer_id);
+                        peers.upsert(peer_id, addresses, permissions);
+                        apply_peer_permissions(&mut swarm, peer_id, permissions);
+                    }
+                    Some(Command::SetLocalPermissions(permissions)) => {
+                        if local_permissions.allows(Permission::ReadData)
+                            != permissions.allows(Permission::ReadData)
+                        {
+                            if permissions.allows(Permission::ReadData) {
+                                let _ = swarm
+                                    .behaviour_mut()
+                                    .data
+                                    .behaviour
+                                    .subscribe(&topics.data);
+                            } else {
+                                swarm
+                                    .behaviour_mut()
+                                    .data
+                                    .behaviour
+                                    .unsubscribe(&topics.data);
+                            }
+                        }
+                        local_permissions = permissions;
                     }
                     Some(Command::RemovePeer { peer_id }) => {
                         peers.remove(peer_id);
-                        swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
-                        swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                        let behaviour = swarm.behaviour_mut();
+                        behaviour.membership.behaviour.blacklist_peer(&peer_id);
+                        behaviour
+                            .membership
+                            .behaviour
+                            .remove_explicit_peer(&peer_id);
+                        behaviour.data.behaviour.blacklist_peer(&peer_id);
+                        behaviour.data.behaviour.remove_explicit_peer(&peer_id);
                         let _ = swarm.disconnect_peer_id(peer_id);
                     }
                     Some(Command::Stop) | None => {
-                        // Publish already-batched events before the worker exits.
                         for envelope in batches.drain() {
-                            publish_envelope(&mut swarm, &context.topic, envelope);
+                            publish_envelope(&mut swarm, &topics, envelope);
                         }
                         break;
                     }
@@ -84,7 +123,7 @@ pub(super) async fn run_worker(
             }
             _ = linger.tick() => {
                 for envelope in batches.drain() {
-                    publish_envelope(&mut swarm, &context.topic, envelope);
+                    publish_envelope(&mut swarm, &topics, envelope);
                 }
             }
             _ = dial.tick() => {
@@ -98,66 +137,82 @@ pub(super) async fn run_worker(
             }
             event = swarm.select_next_some() => {
                 match event {
-                    SwarmEvent::Behaviour(ReplicationBehaviourEvent::Gossipsub(
-                        gossipsub::Event::Message { message, .. }
+                    SwarmEvent::Behaviour(WorkspaceBehaviourEvent::Membership(
+                        MembershipGossipEvent(gossipsub::Event::Message { message, .. })
                     )) => {
                         if let (Some(source), Ok(envelope)) = (
                             message.source,
                             zendb_types::utils::deserialize_from::<Envelope>(&message.data),
-                        ) && peers.is_active(&source)
+                        ) && envelope.table == INSTALLATIONS_TABLE_NAME
+                            && peers.is_active(&source)
                         {
-                            // Network admission performs signature, role, and
-                            // workspace checks on a separate blocking thread.
-                            let _ = context.inbound.send((envelope, source));
+                            let _ = inbound.send((envelope, source));
                         }
                     }
-                    SwarmEvent::Behaviour(ReplicationBehaviourEvent::Mdns(
+                    SwarmEvent::Behaviour(WorkspaceBehaviourEvent::Data(
+                        DataGossipEvent(gossipsub::Event::Message { message, .. })
+                    )) => {
+                        if local_permissions.allows(Permission::ReadData)
+                            && let (Some(source), Ok(envelope)) = (
+                                message.source,
+                                zendb_types::utils::deserialize_from::<Envelope>(&message.data),
+                            )
+                            && envelope.table != INSTALLATIONS_TABLE_NAME
+                            && peers.is_active(&source)
+                        {
+                            let _ = inbound.send((envelope, source));
+                        }
+                    }
+                    SwarmEvent::Behaviour(WorkspaceBehaviourEvent::Mdns(
                         mdns::Event::Discovered(discovered)
                     )) => {
                         for (peer_id, address) in discovered {
                             if peers.discover_mdns(peer_id, address) {
-                                swarm
-                                    .behaviour_mut()
-                                    .gossipsub
-                                    .set_application_score(
-                                        &peer_id,
-                                        context.topology.lan_score_bonus,
-                                    );
+                                set_peer_score(
+                                    &mut swarm,
+                                    peer_id,
+                                    topology.lan_score_bonus,
+                                    peers.can_read_data(&peer_id),
+                                );
                             }
                         }
                     }
-                    SwarmEvent::Behaviour(ReplicationBehaviourEvent::Mdns(
+                    SwarmEvent::Behaviour(WorkspaceBehaviourEvent::Mdns(
                         mdns::Event::Expired(expired)
                     )) => {
                         for (peer_id, address) in expired {
                             peers.expire_mdns(peer_id, address);
                         }
                     }
-                    SwarmEvent::Behaviour(ReplicationBehaviourEvent::Ping(event)) => {
+                    SwarmEvent::Behaviour(WorkspaceBehaviourEvent::Ping(event)) => {
                         if let Ok(round_trip) = event.result {
                             let lan_bonus = if peers.is_lan(&event.peer) {
-                                context.topology.lan_score_bonus
+                                topology.lan_score_bonus
                             } else {
                                 0.0
                             };
                             let score = lan_bonus
                                 - round_trip.as_secs_f64()
                                     * 1_000.0
-                                    * context.topology.latency_weight;
-                            swarm
-                                .behaviour_mut()
-                                .gossipsub
-                                .set_application_score(&event.peer, score);
+                                    * topology.latency_weight;
+                            set_peer_score(
+                                &mut swarm,
+                                event.peer,
+                                score,
+                                peers.can_read_data(&event.peer),
+                            );
                         }
                     }
-                    SwarmEvent::Behaviour(ReplicationBehaviourEvent::Identify(event)) => {
+                    SwarmEvent::Behaviour(WorkspaceBehaviourEvent::Identify(event)) => {
                         if let identify::Event::Received { peer_id, info, .. } = *event {
                             peers.update_identified_addresses(peer_id, info.listen_addrs);
                         }
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         if !peers.mark_connected(peer_id) {
-                            swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
+                            let behaviour = swarm.behaviour_mut();
+                            behaviour.membership.behaviour.blacklist_peer(&peer_id);
+                            behaviour.data.behaviour.blacklist_peer(&peer_id);
                             let _ = swarm.disconnect_peer_id(peer_id);
                         }
                     }
@@ -177,15 +232,62 @@ pub(super) async fn run_worker(
     }
 }
 
+fn apply_peer_permissions(
+    swarm: &mut Swarm<WorkspaceBehaviour>,
+    peer_id: PeerId,
+    permissions: Permissions,
+) {
+    let behaviour = swarm.behaviour_mut();
+    behaviour
+        .membership
+        .behaviour
+        .remove_blacklisted_peer(&peer_id);
+    if permissions.allows(Permission::ReadData) {
+        behaviour.data.behaviour.remove_blacklisted_peer(&peer_id);
+    } else {
+        behaviour.data.behaviour.blacklist_peer(&peer_id);
+        behaviour.data.behaviour.remove_explicit_peer(&peer_id);
+    }
+}
+
+fn set_peer_score(
+    swarm: &mut Swarm<WorkspaceBehaviour>,
+    peer_id: PeerId,
+    score: f64,
+    can_read_data: bool,
+) {
+    let behaviour = swarm.behaviour_mut();
+    let _ = behaviour
+        .membership
+        .behaviour
+        .set_application_score(&peer_id, score);
+    if can_read_data {
+        let _ = behaviour
+            .data
+            .behaviour
+            .set_application_score(&peer_id, score);
+    }
+}
+
 fn publish_envelope(
-    swarm: &mut Swarm<ReplicationBehaviour>,
-    topic: &IdentTopic,
+    swarm: &mut Swarm<WorkspaceBehaviour>,
+    topics: &WorkspaceTopics,
     envelope: Envelope,
 ) {
-    if let Ok(payload) = serialize_to_vec(&envelope) {
+    let Ok(payload) = serialize_to_vec(&envelope) else {
+        return;
+    };
+    if envelope.table == INSTALLATIONS_TABLE_NAME {
         let _ = swarm
             .behaviour_mut()
-            .gossipsub
-            .publish(topic.clone(), payload);
+            .membership
+            .behaviour
+            .publish(topics.membership.clone(), payload);
+    } else {
+        let _ = swarm
+            .behaviour_mut()
+            .data
+            .behaviour
+            .publish(topics.data.clone(), payload);
     }
 }

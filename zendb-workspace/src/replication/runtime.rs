@@ -9,7 +9,7 @@ use std::{
 use libp2p::PeerId;
 use libp2p_identity::Keypair;
 use tokio::sync::mpsc;
-use zendb_types::{Envelope, InstallationId, WorkspaceId};
+use zendb_types::{Envelope, InstallationId, Permissions, WorkspaceId};
 
 use super::{
     ReplicationConfig,
@@ -32,6 +32,7 @@ impl ReplicationRuntime {
         keypair: Keypair,
         core: Weak<WorkspaceCore>,
         config: ReplicationConfig,
+        local_permissions: Permissions,
         initial_routes: BTreeMap<InstallationId, PeerRoute>,
     ) -> Result<Self> {
         if config.channel_capacity == 0 {
@@ -71,14 +72,15 @@ impl ReplicationRuntime {
                     }
                 };
                 runtime.block_on(async move {
-                    match build_swarm(workspace_id, keypair, &config) {
-                        Ok((swarm, topic)) => {
+                    match build_swarm(workspace_id, keypair, local_permissions, &config) {
+                        Ok((swarm, topics)) => {
                             let _ = ready_tx.send(Ok(()));
                             run_worker(
                                 swarm,
                                 command_rx,
                                 WorkerContext {
-                                    topic,
+                                    topics,
+                                    local_permissions,
                                     local_installation_id,
                                     batch: config.batch,
                                     topology: config.topology,

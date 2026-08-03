@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use libp2p_identity::Keypair;
 use zendb_storage::InsertOutcome;
-use zendb_types::{Event, Op, Path, PrimaryKey, Role, WorkspaceId};
+use zendb_types::{Event, Op, Path, Permission, PrimaryKey, WorkspaceId};
 
 use crate::{
     Result,
@@ -56,10 +56,12 @@ impl WorkspaceCore {
         path: Path,
         op: Op,
     ) -> Result<InsertOutcome> {
-        // Commit local change from the TableHandle. TableHandler already blocks system tables direct insertions
-        // So here we can already assume that table type in Application hence the role is contributor
-        self.membership
-            .require_access(&self.membership.local_installation_id(), Role::Contributor)?;
+        // TableHandle blocks direct system-table writes, so this path only
+        // needs application-data authorization.
+        self.membership.require_permission(
+            &self.membership.local_installation_id(),
+            Permission::WriteData,
+        )?;
         self.commit_authorized_local_change(table, primary_key, path, op)
     }
 

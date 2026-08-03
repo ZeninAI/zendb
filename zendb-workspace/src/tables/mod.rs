@@ -6,7 +6,7 @@ mod store;
 use std::sync::Arc;
 
 use zendb_storage::{Storage, TableConfig};
-use zendb_types::{Blob, Op, Path, PrimaryKey, Role, Value};
+use zendb_types::{Blob, Op, Path, Permission, PrimaryKey, Value};
 
 pub use handle::{ChangeListener, TableHandle};
 pub(crate) use handle::{OpenTable, TableKind};
@@ -37,9 +37,10 @@ impl Tables {
         if is_system_table(name) {
             return Err(Error::SystemTableReadOnly(name.to_owned()));
         }
-        self.core
-            .membership
-            .require_access(&self.core.membership.local_installation_id(), Role::Admin)?;
+        self.core.membership.require_permission(
+            &self.core.membership.local_installation_id(),
+            Permission::ManageCatalog,
+        )?;
         if self
             .core
             .table_store
@@ -72,9 +73,10 @@ impl Tables {
         if is_system_table(name) {
             return Err(Error::SystemTableReadOnly(name.to_owned()));
         }
-        self.core
-            .membership
-            .require_access(&self.core.membership.local_installation_id(), Role::Admin)?;
+        self.core.membership.require_permission(
+            &self.core.membership.local_installation_id(),
+            Permission::ManageCatalog,
+        )?;
         let table = match self.core.table_store.get(name) {
             Ok(table) => table,
             Err(Error::TableNotFound(_)) => return Ok(false),

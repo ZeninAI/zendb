@@ -10,7 +10,9 @@ use std::{
 use zendb_it::{TestPeerIdentity, offline_workspace_config};
 use zendb_storage::TableConfig;
 use zendb_types::{Multiaddr, PublicKey};
-use zendb_workspace::{Installation, Role, Workspace, derive_workspace_keypair};
+use zendb_workspace::{
+    Installation, InstallationState, Permissions, Workspace, derive_workspace_keypair,
+};
 
 pub struct WorkspacePair {
     _temp: tempfile::TempDir,
@@ -57,13 +59,13 @@ impl WorkspacePair {
                 installation_b,
                 Installation {
                     display_name: "installation-b".to_owned(),
-                    role: Some(Role::Contributor),
                     public_key: PublicKey::from_libp2p(
                         derive_workspace_keypair(b_identity.as_ref(), workspace_id, installation_b)
                             .expect("failed to derive installation B workspace key")
                             .public(),
                     ),
                     addresses: vec![loopback_address(b_port)],
+                    state: InstallationState::Active(Permissions::CONTRIBUTOR),
                 },
             )
             .expect("failed to enroll installation B");

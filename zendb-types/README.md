@@ -24,10 +24,18 @@ Changing either identifier's width is one macro invocation change.
 `PublicKey` wraps `libp2p_identity::PublicKey` and implements bincode encoding
 through libp2p's canonical protobuf key representation.
 
-`Installation` is the persisted installation schema. It combines the display name,
-optional role, workspace-scoped public key, and stable dial addresses. The
-workspace crate owns registry policy and mutation; the portable value itself
-stays with the other bincode data types.
+`Installation` is the persisted installation schema. It combines the display
+name, workspace-scoped public key, stable dial addresses, and an explicit
+`InstallationState`. Pending installations are visible membership requests but
+hold no authority. Active installations contain a `Permissions` capability
+set. The workspace crate owns registry policy and mutation; the portable value
+itself stays with the other bincode data types.
+
+`Permissions` is a compact capability set with independent `ReadData`,
+`WriteData`, `ManageCatalog`, and `ManageInstallations` flags. Common constants
+cover reader, contributor, operator, Admin, and membership-manager profiles;
+`with` and `without` construct application-specific combinations without
+persisting an application role label.
 
 ZenDB's `Multiaddr` wraps the standalone `multiaddr::Multiaddr` value and
 encodes its canonical binary representation. It stores an Admin-provided route
@@ -61,10 +69,9 @@ pub struct EventTime {
 }
 ```
 
-`EventStamp` orders by
-`(physical_ms, logical, author, sequence)`. `Role` is persisted progressive
-access data with `Contributor`, `Operator`, and `Admin` variants; workspace
-owns enforcement.
+`EventStamp` orders by `(physical_ms, logical, author, sequence)`. Workspace
+authorization maps table operations directly to the active author's persisted
+permissions.
 
 `Event` remains the durable table mutation. `Envelope` and `CompactEvent` are
 bincode wire values that batch one author's events for one table. Envelopes

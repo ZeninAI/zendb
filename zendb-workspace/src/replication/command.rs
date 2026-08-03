@@ -1,12 +1,13 @@
 //! Commands and peer routes exchanged between replication control and transport.
 
 use libp2p::{Multiaddr, PeerId};
-use zendb_types::Event;
+use zendb_types::{Event, Permissions};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PeerRoute {
     pub(super) peer_id: PeerId,
     pub(super) addresses: Vec<Multiaddr>,
+    pub(super) permissions: Permissions,
 }
 
 pub(super) enum Command {
@@ -17,7 +18,9 @@ pub(super) enum Command {
     UpsertPeer {
         peer_id: PeerId,
         addresses: Vec<Multiaddr>,
+        permissions: Permissions,
     },
+    SetLocalPermissions(Permissions),
     RemovePeer {
         peer_id: PeerId,
     },

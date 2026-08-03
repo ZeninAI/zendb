@@ -24,6 +24,7 @@ pub enum Error {
     ClockExhausted,
     WorkspaceClosed,
     LocalInstallationNotEnrolled(InstallationId),
+    LocalInstallationNotActive(InstallationId),
     LocalCausalStateNotFound(InstallationId),
     LocalInstallationKeyMismatch,
     KeyDerivationUnsupported,
@@ -77,6 +78,10 @@ impl std::fmt::Display for Error {
                     "local installation {installation_id:?} is not enrolled"
                 )
             }
+            Self::LocalInstallationNotActive(installation_id) => write!(
+                formatter,
+                "local installation {installation_id:?} is not active"
+            ),
             Self::LocalCausalStateNotFound(installation_id) => write!(
                 formatter,
                 "causal state for local installation {installation_id:?} was not found"

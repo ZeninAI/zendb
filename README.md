@@ -36,6 +36,10 @@ pub struct EventStamp {
 `InstallationId` and `WorkspaceId` are currently random eight-byte values with
 thirteen-character Crockford Base32 display forms.
 
+Installation membership distinguishes replicated pending requests from active
+members. Active installations carry independent read, write, catalog-management,
+and installation-management capabilities rather than a progressive role.
+
 Workspace writes follow one explicit synchronous path: authorize, mint, apply,
 observe, project system state, publish locally authored changes, then notify
 application listeners. Minting never holds the causal lock across table I/O;
@@ -45,15 +49,17 @@ failed writes may therefore leave sequence gaps for future anti-entropy no-ops.
 
 A Table has a fixed `PrimaryKey -> Cell` shape backed by materialized state, a
 bounded write cache, and a durable `Topic<Change>`. Local application writes
-require Contributor access. System tables are publicly readable but writable
-only through workspace-owned APIs.
+require `WriteData`; catalog and installation mutations require their specific
+management capabilities. System tables are publicly readable but writable only
+through workspace-owned APIs.
 
 A State is caller-typed local storage, `State<K, V>`, with no Event or Topic.
 Catalog declarations are durable while typed handles are opened lazily.
 
 ## Replication
 
-`Workspace` privately owns a Tokio worker and a libp2p Gossipsub swarm. The
+`Workspace` privately owns a Tokio worker and one libp2p swarm with isolated
+membership and data Gossipsub behaviours. The
 runtime starts when `_installations` contains another installation and drains then
 stops when the last remote installation is removed. Applications do not create
 a replication link or supply an async runtime.
@@ -64,8 +70,10 @@ Noise authentication, and retries temporarily unreachable peers with capped
 backoff. mDNS and Identify can add transient routes only for enrolled peers;
 discovery never grants workspace membership.
 
-Gossipsub signs each bincode `Envelope` with the derived workspace key and uses
-strict signature validation. `Workspace::admit_event` then binds the signed
+Both live planes sign each bincode `Envelope` with the derived workspace key
+and use strict signature validation. Every active installation receives
+membership events; only installations with `ReadData` join the data plane.
+`Workspace::admit_event` then binds the signed
 libp2p source to the envelope's enrolled `InstallationId`, checks its role, and
 applies events through the normal convergence path.
 
@@ -75,11 +83,12 @@ not an event-size admission limit; Gossipsub's transport limit defaults to
 
 ## Enrollment
 
-Only an Admin writes `_installations`. The Admin assigns an `InstallationId` and
-stores the joining installation's workspace public key together with any stable
-dial addresses. The workspace keypair derivation helper is currently available
-only through the `test-support` feature; the production enrollment API is
-pending.
+Only an active installation with `ManageInstallations` writes
+`_installations`. A verified request may be stored as pending so applications
+can list it across the workspace; approval replaces that row with an active
+permission set. Pending rows never authorize events or become peer routes. The
+workspace keypair derivation helper is currently available only through the
+`test-support` feature; the production join protocol remains pending.
 Addresses are routing hints rather than identities and may be empty.
 
 There is currently no `Workspace::join` API. Initial registry/history

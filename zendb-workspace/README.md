@@ -23,7 +23,7 @@ The lifecycle entry points are:
   system storage before committing `_identity` and removes partial storage if
   creation fails.
 - `Workspace::open(root, identity, config)` reads both IDs and requires the
-  derived local key to match an enrolled installation. When
+  derived local key to match an active installation. When
   `config.workspace_id` is supplied, open also requires it to match the stored
   workspace ID.
 
@@ -40,7 +40,7 @@ API that will expose this operation to applications is still pending.
 
 `Workspace` exposes:
 
-- `installations()` for registry and role operations.
+- `installations()` for pending and active membership operations.
 - `tables()` for replicated table catalog operations.
 - `states()` for local typed state lifecycle.
 - `admit_event(envelope, source)` for authenticated remote admission.
@@ -57,7 +57,8 @@ forwarding. `Workspace::admit_event` then:
 1. Looks up `Envelope.author` in `_installations`.
 2. Derives the expected libp2p PeerId from the stored `PublicKey`.
 3. Requires it to match the signed Gossipsub source.
-4. Requires Admin for system tables or Contributor for application tables.
+4. Requires `ManageInstallations` for `_installations`, `ManageCatalog` for
+   `_catalog`, or `WriteData` for an application table.
 5. Reconstructs full Events and sends them through the workspace's remote
    application path.
 
@@ -88,10 +89,11 @@ default is `/ip4/0.0.0.0/tcp/0`. Known-peer dial retries begin at one second and
 cap at sixty seconds through `DialConfig`.
 
 The private single-thread Tokio network worker uses TCP, Noise, Yamux, DNS,
-mDNS, ping, Identify, and strict signed Gossipsub. Incoming envelopes cross a bounded
-bridge to a sequential admission thread, preserving arrival order without
-blocking the Tokio event loop. mDNS peers receive a LAN score bonus and ping
-latency adjusts their application score. Topics are scoped by `WorkspaceId`.
+mDNS, ping, Identify, and two strict signed Gossipsub behaviours. Membership
+events use a membership protocol and workspace topic; catalog and application
+events use an isolated data protocol and topic. Incoming envelopes cross a
+bounded bridge to a sequential admission thread. mDNS peers receive a LAN
+score bonus and ping latency adjusts their application score.
 
 `Installation.addresses` contains durable Admin-managed `zendb-types`
 `Multiaddr` values. The worker
@@ -106,8 +108,10 @@ admitted remote events are never republished.
 
 ## Installation-Driven Lifecycle
 
-Replication runs only while the local installation remains enrolled with its
-expected workspace key and `_installations` contains another installation.
+Replication runs only while the local installation remains active with its
+expected workspace key and `_installations` contains another active
+installation. Pending rows are visible through `Installations` but are not
+routes and cannot authorize events.
 After an `_installations` event commits, `WorkspaceCore` updates `Membership`
 and asks `ReplicationController` to reconcile. The controller reads the current
 membership through its weak reference to the core and derives the peer routes:
@@ -120,7 +124,7 @@ membership through its weak reference to the core and derives the peer routes:
 - Removing an installation blacklists its derived PeerId and disconnects it.
 - Removing the final remote marks shutdown pending; the commit path submits the
   deletion, then the worker drains and stops.
-- Removing the local installation, clearing its role, or replacing its
+- Removing the local installation, making it pending, or replacing its
   workspace key stops its worker after the registry event completes the
   listener chain.
 
@@ -132,15 +136,26 @@ runtime treats one public key per installation as a trusted enrollment
 invariant. Admission still binds `Envelope.author` to Gossipsub's authenticated
 original publisher by comparing the installation's key-derived PeerId.
 
+Every active installation participates in the membership plane. Only an
+installation with `ReadData` subscribes to the data plane, and peers without
+that capability are blacklisted specifically by the data Gossipsub behaviour.
+`Permissions::INSTALLATION_MANAGER` can therefore manage and replicate
+membership without receiving catalog or application events.
+The provided profiles that author catalog or application events also include
+`ReadData`; write-only data-plane participation is not supported because a
+Gossipsub mesh is bidirectional.
+
 The controller keeps the derived peer projection, pending shutdown, and worker
 lifecycle in one mutex-protected state machine. Replication internals are split
 by responsibility: `batcher` builds envelopes, `peers` owns routes and
-retry state, `swarm` constructs libp2p, `worker` runs the async loop, and
-`runtime` owns the worker and admission threads.
+permissions plus retry state, `swarm` constructs the composite libp2p
+behaviour, `worker` runs the async loop, and `runtime` owns the worker and
+admission threads.
 
 ## Direct Enrollment
 
-Only an Admin may mutate `_installations`:
+Only an active installation with `ManageInstallations` may mutate
+`_installations`:
 
 The following fixture example requires the crate's `test-support` feature;
 production enrollment does not yet expose this helper.
@@ -157,9 +172,9 @@ workspace.installations().upsert(
     installation_id,
     Installation {
         display_name: "new-laptop".to_owned(),
-        role: Some(Role::Contributor),
         public_key,
         addresses: vec!["/dns4/laptop.example/tcp/7400".parse()?],
+        state: InstallationState::Active(Permissions::CONTRIBUTOR),
     },
 )?;
 ```
@@ -168,8 +183,12 @@ The application communicates the workspace ID, assigned installation ID, and
 bootstrap multiaddrs out of band. There are no invitation links, bearer tokens,
 nonce state, or request-response enrollment protocol.
 
-`Installations::delete` is revocation. Deleting the row makes later admission fail
-independently of the network blacklist.
+Applications may first write `InstallationState::Pending` so management UIs on
+every active installation can display and later approve the request. Approval
+upserts the same primary key as `Active(permissions)`. Pending rows hold no
+permissions and are excluded from networking. `Installations::delete` rejects
+or revokes the row; deletion makes later admission fail independently of the
+network blacklist.
 
 ## Event Application
 
@@ -210,7 +229,7 @@ projected directly into table and membership state. Workspace assembly obtains
 both system tables once through the ordinary store lookup: `Tables` retains the
 catalog table and `Installations` retains the installations table for mutations.
 
-`Membership` owns decoded installation and authorization state as an immutable
+`Membership` owns decoded installation lifecycle and capability state as an immutable
 snapshot behind `ArcSwap`. The snapshot caches the local installation separately
 from the complete registry, making the per-event local authorization path
 lock-free and free of map lookup while keeping both views atomically consistent.

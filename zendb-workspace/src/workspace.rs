@@ -14,8 +14,9 @@ use bincode::{Decode, Encode};
 use libp2p_identity::Keypair;
 use zendb_storage::WriteBackend;
 use zendb_types::{
-    Blob, Envelope, Event, EventId, EventStamp, EventTime, Installation, InstallationId, Op,
-    Path as CrdtPath, PeerIdentity, PublicKey, Role, Value, WorkspaceId,
+    Blob, Envelope, Event, EventId, EventStamp, EventTime, Installation, InstallationId,
+    InstallationState, Op, Path as CrdtPath, PeerIdentity, Permissions, PublicKey, Value,
+    WorkspaceId,
     utils::time::physical_ms,
     utils::{deserialize_from, serialize_to_vec},
 };
@@ -223,9 +224,9 @@ impl Workspace {
                 // before the tracker starts allocating new events.
                 let installation = Installation {
                     display_name,
-                    role: Some(Role::Admin),
                     public_key,
                     addresses: Vec::new(),
+                    state: InstallationState::Active(Permissions::ADMIN),
                 };
                 let stamp = EventStamp {
                     id: EventId {

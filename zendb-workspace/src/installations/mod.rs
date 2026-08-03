@@ -4,7 +4,7 @@ mod membership;
 
 use std::sync::Arc;
 
-use zendb_types::{Blob, Installation, InstallationId, Op, Path, Role, Value};
+use zendb_types::{Blob, Installation, InstallationId, Op, Path, Permission, Value};
 
 pub(crate) use membership::Membership;
 
@@ -38,9 +38,10 @@ impl Installations {
         installation_id: InstallationId,
         installation: Installation,
     ) -> Result<bool> {
-        self.core
-            .membership
-            .require_access(&self.core.membership.local_installation_id(), Role::Admin)?;
+        self.core.membership.require_permission(
+            &self.core.membership.local_installation_id(),
+            Permission::ManageInstallations,
+        )?;
         if self.core.membership.get(&installation_id).as_ref() == Some(&installation) {
             return Ok(false);
         }
@@ -58,9 +59,10 @@ impl Installations {
     }
 
     pub fn delete(&self, installation_id: InstallationId) -> Result<bool> {
-        self.core
-            .membership
-            .require_access(&self.core.membership.local_installation_id(), Role::Admin)?;
+        self.core.membership.require_permission(
+            &self.core.membership.local_installation_id(),
+            Permission::ManageInstallations,
+        )?;
         if self.core.membership.get(&installation_id).is_none() {
             return Ok(false);
         }
@@ -73,7 +75,9 @@ impl Installations {
         Ok(true)
     }
 
-    pub fn has_access(&self, installation_id: &InstallationId, required: Role) -> bool {
-        self.core.membership.has_access(installation_id, required)
+    pub fn has_permission(&self, installation_id: &InstallationId, required: Permission) -> bool {
+        self.core
+            .membership
+            .has_permission(installation_id, required)
     }
 }

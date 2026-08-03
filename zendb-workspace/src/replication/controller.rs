@@ -9,7 +9,7 @@ use std::{
 use libp2p::PeerId;
 use libp2p_identity::Keypair;
 use parking_lot::{Condvar, Mutex};
-use zendb_types::{Event, EventId, Installation, InstallationId, WorkspaceId};
+use zendb_types::{Event, EventId, Installation, InstallationId, Permissions, WorkspaceId};
 
 use super::{
     ReplicationConfig,
@@ -20,26 +20,26 @@ use crate::{Result, core::WorkspaceCore};
 
 #[derive(Clone)]
 struct ReplicationPeers {
-    local_is_enrolled: bool,
+    local_permissions: Option<Permissions>,
     remote_routes: BTreeMap<InstallationId, PeerRoute>,
 }
 
 impl ReplicationPeers {
     fn should_run(&self) -> bool {
-        self.local_is_enrolled && !self.remote_routes.is_empty()
+        self.local_permissions.is_some() && !self.remote_routes.is_empty()
     }
 }
 
 #[derive(Clone, Copy)]
 enum PendingStop {
     NoRemoteInstallations(EventId),
-    LocalRevoked(EventId),
+    LocalInactive(EventId),
 }
 
 impl PendingStop {
     const fn event_id(self) -> EventId {
         match self {
-            Self::NoRemoteInstallations(event_id) | Self::LocalRevoked(event_id) => event_id,
+            Self::NoRemoteInstallations(event_id) | Self::LocalInactive(event_id) => event_id,
         }
     }
 }
@@ -83,7 +83,7 @@ impl ReplicationController {
             state: Mutex::new(ControllerState {
                 lifecycle: Lifecycle::Stopped,
                 peers: ReplicationPeers {
-                    local_is_enrolled: false,
+                    local_permissions: None,
                     remote_routes: BTreeMap::new(),
                 },
                 pending_stop: None,
@@ -105,6 +105,7 @@ impl ReplicationController {
             self.keypair.public().to_peer_id(),
         );
         drop(core);
+        let local_permissions = peers.local_permissions;
         let (initial_routes, stopping) = {
             let mut state = self.state.lock();
             state.peers = peers;
@@ -133,6 +134,8 @@ impl ReplicationController {
                 }
             }
         };
+        let local_permissions = local_permissions
+            .expect("a running replication projection has an active local installation");
 
         if let Some(stopping) = stopping {
             let _ = stopping.join();
@@ -152,16 +155,25 @@ impl ReplicationController {
             self.keypair.clone(),
             self.core.clone(),
             self.config.clone(),
+            local_permissions,
             initial_routes.clone(),
         );
         let mut state = self.state.lock();
         match result {
             Ok(runtime) if state.peers.should_run() => {
                 let desired_routes = state.peers.remote_routes.clone();
+                let desired_permissions = state
+                    .peers
+                    .local_permissions
+                    .expect("a running replication projection has an active local installation");
                 let commands = runtime.commands.clone();
                 state.lifecycle = Lifecycle::Running(runtime);
                 self.state_changed.notify_all();
                 drop(state);
+                if desired_permissions != local_permissions {
+                    let _ =
+                        commands.blocking_send(Command::SetLocalPermissions(desired_permissions));
+                }
                 reconcile_peer_routes(&commands, &initial_routes, &desired_routes);
                 Ok(())
             }
@@ -207,10 +219,10 @@ impl ReplicationController {
                 !matches!(state.lifecycle, Lifecycle::Running(_) | Lifecycle::Starting)
             } else {
                 if commands.is_some() {
-                    state.pending_stop = Some(if desired_peers.local_is_enrolled {
+                    state.pending_stop = Some(if desired_peers.local_permissions.is_some() {
                         PendingStop::NoRemoteInstallations(event_id)
                     } else {
-                        PendingStop::LocalRevoked(event_id)
+                        PendingStop::LocalInactive(event_id)
                     });
                 }
                 false
@@ -219,6 +231,11 @@ impl ReplicationController {
         };
 
         if let Some(commands) = commands {
+            if previous_peers.local_permissions != desired_peers.local_permissions
+                && let Some(permissions) = desired_peers.local_permissions
+            {
+                let _ = commands.blocking_send(Command::SetLocalPermissions(permissions));
+            }
             reconcile_peer_routes(
                 &commands,
                 &previous_peers.remote_routes,
@@ -300,14 +317,17 @@ fn derive_replication_peers(
     // The local installation must still be enrolled to publish. Remote routes
     // are derived from every other registry entry, including entries without
     // currently usable addresses for later discovery.
-    let local_is_enrolled = installations.iter().any(|(installation_id, installation)| {
-        *installation_id == local_installation_id
-            && installation.role.is_some()
-            && installation.public_key.as_libp2p().to_peer_id() == local_peer_id
-    });
+    let local_permissions = installations
+        .iter()
+        .find(|(installation_id, installation)| {
+            *installation_id == local_installation_id
+                && installation.public_key.as_libp2p().to_peer_id() == local_peer_id
+        })
+        .and_then(|(_, installation)| installation.state.permissions());
     let remote_routes = installations
         .iter()
         .filter_map(|(installation_id, installation)| {
+            let permissions = installation.state.permissions()?;
             let peer_id = installation.public_key.as_libp2p().to_peer_id();
             (*installation_id != local_installation_id).then(|| {
                 (
@@ -320,13 +340,14 @@ fn derive_replication_peers(
                             .cloned()
                             .map(|address| address.into_libp2p())
                             .collect(),
+                        permissions,
                     },
                 )
             })
         })
         .collect();
     ReplicationPeers {
-        local_is_enrolled,
+        local_permissions,
         remote_routes,
     }
 }
@@ -351,6 +372,7 @@ fn reconcile_peer_routes(
             let _ = sender.blocking_send(Command::UpsertPeer {
                 peer_id: route.peer_id,
                 addresses: route.addresses.clone(),
+                permissions: route.permissions,
             });
         }
     }

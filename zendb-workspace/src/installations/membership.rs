@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use arc_swap::ArcSwap;
 use zendb_storage::{Change, ReadBackend, Table};
-use zendb_types::{Installation, InstallationId, Op, PublicKey, Role, Value};
+use zendb_types::{Installation, InstallationId, Op, Permission, PublicKey, Value};
 
 use crate::{Error, Result};
 
@@ -68,6 +68,9 @@ impl Membership {
         if &local.public_key != expected_public_key {
             return Err(Error::LocalInstallationKeyMismatch);
         }
+        if !local.state.is_active() {
+            return Err(Error::LocalInstallationNotActive(local_installation_id));
+        }
 
         Ok(Self {
             local_installation_id,
@@ -100,7 +103,11 @@ impl Membership {
         }
     }
 
-    pub(crate) fn has_access(&self, installation_id: &InstallationId, required: Role) -> bool {
+    pub(crate) fn has_permission(
+        &self,
+        installation_id: &InstallationId,
+        required: Permission,
+    ) -> bool {
         let state = self.state.load();
         let installation = if installation_id == &self.local_installation_id {
             state.local_installation.as_ref()
@@ -108,16 +115,16 @@ impl Membership {
             state.installations.get(installation_id)
         };
         installation
-            .and_then(|installation| installation.role)
-            .is_some_and(|role| role.has_at_least(required))
+            .and_then(|installation| installation.state.permissions())
+            .is_some_and(|permissions| permissions.allows(required))
     }
 
-    pub(crate) fn require_access(
+    pub(crate) fn require_permission(
         &self,
         installation_id: &InstallationId,
-        required: Role,
+        required: Permission,
     ) -> Result<()> {
-        if self.has_access(installation_id, required) {
+        if self.has_permission(installation_id, required) {
             Ok(())
         } else {
             Err(Error::PermissionDenied)

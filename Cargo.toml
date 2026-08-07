@@ -27,12 +27,10 @@ multiaddr = "0.18"
 libp2p = { version = "0.56", features = [
     "dns",
     "ed25519",
-    "gossipsub",
-    "identify",
     "macros",
     "mdns",
     "noise",
-    "ping",
+    "quic",
     "tcp",
     "tokio",
     "yamux",

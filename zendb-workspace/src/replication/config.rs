@@ -1,99 +1,85 @@
-//! Public tuning values for workspace-owned replication.
+//! Tuning knobs for the Zenin replication runtime.
+//!
+//! All durations and sizes are taken at face value; the runtime does not clamp
+//! or override them.
 
 use std::time::Duration;
 
 use zendb_types::Multiaddr;
 
-/// Outbound event batching thresholds.
+/// Protocol-level settings: sync cadence, frame limits, and batching.
 #[derive(Debug, Clone)]
-pub struct BatchConfig {
-    /// Maximum number of events in one envelope.
-    pub max_events: usize,
-    /// Approximate serialized byte limit for one envelope.
-    pub max_bytes: usize,
-    /// Maximum time to retain an incomplete batch before flushing it.
+pub struct ZeninConfig {
+    /// How often anti-entropy summaries are exchanged with mesh neighbours.
+    pub sync_interval: Duration,
+    /// Interval between mesh maintenance ticks (graft/prune evaluation).
+    pub heartbeat: Duration,
+    /// Maximum size of a single wire frame in bytes.
+    pub max_frame_bytes: usize,
+    /// Maximum bytes returned in a single FetchResponse.
+    pub max_sync_bytes: usize,
+    /// Maximum number of event ranges in a single Fetch request.
+    pub max_ranges: usize,
+    /// How long to accumulate local events before flushing a Push batch.
+    /// Zero means flush on the next event-loop iteration (no delay).
     pub linger: Duration,
+    /// Number of recent events kept in-memory for fast anti-entropy responses.
+    pub recent_cache_capacity: usize,
 }
 
-impl Default for BatchConfig {
+impl Default for ZeninConfig {
     fn default() -> Self {
         Self {
-            max_events: 16,
-            max_bytes: 65_536,
-            linger: Duration::from_millis(50),
+            sync_interval: Duration::from_secs(5),
+            heartbeat: Duration::from_millis(250),
+            max_frame_bytes: 100 * 1024 * 1024,
+            max_sync_bytes: 4 * 1024 * 1024,
+            max_ranges: 256,
+            linger: Duration::ZERO,
+            recent_cache_capacity: 4096,
         }
     }
 }
 
-/// Peer scoring and gossipsub mesh settings.
-#[derive(Debug, Clone)]
-pub struct TopologyConfig {
-    /// Application score bonus for peers discovered on the local network.
-    pub lan_score_bonus: f64,
-    /// Application score penalty weight for round-trip latency.
-    pub latency_weight: f64,
-    /// Target number of peers in the gossipsub mesh.
-    pub mesh_size: usize,
+/// Mesh topology parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct MeshConfig {
+    /// Target number of active forwarding neighbours.
+    pub target_peers: usize,
+    /// Maximum peers accepted into the mesh before incoming grafts are refused.
+    pub high_watermark: usize,
 }
 
-impl Default for TopologyConfig {
+impl Default for MeshConfig {
     fn default() -> Self {
         Self {
-            lan_score_bonus: 10.0,
-            latency_weight: 0.01,
-            mesh_size: 6,
+            target_peers: 6,
+            high_watermark: 12,
         }
     }
 }
 
-/// Dial retry backoff settings for authorized peers.
-#[derive(Debug, Clone)]
-pub struct DialConfig {
-    /// Initial delay before retrying a failed dial.
-    pub initial_backoff: Duration,
-    /// Maximum delay reached by exponential dial backoff.
-    pub max_backoff: Duration,
-}
-
-impl Default for DialConfig {
-    fn default() -> Self {
-        Self {
-            initial_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(60),
-        }
-    }
-}
-
-/// Complete runtime configuration for workspace-owned replication.
+/// Top-level replication configuration exposed through `WorkspaceConfig`.
 #[derive(Debug, Clone)]
 pub struct ReplicationConfig {
-    /// Outbound envelope batching settings.
-    pub batch: BatchConfig,
-    /// Peer scoring and mesh settings.
-    pub topology: TopologyConfig,
-    /// Dial retry settings.
-    pub dial: DialConfig,
-    /// Local multiaddresses on which the replication swarm listens.
+    pub zenin: ZeninConfig,
+    pub mesh: MeshConfig,
     pub listen_addresses: Vec<Multiaddr>,
-    /// Capacity of command and inbound admission channels.
-    pub channel_capacity: usize,
-    /// Maximum gossipsub payload size accepted by the swarm.
-    pub gossipsub_max_transmit_size: usize,
 }
 
 impl Default for ReplicationConfig {
     fn default() -> Self {
         Self {
-            batch: BatchConfig::default(),
-            topology: TopologyConfig::default(),
-            dial: DialConfig::default(),
+            zenin: ZeninConfig::default(),
+            mesh: MeshConfig::default(),
             listen_addresses: vec![
                 "/ip4/0.0.0.0/tcp/0"
                     .parse()
-                    .expect("the default listen address is valid"),
+                    .expect("valid default listen address"),
+                "/ip4/0.0.0.0/udp/0/quic-v1"
+                    .parse()
+                    .expect("valid default QUIC listen address"),
             ],
-            channel_capacity: 1_024,
-            gossipsub_max_transmit_size: 100 * 1024 * 1024,
         }
     }
 }

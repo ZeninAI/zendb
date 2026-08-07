@@ -1,393 +1,431 @@
-//! Replication lifecycle and projection of workspace installations.
+//! Replication thread lifecycle, swarm event loop, and dispatch.
+//!
+//! The controller spawns a dedicated OS thread with a single-threaded Tokio
+//! runtime. The event loop selects over:
+//! - Shutdown signal
+//! - Workspace notifications (events and membership changes)
+//! - Linger-based batcher flush timer
+//! - Periodic heartbeat (mesh maintenance + anti-entropy)
+//! - Swarm network events
 
 use std::{
-    collections::BTreeMap,
+    collections::HashSet,
     sync::{Arc, Weak},
     thread,
+    time::Duration,
 };
 
-use libp2p::PeerId;
+use futures::StreamExt;
+use libp2p::{
+    PeerId, Swarm, mdns,
+    swarm::{NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
+};
 use libp2p_identity::Keypair;
-use parking_lot::{Condvar, Mutex};
-use zendb_types::{Event, EventId, Installation, InstallationId, Permissions, WorkspaceId};
+use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
+use tokio::time::Instant;
+use zendb_types::{InstallationId, WorkspaceId};
 
 use super::{
-    ReplicationConfig,
-    command::{Command, PeerRoute},
-    runtime::ReplicationRuntime,
+    batcher::Batcher,
+    config::ReplicationConfig,
+    engine::Engine,
+    protocol::{BehaviourEvent, ZeninBehaviour},
+    transport::build_swarm,
+    wire::Message,
 };
-use crate::{Result, core::WorkspaceCore};
+use crate::{Error, Result, core::WorkspaceCore};
 
-#[derive(Clone)]
-struct ReplicationPeers {
-    local_permissions: Option<Permissions>,
-    remote_routes: BTreeMap<InstallationId, PeerRoute>,
+// ─── Composite swarm behaviour ───────────────────────────────────────────────
+
+#[derive(NetworkBehaviour)]
+#[behaviour(
+    to_swarm = "SwarmBehaviourEvent",
+    prelude = "libp2p::swarm::derive_prelude"
+)]
+struct SwarmBehaviour {
+    zenin: ZeninBehaviour,
+    mdns: mdns::tokio::Behaviour,
 }
 
-impl ReplicationPeers {
-    fn should_run(&self) -> bool {
-        self.local_permissions.is_some() && !self.remote_routes.is_empty()
+enum SwarmBehaviourEvent {
+    Zenin(BehaviourEvent),
+    Mdns(mdns::Event),
+}
+
+impl From<BehaviourEvent> for SwarmBehaviourEvent {
+    fn from(event: BehaviourEvent) -> Self {
+        Self::Zenin(event)
     }
 }
 
-#[derive(Clone, Copy)]
-enum PendingStop {
-    NoRemoteInstallations(EventId),
-    LocalInactive(EventId),
-}
-
-impl PendingStop {
-    const fn event_id(self) -> EventId {
-        match self {
-            Self::NoRemoteInstallations(event_id) | Self::LocalInactive(event_id) => event_id,
-        }
+impl From<mdns::Event> for SwarmBehaviourEvent {
+    fn from(event: mdns::Event) -> Self {
+        Self::Mdns(event)
     }
 }
 
-enum Lifecycle {
-    Stopped,
-    Starting,
-    Running(ReplicationRuntime),
-    Stopping(thread::JoinHandle<()>),
-    Failed,
-    Closed,
+// ─── Notifications from workspace ────────────────────────────────────────────
+
+/// Granular notifications sent by WorkspaceCore to the replication runtime.
+pub(crate) enum ReplicationNotification {
+    /// A locally committed event ready for replication.
+    Event { table: String, event: zendb_types::Event },
+    /// An installation transitioned to Active.
+    Admitted { installation_id: InstallationId },
+    /// An installation transitioned to Rejected.
+    Rejected { installation_id: InstallationId },
 }
 
-struct ControllerState {
-    lifecycle: Lifecycle,
-    peers: ReplicationPeers,
-    pending_stop: Option<PendingStop>,
-}
+// ─── Controller ──────────────────────────────────────────────────────────────
 
+/// Owns the replication thread and provides a graceful shutdown mechanism.
 pub(crate) struct ReplicationController {
-    workspace_id: WorkspaceId,
-    keypair: Keypair,
-    core: Weak<WorkspaceCore>,
-    config: ReplicationConfig,
-    state: Mutex<ControllerState>,
-    state_changed: Condvar,
+    shutdown: Option<oneshot::Sender<()>>,
+    join: Option<thread::JoinHandle<()>>,
 }
 
 impl ReplicationController {
-    pub(crate) fn new(
+    pub(crate) fn start(
+        core: &Arc<WorkspaceCore>,
         workspace_id: WorkspaceId,
         keypair: Keypair,
-        core: Weak<WorkspaceCore>,
         config: ReplicationConfig,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            workspace_id,
-            keypair,
-            core,
-            config,
-            state: Mutex::new(ControllerState {
-                lifecycle: Lifecycle::Stopped,
-                peers: ReplicationPeers {
-                    local_permissions: None,
-                    remote_routes: BTreeMap::new(),
-                },
-                pending_stop: None,
+        notifications: UnboundedReceiver<ReplicationNotification>,
+    ) -> Result<Self> {
+        let local_installation_id = core.membership.local_installation_id();
+        let local_installation = core
+            .membership
+            .get(&local_installation_id)
+            .ok_or(Error::LocalInstallationNotEnrolled(local_installation_id))?;
+
+        let core_weak = Arc::downgrade(core);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
+
+        let join = thread::Builder::new()
+            .name("zendb-zenin".to_owned())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e.to_string()));
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    match build_runtime(
+                        keypair,
+                        core_weak.clone(),
+                        workspace_id,
+                        local_installation_id,
+                        &local_installation,
+                        &config,
+                    ) {
+                        Ok((swarm, engine)) => {
+                            let _ = ready_tx.send(Ok(()));
+                            run(swarm, engine, core_weak, config, notifications, shutdown_rx).await;
+                        }
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                        }
+                    }
+                });
+            })?;
+
+        match ready_rx.blocking_recv() {
+            Ok(Ok(())) => Ok(Self {
+                shutdown: Some(shutdown_tx),
+                join: Some(join),
             }),
-            state_changed: Condvar::new(),
-        })
-    }
-
-    pub(crate) fn start_if_needed(self: &Arc<Self>) -> Result<()> {
-        let Some(core) = self.core.upgrade() else {
-            return Ok(());
-        };
-        // Membership is read before taking the lifecycle lock. The resulting
-        // peer set is then installed atomically with the start decision.
-        let local_installation_id = core.membership.local_installation_id();
-        let peers = derive_replication_peers(
-            &core.membership.list(),
-            local_installation_id,
-            self.keypair.public().to_peer_id(),
-        );
-        drop(core);
-        let local_permissions = peers.local_permissions;
-        let (initial_routes, stopping) = {
-            let mut state = self.state.lock();
-            state.peers = peers;
-            // Wait for a concurrent transition, but join a stopping worker
-            // outside this mutex so shutdown can finish without blocking state
-            // updates from another thread.
-            loop {
-                if !state.peers.should_run() {
-                    return Ok(());
-                }
-                match &state.lifecycle {
-                    Lifecycle::Closed | Lifecycle::Running(_) => return Ok(()),
-                    Lifecycle::Starting => self.state_changed.wait(&mut state),
-                    Lifecycle::Stopping(_) => {
-                        let Lifecycle::Stopping(join) =
-                            std::mem::replace(&mut state.lifecycle, Lifecycle::Starting)
-                        else {
-                            unreachable!();
-                        };
-                        break (state.peers.remote_routes.clone(), Some(join));
-                    }
-                    Lifecycle::Stopped | Lifecycle::Failed => {
-                        state.lifecycle = Lifecycle::Starting;
-                        break (state.peers.remote_routes.clone(), None);
-                    }
-                }
-            }
-        };
-        let local_permissions = local_permissions
-            .expect("a running replication projection has an active local installation");
-
-        if let Some(stopping) = stopping {
-            let _ = stopping.join();
-            let mut state = self.state.lock();
-            // Membership may have changed while the old worker stopped. Avoid
-            // starting a runtime for a peer set that no longer needs one.
-            if !state.peers.should_run() {
-                state.lifecycle = Lifecycle::Stopped;
-                self.state_changed.notify_all();
-                return Ok(());
-            }
-        }
-
-        let result = ReplicationRuntime::start(
-            self.workspace_id,
-            local_installation_id,
-            self.keypair.clone(),
-            self.core.clone(),
-            self.config.clone(),
-            local_permissions,
-            initial_routes.clone(),
-        );
-        let mut state = self.state.lock();
-        match result {
-            Ok(runtime) if state.peers.should_run() => {
-                let desired_routes = state.peers.remote_routes.clone();
-                let desired_permissions = state
-                    .peers
-                    .local_permissions
-                    .expect("a running replication projection has an active local installation");
-                let commands = runtime.commands.clone();
-                state.lifecycle = Lifecycle::Running(runtime);
-                self.state_changed.notify_all();
-                drop(state);
-                if desired_permissions != local_permissions {
-                    let _ =
-                        commands.blocking_send(Command::SetLocalPermissions(desired_permissions));
-                }
-                reconcile_peer_routes(&commands, &initial_routes, &desired_routes);
-                Ok(())
-            }
-            Ok(runtime) => {
-                // The desired peer set changed while startup was in progress;
-                // stop this runtime immediately instead of exposing it as live.
-                state.lifecycle = Lifecycle::Stopping(thread::spawn(move || runtime.stop()));
-                self.state_changed.notify_all();
-                Ok(())
-            }
-            Err(error) => {
-                if !matches!(state.lifecycle, Lifecycle::Closed) {
-                    state.lifecycle = Lifecycle::Failed;
-                }
-                self.state_changed.notify_all();
-                Err(error)
-            }
-        }
-    }
-
-    pub(crate) fn reconcile_installations(self: &Arc<Self>, event_id: EventId) {
-        let Some(core) = self.core.upgrade() else {
-            return;
-        };
-        let local_installation_id = core.membership.local_installation_id();
-        let desired_peers = derive_replication_peers(
-            &core.membership.list(),
-            local_installation_id,
-            self.keypair.public().to_peer_id(),
-        );
-        drop(core);
-        let (previous_peers, commands, needs_start) = {
-            let mut state = self.state.lock();
-            // The event ID ties a pending stop to the installation change that
-            // caused it, allowing core to publish that event before stopping.
-            let previous_peers = std::mem::replace(&mut state.peers, desired_peers.clone());
-            let commands = match &state.lifecycle {
-                Lifecycle::Running(runtime) => Some(runtime.commands.clone()),
-                _ => None,
-            };
-            let needs_start = if desired_peers.should_run() {
-                state.pending_stop = None;
-                !matches!(state.lifecycle, Lifecycle::Running(_) | Lifecycle::Starting)
-            } else {
-                if commands.is_some() {
-                    state.pending_stop = Some(if desired_peers.local_permissions.is_some() {
-                        PendingStop::NoRemoteInstallations(event_id)
-                    } else {
-                        PendingStop::LocalInactive(event_id)
-                    });
-                }
-                false
-            };
-            (previous_peers, commands, needs_start)
-        };
-
-        if let Some(commands) = commands {
-            if previous_peers.local_permissions != desired_peers.local_permissions
-                && let Some(permissions) = desired_peers.local_permissions
-            {
-                let _ = commands.blocking_send(Command::SetLocalPermissions(permissions));
-            }
-            reconcile_peer_routes(
-                &commands,
-                &previous_peers.remote_routes,
-                &desired_peers.remote_routes,
-            );
-        }
-        if needs_start {
-            let _ = self.start_if_needed();
-        }
-    }
-
-    pub(crate) fn submit_event(&self, table: String, event: Event) {
-        let commands = match &self.state.lock().lifecycle {
-            Lifecycle::Running(runtime) => Some(runtime.commands.clone()),
-            _ => None,
-        };
-        // Replication is downstream of the durable local commit; a stopped or
-        // closed controller may therefore discard this best-effort submission.
-        if let Some(commands) = commands {
-            let _ = commands.blocking_send(Command::PublishEvent { table, event });
-        }
-    }
-
-    pub(crate) fn complete_pending_stop(&self, event_id: EventId) {
-        let mut state = self.state.lock();
-        let Some(pending) = state.pending_stop else {
-            return;
-        };
-        if pending.event_id() != event_id {
-            return;
-        }
-        if matches!(pending, PendingStop::NoRemoteInstallations(_))
-            && !state.peers.remote_routes.is_empty()
-        {
-            state.pending_stop = None;
-            return;
-        }
-        state.pending_stop = None;
-
-        // This is called after submit_event in the core commit pipeline. Stop
-        // only once the triggering installation event has entered replication.
-        let runtime = match std::mem::replace(&mut state.lifecycle, Lifecycle::Stopped) {
-            Lifecycle::Running(runtime) => runtime,
-            lifecycle => {
-                state.lifecycle = lifecycle;
-                return;
-            }
-        };
-        state.lifecycle = Lifecycle::Stopping(thread::spawn(move || runtime.stop()));
-        self.state_changed.notify_all();
-    }
-
-    pub(crate) fn shutdown(&self) {
-        let lifecycle = {
-            let mut state = self.state.lock();
-            while matches!(state.lifecycle, Lifecycle::Starting) {
-                self.state_changed.wait(&mut state);
-            }
-            state.pending_stop = None;
-            std::mem::replace(&mut state.lifecycle, Lifecycle::Closed)
-        };
-        match lifecycle {
-            Lifecycle::Running(runtime) => runtime.stop(),
-            Lifecycle::Stopping(join) => {
+            Ok(Err(e)) => {
                 let _ = join.join();
+                Err(Error::Replication(e))
             }
-            Lifecycle::Failed => {}
-            _ => {}
-        }
-        self.state_changed.notify_all();
-    }
-}
-
-fn derive_replication_peers(
-    installations: &[(InstallationId, Installation)],
-    local_installation_id: InstallationId,
-    local_peer_id: PeerId,
-) -> ReplicationPeers {
-    // The local installation must still be enrolled to publish. Remote routes
-    // are derived from every other registry entry, including entries without
-    // currently usable addresses for later discovery.
-    let local_permissions = installations
-        .iter()
-        .find(|(installation_id, installation)| {
-            *installation_id == local_installation_id
-                && installation.public_key.as_libp2p().to_peer_id() == local_peer_id
-        })
-        .and_then(|(_, installation)| installation.state.permissions());
-    let remote_routes = installations
-        .iter()
-        .filter_map(|(installation_id, installation)| {
-            let permissions = installation.state.permissions()?;
-            let peer_id = installation.public_key.as_libp2p().to_peer_id();
-            (*installation_id != local_installation_id).then(|| {
-                (
-                    *installation_id,
-                    PeerRoute {
-                        peer_id,
-                        addresses: installation
-                            .addresses
-                            .iter()
-                            .cloned()
-                            .map(|address| address.into_libp2p())
-                            .collect(),
-                        permissions,
-                    },
-                )
-            })
-        })
-        .collect();
-    ReplicationPeers {
-        local_permissions,
-        remote_routes,
-    }
-}
-
-fn reconcile_peer_routes(
-    sender: &tokio::sync::mpsc::Sender<Command>,
-    previous: &BTreeMap<InstallationId, PeerRoute>,
-    desired: &BTreeMap<InstallationId, PeerRoute>,
-) {
-    // Remove changed peer IDs before adding replacements so an installation
-    // whose key changed cannot retain the old transport identity.
-    for (installation_id, old) in previous {
-        let replacement = desired.get(installation_id);
-        if replacement.is_none_or(|new| new.peer_id != old.peer_id) {
-            let _ = sender.blocking_send(Command::RemovePeer {
-                peer_id: old.peer_id,
-            });
+            Err(e) => {
+                let _ = join.join();
+                Err(Error::Replication(e.to_string()))
+            }
         }
     }
-    for (installation_id, route) in desired {
-        if previous.get(installation_id) != Some(route) {
-            let _ = sender.blocking_send(Command::UpsertPeer {
-                peer_id: route.peer_id,
-                addresses: route.addresses.clone(),
-                permissions: route.permissions,
-            });
+
+    pub(crate) fn shutdown(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.join.take() {
+            let _ = handle.join();
         }
     }
 }
 
 impl Drop for ReplicationController {
     fn drop(&mut self) {
-        let lifecycle = std::mem::replace(&mut self.state.get_mut().lifecycle, Lifecycle::Closed);
-        match lifecycle {
-            Lifecycle::Running(runtime) => runtime.stop(),
-            Lifecycle::Stopping(join) => {
-                let _ = join.join();
+        self.shutdown();
+    }
+}
+
+// ─── Swarm construction ──────────────────────────────────────────────────────
+
+fn build_runtime(
+    keypair: Keypair,
+    core: Weak<WorkspaceCore>,
+    workspace_id: WorkspaceId,
+    local_installation_id: InstallationId,
+    local_installation: &zendb_types::Installation,
+    config: &ReplicationConfig,
+) -> std::result::Result<(Swarm<SwarmBehaviour>, Engine), String> {
+    let local_peer_id = keypair.public().to_peer_id();
+
+    let addresses = if local_installation.addresses.is_empty() {
+        config.listen_addresses.clone()
+    } else {
+        local_installation.addresses.clone()
+    };
+
+    let handshake = Message::Handshake {
+        workspace_id,
+        installation_id: local_installation_id,
+        display_name: local_installation.display_name.clone(),
+        public_key: local_installation.public_key.clone(),
+        addresses,
+    };
+
+    let behaviour = SwarmBehaviour {
+        zenin: ZeninBehaviour::new(handshake, config.zenin.max_frame_bytes),
+        mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
+            .map_err(|e| e.to_string())?,
+    };
+
+    let mut swarm = build_swarm(keypair, behaviour)?;
+    for addr in &config.listen_addresses {
+        swarm
+            .listen_on(addr.as_libp2p().clone())
+            .map_err(|e| e.to_string())?;
+    }
+
+    let engine = Engine::new(core, local_peer_id, config.zenin.clone(), config.mesh);
+    Ok((swarm, engine))
+}
+
+// ─── Event loop ──────────────────────────────────────────────────────────────
+
+async fn run(
+    mut swarm: Swarm<SwarmBehaviour>,
+    mut engine: Engine,
+    _core: Weak<WorkspaceCore>,
+    config: ReplicationConfig,
+    mut notifications: UnboundedReceiver<ReplicationNotification>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    let mut heartbeat = tokio::time::interval(config.zenin.heartbeat);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut sync_deadline = Instant::now() + config.zenin.sync_interval;
+    let mut batcher = Batcher::new(config.zenin.linger);
+    let mut dialing = HashSet::new();
+
+    // Initialize mesh from current membership.
+    engine.initialize_mesh();
+    let outbound = engine.maintain_mesh();
+    dispatch(&mut swarm, &engine.mesh, &mut dialing, outbound);
+    connect_active(&mut swarm, &engine.mesh, &mut dialing);
+
+    loop {
+        // Compute next batcher flush deadline for tokio::select!.
+        let flush_at = batcher.next_flush().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+
+        tokio::select! {
+            _ = &mut shutdown => break,
+
+            // ── Workspace notifications ──────────────────────────────────
+            notification = notifications.recv() => {
+                let Some(notification) = notification else { break };
+                process_notification(
+                    &mut engine, &mut batcher, &mut swarm, &mut dialing, notification,
+                );
+                // Drain remaining queued notifications.
+                while let Ok(n) = notifications.try_recv() {
+                    process_notification(&mut engine, &mut batcher, &mut swarm, &mut dialing, n);
+                }
+                // Flush immediately if linger is zero.
+                if config.zenin.linger.is_zero() && !batcher.is_empty() {
+                    flush_batcher(&mut batcher, &engine, &mut swarm, &mut dialing);
+                }
             }
-            Lifecycle::Failed => {}
-            _ => {}
+
+            // ── Batcher linger expiry ────────────────────────────────────
+            _ = tokio::time::sleep_until(flush_at), if !batcher.is_empty() => {
+                flush_batcher(&mut batcher, &engine, &mut swarm, &mut dialing);
+            }
+
+            // ── Heartbeat: mesh maintenance + anti-entropy ───────────────
+            _ = heartbeat.tick() => {
+                let outbound = engine.maintain_mesh();
+                dispatch(&mut swarm, &engine.mesh, &mut dialing, outbound);
+                connect_active(&mut swarm, &engine.mesh, &mut dialing);
+
+                let now = Instant::now();
+                if now >= sync_deadline {
+                    sync_deadline = now + config.zenin.sync_interval;
+                    let outbound = engine.send_summaries();
+                    dispatch(&mut swarm, &engine.mesh, &mut dialing, outbound);
+                }
+            }
+
+            // ── Swarm events ─────────────────────────────────────────────
+            event = swarm.select_next_some() => {
+                handle_swarm_event(event, &mut engine, &mut swarm, &mut dialing);
+            }
         }
+    }
+}
+
+// ─── Notification processing ─────────────────────────────────────────────────
+
+fn process_notification(
+    engine: &mut Engine,
+    batcher: &mut Batcher,
+    swarm: &mut Swarm<SwarmBehaviour>,
+    dialing: &mut HashSet<PeerId>,
+    notification: ReplicationNotification,
+) {
+    match notification {
+        ReplicationNotification::Event { table, event } => {
+            engine.cache.insert(&table, &event);
+            batcher.push(table, event);
+        }
+        ReplicationNotification::Admitted { installation_id } => {
+            engine.installation_admitted(installation_id);
+            connect_active(swarm, &engine.mesh, dialing);
+        }
+        ReplicationNotification::Rejected { installation_id } => {
+            engine.installation_rejected(installation_id);
+        }
+    }
+}
+
+fn flush_batcher(
+    batcher: &mut Batcher,
+    engine: &Engine,
+    swarm: &mut Swarm<SwarmBehaviour>,
+    dialing: &mut HashSet<PeerId>,
+) {
+    let batches = batcher.flush();
+    let outbound = engine.broadcast(&batches, None);
+    dispatch(swarm, &engine.mesh, dialing, outbound);
+}
+
+// ─── Swarm event handling ────────────────────────────────────────────────────
+
+fn handle_swarm_event(
+    event: SwarmEvent<SwarmBehaviourEvent>,
+    engine: &mut Engine,
+    swarm: &mut Swarm<SwarmBehaviour>,
+    dialing: &mut HashSet<PeerId>,
+) {
+    match event {
+        SwarmEvent::Behaviour(SwarmBehaviourEvent::Zenin(
+            BehaviourEvent::SessionEstablished {
+                peer_id,
+                installation_id,
+                display_name,
+                public_key,
+                addresses,
+            },
+        )) => {
+            dialing.remove(&peer_id);
+            let outbound = engine.session_established(
+                peer_id,
+                installation_id,
+                display_name,
+                public_key,
+                addresses,
+            );
+            // If the engine returned an error (e.g. NotAdmitted), send it and
+            // close the logical session in the behaviour.
+            let has_error = outbound.iter().any(|(_, m)| matches!(m, Message::Error(_)));
+            dispatch(swarm, &engine.mesh, dialing, outbound);
+            if has_error {
+                swarm.behaviour_mut().zenin.close_session(peer_id);
+            }
+        }
+        SwarmEvent::Behaviour(SwarmBehaviourEvent::Zenin(
+            BehaviourEvent::MessageReceived { peer_id, message },
+        )) => {
+            let outbound = engine.receive(peer_id, message);
+            dispatch(swarm, &engine.mesh, dialing, outbound);
+        }
+        SwarmEvent::Behaviour(SwarmBehaviourEvent::Zenin(
+            BehaviourEvent::SessionClosed { peer_id },
+        )) => {
+            dialing.remove(&peer_id);
+            engine.mesh.disconnected(peer_id);
+        }
+        SwarmEvent::Behaviour(SwarmBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+            for (peer_id, address) in list {
+                if engine.mesh.is_active(peer_id)
+                    && !swarm.is_connected(&peer_id)
+                    && dialing.insert(peer_id)
+                    && swarm
+                        .dial(DialOpts::peer_id(peer_id).addresses(vec![address]).build())
+                        .is_err()
+                {
+                    dialing.remove(&peer_id);
+                }
+            }
+        }
+        SwarmEvent::OutgoingConnectionError {
+            peer_id: Some(peer_id),
+            ..
+        } => {
+            dialing.remove(&peer_id);
+        }
+        _ => {}
+    }
+}
+
+// ─── Dispatch and dialing ────────────────────────────────────────────────────
+
+fn dispatch(
+    swarm: &mut Swarm<SwarmBehaviour>,
+    mesh: &super::mesh::Mesh,
+    dialing: &mut HashSet<PeerId>,
+    outbound: Vec<(PeerId, Message)>,
+) {
+    for (peer_id, message) in outbound {
+        dial_if_needed(swarm, mesh, dialing, peer_id);
+        swarm.behaviour_mut().zenin.send(peer_id, message);
+    }
+}
+
+/// Dial active peers that we are not already connected to.
+fn connect_active(
+    swarm: &mut Swarm<SwarmBehaviour>,
+    mesh: &super::mesh::Mesh,
+    dialing: &mut HashSet<PeerId>,
+) {
+    for peer_id in mesh.known_peers() {
+        dial_if_needed(swarm, mesh, dialing, peer_id);
+    }
+}
+
+fn dial_if_needed(
+    swarm: &mut Swarm<SwarmBehaviour>,
+    mesh: &super::mesh::Mesh,
+    dialing: &mut HashSet<PeerId>,
+    peer_id: PeerId,
+) {
+    let addresses = mesh.addresses(peer_id);
+    if !swarm.is_connected(&peer_id)
+        && !addresses.is_empty()
+        && dialing.insert(peer_id)
+        && swarm
+            .dial(DialOpts::peer_id(peer_id).addresses(addresses).build())
+            .is_err()
+    {
+        dialing.remove(&peer_id);
     }
 }

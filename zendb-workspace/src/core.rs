@@ -2,141 +2,109 @@
 
 use std::sync::Arc;
 
-use libp2p_identity::Keypair;
+use tokio::sync::mpsc::UnboundedSender;
 use zendb_storage::InsertOutcome;
-use zendb_types::{Event, Op, Path, Permission, PrimaryKey, WorkspaceId};
+use zendb_types::{Event, InstallationId, InstallationState, Op, Path, PrimaryKey, Value};
 
 use crate::{
-    Result,
+    Error, Result,
     causal::CausalTracker,
     installations::Membership,
-    replication::{ReplicationConfig, ReplicationController},
+    replication::ReplicationNotification,
     states::States,
     tables::{OpenTable, TableKind, TableStore},
 };
 
 pub(crate) struct WorkspaceCore {
-    pub(crate) table_store: Arc<TableStore>,
-    pub(crate) states: Arc<States>,
+    pub(crate) table_store: TableStore,
+    pub(crate) states: States,
     pub(crate) membership: Membership,
     pub(crate) causal: CausalTracker,
-    pub(crate) replication: Arc<ReplicationController>,
+    pub(crate) replication_notifications: UnboundedSender<ReplicationNotification>,
 }
 
 impl WorkspaceCore {
-    pub(crate) fn new(
-        workspace_id: WorkspaceId,
-        keypair: Keypair,
-        table_store: Arc<TableStore>,
-        states: Arc<States>,
-        membership: Membership,
-        causal: CausalTracker,
-        replication_config: ReplicationConfig,
-    ) -> Arc<Self> {
-        // The replication controller may own a worker thread, but that worker
-        // must not keep the workspace's operational core alive on its own.
-        Arc::new_cyclic(|core| Self {
-            table_store,
-            states,
-            membership,
-            causal,
-            replication: ReplicationController::new(
-                workspace_id,
-                keypair,
-                core.clone(),
-                replication_config,
-            ),
-        })
-    }
-
-    pub(crate) fn commit_local_change(
+    pub(crate) fn commit_change(
         &self,
         table: &Arc<OpenTable>,
         primary_key: PrimaryKey,
         path: Path,
         op: Op,
     ) -> Result<InsertOutcome> {
-        // TableHandle blocks direct system-table writes, so this path only
-        // needs application-data authorization.
-        self.membership.require_permission(
-            &self.membership.local_installation_id(),
-            Permission::WriteData,
-        )?;
-        self.commit_authorized_local_change(table, primary_key, path, op)
-    }
-
-    pub(crate) fn commit_authorized_local_change(
-        &self,
-        table: &Arc<OpenTable>,
-        primary_key: PrimaryKey,
-        path: Path,
-        op: Op,
-    ) -> Result<InsertOutcome> {
-        // Commit local change that is already authorized
-        // Can come from the commit_local_change function or
-        // Can come from the system table modifications where the wrappers already pre-authorize
         let stamp = self.causal.mint()?;
-        self.commit_event(
-            table,
-            Event {
-                primary_key,
-                path,
-                op,
-                stamp,
-            },
-        )
-    }
-
-    pub(crate) fn commit_admitted_event(
-        &self,
-        table: &Arc<OpenTable>,
-        event: Event,
-    ) -> Result<InsertOutcome> {
-        // Facade to commit remote event
-        self.commit_event(table, event)
-    }
-
-    fn commit_event(&self, table: &Arc<OpenTable>, event: Event) -> Result<InsertOutcome> {
-        let outcome = table.insert_event(event)?;
-        // Only an applied CRDT change enters the post-commit pipeline. Ignored
-        // duplicates must not advance receipts, publish, or notify listeners.
-        let InsertOutcome::Applied(change) = &outcome else {
-            return Ok(outcome);
+        let event = Event {
+            primary_key,
+            path,
+            op,
+            stamp,
         };
-
-        // Minting and table I/O intentionally happen outside this observation
-        // lock. A failed local write consumes its sequence and leaves a gap.
-        // Keep the remaining order: observe, update projections, publish local
-        // events, complete pending shutdown, then notify application listeners.
-        let _ = self.causal.observe(change.event.stamp);
-        match table.kind() {
-            TableKind::Installations => {
-                self.membership.apply_installation_change(change);
-                self.replication
-                    .reconcile_installations(change.event.stamp.id);
-            }
-            TableKind::Catalog => self.table_store.apply_catalog_change(change),
-            TableKind::Application => {}
+        let replicated = event.clone();
+        let outcome = table.insert_event(event)?;
+        let _ = self.causal.observe(stamp)?;
+        if let InsertOutcome::Applied(change) = &outcome {
+            self.project_change(table, change)?;
         }
-        if change.event.stamp.id.author == self.membership.local_installation_id() {
-            self.replication
-                .submit_event(table.name().to_owned(), change.event.clone());
-        }
-        self.replication
-            .complete_pending_stop(change.event.stamp.id);
-        table.notify_listeners(change);
+        self.replication_notifications
+            .send(ReplicationNotification::Event {
+                table: table.name().to_owned(),
+                event: replicated,
+            })
+            .map_err(|_| Error::Replication("replication runtime stopped".into()))?;
         Ok(outcome)
     }
 
-    pub(crate) fn flush(&self) -> Result<()> {
-        self.causal.flush()?;
-        self.table_store.flush()?;
-        self.states.flush()
+    /// Apply a remotely produced event to its target table. Returns `true` if
+    /// the event was novel, `false` if it was already present.
+    pub(crate) fn commit_replication_event(&self, table_name: &str, event: Event) -> Result<bool> {
+        let event_id = event.stamp.id;
+        let table = self.table_store.get(table_name)?;
+        if self.causal.contains(event_id) {
+            return Ok(false);
+        }
+        let stamp = event.stamp;
+        let outcome = table.insert_event(event)?;
+        let _ = self.causal.observe(stamp)?;
+        if let InsertOutcome::Applied(change) = &outcome {
+            self.project_change(&table, change)?;
+        }
+        Ok(true)
     }
 
-    pub(crate) fn sync(&self) -> Result<()> {
-        self.causal.sync()?;
-        self.table_store.sync()?;
-        self.states.sync()
+    fn project_change(&self, table: &OpenTable, change: &zendb_storage::Change) -> Result<()> {
+        match table.kind() {
+            TableKind::Installations => {
+                self.membership.apply_installation_change(change);
+                self.emit_membership_notification(change);
+            }
+            TableKind::Catalog => {
+                self.table_store.apply_catalog_change(change);
+            }
+            TableKind::Application => {}
+        }
+        table.notify_listeners(change);
+        Ok(())
+    }
+
+    /// Emit a granular Admitted or Rejected notification based on the
+    /// installation's new materialized state.
+    fn emit_membership_notification(&self, change: &zendb_storage::Change) {
+        let Ok(installation_id) = InstallationId::try_from(&change.event.primary_key) else {
+            return;
+        };
+        // Determine the new state from the materialized cell.
+        let new_state = change.current.as_ref().and_then(|cell| match &cell.value {
+            Some(Value::Installation(i)) => Some(i.state),
+            _ => None,
+        });
+        let notification = match new_state {
+            Some(state) if state.is_active() => {
+                ReplicationNotification::Admitted { installation_id }
+            }
+            Some(InstallationState::Rejected) => {
+                ReplicationNotification::Rejected { installation_id }
+            }
+            _ => return,
+        };
+        let _ = self.replication_notifications.send(notification);
     }
 }

@@ -4,7 +4,8 @@ mod membership;
 
 use std::sync::Arc;
 
-use zendb_types::{Blob, Installation, InstallationId, Op, Path, Permission, Value};
+use zendb_storage::InsertOutcome;
+use zendb_types::{Installation, InstallationId, Op, Path, Permission, TypeOp};
 
 pub(crate) use membership::Membership;
 
@@ -47,15 +48,13 @@ impl Installations {
         }
         // Registry changes are written through WorkspaceCore so membership,
         // replication routes, causal state, and listeners update together.
-        self.core.commit_authorized_local_change(
+        let outcome = self.core.commit_change(
             &self.table,
             installation_id.into(),
             Path::new(),
-            Op::Upsert {
-                value: Value::Blob(Blob::encode(&installation)?),
-            },
+            Op::Type(TypeOp::Installation(installation.set())),
         )?;
-        Ok(true)
+        Ok(matches!(outcome, InsertOutcome::Applied(_)))
     }
 
     pub fn delete(&self, installation_id: InstallationId) -> Result<bool> {
@@ -63,16 +62,20 @@ impl Installations {
             &self.core.membership.local_installation_id(),
             Permission::ManageInstallations,
         )?;
-        if self.core.membership.get(&installation_id).is_none() {
+        let Some(mut installation) = self.core.membership.get(&installation_id) else {
+            return Ok(false);
+        };
+        if installation.state == zendb_types::InstallationState::Rejected {
             return Ok(false);
         }
-        self.core.commit_authorized_local_change(
+        installation.state = zendb_types::InstallationState::Rejected;
+        let outcome = self.core.commit_change(
             &self.table,
             installation_id.into(),
             Path::new(),
-            Op::Delete,
+            Op::Type(TypeOp::Installation(installation.set())),
         )?;
-        Ok(true)
+        Ok(matches!(outcome, InsertOutcome::Applied(_)))
     }
 
     pub fn has_permission(&self, installation_id: &InstallationId, required: Permission) -> bool {

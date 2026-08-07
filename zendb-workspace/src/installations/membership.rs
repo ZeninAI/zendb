@@ -1,17 +1,17 @@
 //! Decoded installation membership and authorization state.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use arc_swap::ArcSwap;
 use zendb_storage::{Change, ReadBackend, Table};
-use zendb_types::{Installation, InstallationId, Op, Permission, PublicKey, Value};
+use zendb_types::{Installation, InstallationId, Op, Permission, PublicKey, TypeOp, Value};
 
 use crate::{Error, Result};
 
 #[derive(Clone)]
 struct MembershipState {
-    local_installation: Option<Installation>,
-    installations: BTreeMap<InstallationId, Installation>,
+    local_installation: Option<Arc<Installation>>,
+    installations: Arc<BTreeMap<InstallationId, Arc<Installation>>>,
 }
 
 pub(crate) struct Membership {
@@ -24,11 +24,12 @@ impl Membership {
         local_installation_id: InstallationId,
         installation: Installation,
     ) -> Self {
+        let installation = Arc::new(installation);
         Self {
             local_installation_id,
             state: ArcSwap::from_pointee(MembershipState {
-                local_installation: Some(installation.clone()),
-                installations: BTreeMap::from([(local_installation_id, installation)]),
+                local_installation: Some(Arc::clone(&installation)),
+                installations: Arc::new(BTreeMap::from([(local_installation_id, installation)])),
             }),
         }
     }
@@ -44,24 +45,17 @@ impl Membership {
             let installation_id = InstallationId::try_from(&key).map_err(|error| {
                 Error::CorruptInstallations(format!("invalid installation key: {error}"))
             })?;
-            let blob = match cell.into_owned().value {
-                Some(Value::Blob(blob)) => blob,
+            let installation = match cell.into_owned().value {
+                Some(Value::Installation(installation)) => installation,
                 None => continue,
                 Some(_) => {
                     return Err(Error::CorruptInstallations(format!(
-                        "installation {installation_id} is not stored as a Blob"
+                        "installation {installation_id} has the wrong value type"
                     )));
                 }
             };
-            let installation: Installation = blob.decode().map_err(|error| {
-                Error::CorruptInstallations(format!(
-                    "installation {installation_id} cannot be decoded: {error}"
-                ))
-            })?;
-            installations.insert(installation_id, installation);
+            installations.insert(installation_id, Arc::new(installation));
         }
-        // Publish one complete immutable snapshot only after the registry has
-        // been decoded and the local installation has passed key validation.
         let local = installations
             .get(&local_installation_id)
             .ok_or(Error::LocalInstallationNotEnrolled(local_installation_id))?;
@@ -75,8 +69,8 @@ impl Membership {
         Ok(Self {
             local_installation_id,
             state: ArcSwap::from_pointee(MembershipState {
-                local_installation: Some(local.clone()),
-                installations,
+                local_installation: Some(Arc::clone(local)),
+                installations: Arc::new(installations),
             }),
         })
     }
@@ -90,16 +84,19 @@ impl Membership {
             .load()
             .installations
             .iter()
-            .map(|(id, installation)| (*id, installation.clone()))
+            .map(|(id, installation)| (*id, installation.as_ref().clone()))
             .collect()
     }
 
     pub(crate) fn get(&self, installation_id: &InstallationId) -> Option<Installation> {
         let state = self.state.load();
         if installation_id == &self.local_installation_id {
-            state.local_installation.clone()
+            state.local_installation.as_deref().cloned()
         } else {
-            state.installations.get(installation_id).cloned()
+            state
+                .installations
+                .get(installation_id)
+                .map(|installation| installation.as_ref().clone())
         }
     }
 
@@ -110,9 +107,9 @@ impl Membership {
     ) -> bool {
         let state = self.state.load();
         let installation = if installation_id == &self.local_installation_id {
-            state.local_installation.as_ref()
+            state.local_installation.as_deref()
         } else {
-            state.installations.get(installation_id)
+            state.installations.get(installation_id).map(AsRef::as_ref)
         };
         installation
             .and_then(|installation| installation.state.permissions())
@@ -139,30 +136,23 @@ impl Membership {
             return;
         }
         let installation = match &change.event.op {
-            Op::Upsert {
-                value: Value::Blob(blob),
-            } => match blob.decode::<Installation>() {
-                Ok(installation) => Some(installation),
-                Err(_) => return,
+            Op::Type(TypeOp::Installation(_)) => match &change.current {
+                Some(cell) => match &cell.value {
+                    Some(Value::Installation(installation)) => Arc::new(installation.clone()),
+                    _ => return,
+                },
+                None => return,
             },
-            Op::Delete => None,
             _ => return,
         };
         // Readers use the old immutable snapshot until this whole projection is
         // ready; the separate local cache keeps authorization on the hot path.
         self.state.rcu(|state| {
             let mut next = (**state).clone();
-            match &installation {
-                Some(installation) => {
-                    next.installations
-                        .insert(installation_id, installation.clone());
-                }
-                None => {
-                    next.installations.remove(&installation_id);
-                }
-            }
+            Arc::make_mut(&mut next.installations)
+                .insert(installation_id, Arc::clone(&installation));
             if installation_id == self.local_installation_id {
-                next.local_installation = installation.clone();
+                next.local_installation = Some(Arc::clone(&installation));
             }
             next
         });

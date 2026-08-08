@@ -2,6 +2,7 @@
 name = "zendb-types"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
@@ -10,4 +11,5 @@ description = "Portable identifiers, event stamps, and CRDT values for ZenDB"
 [dependencies]
 bincode.workspace = true
 libp2p-identity.workspace = true
+multiaddr.workspace = true
 rand.workspace = true

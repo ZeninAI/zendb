@@ -2,13 +2,23 @@
 name = "zendb-workspace"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Catalog, device, and local state lifecycle for ZenDB"
+description = "Catalog, installation, and local state lifecycle for ZenDB"
+
+[features]
+test-support = []
 
 [dependencies]
+arc-swap.workspace = true
 bincode.workspace = true
+futures.workspace = true
+libp2p.workspace = true
+libp2p-identity.workspace = true
 parking_lot.workspace = true
-zendb-storage = { path = "../zendb-storage" }
-zendb-types = { path = "../zendb-types" }
+tokio.workspace = true
+tracing.workspace = true
+zendb-storage.workspace = true
+zendb-types.workspace = true

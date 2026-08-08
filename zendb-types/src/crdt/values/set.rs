@@ -10,7 +10,7 @@ use bincode::{Decode, Encode};
 use crate::{EventStamp, PrimaryKey, Type};
 
 /// Per-element LWW clock pair that determines set membership.
-#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
 struct Meta {
     /// HLC of the latest Add operation targeting this element.
     updated: EventStamp,
@@ -21,15 +21,6 @@ struct Meta {
 impl Meta {
     fn is_live(&self) -> bool {
         self.updated > self.deleted
-    }
-}
-
-impl Default for Meta {
-    fn default() -> Self {
-        Self {
-            updated: EventStamp::default(),
-            deleted: EventStamp::default(),
-        }
     }
 }
 

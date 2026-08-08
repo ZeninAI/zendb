@@ -8,15 +8,15 @@ Cargo workspace with three crates, each owning a strict boundary:
 | Crate | Responsibility |
 |---|---|
 | `zendb-types` | Portable data model shared by all other crates: stable identifiers, event identity and ordering, cells, CRDT operations and value types, and binary encoding. No networking, replication, backend configuration, or authorization types. |
-| `zendb-storage` | Persistence mechanics: ordered and unordered durable backends, an in-memory ordered structure, a generic backend abstraction, an append-only log, and a storage facade that enforces insertion invariants. Backend algorithms are independent of catalog, device, and authorization policy. |
-| `zendb-workspace` | Synchronous orchestration layer: table lifecycle, local typed state lifecycle, device identity and permissions, a local hybrid clock, and duplicate-event detection. No transport, replication runtime, snapshot protocol, or operator host in this phase. |
+| `zendb-storage` | Persistence mechanics: ordered and unordered durable backends, an in-memory ordered structure, a generic backend abstraction, an append-only log, and a storage facade that enforces insertion invariants. Backend algorithms are independent of catalog, installation, and authorization policy. |
+| `zendb-workspace` | Synchronous orchestration layer: workspace and table lifecycle, local typed states, installation identity and permissions, causal tracking, and the private Zenin libp2p replication runtime. |
 
 ### Documentation
 
 - **`.plan/`** is the source of truth for architecture decisions, design
   rationale, and implementation sequence. Read it before making structural
   changes. Except for the `ad-hoc.md` all the plan items should be labeled with incrementing iteration numbers and short semantic
-  description about the change, i.e., `iter-0001-table-device.md`. The iteration plan files can have conflicting requirements, naturally as the idea and the product evolves evolves, in those case know that higher iteration number is the priority as that 
+  description about the change, i.e., `iter-0001-table-installation.md`. The iteration plan files can have conflicting requirements, naturally as the idea and the product evolves evolves, in those case know that higher iteration number is the priority as that
   reflects the decision record at later time.
 - **`README.md`** at the workspace root gives the high-level overview.
 - Each crate has its own **`README.md`** documenting its specific scope, public

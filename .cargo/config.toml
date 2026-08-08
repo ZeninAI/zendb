@@ -1,0 +1,3 @@
+# Ensure maximum debug info for variable inspection in Zed's debugger
+[profile.dev]
+debug = 2

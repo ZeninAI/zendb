@@ -55,10 +55,10 @@ pub enum State<K: Ord, V> {
 }
 
 impl<K: Ord, V> State<K, V> {
-    fn flush(&mut self) -> io::Result<()> {
+    fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()> {
         match self {
-            Self::Ordered { backend, .. } => BPlusTree::flush(backend),
-            Self::Unordered { backend, .. } => KeyDir::flush(backend),
+            Self::Ordered { backend, .. } => BPlusTree::persist(backend, barrier),
+            Self::Unordered { backend, .. } => KeyDir::persist(backend, barrier),
             Self::InMemory { .. } => Ok(()),
         }
     }
@@ -66,7 +66,7 @@ impl<K: Ord, V> State<K, V> {
 
 impl<K: Ord, V> Drop for State<K, V> {
     fn drop(&mut self) {
-        let _ = State::flush(self);
+        let _ = State::persist(self, zendb_types::Barrier::Flush);
     }
 }
 
@@ -142,16 +142,8 @@ where
         }
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        State::flush(self)
-    }
-
-    fn sync(&mut self) -> io::Result<()> {
-        match self {
-            Self::Ordered { backend, .. } => backend.sync(),
-            Self::Unordered { backend, .. } => backend.sync(),
-            Self::InMemory { .. } => Ok(()),
-        }
+    fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()> {
+        State::persist(self, barrier)
     }
 }
 

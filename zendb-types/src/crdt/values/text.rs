@@ -311,10 +311,10 @@ impl Type for Text {
             let Some(local_entry) = self.entries.get(id) else {
                 continue;
             };
-            if let (Some(local), Some(remote)) = (&local_entry.content, &remote_entry.content) {
-                if local != remote {
-                    return Err(TextError::InsertConflict { id: *id });
-                }
+            if let (Some(local), Some(remote)) = (&local_entry.content, &remote_entry.content)
+                && local != remote
+            {
+                return Err(TextError::InsertConflict { id: *id });
             }
         }
         let mut changed = false;

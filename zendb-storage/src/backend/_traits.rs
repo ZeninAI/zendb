@@ -33,8 +33,7 @@ pub trait DurableStorage: Storage {
         Ok(())
     }
 
-    fn flush(&mut self) -> io::Result<()>;
-    fn sync(&mut self) -> io::Result<()>;
+    fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()>;
 }
 
 /// Read-only key/value access shared by raw backends and higher-level tables.

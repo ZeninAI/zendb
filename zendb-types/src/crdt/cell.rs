@@ -50,16 +50,20 @@ impl Type for Cell {
         match op {
             Op::Type(type_op) => {
                 let expected = type_op.type_tag();
-                if !self.ensure_type(expected, incoming) {
-                    return Ok(false);
+                if self.type_tag() != Some(expected) {
+                    if incoming <= self.max_stamp() {
+                        return Ok(false);
+                    }
+                    self.value = Some(expected.empty_value());
                 }
                 let value = self
                     .value
                     .as_mut()
-                    .expect("ensure_type must leave the cell live");
-                let changed = value.apply(type_op, MergeStamps::new(self.stamp, incoming))?;
-                if changed && incoming > self.stamp {
-                    self.stamp = incoming;
+                    .expect("typed operations must leave the cell live");
+                let merge_stamps = MergeStamps::new(self.stamp, incoming);
+                let changed = value.apply(type_op, merge_stamps)?;
+                if let Some(stamp) = value.apply_stamp(merge_stamps, changed) {
+                    self.stamp = stamp;
                 }
                 Ok(changed)
             }
@@ -110,9 +114,11 @@ impl Type for Cell {
                     return Ok(false);
                 }
                 let mut changed = current.merge(incoming_value, stamps)?;
-                if stamps.incoming > stamps.current {
-                    self.stamp = incoming.stamp;
-                    changed = true;
+                if let Some(stamp) = current.merge_stamp(stamps, changed) {
+                    if stamp != self.stamp {
+                        self.stamp = stamp;
+                        changed = true;
+                    }
                 }
                 Ok(changed)
             }

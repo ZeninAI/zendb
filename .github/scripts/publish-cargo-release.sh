@@ -4,7 +4,7 @@ set -euo pipefail
 version="${1:?release version is required}"
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
-crates_io_user_agent="zendb-release-workflow (https://github.com/zenin/zendb)"
+crates_io_user_agent="zendb-release-workflow (https://github.com/ZeninAI/zendb)"
 
 crate_url() {
   printf 'https://crates.io/api/v1/crates/%s/%s' "$1" "$2"

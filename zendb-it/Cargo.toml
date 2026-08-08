@@ -2,18 +2,20 @@
 name = "zendb-it"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Integration tests for ZenDB"
+publish = false
 
 [dependencies]
 bincode.workspace = true
 libp2p-identity.workspace = true
-zendb-workspace = { path = "../zendb-workspace", features = ["test-support"] }
-zendb-storage = { path = "../zendb-storage" }
-zendb-types = { path = "../zendb-types" }
+zendb-workspace = { workspace = true, features = ["test-support"] }
+zendb-storage.workspace = true
+zendb-types.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
 tracing-subscriber.workspace = true

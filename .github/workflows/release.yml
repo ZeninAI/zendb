@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - release-candidate
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  release:
+    name: Semantic release and publish to Cargo
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Create GitHub release and publish crates
+        id: semantic
+        uses: cycjimmy/semantic-release-action@b12c8f6015dc215fe37bc154d4ad456dd3833c90 # v6.0.0
+        with:
+          semantic_version: 25.0.9
+          extra_plugins: |
+            @semantic-release/exec@7.1.0
+          working_directory: .github
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Summarize release
+        if: ${{ steps.semantic.outputs.new_release_published != 'true' }}
+        run: echo "No release was created for this push." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summarize published release
+        if: ${{ steps.semantic.outputs.new_release_published == 'true' }}
+        env:
+          RELEASE_TAG: ${{ steps.semantic.outputs.new_release_git_tag }}
+          RELEASE_VERSION: ${{ steps.semantic.outputs.new_release_version }}
+        run: |
+          {
+            echo "Published $RELEASE_VERSION to crates.io and created GitHub release $RELEASE_TAG."
+            echo "The source Cargo.toml versions were not committed or changed."
+          } >> "$GITHUB_STEP_SUMMARY"

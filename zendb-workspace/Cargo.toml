@@ -2,6 +2,7 @@
 name = "zendb-workspace"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
@@ -19,5 +20,5 @@ libp2p-identity.workspace = true
 parking_lot.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-zendb-storage = { path = "../zendb-storage" }
-zendb-types = { path = "../zendb-types" }
+zendb-storage.workspace = true
+zendb-types.workspace = true

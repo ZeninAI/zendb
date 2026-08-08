@@ -91,3 +91,24 @@ The project is not migration-stable. Compile all crates with:
 ```text
 cargo check --workspace
 ```
+
+## Releases
+
+Pushes to `main`, `release-candidate`, and `develop` are processed by
+`.github/workflows/release.yml`. Conventional commit titles determine whether
+the push produces a release: `feat` creates a minor release, `fix`, `perf`,
+`refactor`, and dependency changes create patch releases, and breaking changes
+create major releases. Documentation, tests, styling, CI, and ordinary chores
+do not release.
+
+`main` publishes stable versions, `release-candidate` publishes `-rc.N`
+versions, and `develop` publishes `-dev.N` versions. Semantic-release derives
+the version from Git tags and commit history. The workflow temporarily applies
+that version to the workspace manifests, publishes `zendb-types`,
+`zendb-storage`, and `zendb-workspace` in dependency order, and then creates the
+GitHub release. No version bump is committed to the repository.
+
+Configure the repository secret `CARGO_REGISTRY_TOKEN` with a crates.io API
+token before enabling the workflow. The first release should have a matching
+version baseline tag, such as `v0.1.0`, if the project should start from that
+version rather than semantic-release's default initial version.

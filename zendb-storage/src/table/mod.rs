@@ -1,7 +1,7 @@
-//! Table storage facade and lazy read-merge support.
+//! Table storage facade over materialized state and its durable change topic.
 
 mod change;
-mod iter;
+mod receipt;
 #[expect(
     clippy::module_inception,
     reason = "the requested table folder keeps its implementation in table.rs"
@@ -9,4 +9,5 @@ mod iter;
 mod table;
 
 pub use change::Change;
-pub use table::{InsertOutcome, Table, TableConfig, TableStats, DEFAULT_MAX_BUFFERED_RECORDS};
+pub use receipt::ReceiptWindow;
+pub use table::{InsertOutcome, Table, TableConfig, TableStats};

@@ -12,7 +12,7 @@
 //!    for the cases that need a free-standing `Vec<u8>` or to materialize
 //!    a typed value from raw bytes.
 //!
-//! All helpers use a single shared configuration ([`cfg()`]) — little-endian,
+//! All helpers use a single shared configuration ([`CONFIG`]) — little-endian,
 //! fixed-int encoding, no decode limit — tuned for the hot inner loops of
 //! the storage backends. Byte-level page helpers (`rd_u*` / `wr_u*` /
 //! `read_u32_le`) live here too so the page-based formats share one
@@ -21,10 +21,10 @@
 use std::io;
 
 use bincode::{
+    Decode, Encode,
     config::{Configuration, Fixint, LittleEndian, NoLimit},
     enc::write::SizeWriter,
     error::{DecodeError, EncodeError},
-    Decode, Encode,
 };
 
 use crate::utils::reusables::PooledBuf;
@@ -35,16 +35,10 @@ use crate::utils::reusables::PooledBuf;
 // avoids per-byte bounds checks on trusted internal data.
 // ---------------------------------------------------------------------------
 
-/// Bincode configuration used everywhere in storage. Returned as a typed
-/// value (rather than a const) because `Configuration` builder methods
-/// aren't const in bincode 2. Constructing it is free — the type itself
-/// is zero-sized.
-#[inline(always)]
-pub fn cfg() -> Configuration<LittleEndian, Fixint, NoLimit> {
-    bincode::config::standard()
-        .with_little_endian()
-        .with_fixed_int_encoding()
-}
+/// Bincode configuration used by every helper in this module.
+const CONFIG: Configuration<LittleEndian, Fixint, NoLimit> = bincode::config::standard()
+    .with_little_endian()
+    .with_fixed_int_encoding();
 
 // ---------------------------------------------------------------------------
 // Sizing / writing / reading helpers
@@ -55,7 +49,7 @@ pub fn cfg() -> Configuration<LittleEndian, Fixint, NoLimit> {
 /// counted and discarded.
 pub fn serialized_size<T: Encode>(value: &T) -> io::Result<usize> {
     let mut sw = SizeWriter::default();
-    bincode::encode_into_writer(value, &mut sw, cfg()).map_err(encode_err)?;
+    bincode::encode_into_writer(value, &mut sw, CONFIG).map_err(encode_err)?;
     Ok(sw.bytes_written)
 }
 
@@ -66,21 +60,21 @@ pub fn serialized_size<T: Encode>(value: &T) -> io::Result<usize> {
 /// Used by backends to write straight into `mmap`, eliminating the
 /// intermediate `Vec<u8>` + `copy_from_slice` step.
 pub fn serialize_into<T: Encode>(value: &T, dst: &mut [u8]) -> io::Result<usize> {
-    bincode::encode_into_slice(value, dst, cfg()).map_err(encode_err)
+    bincode::encode_into_slice(value, dst, CONFIG).map_err(encode_err)
 }
 
 /// Serialize `value` into any [`io::Write`] destination, returning the
 /// number of bytes written. Unlike [`serialize_into`], the destination
 /// grows or streams as needed.
 pub fn serialize_into_std<T: Encode, W: io::Write>(value: &T, dst: &mut W) -> io::Result<usize> {
-    bincode::encode_into_std_write(value, dst, cfg()).map_err(encode_err)
+    bincode::encode_into_std_write(value, dst, CONFIG).map_err(encode_err)
 }
 
 /// Serialize `value` into a freshly-allocated `Vec<u8>`. Used when a
 /// stand-alone byte buffer is needed (e.g., BPlusTree key navigation
 /// scratch where the buffer's lifetime outlives the encode).
 pub fn serialize_to_vec<T: Encode>(value: &T) -> io::Result<Vec<u8>> {
-    bincode::encode_to_vec(value, cfg()).map_err(encode_err)
+    bincode::encode_to_vec(value, CONFIG).map_err(encode_err)
 }
 
 /// Encode a value into a recycled scratch buffer and pass the resulting
@@ -121,7 +115,7 @@ where
 
 /// Decode a value from `src`. Discards the trailing byte count.
 pub fn deserialize_from<T: Decode<()>>(src: &[u8]) -> io::Result<T> {
-    bincode::decode_from_slice(src, cfg())
+    bincode::decode_from_slice(src, CONFIG)
         .map(|(value, _bytes_read)| value)
         .map_err(decode_err)
 }

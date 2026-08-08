@@ -1,154 +1,125 @@
-//! End-to-end test exercising workspace create → table/state ops → cleanup.
-//! Validates the application-supplied peer identity boundary.
+//! End-to-end workspace table, state, durability, and deletion lifecycle.
 
-use std::{fs, sync::Arc};
+mod common;
+
+use std::sync::Arc;
 
 use bincode::{Decode, Encode};
-use libp2p_identity::Keypair;
+use zendb_it::TestPeerIdentity;
 use zendb_storage::{ReadBackend, StateConfig, TableConfig, WriteBackend};
-use zendb_types::{Op, Path, PeerId, PeerIdentity, PrimaryKey, Signature, SigningError, Value};
+use zendb_types::{Op, Path, PrimaryKey, Value};
 use zendb_workspace::{Workspace, WorkspaceConfig};
 
-struct TestPeerIdentity {
-    keypair: Keypair,
-    peer_id: PeerId,
-    display_name: String,
-}
-
-impl TestPeerIdentity {
-    fn generate() -> Self {
-        let keypair = Keypair::generate_ed25519();
-        let peer_id = PeerId::from_public_key(&keypair.public());
-        Self {
-            keypair,
-            peer_id,
-            display_name: "test-device".to_owned(),
-        }
-    }
-}
-
-impl PeerIdentity for TestPeerIdentity {
-    fn peer_id(&self) -> &PeerId {
-        &self.peer_id
-    }
-
-    fn display_name(&self) -> &str {
-        &self.display_name
-    }
-
-    fn sign(&self, message: &[u8]) -> Result<Signature, SigningError> {
-        self.keypair
-            .sign(message)
-            .map(Signature)
-            .map_err(Into::into)
-    }
-}
-
-/// A test value type used for state storage.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 struct Greeting {
     text: String,
 }
 
 #[test]
-fn workspace_create_tables_states_and_cleanup() {
-    // Scoped so the workspace is fully dropped before temp dir cleanup.
-    let root = {
-        let temp = tempfile::tempdir().expect("failed to create temp dir");
-        let root = temp.path().to_path_buf();
+fn workspace_data_survives_reopen_and_lifecycle_deletions() {
+    common::init_logging();
+    let temp = tempfile::tempdir().expect("failed to create workspace directory");
+    let root = temp.path();
+    let identity = Arc::new(TestPeerIdentity::generate("test-installation"));
 
-        // ---- create workspace ----
-        let peer = Arc::new(TestPeerIdentity::generate());
-        let ws = Workspace::create(&root, peer.clone(), WorkspaceConfig::default())
-            .expect("failed to create workspace");
-        assert!(!ws.id().to_string().is_empty());
+    let workspace = Workspace::create(root, identity.clone(), WorkspaceConfig::default())
+        .expect("failed to create workspace");
+    let workspace_id = workspace.workspace_id();
+    workspace
+        .tables()
+        .upsert("users", TableConfig::default())
+        .expect("failed to create users table");
+    let users = workspace
+        .tables()
+        .get("users")
+        .expect("failed to open users table");
+    users
+        .insert(
+            PrimaryKey::String("alice".to_owned()),
+            Path::new(),
+            Op::Upsert {
+                value: Value::String("Alice".to_owned()),
+            },
+        )
+        .expect("failed to insert user");
 
-        // ---- create a table and insert rows ----
-        ws.tables()
-            .upsert("users", TableConfig::default())
-            .expect("failed to create table");
-        let table = ws.tables().get("users").expect("failed to open table");
+    workspace
+        .states()
+        .upsert("greetings", StateConfig::default())
+        .expect("failed to create greetings state");
+    let greetings = workspace
+        .states()
+        .get::<String, Greeting>("greetings")
+        .expect("failed to open greetings state");
+    greetings
+        .write()
+        .expect("application state is writable")
+        .put(
+            "hello".to_owned(),
+            Greeting {
+                text: "Hello, world!".to_owned(),
+            },
+        )
+        .expect("failed to write greeting");
 
-        table
-            .insert(
-                PrimaryKey::String("alice".into()),
-                Path::new(),
-                Op::Upsert {
-                    value: Value::String("Alice".into()),
-                },
-            )
-            .expect("failed to insert alice");
+    workspace
+        .persist(zendb_workspace::Barrier::Sync)
+        .expect("failed to sync workspace");
+    drop(users);
+    drop(greetings);
+    drop(workspace);
 
-        table
-            .insert(
-                PrimaryKey::String("bob".into()),
-                Path::new(),
-                Op::Upsert {
-                    value: Value::String("Bob".into()),
-                },
-            )
-            .expect("failed to insert bob");
+    let workspace = Workspace::open(root, identity.clone(), WorkspaceConfig::default())
+        .expect("failed to reopen workspace");
+    assert_eq!(workspace.workspace_id(), workspace_id);
+    assert!(workspace.tables().list().contains(&"users".to_owned()));
+    assert!(workspace.states().list().contains(&"greetings".to_owned()));
 
-        // verify reads
-        let guard = table.read();
-        let alice_cell = guard
-            .get(&PrimaryKey::String("alice".into()))
-            .expect("alice not found");
-        assert_eq!(alice_cell.value, Some(Value::String("Alice".into())));
-        drop(guard);
-
-        // verify table listing
-        let tables = ws.tables().list();
-        assert!(tables.iter().any(|name| name == "users"));
-
-        // ---- initialize a state and write to it ----
-        ws.states()
-            .upsert("greetings", StateConfig::default())
-            .expect("failed to create state");
-        let state = ws
-            .states()
-            .get::<String, Greeting>("greetings")
-            .expect("failed to open state");
-
-        state
-            .write()
-            .expect("system state write should be refused only for system states")
-            .put(
-                "hello".to_owned(),
-                Greeting {
-                    text: "Hello, world!".into(),
-                },
-            )
-            .expect("failed to write greeting");
-
-        // verify state read
-        let found = state
+    let users = workspace
+        .tables()
+        .get("users")
+        .expect("durable users table is present");
+    assert_eq!(
+        users
+            .read()
+            .get(&PrimaryKey::String("alice".to_owned()))
+            .and_then(|cell| cell.value.clone()),
+        Some(Value::String("Alice".to_owned()))
+    );
+    let greetings = workspace
+        .states()
+        .get::<String, Greeting>("greetings")
+        .expect("durable greetings state is present");
+    assert_eq!(
+        greetings
             .read()
             .get(&"hello".to_owned())
-            .expect("greeting not found")
-            .into_owned();
-        assert_eq!(found.text, "Hello, world!");
+            .expect("durable greeting is present")
+            .into_owned(),
+        Greeting {
+            text: "Hello, world!".to_owned(),
+        }
+    );
 
-        // verify state listing
-        let states = ws.states().list();
-        assert!(states.contains(&"greetings".to_owned()));
+    drop(users);
+    drop(greetings);
+    workspace
+        .tables()
+        .delete("users")
+        .expect("failed to delete users table");
+    workspace
+        .states()
+        .delete("greetings")
+        .expect("failed to delete greetings state");
+    workspace
+        .persist(zendb_workspace::Barrier::Sync)
+        .expect("failed to sync deletions");
+    assert!(!root.join("tables").join("users").exists());
+    assert!(!root.join("states").join("greetings").exists());
+    drop(workspace);
 
-        // ---- verify the workspace left files on disk ----
-        assert!(root.exists());
-        let entries: Vec<_> = fs::read_dir(&root)
-            .expect("failed to read root dir")
-            .filter_map(|e| e.ok())
-            .collect();
-        assert!(!entries.is_empty(), "workspace root should contain files");
-
-        // Drop workspace and state before temp dir is cleaned up.
-        drop(ws);
-        drop(state);
-
-        root
-    };
-    // `temp` is now dropped (directory deleted).
-
-    // ---- cleanup verified: temp dir is gone ----
-    assert!(!root.exists(), "temp dir should be gone after cleanup");
+    let workspace = Workspace::open(root, identity, WorkspaceConfig::default())
+        .expect("failed to reopen workspace after deletion");
+    assert!(!workspace.tables().contains("users"));
+    assert!(!workspace.states().contains("greetings"));
 }

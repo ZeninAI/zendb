@@ -2,11 +2,11 @@
 
 use bincode::{Decode, Encode};
 
-use crate::PeerId;
+use crate::InstallationId;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct EventId {
-    pub peer_id: PeerId,
+    pub author: InstallationId,
     pub sequence: u64,
 }
 
@@ -19,11 +19,11 @@ pub struct EventTime {
 /// A globally ordered event stamp.
 ///
 /// Ordering is time first and identity second:
-/// `(physical_ms, logical, peer_id, sequence)`.
+/// `(physical_ms, logical, author, sequence)`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct EventStamp {
-    pub id: EventId,
     pub time: EventTime,
+    pub id: EventId,
 }
 
 impl PartialOrd for EventStamp {
@@ -37,16 +37,22 @@ impl Ord for EventStamp {
         (
             self.time.physical_ms,
             self.time.logical,
-            self.id.peer_id,
+            self.id.author,
             self.id.sequence,
         )
             .cmp(&(
                 other.time.physical_ms,
                 other.time.logical,
-                other.id.peer_id,
+                other.id.author,
                 other.id.sequence,
             ))
     }
+}
+
+impl EventStamp {
+    /// Fixed encoded size under bincode's fixed-int little-endian config:
+    /// EventId(16) + EventTime(12) = 28 bytes.
+    pub const ENCODED_SIZE: usize = 28;
 }
 
 impl std::fmt::Display for EventStamp {
@@ -54,7 +60,7 @@ impl std::fmt::Display for EventStamp {
         write!(
             formatter,
             "{}:{}:{}:{}",
-            self.time.physical_ms, self.time.logical, self.id.peer_id, self.id.sequence
+            self.time.physical_ms, self.time.logical, self.id.author, self.id.sequence
         )
     }
 }

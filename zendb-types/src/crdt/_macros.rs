@@ -131,6 +131,28 @@ macro_rules! register_types {
                 }
             }
 
+            fn apply_stamp(
+                &self,
+                stamps: $crate::MergeStamps,
+                changed: bool,
+            ) -> Option<$crate::EventStamp> {
+                match self {
+                    $(Value::$leaf_var(value) => value.apply_stamp(stamps, changed),)*
+                    $(Value::$cont_var(value) => value.apply_stamp(stamps, changed),)*
+                }
+            }
+
+            fn merge_stamp(
+                &self,
+                stamps: $crate::MergeStamps,
+                changed: bool,
+            ) -> Option<$crate::EventStamp> {
+                match self {
+                    $(Value::$leaf_var(value) => value.merge_stamp(stamps, changed),)*
+                    $(Value::$cont_var(value) => value.merge_stamp(stamps, changed),)*
+                }
+            }
+
             fn max_stamp(&self) -> $crate::EventStamp {
                 match self {
                     $(Value::$leaf_var(value) => value.max_stamp(),)*

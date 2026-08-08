@@ -19,10 +19,10 @@ and needs no server.
 
 The defining idea is that **every change is an event**. When you insert or
 delete a value, ZenDB does not silently overwrite old data. Instead it stamps
-the change with *who* made it (a device identity), *when* (a hybrid clock), and
+the change with *who* made it (a installation identity), *when* (a hybrid clock), and
 *where* in the data model. Those stamped events are appended to a durable log.
 Because every change carries its own identity and timestamp, the same database
-can later be **merged across devices** without losing information — that is the
+can later be **merged across installations** without losing information — that is the
 property we will build replication on top of, but replication itself is not
 part of this baseline.
 
@@ -49,7 +49,7 @@ not break without a new decision.
 
 ZenDB is organized as three crates that depend on each other in a single
 direction. Lower crates know nothing about the higher ones — `zendb-storage`
-has no idea what a "device" or a "role" is, and `zendb-types` does no file I/O
+has no idea what a "installation" or a "role" is, and `zendb-types` does no file I/O
 at all. This keeps each layer testable and keeps policy (who is allowed to
 write) separate from mechanics (how bytes hit disk).
 
@@ -62,7 +62,7 @@ flowchart TD
         W[Workspace]
         T[Tables / TableHandle]
         S[States / StateHandle]
-        D[Devices / Roles / Clock]
+        D[Installations / Roles / Clock]
     end
     subgraph st["zendb-storage — durability mechanics"]
         TB[Table + Topic + Backends]
@@ -87,7 +87,7 @@ flowchart TD
 > **Boundary rule (enforced by the codebase)**
 > Dependencies flow only downward: `types ← storage ← workspace`. No crate
 > pulls in an async runtime. The workspace crate is the *only* place where
-> authorization, devices, and clocks exist.
+> authorization, installations, and clocks exist.
 
 ---
 
@@ -101,7 +101,7 @@ replication will land.
 sequenceDiagram
     participant App
     participant H as TableHandle (public)
-    participant D as Devices
+    participant D as Installations
     participant T as Table (storage)
     participant L as ChangeListeners
 
@@ -172,11 +172,11 @@ classDiagram
     Cell --> EventStamp
 ```
 
-- **`EventId`** = *which device* (`PeerId`) and *which number* (`sequence`,
-  per device). Together they make an event globally identifiable.
+- **`EventId`** = *which installation* (`PeerId`) and *which number* (`sequence`,
+  per installation). Together they make an event globally identifiable.
 - **`EventTime`** is a **hybrid logical clock**: wall-clock milliseconds plus a
   `logical` counter that breaks ties when two events share the same millisecond.
-  This gives a consistent total order across devices without requiring
+  This gives a consistent total order across installations without requiring
   perfectly synchronized clocks.
 - **`Op`** is the mutation: `Upsert` (create/replace), `Delete`, `Merge`, and
   type-specific operations.
@@ -185,7 +185,7 @@ classDiagram
 
 ### 4.2 CRDT values
 
-"CRDT" means *conflict-free replicated data type*: when two devices change the
+"CRDT" means *conflict-free replicated data type*: when two installations change the
 same key, the values can be merged deterministically without a central arbiter.
 ZenDB registers a fixed set of these:
 
@@ -206,7 +206,7 @@ ZenDB registers a fixed set of these:
 ## 5. The storage engine (`zendb-storage`)
 
 This crate is pure mechanics: how a table is represented in memory and on disk.
-It has no notion of devices, roles, or networking.
+It has no notion of installations, roles, or networking.
 
 ```mermaid
 flowchart LR
@@ -243,9 +243,9 @@ Key facts:
 
 ---
 
-## 6. Identity, devices, and roles (`zendb-workspace`)
+## 6. Identity, installations, and roles (`zendb-workspace`)
 
-This is the policy layer. It decides *who* a device is and *what* it may do.
+This is the policy layer. It decides *who* a installation is and *what* it may do.
 
 ### 6.1 Identities
 
@@ -289,24 +289,24 @@ flowchart LR
 | Write application tables | ❌ | ✅ | ✅ | ✅ |
 | Write application states | ✅ | ✅ | ✅ | ✅ |
 | Create/update/delete table declarations | ❌ | ❌ | ❌ | ✅ |
-| Add/update device records & roles | ❌ | ❌ | ❌ | ✅ |
+| Add/update installation records & roles | ❌ | ❌ | ❌ | ✅ |
 | Future dispatch operations | ❌ | ❌ | ✅ | ✅ |
 
 Authorization is checked **twice** on the local path: once before minting (so a
 denied write does not consume a sequence number) and once inside
 `insert_internal` (the final guard, and the path a replicated event also hits).
 
-### 6.3 Devices and the clock
+### 6.3 Installations and the clock
 
-`Devices` owns:
+`Installations` owns:
 
-- the device registry (`_devices` table),
+- the installation registry (`_installations` table),
 - the local hybrid clock (`mint` advances `sequence` + `EventTime` together),
 - **receipt windows** (`observe` tracks which sequences from each peer have
   been seen — the duplicate-detection and causal-cursor mechanism),
 - an authorization cache and a separate write-back peer cache.
 
-A `DeviceRecord` is simply `{ display_name, role }`. The `display_name` is
+A `Installation` is simply `{ display_name, role }`. The `display_name` is
 seeded from `PeerIdentity::display_name()` when a workspace is created and is
 later changed only through an explicit `upsert`.
 
@@ -327,7 +327,7 @@ workspace-root/
   _lock              ← advisory OS file lock
   tables/
     _catalog/        ← table name → TableConfig (source of truth)
-    _devices/        ← PeerId   → DeviceRecord
+    _installations/        ← PeerId   → Installation
     <table-name>/
   states/
     _catalog/        ← state name → StateConfig
@@ -335,7 +335,7 @@ workspace-root/
     <state-name>/
 ```
 
-The `_catalog` and `_devices` tables are self-registering: they are written
+The `_catalog` and `_installations` tables are self-registering: they are written
 through the normal authorized insert path during bootstrap, and their
 in-memory handle maps are then maintained *only* by listeners (see below).
 
@@ -352,31 +352,31 @@ flowchart TD
     I[insert_internal on any table] --> F[fire ChangeListeners]
     F --> RL[ReceiptListener]
     F --> CL[TableCatalogListener]
-    F --> DL[DeviceRegistryListener]
-    RL --> OB[Devices::observe → clock + receipts]
+    F --> DL[InstallationRegistryListener]
+    RL --> OB[Installations::observe → clock + receipts]
     CL --> OM[open/close TableHandle in map<br/>+ create/remove directory]
     DL --> UC[update registry cache<br/>local_role / entries]
 ```
 
 | Listener | Owns | File |
 |---|---|---|
-| `ReceiptListener` | feeding `Devices::observe` (clock + receipts) | `tables/listeners/receipts.rs` |
+| `ReceiptListener` | feeding `Installations::observe` (clock + receipts) | `tables/listeners/receipts.rs` |
 | `TableCatalogListener` | the in-memory table-handle map after bootstrap (open on `Upsert`, close + `rmdir` on `Delete`) | `tables/listeners/catalog.rs` |
-| `DeviceRegistryListener` | the in-memory device-record cache after initial load | `tables/listeners/devices.rs` |
+| `InstallationRegistryListener` | the in-memory installation-record cache after initial load | `tables/listeners/installations.rs` |
 
 > **Why this matters**
 > Because listeners converge on `insert_internal`, a *replicated* event that
 > reaches `insert_internal` will automatically update receipts, the catalog
-> map, and the device cache — no separate code path needed. The listener model
+> map, and the installation cache — no separate code path needed. The listener model
 > *is* the replication convergence design.
 
 ---
 
 ## 9. Durability and failure semantics
 
-- `Workspace`, `Devices`, `Tables`, and `States` all expose `flush()` (write
+- `Workspace`, `Installations`, `Tables`, and `States` all expose `flush()` (write
   back + OS flush) and `sync()` (write back + durable sync).
-- `Workspace` and `Devices` also flush from their `Drop` impl as a best-effort
+- `Workspace` and `Installations` also flush from their `Drop` impl as a best-effort
   safety net. **Drop-time errors are intentionally ignored** — callers that
   need a guarantee must call `sync()` explicitly.
 - Validation is minimal by design: backends do a magic-byte check and nothing
@@ -433,13 +433,13 @@ machinery via `register_types!`.
 
 ### `zendb-workspace`
 `Workspace` (`create` / `open` / `join` / `flush` / `sync` / `id` / `root` /
-`peer_identity` / `devices` / `tables` / `states`), `WorkspaceConfig`,
+`peer_identity` / `installations` / `tables` / `states`), `WorkspaceConfig`,
 `JoinHints`; `Tables` (`contains` / `list` / `upsert` / `get` / `delete` /
 `flush` / `sync`); `TableHandle` (`insert` / `read` / `consumer` /
 `add_listener` / `is_system`); `ChangeListener`; `States` (`upsert` / `get` /
-`list` / `list_open` / `close` / `flush` / `sync`); `StateHandle`; `Devices`
+`list` / `list_open` / `close` / `flush` / `sync`); `StateHandle`; `Installations`
 (`list` / `get` / `upsert` / `has_access` / `local_peer_id` / `flush` /
-`sync`); `DeviceRecord`; `Error` / `Result`.
+`sync`); `Installation`; `Error` / `Result`.
 
 ---
 

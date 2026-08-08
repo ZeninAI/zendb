@@ -2,8 +2,8 @@
 
 use bincode::{Decode, Encode};
 
-use crate::crdt::{Cell, EventStamp, Op};
 use crate::Segment;
+use crate::crdt::{Cell, EventStamp, Op};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MergeStamps {
@@ -62,6 +62,14 @@ pub trait Type: Sized + Encode + Decode<()> {
     fn apply(&mut self, op: &Self::Op, stamps: MergeStamps) -> Result<bool, Self::Error>;
 
     fn merge(&mut self, incoming: &Self, stamps: MergeStamps) -> Result<bool, Self::Error>;
+
+    fn apply_stamp(&self, stamps: MergeStamps, changed: bool) -> Option<EventStamp> {
+        (changed && stamps.incoming > stamps.current).then_some(stamps.incoming)
+    }
+
+    fn merge_stamp(&self, stamps: MergeStamps, _changed: bool) -> Option<EventStamp> {
+        (stamps.incoming > stamps.current).then_some(stamps.incoming)
+    }
 
     fn max_stamp(&self) -> EventStamp {
         EventStamp::default()

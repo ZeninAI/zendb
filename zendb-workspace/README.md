@@ -1,240 +1,141 @@
 # zendb-workspace
 
-`zendb-workspace` is ZenDB's synchronous orchestration layer. It owns the table
-catalog, state catalog, and peer policy without introducing transport,
-replication workers, snapshots, or an async service framework.
+`zendb-workspace` is ZenDB's synchronous orchestration layer. It owns workspace
+lifecycle, table and state catalogs, installation permissions, workspace clock,
+network admission, and the private Zenin libp2p runtime.
 
-## Identity Boundary
+## Lifecycle
 
-The workspace owns its random 128-bit `WorkspaceId` but **does not own device
-identity**. Its canonical text form is 26-character Crockford Base32, suitable
-for future join links. `PeerId` and the private key belong to the application;
-the workspace receives a `PeerIdentity` trait object at construction and never
-sees private key material directly. This separation supports the open modes
-the system must support:
+Applications pass `Arc<dyn PeerIdentity>`. ZenDB derives an Ed25519 key from a
+versioned domain, `WorkspaceId`, and `InstallationId`; `_identity` persists the
+two IDs and the latest durable hybrid-clock checkpoint.
 
-- **Create**: `Workspace::create(root, identity, config)` — generates and
-  persists a fresh `WorkspaceId`.
-- **Open**: `Workspace::open(root, identity)` — reads the existing `WorkspaceId`
-  from disk.
-- **Join**: `Workspace::join(root, workspace_id, identity, hints, config)` —
-  persists a caller-provided `WorkspaceId` for the workspace being joined.
-  `JoinHints` is a placeholder; networking is out of scope for this iteration.
+- `Workspace::create` creates system storage and the initial full-access local
+  installation from the peer identity's display name and route hints,
+  synchronizes it, then writes `_identity`.
+- `Workspace::open` derives the same key and requires a matching active local
+  installation, then restores the persisted hybrid clock. Before replication
+  starts, it updates only the
+  local installation's display name and route hints when the peer identity has
+  changed; this internal update does not require installation-management
+  permission.
 
-`identity` is `Arc<dyn PeerIdentity>`. Applications supply an implementation
-backed by their chosen key store, such as an OS keychain, HSM, KMS, or an
-in-memory key for tests, without workspace changes.
+`WorkspaceConfig::workspace_id` is optional. Supplying the same ID to separate
+`create` calls produces independent replicas that may later merge.
 
-`Workspace` owns the persisted `WorkspaceId` and keeps the workspace lock file
-open for its lifetime. The narrow identity read/write and lock acquisition
-logic lives directly in `workspace.rs`; there is no separate bootstrap type.
-Persisted file, directory, and system-resource names are centralized in
-`consts.rs`. Wall-clock reads go through
-`zendb-types::utils::time::physical_ms()`.
-System state and table bootstrap configurations are also centralized there.
+## Core Ownership
 
-## Public Surface
+Each open workspace owns one flat `WorkspaceCore`:
 
-`Workspace` exposes three shared handlers plus the local identity:
+- `TableStore` owns open system and application tables.
+- `States` owns typed local states and the state catalog.
+- `Membership` is an immutable `ArcSwap` projection of `_installations`.
+- `HybridClock` owns only the workspace HLC. Each physical table owns its
+  per-installation sequence allocator and receipt state through its configured
+  causal `State`.
+- an optional MPSC sender delivers committed events to replication when the
+  runtime is enabled.
 
-- `Workspace::devices()` — peer registry, hybrid clock, roles, and
-  duplicate-event tracking.
-- `Workspace::tables()` — table catalog management.
-- `Workspace::states()` — state catalog management.
-- `Workspace::peer_identity()` — the local device identity, for signing
-  messages on behalf of the local device without the workspace holding the
-  private key.
+`Workspace` separately owns the always-running `ReplicationController`, which
+contains the replication thread and its receiver. There is no intermediate
+workspace-components bundle, assembly DTO, or separate runtime lifecycle
+object.
 
-`Workspace::flush()` and `Workspace::sync()` are the cross-module durability
-barriers. `flush` drains runtime caches into their storage writeback paths;
-`sync` additionally requests durable synchronization from every backend.
+The local mutation pipeline is:
 
-## Event-Driven Maintenance
-
-Table and device maintenance is **reactive**: CRUD methods validate and publish
-events; callbacks react. This makes local edits and (future) remote events go
-through the exact same code path.
-
-### Change listeners
-
-`ChangeListener` is a `pub` trait owned by `TableHandle`:
-
-```rust
-pub trait ChangeListener: Send + Sync {
-    fn on_change(&self, change: &Change);
-}
+```text
+authorize -> mint time -> table::insert
+          -> project -> notify
 ```
 
-Listeners are registered at open time and dispatched synchronously after every
-successful authorized handle insertion, once the storage-table write guard has
-been released. `TableHandle::add_listener` is `pub`, so applications can
-register custom listeners on tables they hold handles to. Internal listeners
-and application listeners share the same listener list.
+Remote events enter through `table::observe`, which owns duplicate detection,
+receipt updates, CRDT application, and topic admission. Once an installation
+is admitted, committed events are trusted. The receiver does not repeat
+per-event signature or permission checks.
 
-### Internal listeners
+When enabled, local commits notify the replication runtime immediately after
+durable insertion through an unbounded Tokio channel. Disabled replication
+uses no controller and the core notification sender is a no-op. Notifications
+are granular:
 
-| Listener | Registered on | Reaction |
-| --- | --- | --- |
-| `ReceiptListener` | every table | `Devices::observe(stamp)` — replaces the one-shot replay consumer |
-| `TableCatalogListener` | `_catalog` | open tables on `Upsert`, close + rmdir on `Delete` — single owner of the handle map |
-| `DeviceRegistryListener` | `_devices` | update the registry cache after the initial open-time load |
+- `Event { table, event }` — a locally committed event.
+- `InstallationChanged { installation_id }` — installation metadata or state
+  changed.
 
-`TableCatalogListener` holds a shared `Arc<dyn ChangeListener>` (the receipt
-listener) to register on newly opened application tables, so every table has
-the receipt listener.
+Events are serialized once on admission and accumulated as length-delimited
+bytes per table. A batch is completed when its soft `BatchConfig::batch_size`
+threshold is crossed or its optional `BatchConfig::linger` duration expires,
+whichever comes first. With no linger, size is the only completion trigger.
 
-### CRUD methods publish; callbacks react
+`ReplicationConfig` is grouped by responsibility: `transport` owns listener
+bindings, `mesh` owns neighbour topology and maintenance cadence, `sync` owns
+anti-entropy cadence and range/cache counts, and `batch` owns outbound
+accumulation. The default batch size is 1 MiB. Wire-frame and sync-response
+byte ceilings are not public configuration settings.
 
-`Tables` CRUD methods validate a precondition and publish a catalog event.
-They do not open/close tables or mutate the handle map directly — the
-`TableCatalogListener` does. `Devices::upsert` checks access, mints, and
-publishes directly; `DeviceRegistryListener` updates the registry cache and
-`ReceiptListener` observes the stamp.
+## Network Admission
 
-## Tables
+Each connection opens a long-lived `/zenin/1` session over TCP+Noise+Yamux or
+QUIC. Noise authenticates the transport, and the handshake binds the connected
+PeerId to the workspace ID, installation ID, display name, public key, and
+route hints.
 
-`Tables` owns the `_catalog` handle and the in-memory map of opened
-`Arc<TableHandle>` values. The `_catalog` Table is the source of truth for
-declarations, and every declared table is eagerly represented in the handle
-map. The typed catalog field and its map entry share the same `Arc<TableHandle>`;
-the devices registry follows the same ownership model.
+Unknown or Pending installations are rejected at the protocol level:
+the replication runtime records the peer as `Pending` in `_installations` and
+disconnects with `Error(NotAdmitted)`. Only peers whose installation is locally
+Active are accepted for replication. This means both sides must independently
+approve each other before event exchange begins.
 
-- `Tables::upsert(name, config) -> Result<bool>` — declare a table or update
-  its config. `TableCatalogListener` opens new tables synchronously.
-- `Tables::get(name) -> Result<Arc<TableHandle>>` — obtain the stored handle
-  for an existing table. Returns handles to system tables too; system handles
-  refuse `insert`.
-- `Tables::contains(name)` and `Tables::list()` include system and application
-  tables; `list()` returns the eager map's natural iteration order.
-- `Tables::delete(name) -> Result<bool>` — delete a table. Refuses system
-  tables with `ResourceBusy`.
-- `Tables::flush()` and `Tables::sync()` snapshot the eager handle map and
-  invoke the matching durability operation on every table. The catalog and
-  device registry need no special case because both are map entries.
+`WorkspaceConfig`, `ReplicationConfig`, and their responsibility-specific
+sub-configurations are defined together in the workspace-level `config.rs`.
+Replication
+can be disabled with `ReplicationConfig::enabled`; in that mode no replication
+controller or notification channel is created. `TransportConfig::enable_port_reuse`
+defaults to `true`; disabling it makes outbound dials allocate a fresh local
+port, which is useful for isolated integration processes. TCP, QUIC, and mDNS
+are independently controlled by `enable_tcp`, `enable_quic`, and `enable_mdns`,
+all of which default to `true`.
 
-### System tables
+`Installation` is a leaf CRDT whose merge gives `Active` higher precedence
+than `Pending` and `Rejected`, so discovery races cannot demote an active
+installation. Applications list pending installations and use
+`Installations::upsert` to store `Active(permissions)` or `Rejected`. When an
+installation is Active, the mesh automatically dials the peer using its current
+durable route hints. The runtime binds only the configured
+`ReplicationConfig::transport.listener_addresses`; listener bindings are not copied into
+installation metadata. A local installation change also updates the handshake
+used for future sessions. There is no temporary join swarm, join claim, or
+bootstrap protocol.
 
-System tables (`_catalog`, `_devices`) are openable but cannot be
-upserted, deleted, or directly written via `TableHandle`. `TableHandle` stores
-`is_system: bool` set at construction; public mutation returns
-`SystemTableReadOnly`. Idiomatic catalog and device methods require Admin and
-call the authorized `TableHandle::insert_internal`.
+If both peers dial each other at the same time, the runtime temporarily accepts
+both physical connections. Once both directions are established, each peer
+chooses the same connection using peer-ID ordering and endpoint direction, then
+closes the other connection. A single connection is retained regardless of
+which peer initiated it.
 
-### Table operations
+## Workspace Merge
 
-`TableHandle::insert` is the single local mutation path for application tables:
-reject system handles, require Contributor, mint, and delegate to
-`TableHandle::insert_internal`. The internal path independently checks the
-event actor, requiring Contributor for application tables and Admin for system
-tables, before inserting and dispatching callbacks. `read` returns the storage
-table's `RwLockReadGuard` directly. `consumer` returns
-`zendb_storage::TopicConsumer<Change>` directly; the storage consumer already
-owns its topic state and cursor.
+Zenin exchanges receipt summaries and missing ranges per table and author.
+Sequence numbers are allocated independently by each physical table, so the
+same installation can have sequence 1 on multiple tables.
 
-`Tables::create/open` owns table runtime initialization: it creates or opens
-both system tables, constructs `Devices`, builds the eager handle map,
-registers listeners, and (on create) writes the self-referencing system catalog
-rows. `Devices::create` inserts the initial Admin row directly into the raw
-registry Table before wrapping it in `TableHandle`; subsequent catalog writes
-use normal Admin-authorized insertion. `Devices::open` loads the durable
-registry and rejects an unregistered local peer before returning. The
-constructors return `Arc<Tables>`; `Workspace::assemble` only clones the device
-handle from the crate-visible `Tables::devices` field.
+Fetched batches are applied in this order:
 
-## States
+1. `_catalog`
+2. `_installations`
+3. application tables
 
-`States` is the state catalog management surface. States are **lazy** after
-creation: a state may be declared in `_catalog` but not currently open.
-Catalog lifecycle remains in `states/mod.rs`; the typed `StateHandle` runtime
-API lives in `states/runtime.rs`.
-The catalog itself is bootstrapped into the open-state registry; its typed
-catalog field and erased registry entry share the same `Arc<StateHandle<_, _>>`.
-Opening `_catalog` therefore returns the existing guarded state instead
-of opening the same backend a second time.
+This lets catalog events materialize missing tables before their historical
+events are applied. Installation histories then CRDT-merge the participating
+clusters.
 
-- `States::upsert(name, config) -> Result<bool>` — declare and physically
-  create a state, or update an existing declaration's config. System states
-  are visible but cannot be upserted.
-- `States::get::<K, V>(name) -> Result<Arc<StateHandle<K, V>>>` — obtain a
-  shared typed handle. Lazy-loads by downcasting an open handle or opening the
-  declared physical state.
-- `contains`, `list`, `list_open`, and `close` treat system and
-  application states uniformly.
-- `delete` refuses `_catalog` and `_peers` with `ResourceBusy`.
-- `flush` and `sync` visit every currently open state. Declared but unopened
-  states have no runtime cache to drain.
+Permissions govern events produced after admission. They do not filter
+committed history during replication. A newly admitted read-only installation
+therefore still contributes events authored while its workspace was isolated.
 
-### System states
+## Lifecycle And Durability
 
-`StateHandle` stores `is_system: bool`; public `write()` returns
-`SystemStateReadOnly` for system states, while `read()` is unaffected.
-`Devices` owns the `_peers` handle and uses its crate-internal
-`write_internal()` method during durability barriers. `States::create`
-declares and materializes the `_peers` system state before returning;
-`Workspace::assemble` only obtains its handle with `States::get`.
-
-## Peers And Roles
-
-`_devices` stores `PeerId -> DeviceRecord`, where each record has
-`display_name` and an optional progressive `Role`. No role means Reader.
-
-The public `Devices` facade is intentionally small:
-
-- `local_peer_id()` borrows the identity used for local mutations.
-- `list()` returns the cached device records.
-- `get(&peer_id)` reads one cached device record.
-- `has_access(&peer_id, role)` checks any peer against the progressive
-  hierarchy.
-- `upsert(peer_id, record)` requires Admin and publishes a registry change,
-  returning whether the record changed.
-
-The registry's read-oriented cache is one
-`RwLock<RegistryCache { entries, local_role }>` so a listener updates the
-local record and its fast authorization value atomically. Event bookkeeping is
-kept separately in `peer_cache`.
-
-On create, `Devices` directly establishes the local Admin record as registry
-event sequence `1`, seeds the registry cache, and records that receipt in the
-initial peer state. Its clock starts with `next_sequence = 2`, so subsequent
-events cannot reuse the bootstrap event ID. On open, `Devices` requires the
-current peer to already have a registry entry; opening never silently promotes
-an unknown peer. Only Admin may upsert device records or manage application
-table declarations.
-
-- Reader can read tables and is represented by no role.
-- `Contributor` writes existing application tables.
-- `Operator` includes Contributor behavior and is reserved for future
-  dispatch operations.
-- `Admin` includes Operator behavior and manages table declarations and device
-  records through their idiomatic APIs.
-
-States are local and do not perform role authorization. Their existing system
-state handle guard remains unchanged. Direct system table insertion is refused
-for every role, including Admin.
-
-`_peers` stores `PeerState { receipts, clock }`; the optional clock is an
-`EventClock { next_sequence, last_time }`. Only the local peer has a clock.
-`Devices` keeps the local peer state separate from `others` in one
-mutex-protected `PeerCache`. Minting updates only the local clock and marks it
-dirty; it does not search a peer map or acquire the state write lock. Receipt
-observation updates the same cache.
-
-Local mutations are linear: require access, mint, insert, then observe (via
-callback). There is no callback-based mutation API, reconciliation poison
-state, or event journal outside each Table's Topic.
-
-## Durability
-
-`Devices`, `Tables`, and `States` each expose `flush` and `sync`. Device
-durability first writes dirty peer states to `_peers`; Tables and States
-then invoke the matching operation on the handles already stored in their
-maps. `Workspace` coordinates them in that order so a device checkpoint is
-written before table events are synchronized.
-
-`Workspace` performs a coordinated best-effort `flush` from `Drop`, and
-`Devices` flushes its separate peer cache before it is destroyed. Individual
-storage `Table` and `State` values already flush when their final owners are
-dropped, so `Tables` and `States` do not duplicate that behavior. Drop-time
-errors cannot be reported; callers requiring error handling or an explicit
-durability guarantee must call `Workspace::flush()` or `Workspace::sync()`.
-Calling a submodule durability method only covers that submodule.
+Networking starts whenever a workspace is created or opened and stops when it
+closes. Runtime shutdown uses a one-shot wakeup. Explicit barriers synchronize
+table state, table causal state, topics, local states, and the workspace clock
+checkpoint.

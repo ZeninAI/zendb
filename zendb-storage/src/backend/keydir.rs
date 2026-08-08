@@ -80,8 +80,8 @@ use std::{
 };
 
 use bincode::{Decode, Encode};
-use hashbrown::hash_map::Entry;
 use hashbrown::HashMap;
+use hashbrown::hash_map::Entry;
 use memmap2::MmapMut;
 
 use crate::backend::_traits::{DurableStorage, Storage};
@@ -260,8 +260,11 @@ pub struct KeyDir<K, V> {
 }
 
 impl<K, V> KeyDir<K, V> {
-    pub(crate) fn flush(&mut self) -> io::Result<()> {
-        self.mmap.flush_async()
+    pub(crate) fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()> {
+        match barrier {
+            zendb_types::Barrier::Flush => self.mmap.flush_async(),
+            zendb_types::Barrier::Sync => self.mmap.flush(),
+        }
     }
 }
 
@@ -359,10 +362,10 @@ impl<K, V> Drop for KeyDir<K, V> {
     /// Schedule a final writeback without blocking. We don't promise
     /// crash recovery in this layer, so a sync `flush()` here would
     /// just stall shutdown for a guarantee we don't make. Callers that
-    /// need durability should call [`DurableStorage::sync`] explicitly before
-    /// dropping.
+    /// need durability should call [`DurableStorage::persist`] with
+    /// [`zendb_types::Barrier::Sync`] explicitly before dropping.
     fn drop(&mut self) {
-        let _ = KeyDir::flush(self);
+        let _ = KeyDir::persist(self, zendb_types::Barrier::Flush);
     }
 }
 
@@ -484,16 +487,8 @@ where
         Ok(())
     }
 
-    /// Schedule mmap writeback asynchronously. Returns once the OS has
-    /// accepted the request; use [`sync`](Self::sync) to wait for it.
-    fn flush(&mut self) -> io::Result<()> {
-        KeyDir::flush(self)
-    }
-
-    /// Block until pending mmap writes have been flushed by the OS.
-    /// This does not provide crash recovery or log repair.
-    fn sync(&mut self) -> io::Result<()> {
-        self.mmap.flush()
+    fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()> {
+        KeyDir::persist(self, barrier)
     }
 }
 
@@ -964,7 +959,7 @@ mod tests {
             let mut kd = create(&p);
             kd.put(k("a"), v("alpha", 1)).unwrap();
             kd.put(k("b"), v("beta", 2)).unwrap();
-            kd.flush().unwrap();
+            kd.persist(zendb_types::Barrier::Flush).unwrap();
         }
         let kd = open(&p);
         assert_eq!(kd.size(), 2);
@@ -980,7 +975,7 @@ mod tests {
             kd.put(k("a"), v("a", 1)).unwrap();
             kd.put(k("b"), v("b", 2)).unwrap();
             kd.delete(&k("a")).unwrap();
-            kd.flush().unwrap();
+            kd.persist(zendb_types::Barrier::Flush).unwrap();
         }
         let kd = open(&p);
         assert_eq!(kd.size(), 1);
@@ -996,7 +991,7 @@ mod tests {
             kd.put(k("a"), v("v1", 1)).unwrap();
             kd.put(k("a"), v("v2", 2)).unwrap();
             kd.put(k("a"), v("v3", 3)).unwrap();
-            kd.flush().unwrap();
+            kd.persist(zendb_types::Barrier::Flush).unwrap();
         }
         let kd = open(&p);
         assert_eq!(kd.size(), 1);
@@ -1016,7 +1011,7 @@ mod tests {
             );
             kd.put(k("a"), v("v1", 1)).unwrap();
             kd.put(k("a"), v("v2", 2)).unwrap();
-            kd.flush().unwrap();
+            kd.persist(zendb_types::Barrier::Flush).unwrap();
         }
         let kd = KeyDir::<TestKey, TestVal>::open(
             &p,
@@ -1136,7 +1131,7 @@ mod tests {
                         .unwrap();
                 }
             }
-            kd.flush().unwrap();
+            kd.persist(zendb_types::Barrier::Flush).unwrap();
         }
         let kd: KeyDir<TestKey, TestVal> = KeyDir::open(&p, cfg).unwrap();
         assert_eq!(kd.size(), 10);
@@ -1161,7 +1156,7 @@ mod tests {
                 kd.put(k("a"), v("payload", i)).unwrap();
             }
             assert!(kd.stats().dead_bytes > 0);
-            kd.sync().unwrap();
+            kd.persist(zendb_types::Barrier::Sync).unwrap();
         }
 
         let mut kd: KeyDir<TestKey, TestVal> = KeyDir::open(
@@ -1264,7 +1259,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            kd.flush().unwrap();
+            kd.persist(zendb_types::Barrier::Flush).unwrap();
         }
         let kd = open(&p);
         assert_eq!(kd.size(), n as usize);
@@ -1446,7 +1441,7 @@ mod tests {
             kd.put(k("a"), v("av", 1)).unwrap();
             kd.put(k("b"), v("bv", 2)).unwrap();
             kd.clear().unwrap();
-            kd.flush().unwrap();
+            kd.persist(zendb_types::Barrier::Flush).unwrap();
         }
         let kd = open(&p);
         assert_eq!(kd.size(), 0);
@@ -1541,7 +1536,7 @@ mod tests {
         {
             let mut kd = create(&p);
             kd.put(k("a"), v("alpha", 1)).unwrap();
-            kd.sync().unwrap();
+            kd.persist(zendb_types::Barrier::Sync).unwrap();
         }
         let kd = open(&p);
         assert_eq!(get(&kd, &k("a")), Some(v("alpha", 1)));
@@ -1551,8 +1546,8 @@ mod tests {
     fn flush_returns_ok_on_empty_keydir() {
         let p = tmp_path("flush_empty");
         let mut kd = create(&p);
-        kd.flush().unwrap();
-        kd.sync().unwrap();
+        kd.persist(zendb_types::Barrier::Flush).unwrap();
+        kd.persist(zendb_types::Barrier::Sync).unwrap();
     }
 
     // ---- replace / put_if_absent: persistence checks for the overrides ----
@@ -1567,7 +1562,7 @@ mod tests {
             let mut kd = create(&p);
             let prev = WriteBackend::replace(&mut kd, &k("fresh"), v("inserted", 7)).unwrap();
             assert!(prev.is_none());
-            kd.sync().unwrap();
+            kd.persist(zendb_types::Barrier::Sync).unwrap();
         }
         let kd = open(&p);
         assert_eq!(get(&kd, &k("fresh")), Some(v("inserted", 7)));
@@ -1634,8 +1629,10 @@ mod tests {
         ));
         assert!(ReadBackend::keys(&kd).all(|c| matches!(c, Cow::Borrowed(_))));
         assert!(ReadBackend::values(&kd).all(|c| matches!(c, Cow::Owned(_))));
-        assert!(ReadBackend::entries(&kd)
-            .all(|(k, v)| { matches!(k, Cow::Borrowed(_)) && matches!(v, Cow::Owned(_)) }));
+        assert!(
+            ReadBackend::entries(&kd)
+                .all(|(k, v)| { matches!(k, Cow::Borrowed(_)) && matches!(v, Cow::Owned(_)) })
+        );
     }
 
     /// Read paths must round-trip cleanly through `Cow::into_owned()`.
@@ -1661,7 +1658,7 @@ mod tests {
             let mut kd = create(&p);
             assert!(WriteBackend::put_if_absent(&mut kd, &k("only"), v("once", 1)).unwrap());
             assert!(!WriteBackend::put_if_absent(&mut kd, &k("only"), v("twice", 2)).unwrap());
-            kd.sync().unwrap();
+            kd.persist(zendb_types::Barrier::Sync).unwrap();
         }
         let kd = open(&p);
         assert_eq!(get(&kd, &k("only")), Some(v("once", 1)));
@@ -1680,7 +1677,7 @@ mod tests {
             kd.put(k("beta"), ()).unwrap();
             kd.put(k("gamma"), ()).unwrap();
             kd.delete(&k("beta")).unwrap();
-            kd.sync().unwrap();
+            kd.persist(zendb_types::Barrier::Sync).unwrap();
         }
         let kd: KeyDir<TestKey, ()> = KeyDir::open(&p, KeyDirConfig::default()).unwrap();
         assert_eq!(kd.size(), 2);

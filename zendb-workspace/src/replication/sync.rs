@@ -9,10 +9,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use zendb_types::{Event, EventId, InstallationId, utils::serdes::serialized_size};
+use zendb_types::{Event, EventId, InstallationId};
 
-use super::wire::{EventRange, ReceiptSummary, TableBatch};
 use super::batcher::table_order;
+use super::wire::{EventRange, ReceiptSummary, TableBatch};
 use crate::Result;
 use crate::core::WorkspaceCore;
 
@@ -22,8 +22,8 @@ use crate::core::WorkspaceCore;
 /// Serves Fetch requests from memory without topic scans.
 pub(super) struct RecentCache {
     capacity: usize,
-    ring: VecDeque<EventId>,
-    index: HashMap<EventId, (String, Event)>,
+    ring: VecDeque<(String, EventId)>,
+    index: HashMap<(String, EventId), Event>,
 }
 
 impl RecentCache {
@@ -38,7 +38,8 @@ impl RecentCache {
     /// Record an event. Evicts the oldest entry when at capacity.
     pub(super) fn insert(&mut self, table: &str, event: &Event) {
         let id = event.stamp.id;
-        if self.index.contains_key(&id) {
+        let key = (table.to_owned(), id);
+        if self.index.contains_key(&key) {
             return;
         }
         if self.ring.len() >= self.capacity {
@@ -46,16 +47,13 @@ impl RecentCache {
                 self.index.remove(&evicted);
             }
         }
-        self.ring.push_back(id);
-        self.index.insert(id, (table.to_owned(), event.clone()));
+        self.ring.push_back(key.clone());
+        self.index.insert(key, event.clone());
     }
 
     /// Try to fulfill ranges from the cache. Returns matched events grouped by
     /// table and the remaining unfulfilled ranges.
-    pub(super) fn fetch(
-        &self,
-        ranges: &[EventRange],
-    ) -> (Vec<TableBatch>, Vec<EventRange>) {
+    pub(super) fn fetch(&self, ranges: &[EventRange]) -> (Vec<TableBatch>, Vec<EventRange>) {
         let mut found: HashMap<String, Vec<Event>> = HashMap::new();
         let mut remaining = Vec::new();
 
@@ -66,14 +64,17 @@ impl RecentCache {
                     author: range.author,
                     sequence: seq,
                 };
-                if let Some((table, event)) = self.index.get(&id) {
-                    found.entry(table.clone()).or_default().push(event.clone());
+                if let Some(event) = self.index.get(&(range.table.clone(), id)) {
+                    found
+                        .entry(range.table.clone())
+                        .or_default()
+                        .push(event.clone());
                 } else {
                     any_missing = true;
                 }
             }
             if any_missing {
-                remaining.push(*range);
+                remaining.push(range.clone());
             }
         }
 
@@ -88,17 +89,24 @@ impl RecentCache {
 
 // ─── Receipt summaries ───────────────────────────────────────────────────────
 
-/// Build receipt summaries from the causal tracker.
+/// Build table-scoped receipt summaries from the durable table causal states.
 pub(super) fn receipt_summaries(core: &WorkspaceCore) -> Vec<ReceiptSummary> {
-    core.causal
-        .receipt_summaries()
-        .into_iter()
-        .map(|(author, max_seen, missing)| ReceiptSummary {
-            author,
-            max_seen,
-            missing,
-        })
-        .collect()
+    let mut summaries = Vec::new();
+    core.table_store.for_each(|table_name, table| {
+        for (author, receipt) in table.read().receipt_summaries() {
+            summaries.push(ReceiptSummary {
+                table: table_name.to_owned(),
+                author,
+                max_seen: receipt.max_seen,
+                missing: receipt
+                    .missing
+                    .iter()
+                    .map(|range| (*range.start(), *range.end()))
+                    .collect(),
+            });
+        }
+    });
+    summaries
 }
 
 // ─── Missing-range computation ───────────────────────────────────────────────
@@ -123,7 +131,15 @@ pub(super) fn compute_missing(
                 continue;
             }
             // Scan the range [cursor, gap_start) for sequences we don't have.
-            scan_range(core, receipt.author, cursor, gap_start - 1, &mut missing, max_ranges);
+            scan_range(
+                core,
+                &receipt.table,
+                receipt.author,
+                cursor,
+                gap_start - 1,
+                &mut missing,
+                max_ranges,
+            );
             if missing.len() >= max_ranges {
                 return missing;
             }
@@ -131,7 +147,15 @@ pub(super) fn compute_missing(
         }
         // Scan from cursor to max_seen (the tail after all gaps).
         if cursor <= receipt.max_seen {
-            scan_range(core, receipt.author, cursor, receipt.max_seen, &mut missing, max_ranges);
+            scan_range(
+                core,
+                &receipt.table,
+                receipt.author,
+                cursor,
+                receipt.max_seen,
+                &mut missing,
+                max_ranges,
+            );
             if missing.len() >= max_ranges {
                 return missing;
             }
@@ -143,16 +167,25 @@ pub(super) fn compute_missing(
 /// Scan a contiguous range and emit sub-ranges for sequences we don't have.
 fn scan_range(
     core: &WorkspaceCore,
+    table_name: &str,
     author: InstallationId,
     from: u64,
     to: u64,
     out: &mut Vec<EventRange>,
     max_ranges: usize,
 ) {
+    let Ok(table) = core.table_store.get(table_name) else {
+        return;
+    };
     let mut seq = from;
     while seq <= to && out.len() < max_ranges {
         // Skip sequences we already have.
-        while seq <= to && core.causal.contains(EventId { author, sequence: seq }) {
+        while seq <= to
+            && table.read().contains_event(EventId {
+                author,
+                sequence: seq,
+            })
+        {
             seq += 1;
         }
         if seq > to {
@@ -160,10 +193,16 @@ fn scan_range(
         }
         let range_start = seq;
         // Extend through contiguous missing sequences.
-        while seq <= to && !core.causal.contains(EventId { author, sequence: seq }) {
+        while seq <= to
+            && !table.read().contains_event(EventId {
+                author,
+                sequence: seq,
+            })
+        {
             seq += 1;
         }
         out.push(EventRange {
+            table: table_name.to_owned(),
             author,
             start: range_start,
             end: seq - 1,
@@ -174,14 +213,8 @@ fn scan_range(
 // ─── Range-based fetch from durable topics ───────────────────────────────────
 
 /// Read events matching the requested ranges from durable table topics.
-/// Respects a byte budget to avoid unbounded responses.
-pub(super) fn fetch_ranges(
-    core: &WorkspaceCore,
-    ranges: &[EventRange],
-    max_bytes: usize,
-) -> Result<Vec<TableBatch>> {
+pub(super) fn fetch_ranges(core: &WorkspaceCore, ranges: &[EventRange]) -> Result<Vec<TableBatch>> {
     let mut batches = Vec::new();
-    let mut total_bytes = 0_usize;
 
     let mut tables = Vec::new();
     core.table_store.for_each(|name, table| {
@@ -192,31 +225,22 @@ pub(super) fn fetch_ranges(
     for (table_name, handle) in tables {
         let reader = {
             let table = handle.read();
-            table.topic.reader()
+            table.reader()
         };
         let mut events = Vec::new();
         for record in reader {
             let (_, change) = record?;
             let event = change.event;
             let matches = ranges.iter().any(|r| {
-                r.author == event.stamp.id.author
+                r.table == table_name
+                    && r.author == event.stamp.id.author
                     && event.stamp.id.sequence >= r.start
                     && event.stamp.id.sequence <= r.end
             });
             if !matches {
                 continue;
             }
-            let size = serialized_size(&event)?;
-            if !events.is_empty() && total_bytes.saturating_add(size) > max_bytes {
-                batches.push(TableBatch { table: table_name, events });
-                return Ok(batches);
-            }
-            total_bytes = total_bytes.saturating_add(size);
             events.push(event);
-            if total_bytes >= max_bytes {
-                batches.push(TableBatch { table: table_name, events });
-                return Ok(batches);
-            }
         }
         if !events.is_empty() {
             batches.push(TableBatch {

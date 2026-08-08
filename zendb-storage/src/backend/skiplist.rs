@@ -107,13 +107,13 @@ impl<K: Ord, V> SkipList<K, V> {
             return Ok(index);
         }
 
-        if let SkipListCapacity::Bounded { max_entries } = self.config.capacity {
-            if self.arena.len() >= max_entries {
-                return Err(io::Error::new(
-                    io::ErrorKind::StorageFull,
-                    format!("skip list capacity of {max_entries} entries reached"),
-                ));
-            }
+        if let SkipListCapacity::Bounded { max_entries } = self.config.capacity
+            && self.arena.len() >= max_entries
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!("skip list capacity of {max_entries} entries reached"),
+            ));
         }
 
         self.arena.push(node);
@@ -310,11 +310,11 @@ where
                 current = self.arena[index].next[0];
             }
 
-            if let Some(index) = current {
-                if self.arena[index].key == key {
-                    self.arena[index].value = Some(value);
-                    continue;
-                }
+            if let Some(index) = current
+                && self.arena[index].key == key
+            {
+                self.arena[index].value = Some(value);
+                continue;
             }
 
             current = Some(self.insert_new(key, value, update)?);

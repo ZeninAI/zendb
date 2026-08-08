@@ -1,18 +1,16 @@
 //! Persistent single-writer, multiple-reader append-only topic.
 //!
-//! [`Topic`] owns the topic files, provides exclusive mutable appends, and
-//! creates independent [`TopicConsumer`] handles for reads. Consumers keep
-//! only their current segment open and advance volatile offsets without
-//! locking other consumers.
+//! [`Topic`] owns segmented log files, provides exclusive mutable appends, and
+//! creates independent [`TopicReader`] and [`TopicConsumer`] cursors.
 
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Write},
     marker::PhantomData,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -23,80 +21,22 @@ use parking_lot::Mutex;
 
 use crate::backend::{
     _traits::{DurableStorage, ReadBackend, Storage, WriteBackend},
-    keydir::{KeyDir, KeyDirConfig},
+    keydir::KeyDir,
 };
-use zendb_types::utils::{
-    reusables::PooledBuf,
-    serdes::{deserialize_from, with_scratch},
+use zendb_types::utils::reusables::PooledBuf;
+
+use super::{
+    consumer::TopicConsumer,
+    reader::TopicReader,
+    segment::{
+        Segment, build_sparse_index, check_segment_magic, create_segment, list_segments,
+        open_segment_writer, scan_active_segment,
+    },
+    types::{
+        ConsumerRegistration, HEADER_SIZE, OFFSETS_FILE, TopicConfig, TopicOffset, TopicShared,
+        TopicStats,
+    },
 };
-
-pub type TopicOffset = u64;
-
-const OFFSETS_FILE: &str = "offsets";
-const SEGMENT_EXTENSION: &str = "log";
-const MAGIC: u32 = 0x4349_5054;
-const HEADER_SIZE: u64 = 4;
-const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
-
-#[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub struct TopicConfig {
-    pub max_segment_bytes: u64,
-    pub offsets: KeyDirConfig,
-}
-
-impl Default for TopicConfig {
-    fn default() -> Self {
-        Self {
-            max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
-            offsets: KeyDirConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub struct TopicStats {
-    pub earliest_offset: TopicOffset,
-    pub next_offset: TopicOffset,
-    pub records: u64,
-    pub retained_bytes: u64,
-}
-
-struct ConsumerState {
-    committed: AtomicU64,
-    volatile: AtomicU64,
-    reader_active: AtomicBool,
-}
-
-#[derive(Debug)]
-struct Segment {
-    base_offset: TopicOffset,
-    end_offset: AtomicU64,
-    byte_len: AtomicU64,
-    path: PathBuf,
-    delete_on_drop: AtomicBool,
-}
-
-impl Segment {
-    fn record_count(&self) -> u64 {
-        self.end_offset.load(Ordering::Acquire) - self.base_offset
-    }
-}
-
-impl Drop for Segment {
-    fn drop(&mut self) {
-        if self.delete_on_drop.load(Ordering::Acquire) {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-struct TopicShared<T> {
-    segments: ArcSwap<Vec<Arc<Segment>>>,
-    next_offset: AtomicU64,
-    consumers: Mutex<HashMap<String, Arc<ConsumerState>>>,
-    offsets: Mutex<KeyDir<String, TopicOffset>>,
-    _value: PhantomData<T>,
-}
 
 /// Persistent single-writer, multiple-reader append-only topic.
 pub struct Topic<T> {
@@ -104,68 +44,74 @@ pub struct Topic<T> {
     config: TopicConfig,
     segments: Vec<Arc<Segment>>,
     active: File,
+    active_byte_len: u64,
     shared: Arc<TopicShared<T>>,
     stats: TopicStats,
 }
 
 impl<T> Topic<T> {
-    fn flush(&mut self) -> io::Result<()> {
-        self.active.flush()?;
-        self.shared.offsets.lock().flush()
+    fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()> {
+        match barrier {
+            zendb_types::Barrier::Flush => self.active.flush()?,
+            zendb_types::Barrier::Sync => self.active.sync_all()?,
+        }
+        self.shared.offsets.lock().persist(barrier)
     }
-}
-
-/// Named consumer handle over a topic.
-pub struct TopicConsumer<T> {
-    topic: Arc<TopicShared<T>>,
-    name: String,
-    consumer: Arc<ConsumerState>,
-    current: Option<SegmentCursor>,
 }
 
 impl<T> Topic<T>
 where
     T: Encode + Decode<()>,
 {
+    /// Create an unregistered reader at the earliest retained offset.
+    pub fn reader(&self) -> TopicReader<T> {
+        TopicReader {
+            topic: Arc::clone(&self.shared),
+            offset: self.shared.segments.load()[0].base_offset,
+            current: None,
+        }
+    }
+
     /// Create a named consumer, registering it at the current tail when first
     /// seen. A consumer name may have only one active handle.
     pub fn consumer(&self, consumer: &str) -> io::Result<TopicConsumer<T>> {
+        let name = consumer.to_owned();
         let mut consumers = self.shared.consumers.lock();
-        let state = match consumers.get(consumer) {
-            Some(state) => Arc::clone(state),
+        let committed = match consumers.get_mut(consumer) {
+            Some(registration) => {
+                if registration.active {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("consumer {consumer:?} already has an active reader"),
+                    ));
+                }
+                registration.active = true;
+                registration.committed
+            }
             None => {
                 let offset = self.shared.next_offset.load(Ordering::Acquire);
-                self.shared
-                    .offsets
-                    .lock()
-                    .put(consumer.to_owned(), offset)?;
-                let state = Arc::new(ConsumerState {
-                    committed: AtomicU64::new(offset),
-                    volatile: AtomicU64::new(offset),
-                    reader_active: AtomicBool::new(false),
-                });
-                consumers.insert(consumer.to_owned(), Arc::clone(&state));
-                state
+                self.shared.offsets.lock().put(name.clone(), offset)?;
+                consumers.insert(
+                    name.clone(),
+                    ConsumerRegistration {
+                        committed: offset,
+                        active: true,
+                    },
+                );
+                offset
             }
         };
-        if state.reader_active.swap(true, Ordering::AcqRel) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("consumer {consumer:?} already has an active reader"),
-            ));
-        }
         drop(consumers);
 
         Ok(TopicConsumer {
-            topic: Arc::clone(&self.shared),
-            name: consumer.to_owned(),
-            consumer: state,
-            current: None,
+            reader: TopicReader {
+                topic: Arc::clone(&self.shared),
+                offset: committed,
+                current: None,
+            },
+            name,
+            committed,
         })
-    }
-
-    fn active_segment(&self) -> &Arc<Segment> {
-        self.segments.last().unwrap()
     }
 
     fn rotate_segment(&mut self) -> io::Result<()> {
@@ -173,6 +119,7 @@ where
 
         let segment = create_segment(&self.path, self.stats.next_offset)?;
         self.active = open_segment_writer(&segment.path)?;
+        self.active_byte_len = HEADER_SIZE;
         self.stats.retained_bytes += HEADER_SIZE;
         self.segments.push(segment);
         self.publish_segments();
@@ -183,26 +130,38 @@ where
     fn publish_segments(&self) {
         self.shared.segments.store(Arc::new(self.segments.clone()));
     }
+
     pub fn append(&mut self, value: &T) -> io::Result<TopicOffset> {
-        with_scratch(value, |encoded| {
-            let record_size = 4 + encoded.len() as u64;
-            if self.active_segment().record_count() != 0
-                && self.active_segment().byte_len.load(Ordering::Acquire) + record_size
-                    > self.config.max_segment_bytes
+        let mut encoded = PooledBuf::acquire();
+        encoded.resize(4, 0);
+        let payload_len = zendb_types::utils::serdes::serialize_into_std(value, &mut *encoded)?;
+        let written = 4 + payload_len;
+        encoded[..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        let record_size = written as u64;
+
+        {
+            if self.active_byte_len != HEADER_SIZE
+                && self.active_byte_len + record_size > self.config.max_segment_bytes
             {
                 self.rotate_segment()?;
             }
 
             let offset = self.stats.next_offset;
-            self.active
-                .write_all(&(encoded.len() as u32).to_le_bytes())?;
-            self.active.write_all(encoded)?;
+            let segment = self.segments.last().unwrap();
+            if offset != segment.base_offset
+                && (offset - segment.base_offset).is_multiple_of(self.config.sparse_index_stride)
+            {
+                segment
+                    .sparse_index
+                    .write()
+                    .push((offset, self.active_byte_len));
+            }
+            self.active.write_all(&encoded[..written])?;
 
-            let segment = self.active_segment();
-            segment.byte_len.store(
-                segment.byte_len.load(Ordering::Relaxed) + record_size,
-                Ordering::Release,
-            );
+            self.active_byte_len += record_size;
+            segment
+                .byte_len
+                .store(self.active_byte_len, Ordering::Release);
             segment.end_offset.store(offset + 1, Ordering::Release);
             self.stats.next_offset = offset + 1;
             self.stats.records += 1;
@@ -211,7 +170,7 @@ where
                 .next_offset
                 .store(self.stats.next_offset, Ordering::Release);
             Ok(offset)
-        })
+        }
     }
 }
 
@@ -223,7 +182,7 @@ where
     type Config = TopicConfig;
 
     fn stats(&self) -> Self::Stats {
-        self.stats.clone()
+        self.stats
     }
 
     fn config(&self) -> Self::Config {
@@ -255,6 +214,7 @@ where
             config,
             segments,
             active,
+            active_byte_len: HEADER_SIZE,
             shared,
             stats: TopicStats {
                 earliest_offset: 0,
@@ -295,6 +255,12 @@ where
                     base_offset: *base_offset,
                     end_offset: AtomicU64::new(end_offset),
                     byte_len: AtomicU64::new(byte_len),
+                    sparse_index: parking_lot::RwLock::new(build_sparse_index(
+                        path,
+                        *base_offset,
+                        end_offset,
+                        config.sparse_index_stride,
+                    )?),
                     path: path.clone(),
                     delete_on_drop: AtomicBool::new(false),
                 }))
@@ -308,14 +274,12 @@ where
             .sum();
         let mut consumers = HashMap::new();
         for (consumer, committed) in offsets.entries() {
-            let committed = committed.into_owned();
             consumers.insert(
                 consumer.into_owned(),
-                Arc::new(ConsumerState {
-                    committed: AtomicU64::new(committed),
-                    volatile: AtomicU64::new(committed),
-                    reader_active: AtomicBool::new(false),
-                }),
+                ConsumerRegistration {
+                    committed: committed.into_owned(),
+                    active: false,
+                },
             );
         }
 
@@ -332,6 +296,7 @@ where
             config,
             segments,
             active,
+            active_byte_len: active_len,
             shared,
             stats: TopicStats {
                 earliest_offset,
@@ -343,16 +308,14 @@ where
     }
 
     fn compact(&mut self) -> io::Result<()> {
-        let through = {
+        let Some(through) = ({
             let consumers = self.shared.consumers.lock();
-            let Some(through) = consumers
+            consumers
                 .values()
-                .map(|state| state.committed.load(Ordering::Acquire))
+                .map(|registration| registration.committed)
                 .min()
-            else {
-                return Ok(());
-            };
-            through
+        }) else {
+            return Ok(());
         };
 
         let removable = self
@@ -382,252 +345,28 @@ where
         Ok(())
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        Topic::flush(self)
-    }
-
-    fn sync(&mut self) -> io::Result<()> {
-        self.active.sync_all()?;
-        self.shared.offsets.lock().sync()
+    fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()> {
+        Topic::persist(self, barrier)
     }
 }
 
 impl<T> Drop for Topic<T> {
     fn drop(&mut self) {
-        let _ = Topic::flush(self);
+        let _ = Topic::persist(self, zendb_types::Barrier::Flush);
     }
-}
-
-struct SegmentCursor {
-    // The file must close before the final segment Arc can remove its path.
-    file: File,
-    segment: Arc<Segment>,
-    logical_offset: TopicOffset,
-}
-
-impl<T> TopicConsumer<T> {
-    /// Persist the current volatile cursor for this consumer.
-    pub fn commit(&self) -> io::Result<()> {
-        let volatile = self.consumer.volatile.load(Ordering::Acquire);
-        self.topic.offsets.lock().put(self.name.clone(), volatile)?;
-        self.consumer.committed.store(volatile, Ordering::Release);
-        Ok(())
-    }
-
-    /// Move the volatile cursor to `offset`. The next read will start at
-    /// that offset. Call [`commit`](Self::commit) to persist.
-    pub fn seek(&mut self, offset: TopicOffset) {
-        self.consumer.volatile.store(offset, Ordering::Release);
-        self.current = None;
-    }
-
-    /// Rewind this consumer to its last committed cursor.
-    pub fn reset(&mut self) -> io::Result<()> {
-        self.consumer.volatile.store(
-            self.consumer.committed.load(Ordering::Acquire),
-            Ordering::Release,
-        );
-        self.current = None;
-        Ok(())
-    }
-
-    /// Delete this consumer's persisted cursor and unregister its name.
-    pub fn delete(mut self) -> io::Result<()> {
-        self.current = None;
-        let mut consumers = self.topic.consumers.lock();
-        self.topic.offsets.lock().delete(&self.name)?;
-        consumers.remove(&self.name);
-        self.consumer.reader_active.store(false, Ordering::Release);
-        Ok(())
-    }
-
-    fn position(&mut self) -> io::Result<bool> {
-        let offset = self.consumer.volatile.load(Ordering::Acquire);
-        if offset >= self.topic.next_offset.load(Ordering::Acquire) {
-            return Ok(false);
-        }
-
-        let segments = self.topic.segments.load_full();
-        let segment = Arc::clone(
-            segments
-                .iter()
-                .find(|segment| {
-                    offset >= segment.base_offset
-                        && offset < segment.end_offset.load(Ordering::Acquire)
-                })
-                .unwrap(),
-        );
-        let mut file = File::open(&segment.path)?;
-        let mut byte_offset = HEADER_SIZE;
-        for _ in segment.base_offset..offset {
-            file.seek(SeekFrom::Start(byte_offset))?;
-            let mut size = [0; 4];
-            file.read_exact(&mut size)?;
-            byte_offset += 4 + u32::from_le_bytes(size) as u64;
-        }
-        file.seek(SeekFrom::Start(byte_offset))?;
-        self.current = Some(SegmentCursor {
-            file,
-            segment,
-            logical_offset: offset,
-        });
-        Ok(true)
-    }
-}
-
-impl<T> Iterator for TopicConsumer<T>
-where
-    T: Decode<()>,
-{
-    type Item = io::Result<T>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let needs_position = match &self.current {
-            Some(cursor) => {
-                if cursor.logical_offset < cursor.segment.end_offset.load(Ordering::Acquire) {
-                    false
-                } else if cursor.logical_offset >= self.topic.next_offset.load(Ordering::Acquire) {
-                    return None;
-                } else {
-                    true
-                }
-            }
-            None => true,
-        };
-        if needs_position {
-            self.current = None;
-            match self.position() {
-                Ok(true) => {}
-                Ok(false) => return None,
-                Err(error) => return Some(Err(error)),
-            }
-        }
-
-        let cursor = self.current.as_mut().unwrap();
-        let mut size = [0; 4];
-        let result = cursor.file.read_exact(&mut size).and_then(|_| {
-            let value_size = u32::from_le_bytes(size) as usize;
-            let mut bytes = PooledBuf::acquire();
-            bytes.resize(value_size, 0);
-            cursor.file.read_exact(&mut bytes[..])?;
-            deserialize_from(&bytes[..])
-        });
-        if result.is_ok() {
-            cursor.logical_offset += 1;
-            self.consumer
-                .volatile
-                .store(cursor.logical_offset, Ordering::Release);
-        }
-        Some(result)
-    }
-}
-
-impl<T> Drop for TopicConsumer<T> {
-    fn drop(&mut self) {
-        // Reset the volatile uncommited offsets
-        self.consumer.volatile.store(
-            self.consumer.committed.load(Ordering::Acquire),
-            Ordering::Release,
-        );
-        self.consumer.reader_active.store(false, Ordering::Release);
-    }
-}
-
-fn segment_name(base_offset: TopicOffset) -> String {
-    format!("{base_offset:020}.{SEGMENT_EXTENSION}")
-}
-
-fn list_segments(path: &Path) -> io::Result<Vec<(TopicOffset, PathBuf)>> {
-    let mut segments = Vec::new();
-    for entry in fs::read_dir(path)? {
-        let path = entry?.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some(SEGMENT_EXTENSION) {
-            continue;
-        }
-        let Some(base_offset) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| stem.parse().ok())
-        else {
-            continue;
-        };
-        segments.push((base_offset, path));
-    }
-    segments.sort_by_key(|(base_offset, _)| *base_offset);
-    Ok(segments)
-}
-
-fn check_segment_magic(path: &Path) -> io::Result<()> {
-    let mut file = File::open(path)?;
-    let mut magic = [0; 4];
-    file.read_exact(&mut magic)?;
-    if u32::from_le_bytes(magic) != MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not a topic segment",
-        ));
-    }
-    Ok(())
-}
-
-fn create_segment(path: &Path, base_offset: TopicOffset) -> io::Result<Arc<Segment>> {
-    let segment_path = path.join(segment_name(base_offset));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(&segment_path)?;
-    file.write_all(&MAGIC.to_le_bytes())?;
-    Ok(Arc::new(Segment {
-        base_offset,
-        end_offset: AtomicU64::new(base_offset),
-        byte_len: AtomicU64::new(HEADER_SIZE),
-        path: segment_path,
-        delete_on_drop: AtomicBool::new(false),
-    }))
-}
-
-fn open_segment_writer(path: &Path) -> io::Result<File> {
-    let mut file = OpenOptions::new().read(true).append(true).open(path)?;
-    file.seek(SeekFrom::End(0))?;
-    Ok(file)
-}
-
-fn scan_active_segment(path: &Path, base_offset: TopicOffset) -> io::Result<(u64, u64, u64)> {
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
-    let mut magic = [0; 4];
-    file.read_exact(&mut magic)?;
-    if u32::from_le_bytes(magic) != MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not a topic segment",
-        ));
-    }
-
-    let mut records = 0;
-    let mut cursor = HEADER_SIZE;
-    while cursor + 4 <= file_len {
-        file.seek(SeekFrom::Start(cursor))?;
-        let mut size = [0; 4];
-        file.read_exact(&mut size)?;
-        let end = cursor + 4 + u32::from_le_bytes(size) as u64;
-        if end > file_len {
-            break;
-        }
-        records += 1;
-        cursor = end;
-    }
-    Ok((base_offset + records, cursor, file_len))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::keydir::KeyDirConfig;
     use std::{
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
+
+    use super::super::segment::segment_name;
+    use super::super::types::{DEFAULT_SPARSE_INDEX_STRIDE, SeekTarget};
 
     /// RAII guard that removes the test directory when dropped.
     struct TmpDir(PathBuf);
@@ -660,6 +399,7 @@ mod tests {
     fn config(max_segment_bytes: u64) -> TopicConfig {
         TopicConfig {
             max_segment_bytes,
+            sparse_index_stride: DEFAULT_SPARSE_INDEX_STRIDE,
             offsets: KeyDirConfig::default(),
         }
     }
@@ -699,7 +439,7 @@ mod tests {
             reader.commit().unwrap();
         }
 
-        topic.sync().unwrap();
+        topic.persist(zendb_types::Barrier::Sync).unwrap();
         drop(topic);
 
         let topic = Topic::<u64>::open(&path, TopicConfig::default()).unwrap();
@@ -734,7 +474,7 @@ mod tests {
 
         let mut reader = topic.consumer("c").unwrap();
         assert_eq!(reader.next().unwrap().unwrap(), 1);
-        reader.reset().unwrap();
+        reader.reset();
         assert_eq!(reader.next().unwrap().unwrap(), 1);
     }
 
@@ -805,7 +545,7 @@ mod tests {
         topic.append(&2).unwrap();
 
         let mut consumer = topic.consumer("c").unwrap();
-        consumer.seek(first + 1);
+        consumer.seek(SeekTarget::Offset(first + 1)).unwrap();
         consumer.commit().unwrap();
         drop(consumer);
 
@@ -898,7 +638,7 @@ mod tests {
             let before = topic.segments.len();
             topic.compact().unwrap();
             assert!(topic.segments.len() < before);
-            topic.sync().unwrap();
+            topic.persist(zendb_types::Barrier::Sync).unwrap();
         }
 
         let mut topic = Topic::<u64>::open(&path, config).unwrap();
@@ -913,7 +653,7 @@ mod tests {
         {
             let mut topic = Topic::<u64>::create(&path, TopicConfig::default()).unwrap();
             topic.append(&1).unwrap();
-            topic.sync().unwrap();
+            topic.persist(zendb_types::Barrier::Sync).unwrap();
         }
         let active_path = path.join(segment_name(0));
         let mut file = OpenOptions::new().append(true).open(&active_path).unwrap();

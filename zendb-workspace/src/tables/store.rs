@@ -1,4 +1,6 @@
 //! Physical table ownership, catalog decoding, and catalog change application.
+//! A lifecycle mutex serializes flush, sync, and catalog mutations against each
+//! other, mirroring the pattern in `states/mod.rs`.
 
 use std::{
     collections::HashMap,
@@ -7,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use zendb_storage::{Change, DurableStorage, ReadBackend, Table, TableConfig};
 use zendb_types::{
     Blob, Cell, Event, EventId, EventStamp, EventTime, InstallationId, Op, Path as CrdtPath,
@@ -23,13 +25,21 @@ use crate::{
     },
 };
 
+/// Physical table ownership, catalog decoding, and catalog change
+/// application. All tables are eagerly opened at construction (unlike
+/// [`States`] which lazily opens on first access). A `lifecycle` mutex
+/// serializes cold-path operations (flush, sync, catalog changes) so that a
+/// concurrent delete cannot remove a backing directory while a flush is
+/// writing to it.
 pub(crate) struct TableStore {
     root: PathBuf,
+    lifecycle: Mutex<()>,
     tables: RwLock<HashMap<String, Arc<OpenTable>>>,
 }
 
 impl TableStore {
-    pub(crate) fn create(root: &Path, local_installation_id: InstallationId) -> Result<Arc<Self>> {
+    /// Create the system tables and their initial catalog declarations.
+    pub(crate) fn create(root: &Path, local_installation_id: InstallationId) -> Result<Self> {
         let root = root.join(TABLES_DIR);
         fs::create_dir_all(&root)?;
         let mut catalog =
@@ -38,9 +48,9 @@ impl TableStore {
             &root.join(INSTALLATIONS_TABLE_NAME),
             SYSTEM_TABLE_CONFIG.clone(),
         )?;
-        // These declarations are bootstrap events authored directly by the
-        // store. Workspace assembly continues the same local sequence at 3
-        // for the initial Admin installation.
+        // These declarations are authored directly by the store. Each table
+        // owns its own local sequence stream, so the first declaration starts
+        // at sequence 1 on the catalog table.
         catalog.insert(Event {
             primary_key: PrimaryKey::String(TABLE_CATALOG_NAME.to_owned()),
             path: CrdtPath::new(),
@@ -50,7 +60,7 @@ impl TableStore {
             stamp: EventStamp {
                 id: EventId {
                     author: local_installation_id,
-                    sequence: 1,
+                    sequence: 0,
                 },
                 time: EventTime {
                     physical_ms: physical_ms().ok_or(Error::ClockExhausted)?,
@@ -67,7 +77,7 @@ impl TableStore {
             stamp: EventStamp {
                 id: EventId {
                     author: local_installation_id,
-                    sequence: 2,
+                    sequence: 0,
                 },
                 time: EventTime {
                     physical_ms: physical_ms().ok_or(Error::ClockExhausted)?,
@@ -78,7 +88,7 @@ impl TableStore {
         Self::from_system_tables(root, catalog, installations)
     }
 
-    pub(crate) fn open(root: &Path) -> Result<Arc<Self>> {
+    pub(crate) fn open(root: &Path) -> Result<Self> {
         let root = root.join(TABLES_DIR);
         let catalog = Table::open(&root.join(TABLE_CATALOG_NAME), SYSTEM_TABLE_CONFIG.clone())?;
         let installations = Table::open(
@@ -92,7 +102,7 @@ impl TableStore {
         root: PathBuf,
         catalog_table: Table,
         installations_table: Table,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<Self> {
         let catalog = OpenTable::new(
             TABLE_CATALOG_NAME.to_owned(),
             catalog_table,
@@ -108,7 +118,7 @@ impl TableStore {
         let tables = catalog.table.read().entries().try_fold(
             HashMap::from([
                 (TABLE_CATALOG_NAME.to_owned(), catalog.clone()),
-                (INSTALLATIONS_TABLE_NAME.to_owned(), installations.clone()),
+                (INSTALLATIONS_TABLE_NAME.to_owned(), installations),
             ]),
             |mut tables, (key, cell)| {
                 if let Some((name, config)) =
@@ -124,10 +134,11 @@ impl TableStore {
                 Ok::<_, Error>(tables)
             },
         )?;
-        Ok(Arc::new(Self {
+        Ok(Self {
             root,
+            lifecycle: Mutex::new(()),
             tables: RwLock::new(tables),
-        }))
+        })
     }
 
     pub(crate) fn contains(&self, name: &str) -> bool {
@@ -138,16 +149,18 @@ impl TableStore {
         self.tables.read().keys().cloned().collect()
     }
 
-    pub(crate) fn flush(&self) -> Result<()> {
-        for table in self.tables.read().values() {
-            table.table.write().flush()?;
+    pub(crate) fn for_each(&self, mut f: impl FnMut(&str, &Arc<OpenTable>)) {
+        let tables = self.tables.read();
+        for (name, table) in tables.iter() {
+            f(name, table);
         }
-        Ok(())
     }
 
-    pub(crate) fn sync(&self) -> Result<()> {
-        for table in self.tables.read().values() {
-            table.table.write().sync()?;
+    pub(crate) fn persist(&self, barrier: zendb_types::Barrier) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock();
+        let tables: Vec<_> = self.tables.read().values().cloned().collect();
+        for table in tables {
+            table.table.write().persist(barrier)?;
         }
         Ok(())
     }
@@ -167,6 +180,7 @@ impl TableStore {
         if !change.event.path.is_empty() {
             return;
         }
+        let _lifecycle = self.lifecycle.lock();
         match &change.event.op {
             Op::Upsert {
                 value: Value::Blob(blob),
@@ -186,7 +200,7 @@ impl TableStore {
                 // Catalog projection is post-commit and best effort; the event
                 // remains durable even when its physical table cannot be opened.
                 if let Ok(table) = table {
-                    self.tables.write().insert(
+                    let _inserted = self.tables.write().insert(
                         name.clone(),
                         OpenTable::new(name.clone(), table, TableKind::Application),
                     );

@@ -39,7 +39,7 @@ impl Tables {
         }
         self.core.membership.require_permission(
             &self.core.membership.local_installation_id(),
-            Permission::ManageCatalog,
+            Permission::ManageTables,
         )?;
         if self
             .core
@@ -51,7 +51,7 @@ impl Tables {
         }
         // The catalog event is authoritative; WorkspaceCore materializes the
         // physical table only after this event has applied successfully.
-        self.core.commit_authorized_local_change(
+        self.core.commit_change(
             &self.catalog,
             PrimaryKey::String(name.to_owned()),
             Path::new(),
@@ -75,7 +75,7 @@ impl Tables {
         }
         self.core.membership.require_permission(
             &self.core.membership.local_installation_id(),
-            Permission::ManageCatalog,
+            Permission::ManageTables,
         )?;
         let table = match self.core.table_store.get(name) {
             Ok(table) => table,
@@ -88,7 +88,7 @@ impl Tables {
             return Err(Error::TableInUse(name.to_owned()));
         }
         drop(table);
-        self.core.commit_authorized_local_change(
+        self.core.commit_change(
             &self.catalog,
             PrimaryKey::String(name.to_owned()),
             Path::new(),

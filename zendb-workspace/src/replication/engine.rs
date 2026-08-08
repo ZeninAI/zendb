@@ -18,10 +18,10 @@ use zendb_types::{
 };
 
 use super::batcher::table_order;
-use super::config::ZeninConfig;
 use super::mesh::{Mesh, MeshAction};
 use super::sync::{self, RecentCache};
 use super::wire::{EventRange, Message, ProtocolError, ReceiptSummary, TableBatch};
+use crate::config::{MeshConfig, SyncConfig};
 use crate::core::WorkspaceCore;
 use crate::system::INSTALLATIONS_TABLE_NAME;
 use crate::{Error, Result};
@@ -30,7 +30,7 @@ use crate::{Error, Result};
 
 pub(super) struct Engine {
     core: Weak<WorkspaceCore>,
-    config: ZeninConfig,
+    config: SyncConfig,
     pub(super) mesh: Mesh,
     pub(super) cache: RecentCache,
 }
@@ -39,8 +39,8 @@ impl Engine {
     pub(super) fn new(
         core: Weak<WorkspaceCore>,
         local_peer_id: PeerId,
-        config: ZeninConfig,
-        mesh_config: super::config::MeshConfig,
+        config: SyncConfig,
+        mesh_config: MeshConfig,
     ) -> Self {
         let cache_cap = config.recent_cache_capacity;
         Self {
@@ -59,8 +59,10 @@ impl Engine {
         let Some(core) = self.core.upgrade() else {
             return;
         };
-        for (id, installation) in core.membership.list() {
-            self.mesh.add(id, &installation);
+        for (_, installation) in core.membership.list() {
+            if installation.state.is_active() {
+                self.mesh.add(&installation);
+            }
         }
     }
 
@@ -95,7 +97,14 @@ impl Engine {
         self.mesh
             .neighbours(None)
             .into_iter()
-            .map(|peer_id| (peer_id, Message::Summary { receipts: receipts.clone() }))
+            .map(|peer_id| {
+                (
+                    peer_id,
+                    Message::Summary {
+                        receipts: receipts.clone(),
+                    },
+                )
+            })
             .collect()
     }
 
@@ -173,8 +182,10 @@ impl Engine {
                 Vec::new()
             }
             Message::Summary { receipts } => self.handle_summary(&core, peer_id, receipts),
-            Message::SummaryResponse { receipts } => self.handle_summary_response(&core, peer_id, receipts),
-            Message::Fetch { ranges, max_bytes } => self.handle_fetch(&core, peer_id, ranges, max_bytes),
+            Message::SummaryResponse { receipts } => {
+                self.handle_summary_response(&core, peer_id, receipts)
+            }
+            Message::Fetch { ranges } => self.handle_fetch(&core, peer_id, ranges),
             Message::FetchResponse { batches } => self.handle_push(&core, peer_id, batches),
             Message::Error(_) | Message::Handshake { .. } => Vec::new(),
         }
@@ -207,23 +218,17 @@ impl Engine {
 
     // ── Membership events ────────────────────────────────────────────────
 
-    /// An installation was admitted (state became Active).
-    pub(super) fn installation_admitted(&mut self, installation_id: InstallationId) {
+    /// Refresh the mesh route after an installation changes.
+    pub(super) fn installation_changed(&mut self, installation_id: InstallationId) {
         let Some(core) = self.core.upgrade() else {
             return;
         };
         if let Some(installation) = core.membership.get(&installation_id) {
-            self.mesh.add(installation_id, &installation);
-        }
-    }
-
-    /// An installation was rejected or removed.
-    pub(super) fn installation_rejected(&mut self, installation_id: InstallationId) {
-        let Some(core) = self.core.upgrade() else {
-            return;
-        };
-        if let Some(installation) = core.membership.get(&installation_id) {
-            self.mesh.remove(installation_id, &installation.public_key);
+            if installation.state.is_active() {
+                self.mesh.add(&installation);
+            } else {
+                self.mesh.remove(&installation);
+            }
         }
     }
 
@@ -263,13 +268,7 @@ impl Engine {
         )];
         let ranges = sync::compute_missing(core, receipts, self.config.max_ranges);
         if !ranges.is_empty() {
-            outbound.push((
-                peer_id,
-                Message::Fetch {
-                    ranges,
-                    max_bytes: self.config.max_sync_bytes.min(u32::MAX as usize) as u32,
-                },
-            ));
+            outbound.push((peer_id, Message::Fetch { ranges }));
         }
         outbound
     }
@@ -284,13 +283,7 @@ impl Engine {
         if ranges.is_empty() {
             Vec::new()
         } else {
-            vec![(
-                peer_id,
-                Message::Fetch {
-                    ranges,
-                    max_bytes: self.config.max_sync_bytes.min(u32::MAX as usize) as u32,
-                },
-            )]
+            vec![(peer_id, Message::Fetch { ranges })]
         }
     }
 
@@ -299,26 +292,31 @@ impl Engine {
         core: &WorkspaceCore,
         peer_id: PeerId,
         ranges: Vec<EventRange>,
-        max_bytes: u32,
     ) -> Vec<(PeerId, Message)> {
-        let budget = (max_bytes as usize).min(self.config.max_sync_bytes);
-
         // Try serving from the recent cache first.
         let (cached_batches, remaining) = self.cache.fetch(&ranges);
         if remaining.is_empty() && !cached_batches.is_empty() {
-            return vec![(peer_id, Message::FetchResponse { batches: cached_batches })];
+            return vec![(
+                peer_id,
+                Message::FetchResponse {
+                    batches: cached_batches,
+                },
+            )];
         }
 
         // Fall through to durable topic scan for remaining ranges.
-        let scan_ranges = if remaining.is_empty() { &ranges } else { &remaining };
-        match sync::fetch_ranges(core, scan_ranges, budget) {
+        let scan_ranges = if remaining.is_empty() {
+            &ranges
+        } else {
+            &remaining
+        };
+        match sync::fetch_ranges(core, scan_ranges) {
             Ok(mut batches) => {
                 if !cached_batches.is_empty() {
                     // Merge cached results with topic results.
                     batches.extend(cached_batches);
-                    batches.sort_unstable_by(|a, b| {
-                        table_order(&a.table).cmp(&table_order(&b.table))
-                    });
+                    batches
+                        .sort_unstable_by(|a, b| table_order(&a.table).cmp(&table_order(&b.table)));
                 }
                 vec![(peer_id, Message::FetchResponse { batches })]
             }

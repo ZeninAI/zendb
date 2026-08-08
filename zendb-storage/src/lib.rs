@@ -13,7 +13,7 @@ pub use backend::{
     OrderedReadBackend, ReadBackend, SkipList, SkipListCapacity, SkipListConfig, SkipListStats,
     State, StateConfig, StateStats, Storage, WriteBackend,
 };
-pub use table::{
-    Change, InsertOutcome, Table, TableConfig, TableStats, DEFAULT_MAX_BUFFERED_RECORDS,
+pub use table::{Change, InsertOutcome, ReceiptWindow, Table, TableConfig, TableStats};
+pub use topic::{
+    SeekTarget, Topic, TopicConfig, TopicConsumer, TopicOffset, TopicReader, TopicStats,
 };
-pub use topic::{Topic, TopicConfig, TopicConsumer, TopicOffset, TopicStats};

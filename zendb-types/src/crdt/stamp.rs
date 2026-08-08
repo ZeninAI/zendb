@@ -22,8 +22,8 @@ pub struct EventTime {
 /// `(physical_ms, logical, author, sequence)`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct EventStamp {
-    pub id: EventId,
     pub time: EventTime,
+    pub id: EventId,
 }
 
 impl PartialOrd for EventStamp {
@@ -47,6 +47,12 @@ impl Ord for EventStamp {
                 other.id.sequence,
             ))
     }
+}
+
+impl EventStamp {
+    /// Fixed encoded size under bincode's fixed-int little-endian config:
+    /// EventId(16) + EventTime(12) = 28 bytes.
+    pub const ENCODED_SIZE: usize = 28;
 }
 
 impl std::fmt::Display for EventStamp {

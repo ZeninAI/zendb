@@ -17,6 +17,7 @@ register_types! {
     leaf String => crate::crdt::values::string::String,
     leaf Timestamp => crate::crdt::values::timestamp::Timestamp,
     leaf Blob => crate::crdt::values::blob::Blob,
+    leaf Installation => crate::crdt::values::installation::Installation,
     leaf Float32 => crate::crdt::values::float::Float32,
     leaf Float64 => crate::crdt::values::float::Float64,
     leaf Counter => crate::crdt::values::counter::Counter,
@@ -31,7 +32,15 @@ register_types! {
 
 pub use crdt::*;
 pub use replication::{
-    CompactEvent, Envelope, IdFromPrimaryKeyError, Installation, InstallationId,
-    InstallationIdParseError, InstallationState, Multiaddr, MultiaddrError, PeerIdentity,
-    Permission, Permissions, PublicKey, WorkspaceId, WorkspaceIdParseError,
+    IdFromPrimaryKeyError, InstallationId, InstallationIdParseError, Multiaddr, MultiaddrError,
+    PeerIdentity, Permission, Permissions, PublicKey, WorkspaceId, WorkspaceIdParseError,
 };
+
+/// Selects the durability guarantee for a persist operation.
+#[derive(Clone, Copy)]
+pub enum Barrier {
+    /// Write dirty data to the OS page cache.
+    Flush,
+    /// Write dirty data and fsync to stable storage.
+    Sync,
+}

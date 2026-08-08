@@ -18,5 +18,6 @@ libp2p.workspace = true
 libp2p-identity.workspace = true
 parking_lot.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 zendb-storage = { path = "../zendb-storage" }
 zendb-types = { path = "../zendb-types" }

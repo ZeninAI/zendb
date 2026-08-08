@@ -1,4 +1,4 @@
-//! Workspace identity, failure-aware construction, and synchronous public API.
+//! Workspace identity, construction, and synchronous public API.
 //!
 //! Creation is a two-phase commit: storage is assembled and synchronized first,
 //! then `_identity` is written as the durable marker that the workspace exists.
@@ -12,75 +12,40 @@ use std::{
 
 use bincode::{Decode, Encode};
 use libp2p_identity::Keypair;
-use zendb_storage::WriteBackend;
+use tokio::sync::mpsc::unbounded_channel;
 use zendb_types::{
-    Blob, Envelope, Event, EventId, EventStamp, EventTime, Installation, InstallationId,
-    InstallationState, Op, Path as CrdtPath, PeerIdentity, Permissions, PublicKey, Value,
-    WorkspaceId,
+    Event, EventId, EventStamp, EventTime, Installation, InstallationId, InstallationState,
+    Multiaddr, Op, Path as CrdtPath, PeerIdentity, Permissions, PublicKey, TypeOp, WorkspaceId,
     utils::time::physical_ms,
     utils::{deserialize_from, serialize_to_vec},
 };
 
 use crate::{
-    AdmitError, Error, Result,
-    causal::{CausalState, CausalTracker},
+    Error, Result,
+    clock::HybridClock,
+    config::{ReplicationConfig, WorkspaceConfig},
     core::WorkspaceCore,
     installations::{Installations, Membership},
-    replication::ReplicationConfig,
+    replication::ReplicationController,
     states::States,
     system::{
-        CAUSAL_STATE_NAME, IDENTITY_FILE, IDENTITY_TEMP_FILE, INSTALLATIONS_TABLE_NAME, LOCK_FILE,
-        STATES_DIR, TABLE_CATALOG_NAME, TABLES_DIR, WORKSPACE_KEY_DOMAIN,
+        IDENTITY_FILE, INSTALLATIONS_TABLE_NAME, LOCK_FILE, TABLE_CATALOG_NAME,
+        WORKSPACE_KEY_DOMAIN,
     },
     tables::{TableStore, Tables},
 };
 
 #[derive(Debug, Clone, Encode, Decode)]
-struct WorkspaceBinding {
+struct WorkspaceState {
     workspace_id: WorkspaceId,
     installation_id: InstallationId,
+    clock: EventTime,
 }
 
-struct LocalInstallationIdentity {
-    workspace_id: WorkspaceId,
-    installation_id: InstallationId,
-    keypair: Keypair,
-}
-
-impl LocalInstallationIdentity {
-    fn derive(
-        peer_identity: &dyn PeerIdentity,
-        workspace_id: WorkspaceId,
-        installation_id: InstallationId,
-    ) -> Result<Self> {
-        Ok(Self {
-            workspace_id,
-            installation_id,
-            keypair: derive_workspace_keypair(peer_identity, workspace_id, installation_id)?,
-        })
-    }
-}
-
-/// Workspace-level runtime configuration.
-#[derive(Debug, Clone, Default)]
-pub struct WorkspaceConfig {
-    /// Workspace ID to create, or an optional assertion when opening.
-    pub workspace_id: Option<WorkspaceId>,
-    /// Replication runtime settings for this workspace.
-    pub replication: ReplicationConfig,
-}
-
+#[derive(Clone, Copy)]
 enum AssemblyMode {
-    Create { display_name: String },
+    Create,
     Open,
-}
-
-struct WorkspaceAssembly {
-    root: PathBuf,
-    local_identity: LocalInstallationIdentity,
-    lock: File,
-    mode: AssemblyMode,
-    replication_config: ReplicationConfig,
 }
 
 pub struct Workspace {
@@ -89,6 +54,7 @@ pub struct Workspace {
     core: Arc<WorkspaceCore>,
     installations: Installations,
     tables: Tables,
+    replication: Option<ReplicationController>,
     // Declared last so the lock outlives every storage-owning field.
     _lock: File,
 }
@@ -107,59 +73,32 @@ impl Workspace {
             return Err(Error::WorkspaceExists);
         }
 
-        // The identity file is the create commit marker. Without it, any existing
-        // storage is partial output from an interrupted create and can be removed.
-        cleanup_failed_create(&root);
-        let binding = WorkspaceBinding {
+        let state = WorkspaceState {
             workspace_id: config.workspace_id.unwrap_or_else(WorkspaceId::generate),
             installation_id: InstallationId::generate(),
+            clock: EventTime::default(),
         };
-        let binding_bytes = serialize_to_vec(&binding)?;
-        let local_identity = LocalInstallationIdentity::derive(
+        let keypair = derive_workspace_keypair(
             peer_identity.as_ref(),
-            binding.workspace_id,
-            binding.installation_id,
+            state.workspace_id,
+            state.installation_id,
         )?;
-        let assembled = Self::assemble(WorkspaceAssembly {
-            root: root.clone(),
-            local_identity,
+        let display_name = peer_identity.display_name().to_owned();
+        let addresses = peer_identity.addresses();
+        let workspace = Self::assemble(
+            root.clone(),
+            state,
+            keypair,
             lock,
-            mode: AssemblyMode::Create {
-                display_name: peer_identity.display_name().to_owned(),
-            },
-            replication_config: config.replication,
-        });
-        let workspace = match assembled {
-            Ok(workspace) => workspace,
-            Err(error) => {
-                cleanup_failed_create(&root);
-                return Err(error);
-            }
-        };
+            AssemblyMode::Create,
+            config.replication,
+            display_name,
+            addresses,
+        )?;
 
         // System storage must be durable before the identity becomes visible;
-        // otherwise a later open could accept a binding for incomplete storage.
-        if let Err(error) = workspace.sync() {
-            drop(workspace);
-            cleanup_failed_create(&root);
-            return Err(error);
-        }
-
-        let identity_temp_path = root.join(IDENTITY_TEMP_FILE);
-        let commit_binding = || -> std::io::Result<()> {
-            // Sync the temporary binding before the rename so the final identity
-            // file is never the only durable evidence of a completed create.
-            let mut file = File::create(&identity_temp_path)?;
-            file.write_all(&binding_bytes)?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&identity_temp_path, identity_path)
-        };
-        if let Err(error) = commit_binding() {
-            drop(workspace);
-            cleanup_failed_create(&root);
-            return Err(error.into());
-        }
+        // otherwise a later open could accept state for incomplete storage.
+        workspace.persist(zendb_types::Barrier::Sync)?;
         Ok(workspace)
     }
 
@@ -171,140 +110,173 @@ impl Workspace {
         let root = path.as_ref().to_path_buf();
         let lock = acquire_lock(&root)?;
         let bytes = fs::read(root.join(IDENTITY_FILE))?;
-        let binding: WorkspaceBinding = deserialize_from(&bytes)?;
+        let state: WorkspaceState = deserialize_from(&bytes)?;
         if let Some(configured) = config.workspace_id
-            && configured != binding.workspace_id
+            && configured != state.workspace_id
         {
             return Err(Error::WorkspaceIdMismatch {
-                stored: binding.workspace_id,
+                stored: state.workspace_id,
                 configured,
             });
         }
-        let local_identity = LocalInstallationIdentity::derive(
+        let keypair = derive_workspace_keypair(
             peer_identity.as_ref(),
-            binding.workspace_id,
-            binding.installation_id,
+            state.workspace_id,
+            state.installation_id,
         )?;
-        Self::assemble(WorkspaceAssembly {
+        let display_name = peer_identity.display_name().to_owned();
+        let addresses = peer_identity.addresses();
+        Self::assemble(
             root,
-            local_identity,
+            state,
+            keypair,
             lock,
-            mode: AssemblyMode::Open,
-            replication_config: config.replication,
-        })
+            AssemblyMode::Open,
+            config.replication,
+            display_name,
+            addresses,
+        )
     }
 
-    fn assemble(assembly: WorkspaceAssembly) -> Result<Self> {
-        let WorkspaceAssembly {
-            root,
-            local_identity,
-            lock,
-            mode,
-            replication_config,
-        } = assembly;
+    fn assemble(
+        root: PathBuf,
+        mut state: WorkspaceState,
+        keypair: Keypair,
+        lock: File,
+        mode: AssemblyMode,
+        replication_config: ReplicationConfig,
+        display_name: String,
+        addresses: Vec<Multiaddr>,
+    ) -> Result<Self> {
         let states = match &mode {
-            AssemblyMode::Create { .. } => States::create(&root)?,
+            AssemblyMode::Create => States::create(&root)?,
             AssemblyMode::Open => States::open(&root)?,
         };
-        let causal_state = states.get::<InstallationId, CausalState>(CAUSAL_STATE_NAME)?;
         let table_store = match &mode {
-            AssemblyMode::Create { .. } => {
-                TableStore::create(&root, local_identity.installation_id)?
-            }
+            AssemblyMode::Create => TableStore::create(&root, state.installation_id)?,
             AssemblyMode::Open => TableStore::open(&root)?,
         };
         let catalog_table = table_store.get(TABLE_CATALOG_NAME)?;
         let installations_table = table_store.get(INSTALLATIONS_TABLE_NAME)?;
-        let public_key = PublicKey::from_libp2p(local_identity.keypair.public());
-        let (membership, causal) = match mode {
-            AssemblyMode::Create { display_name } => {
-                // TableStore::create already authored the two system catalog
-                // events at sequences 1 and 2. The initial Admin installation is
-                // therefore sequence 3, and its causal row must match that stamp
-                // before the tracker starts allocating new events.
+        let public_key = PublicKey::from_libp2p(keypair.public());
+        let (membership, clock) = match mode {
+            AssemblyMode::Create => {
+                // The installations table owns its sequence stream, so the
+                // initial local installation event starts at sequence 1 there.
                 let installation = Installation {
-                    display_name,
+                    display_name: display_name.clone(),
                     public_key,
-                    addresses: Vec::new(),
-                    state: InstallationState::Active(Permissions::ADMIN),
+                    addresses: addresses.clone(),
+                    state: InstallationState::Active(Permissions::FULL),
                 };
                 let stamp = EventStamp {
                     id: EventId {
-                        author: local_identity.installation_id,
-                        sequence: 3, // Two events already exist from system-table creation.
+                        author: state.installation_id,
+                        sequence: 0,
                     },
                     time: EventTime {
                         physical_ms: physical_ms().ok_or(Error::ClockExhausted)?,
                         logical: 0,
                     },
                 };
-                installations_table.insert_event(Event {
-                    primary_key: local_identity.installation_id.into(),
+                let installation_event = Event {
+                    primary_key: state.installation_id.into(),
                     path: CrdtPath::new(),
-                    op: Op::Upsert {
-                        value: Value::Blob(Blob::encode(&installation)?),
-                    },
+                    op: Op::Type(TypeOp::Installation(installation.set())),
                     stamp,
-                })?;
-                let initial_causal_state = CausalState::from_initial_stamp(stamp);
-                causal_state
-                    .write_internal()
-                    .put(local_identity.installation_id, initial_causal_state.clone())?;
+                };
+                installations_table.insert_event(installation_event)?;
+                state.clock = stamp.time;
                 (
-                    Membership::create(local_identity.installation_id, installation),
-                    CausalTracker::create(
-                        causal_state,
-                        local_identity.installation_id,
-                        initial_causal_state,
-                    ),
+                    Membership::create(state.installation_id, installation),
+                    HybridClock::new(state.clock),
                 )
             }
             AssemblyMode::Open => {
-                // Opening validates the persisted membership and causal state;
-                // neither is silently reconstructed when local data is missing.
+                // Opening validates membership and restores the last durable
+                // hybrid-clock checkpoint from the workspace state.
                 let membership = {
                     let installations = installations_table.read();
-                    Membership::open(&installations, local_identity.installation_id, &public_key)?
+                    Membership::open(&installations, state.installation_id, &public_key)?
                 };
-                (
-                    membership,
-                    CausalTracker::open(causal_state, local_identity.installation_id)?,
-                )
+                (membership, HybridClock::new(state.clock))
             }
         };
-        let workspace_id = local_identity.workspace_id;
-        let core = WorkspaceCore::new(
-            workspace_id,
-            local_identity.keypair,
+        let (replication_tx, replication_rx) = if replication_config.enabled {
+            let (sender, receiver) = unbounded_channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let core = Arc::new(WorkspaceCore {
             table_store,
             states,
             membership,
-            causal,
-            replication_config,
-        );
-        // Membership is complete before replication derives its peer set. The
-        // controller only weakly references the core, so its worker cannot keep
-        // the workspace alive after the public owner is dropped.
-        core.replication.start_if_needed()?;
+            clock,
+            replication_notifications: replication_tx,
+        });
+        if matches!(mode, AssemblyMode::Open) {
+            let local_installation_id = state.installation_id;
+            let mut installation = core
+                .membership
+                .get(&local_installation_id)
+                .ok_or(Error::LocalInstallationNotEnrolled(local_installation_id))?;
+            if installation.display_name != display_name || installation.addresses != addresses {
+                installation.display_name = display_name;
+                installation.addresses = addresses;
+                core.commit_change(
+                    &installations_table,
+                    local_installation_id.into(),
+                    CrdtPath::new(),
+                    Op::Type(TypeOp::Installation(installation.set())),
+                )?;
+            }
+        }
+        let replication = if replication_config.enabled {
+            Some(ReplicationController::start(
+                &core,
+                state.workspace_id,
+                keypair,
+                replication_config,
+                replication_rx.expect("enabled replication has a notification receiver"),
+            )?)
+        } else {
+            None
+        };
         let installations = Installations::new(core.clone(), installations_table);
         let tables = Tables::new(core.clone(), catalog_table);
 
         Ok(Self {
             root,
-            workspace_id,
+            workspace_id: state.workspace_id,
             core,
             installations,
             tables,
+            replication,
             _lock: lock,
         })
     }
 
-    pub fn flush(&self) -> Result<()> {
-        self.core.flush()
-    }
-
-    pub fn sync(&self) -> Result<()> {
-        self.core.sync()
+    pub fn persist(&self, barrier: zendb_types::Barrier) -> Result<()> {
+        self.core.table_store.persist(barrier)?;
+        self.core.states.persist(barrier)?;
+        let state = WorkspaceState {
+            workspace_id: self.workspace_id,
+            installation_id: self.core.membership.local_installation_id(),
+            clock: self.core.clock.snapshot(),
+        };
+        let bytes = serialize_to_vec(&state)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(self.root.join(IDENTITY_FILE))?;
+        file.write_all(&bytes)?;
+        match barrier {
+            zendb_types::Barrier::Flush => file.flush()?,
+            zendb_types::Barrier::Sync => file.sync_all()?,
+        }
+        Ok(())
     }
 
     pub const fn workspace_id(&self) -> WorkspaceId {
@@ -326,31 +298,17 @@ impl Workspace {
     pub fn states(&self) -> &States {
         &self.core.states
     }
-
-    pub fn admit_event(
-        &self,
-        envelope: Envelope,
-        gossipsub_source: libp2p_identity::PeerId,
-    ) -> std::result::Result<(), AdmitError> {
-        crate::admission::admit_event(&self.core, envelope, gossipsub_source)
-    }
 }
 
 impl Drop for Workspace {
     fn drop(&mut self) {
         // Stop producers before flushing their storage; the lock remains held
         // until every storage-owning field has been dropped.
-        self.core.replication.shutdown();
-        let _ = self.flush();
+        if let Some(replication) = &mut self.replication {
+            replication.shutdown();
+        }
+        let _ = self.persist(zendb_types::Barrier::Flush);
     }
-}
-
-fn cleanup_failed_create(root: &Path) {
-    // Keep the root and lock file so another create can retry, but remove all
-    // artifacts that could make a later open look partially valid.
-    let _ = fs::remove_file(root.join(IDENTITY_TEMP_FILE));
-    let _ = fs::remove_dir_all(root.join(TABLES_DIR));
-    let _ = fs::remove_dir_all(root.join(STATES_DIR));
 }
 
 fn acquire_lock(root: &Path) -> Result<File> {

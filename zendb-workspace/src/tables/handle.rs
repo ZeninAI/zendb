@@ -3,8 +3,8 @@
 use std::sync::{Arc, Weak};
 
 use parking_lot::{RwLock, RwLockReadGuard};
-use zendb_storage::{Change, InsertOutcome, Table, TopicConsumer};
-use zendb_types::{Event, Op, Path, PrimaryKey};
+use zendb_storage::{Change, InsertOutcome, Table};
+use zendb_types::{Event, Op, Path, Permission, PrimaryKey};
 
 use crate::{Error, Result, core::WorkspaceCore};
 
@@ -23,7 +23,7 @@ pub(crate) enum TableKind {
 pub(crate) struct OpenTable {
     name: String,
     pub(super) table: RwLock<Table>,
-    listeners: RwLock<Vec<Arc<dyn ChangeListener>>>,
+    listeners: RwLock<Arc<Vec<Arc<dyn ChangeListener>>>>,
     kind: TableKind,
 }
 
@@ -32,7 +32,7 @@ impl OpenTable {
         Arc::new(Self {
             name,
             table: RwLock::new(table),
-            listeners: RwLock::new(Vec::new()),
+            listeners: RwLock::new(Arc::new(Vec::new())),
             kind,
         })
     }
@@ -49,6 +49,10 @@ impl OpenTable {
         Ok(self.table.write().insert(event)?)
     }
 
+    pub(crate) fn observe_event(&self, event: Event) -> Result<InsertOutcome> {
+        Ok(self.table.write().observe(event)?)
+    }
+
     pub(crate) fn read(&self) -> RwLockReadGuard<'_, Table> {
         self.table.read()
     }
@@ -56,8 +60,8 @@ impl OpenTable {
     pub(crate) fn notify_listeners(&self, change: &Change) {
         // Release the listener lock before callbacks so a listener can add,
         // remove, or re-enter workspace operations without deadlocking.
-        let listeners = self.listeners.read().clone();
-        for listener in listeners {
+        let listeners = Arc::clone(&self.listeners.read());
+        for listener in listeners.iter() {
             listener.on_change(change);
         }
     }
@@ -89,27 +93,23 @@ impl TableHandle {
         if self.is_system() {
             return Err(Error::SystemTableReadOnly(self.table.name().to_owned()));
         }
-        // Handles do not keep the workspace core alive; operations fail closed
-        // after Workspace is dropped while the raw table remains readable.
-        self.core
-            .upgrade()
-            .ok_or(Error::WorkspaceClosed)?
-            .commit_local_change(&self.table, primary_key, path, op)
+        let core = self.core.upgrade().ok_or(Error::WorkspaceClosed)?;
+        core.membership.require_permission(
+            &core.membership.local_installation_id(),
+            Permission::WriteData,
+        )?;
+        core.commit_change(&self.table, primary_key, path, op)
     }
 
     pub fn read(&self) -> RwLockReadGuard<'_, Table> {
         self.table.table.read()
     }
 
-    pub fn consumer(&self, consumer_name: &str) -> Result<TopicConsumer<Change>> {
-        Ok(self.table.table.read().consumer(consumer_name)?)
-    }
-
     pub fn add_listener(&self, listener: Arc<dyn ChangeListener>) {
-        self.table.listeners.write().push(listener);
+        Arc::make_mut(&mut self.table.listeners.write()).push(listener);
     }
 
     pub fn pop_listener(&self) -> Option<Arc<dyn ChangeListener>> {
-        self.table.listeners.write().pop()
+        Arc::make_mut(&mut self.table.listeners.write()).pop()
     }
 }

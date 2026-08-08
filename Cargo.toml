@@ -38,9 +38,10 @@ libp2p = { version = "0.56", features = [
 futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 rand = "0.8"
+tracing = "0.1"
 
 parking_lot = "0.12"
 arc-swap = "1"
 
 # zendb-it
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

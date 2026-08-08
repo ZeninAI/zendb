@@ -309,8 +309,11 @@ pub struct BPlusTree<K, V> {
 }
 
 impl<K, V> BPlusTree<K, V> {
-    pub(crate) fn flush(&mut self) -> io::Result<()> {
-        self.mmap.flush_async()
+    pub(crate) fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()> {
+        match barrier {
+            zendb_types::Barrier::Flush => self.mmap.flush_async(),
+            zendb_types::Barrier::Sync => self.mmap.flush(),
+        }
     }
 }
 
@@ -1772,7 +1775,10 @@ where
             m.clamp(1, order.len() - 1)
         };
 
-        let sep = truncated_separator(key_bytes_of(order[mid - 1]), key_bytes_of(order[mid]));
+        // Internal entries already contain valid subtree separators. Promote
+        // the middle separator unchanged; truncating it again against the
+        // preceding separator can move the boundary into the left subtree.
+        let sep = key_bytes_of(order[mid]).to_vec();
         // The entry at `mid` is the "lifted" entry — its child becomes
         // the right page's leftmost child, and only its separator key
         // is stored in the parent.
@@ -2195,14 +2201,8 @@ where
         Ok(())
     }
 
-    /// Schedule mmap writeback asynchronously.
-    fn flush(&mut self) -> io::Result<()> {
-        BPlusTree::flush(self)
-    }
-
-    /// Block until pending mmap writes have been flushed.
-    fn sync(&mut self) -> io::Result<()> {
-        self.mmap.flush()
+    fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()> {
+        BPlusTree::persist(self, barrier)
     }
 }
 
@@ -2949,9 +2949,10 @@ where
 impl<K, V> Drop for BPlusTree<K, V> {
     /// Schedule a final writeback without blocking. We don't promise
     /// crash recovery; callers that need durability should call
-    /// `DurableStorage::sync` explicitly before dropping.
+    /// `DurableStorage::persist(zendb_types::Barrier::Sync)` explicitly
+    /// before dropping.
     fn drop(&mut self) {
-        let _ = BPlusTree::flush(self);
+        let _ = BPlusTree::persist(self, zendb_types::Barrier::Flush);
     }
 }
 
@@ -3023,7 +3024,7 @@ mod tests {
     #[test]
     fn create_and_open() {
         let p = tmp("co");
-        create(&p).flush().unwrap();
+        create(&p).persist(zendb_types::Barrier::Flush).unwrap();
         open(&p);
     }
 
@@ -3033,7 +3034,7 @@ mod tests {
         let mut t = create(&p);
         t.put(k("hello"), vbytes("world")).unwrap();
         t.put(k("foo"), vbytes("bar")).unwrap();
-        t.flush().unwrap();
+        t.persist(zendb_types::Barrier::Flush).unwrap();
         assert_eq!(vget(&t, &k("hello")), Some(vbytes("world")));
         assert_eq!(vget(&t, &k("foo")), Some(vbytes("bar")));
         assert_eq!(vget(&t, &k("nope")), None);
@@ -3117,7 +3118,7 @@ mod tests {
         {
             let mut t = create(&p);
             t.put(k("p"), vbytes("d")).unwrap();
-            t.flush().unwrap();
+            t.persist(zendb_types::Barrier::Flush).unwrap();
         }
         let t: BPlusTree<TestKey, TestVal> = open(&p);
         assert_eq!(vget(&t, &k("p")), Some(vbytes("d")));
@@ -3146,11 +3147,11 @@ mod tests {
         let mut t = create(&p);
         let big = vec![0xABu8; 10_000];
         t.put(k("big"), big.clone()).unwrap();
-        t.flush().unwrap();
-        assert_eq!(vget(&t, &k("big")), Some(big.clone()));
+        t.persist(zendb_types::Barrier::Flush).unwrap();
+        assert_eq!(vget(&t, &k("big")), Some(big));
         let bigger = vec![0xCDu8; 15_000];
         t.put(k("big"), bigger.clone()).unwrap();
-        assert_eq!(vget(&t, &k("big")), Some(bigger.clone()));
+        assert_eq!(vget(&t, &k("big")), Some(bigger));
         assert!(t.delete(&k("big")).unwrap());
         assert_eq!(vget(&t, &k("big")), None);
         assert_eq!(t.size(), 0);
@@ -3164,7 +3165,7 @@ mod tests {
             let mut t = create(&p);
             t.put(k("a"), big.clone()).unwrap();
             t.put(k("b"), vbytes("inline")).unwrap();
-            t.flush().unwrap();
+            t.persist(zendb_types::Barrier::Flush).unwrap();
         }
         let t: BPlusTree<TestKey, TestVal> = open(&p);
         assert_eq!(vget(&t, &k("a")), Some(big));
@@ -3207,7 +3208,7 @@ mod tests {
             for i in 0u32..50 {
                 assert!(t.delete(&format!("k{:04}", i).into_bytes()).unwrap());
             }
-            t.flush().unwrap();
+            t.persist(zendb_types::Barrier::Flush).unwrap();
             t.stats()
         };
         let t: BPlusTree<TestKey, TestVal> = open(&p);
@@ -3422,7 +3423,7 @@ mod tests {
                 .map(|i| (format!("k{:04}", i).into_bytes(), vbytes("v")))
                 .collect();
             WriteBackend::bulk_put_sorted(&mut t, items).unwrap();
-            t.flush().unwrap();
+            t.persist(zendb_types::Barrier::Flush).unwrap();
         }
         let t: BPlusTree<TestKey, TestVal> = open(&p);
         assert_eq!(t.size(), 200);
@@ -3461,12 +3462,11 @@ mod tests {
                 .unwrap();
         }
         // Delete every other key.
-        let to_delete: Vec<TestKey> = (0u32..50)
+        let mut all: Vec<TestKey> = (0u32..50)
             .filter(|i| i % 2 == 0)
             .map(|i| format!("k{:04}", i).into_bytes())
             .collect();
         // Plus some misses.
-        let mut all: Vec<TestKey> = to_delete.clone();
         all.push(k("zzzz"));
         let n = WriteBackend::bulk_delete_sorted(&mut t, all.iter()).unwrap();
         assert_eq!(n, 25);
@@ -3677,7 +3677,7 @@ mod tests {
         {
             let mut t = create(&p);
             t.put(k("a"), vbytes("v")).unwrap();
-            t.sync().unwrap();
+            t.persist(zendb_types::Barrier::Sync).unwrap();
         }
         let t: BPlusTree<TestKey, TestVal> = open(&p);
         assert_eq!(vget(&t, &k("a")), Some(vbytes("v")));
@@ -3853,13 +3853,15 @@ mod tests {
         assert!(matches!(t.get(&k("k00")), Some(Cow::Owned(_))));
         assert!(t.keys().all(|c| matches!(c, Cow::Owned(_))));
         assert!(t.values().all(|c| matches!(c, Cow::Owned(_))));
-        assert!(t
-            .entries()
-            .all(|(k, v)| matches!(k, Cow::Owned(_)) && matches!(v, Cow::Owned(_))));
+        assert!(
+            t.entries()
+                .all(|(k, v)| matches!(k, Cow::Owned(_)) && matches!(v, Cow::Owned(_)))
+        );
 
-        assert!(t
-            .range(&k("k00"), &k("k05"))
-            .all(|(k, v)| matches!(k, Cow::Owned(_)) && matches!(v, Cow::Owned(_))));
+        assert!(
+            t.range(&k("k00"), &k("k05"))
+                .all(|(k, v)| matches!(k, Cow::Owned(_)) && matches!(v, Cow::Owned(_)))
+        );
         assert!(matches!(
             OrderedReadBackend::first(&t),
             Some((Cow::Owned(_), Cow::Owned(_)))
@@ -3868,8 +3870,10 @@ mod tests {
             OrderedReadBackend::last(&t),
             Some((Cow::Owned(_), Cow::Owned(_)))
         ));
-        assert!(OrderedReadBackend::entries_rev(&t)
-            .all(|(k, v)| matches!(k, Cow::Owned(_)) && matches!(v, Cow::Owned(_))));
+        assert!(
+            OrderedReadBackend::entries_rev(&t)
+                .all(|(k, v)| matches!(k, Cow::Owned(_)) && matches!(v, Cow::Owned(_)))
+        );
     }
 
     /// Round-trip retrieval through `Cow::into_owned()` returns the

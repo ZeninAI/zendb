@@ -1,101 +1,74 @@
 # ZenDB
 
-ZenDB is a synchronous embedded database foundation with portable CRDT values,
-durable storage mechanics, workspace authorization, and workspace-owned
-peer-to-peer replication.
+ZenDB is a synchronous embedded CRDT database with durable local storage,
+workspace authorization, and workspace-owned peer-to-peer replication.
 
 ## Crates
 
 | Crate | Responsibility |
 |---|---|
-| `zendb-types` | Installation and workspace IDs, persisted libp2p public keys and installation addresses, event stamps, envelopes, cells, operations, CRDT values, and binary utilities |
-| `zendb-storage` | B+ tree, KeyDir, SkipList, generic State, Topic, and the invariant-preserving Table facade |
-| `zendb-workspace` | Catalog and installation policy, local HLC and receipts, authenticated admission, and the private Tokio/libp2p replication runtime |
+| `zendb-types` | IDs, installations, permissions, CRDT values, and binary utilities |
+| `zendb-storage` | B+ tree, KeyDir, SkipList, State, segmented Topic, indexed topics, and Table |
+| `zendb-workspace` | Workspace lifecycle, catalogs, membership, workspace clock, network admission, and the Zenin libp2p runtime |
+| `zendb-it` | Integration coverage for workspace lifecycle and replication |
 
-## Identity And Events
+Applications provide an account-root libp2p keypair, display name, and optional
+route hints through `PeerIdentity`. ZenDB derives a distinct Ed25519 installation key for each
+`(WorkspaceId, InstallationId)` pair and persists only its public key.
 
-Applications provide an account-root libp2p keypair through `PeerIdentity`.
-ZenDB derives a distinct Ed25519 transport key for every
-`(WorkspaceId, InstallationId)` pair. Only that derived public key is stored in
-the workspace installation registry; private keys are never serialized.
+## Storage
 
-Every table mutation is a fully stamped `Event`:
+A `Table` combines materialized `PrimaryKey -> Cell` state, per-installation
+causal state, and a `Topic<Change>`. The table writes applied cells directly to
+State. Local CRDT no-ops are not appended to the topic; remote observations
+that do not change local state update causal receipt state without entering the
+topic until the later no-op replication response is implemented.
 
-```rust
-pub struct EventId {
-    pub author: InstallationId,
-    pub sequence: u64,
-}
+Because `Event` starts with `stamp` and bincode uses fixed-int encoding, the
+first 28 bytes of every record are the `EventStamp`. Topic readers can filter
+by installation or time by scanning only this prefix.
+Topic segments maintain a sparse byte-position index for bounded local seeks.
 
-pub struct EventStamp {
-    pub id: EventId,
-    pub time: EventTime,
-}
-```
+A `State` is caller-typed local storage without a change topic. The system
+state catalog remains open for the workspace lifetime; the workspace hybrid
+clock is stored in `_identity` alongside the workspace and installation IDs.
 
-`InstallationId` and `WorkspaceId` are currently random eight-byte values with
-thirteen-character Crockford Base32 display forms.
+## Zenin Protocol
 
-Installation membership distinguishes replicated pending requests from active
-members. Active installations carry independent read, write, catalog-management,
-and installation-management capabilities rather than a progressive role.
+Every open workspace owns a private libp2p swarm. A single custom `/zenin/1`
+session protocol carries authenticated handshakes, admission notifications,
+live pushes, mesh graft/prune, and table-scoped anti-entropy summaries and
+fetches.
+When replication is enabled, local commits wake the replication runtime through
+an unbounded Tokio channel. Disabled replication has no controller and local
+commits use a no-op notification path.
 
-Workspace writes follow one explicit synchronous path: authorize, mint, apply,
-observe, project system state, publish locally authored changes, then notify
-application listeners. Minting never holds the causal lock across table I/O;
-failed writes may therefore leave sequence gaps for future anti-entropy no-ops.
+Events are grouped per table in `TableBatch` envelopes. Once an installation is
+admitted, every committed event is trusted; there is no per-event signature or
+RBAC re-check in the network. RBAC is enforced only by the producing device
+before local insertion.
 
-## Tables And States
+Pending installations remain dialable route candidates but do not enter the
+replication mesh. Active installations exchange receipt summaries per table;
+each table owns an independent per-installation sequence stream.
 
-A Table has a fixed `PrimaryKey -> Cell` shape backed by materialized state, a
-bounded write cache, and a durable `Topic<Change>`. Local application writes
-require `WriteData`; catalog and installation mutations require their specific
-management capabilities. System tables are publicly readable but writable only
-through workspace-owned APIs.
+## Network Admission And Workspace Merge
 
-A State is caller-typed local storage, `State<K, V>`, with no Event or Topic.
-Catalog declarations are durable while typed handles are opened lazily.
+`Workspace` exposes only `create` and `open`. `WorkspaceConfig::workspace_id`
+may be supplied when creating independent replicas that should later merge.
 
-## Replication
+Applications exchange installation IDs, public keys, and routes through their
+own product flow and add the remote installation as `Pending`. Zenin dials that
+route; an authenticated same-workspace handshake also records unknown peers as
+`Pending`. A manager uses the normal `Installations::upsert` path to write
+`Active(permissions)` or `Rejected`.
 
-`Workspace` privately owns a Tokio worker and one libp2p swarm with isolated
-membership and data Gossipsub behaviours. The
-runtime starts when `_installations` contains another installation and drains then
-stops when the last remote installation is removed. Applications do not create
-a replication link or supply an async runtime.
+Activation starts ordinary anti-entropy rather than a bootstrap phase. The
+installation, catalog, and application topics merge in catalog-first order.
+Permissions govern future local writes, not events already committed before
+the two workspace clusters merged.
 
-Each `Installation` may contain Admin-managed libp2p addresses. The worker
-derives the installation `PeerId` from its stored public key, dials those routes with
-Noise authentication, and retries temporarily unreachable peers with capped
-backoff. mDNS and Identify can add transient routes only for enrolled peers;
-discovery never grants workspace membership.
-
-Both live planes sign each bincode `Envelope` with the derived workspace key
-and use strict signature validation. Every active installation receives
-membership events; only installations with `ReadData` join the data plane.
-`Workspace::admit_event` then binds the signed
-libp2p source to the envelope's enrolled `InstallationId`, checks its role, and
-applies events through the normal convergence path.
-
-Publishing batches per table. `BatchConfig::max_bytes` is a flush threshold,
-not an event-size admission limit; Gossipsub's transport limit defaults to
-100 MiB.
-
-## Enrollment
-
-Only an active installation with `ManageInstallations` writes
-`_installations`. A verified request may be stored as pending so applications
-can list it across the workspace; approval replaces that row with an active
-permission set. Pending rows never authorize events or become peer routes. The
-workspace keypair derivation helper is currently available only through the
-`test-support` feature; the production join protocol remains pending.
-Addresses are routing hints rather than identities and may be empty.
-
-There is currently no `Workspace::join` API. Initial registry/history
-synchronization will define that lifecycle later; ZenDB does not expose an
-incomplete staged workspace in the meantime.
-
-## Durable Layout
+## Layout
 
 ```text
 workspace-root/
@@ -105,18 +78,16 @@ workspace-root/
     _catalog/
     _installations/
     <table-name>/
+      state/
+      causal/
+      topic/
   states/
-    _catalog/
-    _causal/
-    <state-name>/
+    _catalog
+    <state-name>
 ```
 
-The project is not migration-stable. Compile the workspace with:
+The project is not migration-stable. Compile all crates with:
 
 ```text
 cargo check --workspace
 ```
-
-`zendb-it` runs two live workspaces in one process over distinct loopback TCP
-ports, covering offline-peer recovery, bidirectional events, replicated table
-lifecycle, and durable reopen.

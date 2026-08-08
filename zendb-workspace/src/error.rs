@@ -18,14 +18,11 @@ pub enum Error {
     SystemTableReadOnly(String),
     StateTypeMismatch(String),
     CorruptTableCatalog(String),
-    CorruptCausalState(String),
     CorruptInstallations(String),
-    InvalidEventSequence,
     ClockExhausted,
     WorkspaceClosed,
     LocalInstallationNotEnrolled(InstallationId),
     LocalInstallationNotActive(InstallationId),
-    LocalCausalStateNotFound(InstallationId),
     LocalInstallationKeyMismatch,
     KeyDerivationUnsupported,
     KeyDerivationFailed(String),
@@ -63,13 +60,9 @@ impl std::fmt::Display for Error {
             Self::CorruptTableCatalog(message) => {
                 write!(formatter, "corrupt table catalog: {message}")
             }
-            Self::CorruptCausalState(message) => {
-                write!(formatter, "corrupt causal state: {message}")
-            }
             Self::CorruptInstallations(message) => {
                 write!(formatter, "corrupt installations table: {message}")
             }
-            Self::InvalidEventSequence => formatter.write_str("event sequence zero is reserved"),
             Self::ClockExhausted => formatter.write_str("installation clock exhausted"),
             Self::WorkspaceClosed => formatter.write_str("workspace is closed"),
             Self::LocalInstallationNotEnrolled(installation_id) => {
@@ -81,10 +74,6 @@ impl std::fmt::Display for Error {
             Self::LocalInstallationNotActive(installation_id) => write!(
                 formatter,
                 "local installation {installation_id:?} is not active"
-            ),
-            Self::LocalCausalStateNotFound(installation_id) => write!(
-                formatter,
-                "causal state for local installation {installation_id:?} was not found"
             ),
             Self::LocalInstallationKeyMismatch => formatter
                 .write_str("the supplied identity does not match the local installation key"),

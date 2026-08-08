@@ -1,19 +1,24 @@
 # zendb-workspace
 
 `zendb-workspace` is ZenDB's synchronous orchestration layer. It owns workspace
-lifecycle, table and state catalogs, installation permissions, causal tracking,
+lifecycle, table and state catalogs, installation permissions, workspace clock,
 network admission, and the private Zenin libp2p runtime.
 
 ## Lifecycle
 
 Applications pass `Arc<dyn PeerIdentity>`. ZenDB derives an Ed25519 key from a
-versioned domain, `WorkspaceId`, and `InstallationId`; `_identity` persists only
-the two IDs.
+versioned domain, `WorkspaceId`, and `InstallationId`; `_identity` persists the
+two IDs and the latest durable hybrid-clock checkpoint.
 
 - `Workspace::create` creates system storage and the initial full-access local
-  installation, synchronizes it, then writes `_identity`.
+  installation from the peer identity's display name and route hints,
+  synchronizes it, then writes `_identity`.
 - `Workspace::open` derives the same key and requires a matching active local
-  installation and causal clock.
+  installation, then restores the persisted hybrid clock. Before replication
+  starts, it updates only the
+  local installation's display name and route hints when the peer identity has
+  changed; this internal update does not require installation-management
+  permission.
 
 `WorkspaceConfig::workspace_id` is optional. Supplying the same ID to separate
 `create` calls produces independent replicas that may later merge.
@@ -25,8 +30,11 @@ Each open workspace owns one flat `WorkspaceCore`:
 - `TableStore` owns open system and application tables.
 - `States` owns typed local states and the state catalog.
 - `Membership` is an immutable `ArcSwap` projection of `_installations`.
-- `CausalTracker` owns the local allocator, HLC, and per-author receipts.
-- an MPSC sender delivers committed events to replication.
+- `HybridClock` owns only the workspace HLC. Each physical table owns its
+  per-installation sequence allocator and receipt state through its configured
+  causal `State`.
+- an optional MPSC sender delivers committed events to replication when the
+  runtime is enabled.
 
 `Workspace` separately owns the always-running `ReplicationController`, which
 contains the replication thread and its receiver. There is no intermediate
@@ -36,25 +44,34 @@ object.
 The local mutation pipeline is:
 
 ```text
-authorize -> mint -> table admission -> observe
+authorize -> mint time -> table::insert
           -> project -> notify
 ```
 
-Remote events enter through the same table, causal, projection, and listener
-path. Once an installation is admitted, committed events are trusted. The
-receiver does not repeat per-event signature or permission checks.
+Remote events enter through `table::observe`, which owns duplicate detection,
+receipt updates, CRDT application, and topic admission. Once an installation
+is admitted, committed events are trusted. The receiver does not repeat
+per-event signature or permission checks.
 
-Local commits notify the replication runtime immediately after durable
-insertion through an unbounded Tokio channel. Notifications are granular:
+When enabled, local commits notify the replication runtime immediately after
+durable insertion through an unbounded Tokio channel. Disabled replication
+uses no controller and the core notification sender is a no-op. Notifications
+are granular:
 
 - `Event { table, event }` — a locally committed event.
-- `Admitted { installation_id }` — an installation became Active.
-- `Rejected { installation_id }` — an installation was rejected.
+- `InstallationChanged { installation_id }` — installation metadata or state
+  changed.
 
-Events are accumulated per-table using a configurable linger duration before
-being broadcast as `Push` batches. The runtime is expected to remain alive for
-the workspace lifetime, and a disconnected channel is surfaced as a replication
-error.
+Events are serialized once on admission and accumulated as length-delimited
+bytes per table. A batch is completed when its soft `BatchConfig::batch_size`
+threshold is crossed or its optional `BatchConfig::linger` duration expires,
+whichever comes first. With no linger, size is the only completion trigger.
+
+`ReplicationConfig` is grouped by responsibility: `transport` owns listener
+bindings, `mesh` owns neighbour topology and maintenance cadence, `sync` owns
+anti-entropy cadence and range/cache counts, and `batch` owns outbound
+accumulation. The default batch size is 1 MiB. Wire-frame and sync-response
+byte ceilings are not public configuration settings.
 
 ## Network Admission
 
@@ -69,19 +86,38 @@ disconnects with `Error(NotAdmitted)`. Only peers whose installation is locally
 Active are accepted for replication. This means both sides must independently
 approve each other before event exchange begins.
 
+`WorkspaceConfig`, `ReplicationConfig`, and their responsibility-specific
+sub-configurations are defined together in the workspace-level `config.rs`.
+Replication
+can be disabled with `ReplicationConfig::enabled`; in that mode no replication
+controller or notification channel is created. `TransportConfig::enable_port_reuse`
+defaults to `true`; disabling it makes outbound dials allocate a fresh local
+port, which is useful for isolated integration processes. TCP, QUIC, and mDNS
+are independently controlled by `enable_tcp`, `enable_quic`, and `enable_mdns`,
+all of which default to `true`.
+
 `Installation` is a leaf CRDT whose merge gives `Active` higher precedence
 than `Pending` and `Rejected`, so discovery races cannot demote an active
 installation. Applications list pending installations and use
 `Installations::upsert` to store `Active(permissions)` or `Rejected`. When an
-installation becomes Active, the mesh automatically dials the peer using the
-addresses from its handshake. There is no temporary join swarm, join claim, or
+installation is Active, the mesh automatically dials the peer using its current
+durable route hints. The runtime binds only the configured
+`ReplicationConfig::transport.listener_addresses`; listener bindings are not copied into
+installation metadata. A local installation change also updates the handshake
+used for future sessions. There is no temporary join swarm, join claim, or
 bootstrap protocol.
+
+If both peers dial each other at the same time, the runtime temporarily accepts
+both physical connections. Once both directions are established, each peer
+chooses the same connection using peer-ID ordering and endpoint direction, then
+closes the other connection. A single connection is retained regardless of
+which peer initiated it.
 
 ## Workspace Merge
 
-Zenin uses one mesh and one global receipt stream because event sequences are
-global per installation. Summary and fetch exchange missing author-sequence
-ranges across every table.
+Zenin exchanges receipt summaries and missing ranges per table and author.
+Sequence numbers are allocated independently by each physical table, so the
+same installation can have sequence 1 on multiple tables.
 
 Fetched batches are applied in this order:
 
@@ -101,4 +137,5 @@ therefore still contributes events authored while its workspace was isolated.
 
 Networking starts whenever a workspace is created or opened and stops when it
 closes. Runtime shutdown uses a one-shot wakeup. Explicit barriers synchronize
-table state and topics before causal receipts and remaining local states.
+table state, table causal state, topics, local states, and the workspace clock
+checkpoint.

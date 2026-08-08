@@ -18,6 +18,7 @@ use std::{
 use futures::StreamExt;
 use libp2p::{
     PeerId, Swarm, mdns,
+    swarm::behaviour::toggle::Toggle,
     swarm::{NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
 };
 use libp2p_identity::Keypair;
@@ -27,41 +28,20 @@ use zendb_types::{InstallationId, WorkspaceId};
 
 use super::{
     batcher::Batcher,
-    config::ReplicationConfig,
     engine::Engine,
     protocol::{BehaviourEvent, ZeninBehaviour},
     transport::build_swarm,
     wire::Message,
 };
-use crate::{Error, Result, core::WorkspaceCore};
+use crate::{Error, Result, config::ReplicationConfig, core::WorkspaceCore};
 
 // ─── Composite swarm behaviour ───────────────────────────────────────────────
 
 #[derive(NetworkBehaviour)]
-#[behaviour(
-    to_swarm = "SwarmBehaviourEvent",
-    prelude = "libp2p::swarm::derive_prelude"
-)]
+#[behaviour(prelude = "libp2p::swarm::derive_prelude")]
 struct SwarmBehaviour {
     zenin: ZeninBehaviour,
-    mdns: mdns::tokio::Behaviour,
-}
-
-enum SwarmBehaviourEvent {
-    Zenin(BehaviourEvent),
-    Mdns(mdns::Event),
-}
-
-impl From<BehaviourEvent> for SwarmBehaviourEvent {
-    fn from(event: BehaviourEvent) -> Self {
-        Self::Zenin(event)
-    }
-}
-
-impl From<mdns::Event> for SwarmBehaviourEvent {
-    fn from(event: mdns::Event) -> Self {
-        Self::Mdns(event)
-    }
+    mdns: Toggle<mdns::tokio::Behaviour>,
 }
 
 // ─── Notifications from workspace ────────────────────────────────────────────
@@ -69,11 +49,12 @@ impl From<mdns::Event> for SwarmBehaviourEvent {
 /// Granular notifications sent by WorkspaceCore to the replication runtime.
 pub(crate) enum ReplicationNotification {
     /// A locally committed event ready for replication.
-    Event { table: String, event: zendb_types::Event },
-    /// An installation transitioned to Active.
-    Admitted { installation_id: InstallationId },
-    /// An installation transitioned to Rejected.
-    Rejected { installation_id: InstallationId },
+    Event {
+        table: String,
+        event: zendb_types::Event,
+    },
+    /// An installation's materialized metadata or state changed.
+    InstallationChanged { installation_id: InstallationId },
 }
 
 // ─── Controller ──────────────────────────────────────────────────────────────
@@ -101,39 +82,48 @@ impl ReplicationController {
         let core_weak = Arc::downgrade(core);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = oneshot::channel();
+        let thread_name = keypair.public().to_peer_id().to_base58();
 
-        let join = thread::Builder::new()
-            .name("zendb-zenin".to_owned())
-            .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
+        let join = thread::Builder::new().name(thread_name).spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e.to_string()));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                match build_runtime(
+                    keypair,
+                    core_weak.clone(),
+                    workspace_id,
+                    local_installation_id,
+                    &local_installation,
+                    &config,
+                ) {
+                    Ok((swarm, engine)) => {
+                        let _ = ready_tx.send(Ok(()));
+                        run(
+                            swarm,
+                            engine,
+                            core_weak,
+                            workspace_id,
+                            local_installation_id,
+                            config,
+                            notifications,
+                            shutdown_rx,
+                        )
+                        .await;
+                    }
                     Err(e) => {
-                        let _ = ready_tx.send(Err(e.to_string()));
-                        return;
+                        let _ = ready_tx.send(Err(e));
                     }
-                };
-                runtime.block_on(async move {
-                    match build_runtime(
-                        keypair,
-                        core_weak.clone(),
-                        workspace_id,
-                        local_installation_id,
-                        &local_installation,
-                        &config,
-                    ) {
-                        Ok((swarm, engine)) => {
-                            let _ = ready_tx.send(Ok(()));
-                            run(swarm, engine, core_weak, config, notifications, shutdown_rx).await;
-                        }
-                        Err(e) => {
-                            let _ = ready_tx.send(Err(e));
-                        }
-                    }
-                });
-            })?;
+                }
+            });
+        })?;
 
         match ready_rx.blocking_recv() {
             Ok(Ok(())) => Ok(Self {
@@ -179,34 +169,39 @@ fn build_runtime(
 ) -> std::result::Result<(Swarm<SwarmBehaviour>, Engine), String> {
     let local_peer_id = keypair.public().to_peer_id();
 
-    let addresses = if local_installation.addresses.is_empty() {
-        config.listen_addresses.clone()
-    } else {
-        local_installation.addresses.clone()
-    };
-
-    let handshake = Message::Handshake {
-        workspace_id,
-        installation_id: local_installation_id,
-        display_name: local_installation.display_name.clone(),
-        public_key: local_installation.public_key.clone(),
-        addresses,
-    };
+    let handshake = local_handshake(workspace_id, local_installation_id, local_installation);
 
     let behaviour = SwarmBehaviour {
-        zenin: ZeninBehaviour::new(handshake, config.zenin.max_frame_bytes),
-        mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
-            .map_err(|e| e.to_string())?,
+        zenin: ZeninBehaviour::new(local_peer_id, handshake),
+        mdns: if config.transport.enable_mdns {
+            Some(
+                mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        }
+        .into(),
     };
 
-    let mut swarm = build_swarm(keypair, behaviour)?;
-    for addr in &config.listen_addresses {
+    let mut swarm = build_swarm(keypair, behaviour, &config.transport)?;
+    for addr in &config.transport.listener_addresses {
+        let protocols = addr.as_libp2p().iter().collect::<Vec<_>>();
+        let is_tcp = protocols
+            .iter()
+            .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::Tcp(_)));
+        let is_quic = protocols
+            .iter()
+            .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::QuicV1));
+        if (is_tcp && !config.transport.enable_tcp) || (is_quic && !config.transport.enable_quic) {
+            continue;
+        }
         swarm
             .listen_on(addr.as_libp2p().clone())
             .map_err(|e| e.to_string())?;
     }
 
-    let engine = Engine::new(core, local_peer_id, config.zenin.clone(), config.mesh);
+    let engine = Engine::new(core, local_peer_id, config.sync.clone(), config.mesh);
     Ok((swarm, engine))
 }
 
@@ -215,69 +210,170 @@ fn build_runtime(
 async fn run(
     mut swarm: Swarm<SwarmBehaviour>,
     mut engine: Engine,
-    _core: Weak<WorkspaceCore>,
+    core: Weak<WorkspaceCore>,
+    workspace_id: WorkspaceId,
+    local_installation_id: InstallationId,
     config: ReplicationConfig,
     mut notifications: UnboundedReceiver<ReplicationNotification>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
-    let mut heartbeat = tokio::time::interval(config.zenin.heartbeat);
+    let mut heartbeat = tokio::time::interval(config.mesh.maintenance_interval);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let mut sync_deadline = Instant::now() + config.zenin.sync_interval;
-    let mut batcher = Batcher::new(config.zenin.linger);
+    let mut sync_deadline = Instant::now() + config.sync.interval;
+    let mut batcher = Batcher::new(config.batch.clone());
+    let mut batch_sleep = Box::pin(tokio::time::sleep(Duration::from_secs(3600)));
     let mut dialing = HashSet::new();
+    let enable_port_reuse = config.transport.enable_port_reuse;
 
     // Initialize mesh from current membership.
     engine.initialize_mesh();
     let outbound = engine.maintain_mesh();
-    dispatch(&mut swarm, &engine.mesh, &mut dialing, outbound);
-    connect_active(&mut swarm, &engine.mesh, &mut dialing);
+    dispatch(
+        &mut swarm,
+        &engine.mesh,
+        &mut dialing,
+        enable_port_reuse,
+        outbound,
+    );
+    connect_active(&mut swarm, &engine.mesh, &mut dialing, enable_port_reuse);
 
     loop {
-        // Compute next batcher flush deadline for tokio::select!.
-        let flush_at = batcher.next_flush().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+        let sleep_until = batcher
+            .next_flush()
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+        batch_sleep.as_mut().reset(sleep_until);
 
         tokio::select! {
-            _ = &mut shutdown => break,
+            biased;
+
+            _ = &mut shutdown => {
+                if !batcher.is_empty() {
+                    flush_batcher(
+                        &mut batcher,
+                        &engine,
+                        &mut swarm,
+                        &mut dialing,
+                        enable_port_reuse,
+                    );
+                }
+                break;
+            }
 
             // ── Workspace notifications ──────────────────────────────────
             notification = notifications.recv() => {
                 let Some(notification) = notification else { break };
-                process_notification(
-                    &mut engine, &mut batcher, &mut swarm, &mut dialing, notification,
+                let completed = process_notification(
+                    &core,
+                    workspace_id,
+                    local_installation_id,
+                    &mut engine,
+                    &mut batcher,
+                    &mut swarm,
+                    &mut dialing,
+                    enable_port_reuse,
+                    notification,
                 );
+                if completed {
+                    flush_batcher(
+                        &mut batcher,
+                        &engine,
+                        &mut swarm,
+                        &mut dialing,
+                        enable_port_reuse,
+                    );
+                }
                 // Drain remaining queued notifications.
                 while let Ok(n) = notifications.try_recv() {
-                    process_notification(&mut engine, &mut batcher, &mut swarm, &mut dialing, n);
+                    let completed = process_notification(
+                        &core,
+                        workspace_id,
+                        local_installation_id,
+                        &mut engine,
+                        &mut batcher,
+                        &mut swarm,
+                        &mut dialing,
+                        enable_port_reuse,
+                        n,
+                    );
+                    if completed {
+                        flush_batcher(
+                            &mut batcher,
+                            &engine,
+                            &mut swarm,
+                            &mut dialing,
+                            enable_port_reuse,
+                        );
+                    }
                 }
-                // Flush immediately if linger is zero.
-                if config.zenin.linger.is_zero() && !batcher.is_empty() {
-                    flush_batcher(&mut batcher, &engine, &mut swarm, &mut dialing);
+                if batcher.is_due() {
+                    flush_batcher(
+                        &mut batcher,
+                        &engine,
+                        &mut swarm,
+                        &mut dialing,
+                        enable_port_reuse,
+                    );
                 }
             }
 
             // ── Batcher linger expiry ────────────────────────────────────
-            _ = tokio::time::sleep_until(flush_at), if !batcher.is_empty() => {
-                flush_batcher(&mut batcher, &engine, &mut swarm, &mut dialing);
+            _ = &mut batch_sleep => {
+                if !batcher.is_empty() {
+                    flush_batcher(
+                        &mut batcher,
+                        &engine,
+                        &mut swarm,
+                        &mut dialing,
+                        enable_port_reuse,
+                    );
+                }
             }
 
             // ── Heartbeat: mesh maintenance + anti-entropy ───────────────
             _ = heartbeat.tick() => {
+                if batcher.is_due() {
+                    flush_batcher(
+                        &mut batcher,
+                        &engine,
+                        &mut swarm,
+                        &mut dialing,
+                        enable_port_reuse,
+                    );
+                }
                 let outbound = engine.maintain_mesh();
-                dispatch(&mut swarm, &engine.mesh, &mut dialing, outbound);
-                connect_active(&mut swarm, &engine.mesh, &mut dialing);
+                dispatch(
+                    &mut swarm,
+                    &engine.mesh,
+                    &mut dialing,
+                    enable_port_reuse,
+                    outbound,
+                );
+                connect_active(&mut swarm, &engine.mesh, &mut dialing, enable_port_reuse);
 
                 let now = Instant::now();
                 if now >= sync_deadline {
-                    sync_deadline = now + config.zenin.sync_interval;
+                    sync_deadline = now + config.sync.interval;
                     let outbound = engine.send_summaries();
-                    dispatch(&mut swarm, &engine.mesh, &mut dialing, outbound);
+                    dispatch(
+                        &mut swarm,
+                        &engine.mesh,
+                        &mut dialing,
+                        enable_port_reuse,
+                        outbound,
+                    );
                 }
             }
 
             // ── Swarm events ─────────────────────────────────────────────
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut engine, &mut swarm, &mut dialing);
+                handle_swarm_event(
+                    event,
+                    &mut engine,
+                    &mut swarm,
+                    &mut dialing,
+                    enable_port_reuse,
+                );
             }
         }
     }
@@ -286,24 +382,51 @@ async fn run(
 // ─── Notification processing ─────────────────────────────────────────────────
 
 fn process_notification(
+    core: &Weak<WorkspaceCore>,
+    workspace_id: WorkspaceId,
+    local_installation_id: InstallationId,
     engine: &mut Engine,
     batcher: &mut Batcher,
     swarm: &mut Swarm<SwarmBehaviour>,
     dialing: &mut HashSet<PeerId>,
+    enable_port_reuse: bool,
     notification: ReplicationNotification,
-) {
+) -> bool {
     match notification {
         ReplicationNotification::Event { table, event } => {
             engine.cache.insert(&table, &event);
-            batcher.push(table, event);
+            batcher.push(table, event)
         }
-        ReplicationNotification::Admitted { installation_id } => {
-            engine.installation_admitted(installation_id);
-            connect_active(swarm, &engine.mesh, dialing);
+        ReplicationNotification::InstallationChanged { installation_id } => {
+            if installation_id == local_installation_id
+                && let Some(installation) = core
+                    .upgrade()
+                    .and_then(|core| core.membership.get(&installation_id))
+            {
+                swarm.behaviour_mut().zenin.set_handshake(local_handshake(
+                    workspace_id,
+                    installation_id,
+                    &installation,
+                ));
+            }
+            engine.installation_changed(installation_id);
+            connect_active(swarm, &engine.mesh, dialing, enable_port_reuse);
+            false
         }
-        ReplicationNotification::Rejected { installation_id } => {
-            engine.installation_rejected(installation_id);
-        }
+    }
+}
+
+fn local_handshake(
+    workspace_id: WorkspaceId,
+    installation_id: InstallationId,
+    installation: &zendb_types::Installation,
+) -> Message {
+    Message::Handshake {
+        workspace_id,
+        installation_id,
+        display_name: installation.display_name.clone(),
+        public_key: installation.public_key.clone(),
+        addresses: installation.addresses.clone(),
     }
 }
 
@@ -312,10 +435,11 @@ fn flush_batcher(
     engine: &Engine,
     swarm: &mut Swarm<SwarmBehaviour>,
     dialing: &mut HashSet<PeerId>,
+    enable_port_reuse: bool,
 ) {
     let batches = batcher.flush();
     let outbound = engine.broadcast(&batches, None);
-    dispatch(swarm, &engine.mesh, dialing, outbound);
+    dispatch(swarm, &engine.mesh, dialing, enable_port_reuse, outbound);
 }
 
 // ─── Swarm event handling ────────────────────────────────────────────────────
@@ -325,17 +449,16 @@ fn handle_swarm_event(
     engine: &mut Engine,
     swarm: &mut Swarm<SwarmBehaviour>,
     dialing: &mut HashSet<PeerId>,
+    enable_port_reuse: bool,
 ) {
     match event {
-        SwarmEvent::Behaviour(SwarmBehaviourEvent::Zenin(
-            BehaviourEvent::SessionEstablished {
-                peer_id,
-                installation_id,
-                display_name,
-                public_key,
-                addresses,
-            },
-        )) => {
+        SwarmEvent::Behaviour(SwarmBehaviourEvent::Zenin(BehaviourEvent::SessionEstablished {
+            peer_id,
+            installation_id,
+            display_name,
+            public_key,
+            addresses,
+        })) => {
             dialing.remove(&peer_id);
             let outbound = engine.session_established(
                 peer_id,
@@ -347,20 +470,21 @@ fn handle_swarm_event(
             // If the engine returned an error (e.g. NotAdmitted), send it and
             // close the logical session in the behaviour.
             let has_error = outbound.iter().any(|(_, m)| matches!(m, Message::Error(_)));
-            dispatch(swarm, &engine.mesh, dialing, outbound);
+            dispatch(swarm, &engine.mesh, dialing, enable_port_reuse, outbound);
             if has_error {
                 swarm.behaviour_mut().zenin.close_session(peer_id);
             }
         }
-        SwarmEvent::Behaviour(SwarmBehaviourEvent::Zenin(
-            BehaviourEvent::MessageReceived { peer_id, message },
-        )) => {
+        SwarmEvent::Behaviour(SwarmBehaviourEvent::Zenin(BehaviourEvent::MessageReceived {
+            peer_id,
+            message,
+        })) => {
             let outbound = engine.receive(peer_id, message);
-            dispatch(swarm, &engine.mesh, dialing, outbound);
+            dispatch(swarm, &engine.mesh, dialing, enable_port_reuse, outbound);
         }
-        SwarmEvent::Behaviour(SwarmBehaviourEvent::Zenin(
-            BehaviourEvent::SessionClosed { peer_id },
-        )) => {
+        SwarmEvent::Behaviour(SwarmBehaviourEvent::Zenin(BehaviourEvent::SessionClosed {
+            peer_id,
+        })) => {
             dialing.remove(&peer_id);
             engine.mesh.disconnected(peer_id);
         }
@@ -370,7 +494,7 @@ fn handle_swarm_event(
                     && !swarm.is_connected(&peer_id)
                     && dialing.insert(peer_id)
                     && swarm
-                        .dial(DialOpts::peer_id(peer_id).addresses(vec![address]).build())
+                        .dial(dial_opts(peer_id, vec![address], enable_port_reuse))
                         .is_err()
                 {
                     dialing.remove(&peer_id);
@@ -393,10 +517,11 @@ fn dispatch(
     swarm: &mut Swarm<SwarmBehaviour>,
     mesh: &super::mesh::Mesh,
     dialing: &mut HashSet<PeerId>,
+    enable_port_reuse: bool,
     outbound: Vec<(PeerId, Message)>,
 ) {
     for (peer_id, message) in outbound {
-        dial_if_needed(swarm, mesh, dialing, peer_id);
+        dial_if_needed(swarm, mesh, dialing, peer_id, enable_port_reuse);
         swarm.behaviour_mut().zenin.send(peer_id, message);
     }
 }
@@ -406,9 +531,10 @@ fn connect_active(
     swarm: &mut Swarm<SwarmBehaviour>,
     mesh: &super::mesh::Mesh,
     dialing: &mut HashSet<PeerId>,
+    enable_port_reuse: bool,
 ) {
     for peer_id in mesh.known_peers() {
-        dial_if_needed(swarm, mesh, dialing, peer_id);
+        dial_if_needed(swarm, mesh, dialing, peer_id, enable_port_reuse);
     }
 }
 
@@ -417,15 +543,29 @@ fn dial_if_needed(
     mesh: &super::mesh::Mesh,
     dialing: &mut HashSet<PeerId>,
     peer_id: PeerId,
+    enable_port_reuse: bool,
 ) {
     let addresses = mesh.addresses(peer_id);
     if !swarm.is_connected(&peer_id)
         && !addresses.is_empty()
         && dialing.insert(peer_id)
         && swarm
-            .dial(DialOpts::peer_id(peer_id).addresses(addresses).build())
+            .dial(dial_opts(peer_id, addresses, enable_port_reuse))
             .is_err()
     {
         dialing.remove(&peer_id);
+    }
+}
+
+fn dial_opts(
+    peer_id: PeerId,
+    addresses: Vec<libp2p::Multiaddr>,
+    enable_port_reuse: bool,
+) -> libp2p::swarm::dial_opts::DialOpts {
+    let dial = DialOpts::peer_id(peer_id).addresses(addresses);
+    if enable_port_reuse {
+        dial.build()
+    } else {
+        dial.allocate_new_port().build()
     }
 }

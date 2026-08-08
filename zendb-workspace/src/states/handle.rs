@@ -8,7 +8,6 @@ use crate::{Error, Result};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StateKind {
     Catalog,
-    Causal,
     Application,
 }
 

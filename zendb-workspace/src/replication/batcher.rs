@@ -1,65 +1,100 @@
-//! Linger-based event batching for outbound Push messages.
+//! Serialized event batching for outbound Push messages.
 //!
-//! Events arriving from the workspace are accumulated per-table. When the
-//! linger duration expires (or immediately if linger is zero), the batcher
-//! produces sorted `TableBatch` vectors ready for broadcast.
+//! Events are encoded once when admitted and stored as length-delimited bytes
+//! per table. The batch size is therefore measured from the bytes already
+//! produced, without a separate sizing pass.
 
 use std::collections::HashMap;
-use std::time::Duration;
-
 use tokio::time::Instant;
-use zendb_types::Event;
+use zendb_types::{
+    Event,
+    utils::{deserialize_from, serialize_to_vec},
+};
 
 use super::wire::TableBatch;
+use crate::config::BatchConfig;
 use crate::system::{INSTALLATIONS_TABLE_NAME, TABLE_CATALOG_NAME};
 
 pub(super) struct Batcher {
-    linger: Duration,
-    pending: HashMap<String, Vec<Event>>,
+    config: BatchConfig,
+    pending: HashMap<String, Vec<u8>>,
+    pending_bytes: usize,
     deadline: Option<Instant>,
 }
 
 impl Batcher {
-    pub(super) fn new(linger: Duration) -> Self {
+    pub(super) fn new(config: BatchConfig) -> Self {
         Self {
-            linger,
+            config,
             pending: HashMap::new(),
+            pending_bytes: 0,
             deadline: None,
         }
     }
 
-    /// Enqueue an event for batched delivery.
-    pub(super) fn push(&mut self, table: String, event: Event) {
-        self.pending.entry(table).or_default().push(event);
-        if !self.linger.is_zero() && self.deadline.is_none() {
-            self.deadline = Some(Instant::now() + self.linger);
+    /// Enqueue an event and report whether the resulting batch crossed its
+    /// soft size threshold.
+    pub(super) fn push(&mut self, table: String, event: Event) -> bool {
+        let encoded = serialize_to_vec(&event).expect("replication events must be serializable");
+        let encoded_len = encoded.len() + std::mem::size_of::<u64>();
+        let entry = self.pending.entry(table).or_default();
+        entry.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+        entry.extend_from_slice(&encoded);
+        self.pending_bytes = self.pending_bytes.saturating_add(encoded_len);
+
+        if self.pending_bytes == encoded_len {
+            if let Some(linger) = self.config.linger {
+                self.deadline = Some(Instant::now() + linger);
+            }
         }
+        self.pending_bytes > self.config.batch_size
     }
 
     /// Returns the instant at which the batcher should be flushed, or `None`
-    /// if there is nothing pending.
+    /// when completion is controlled only by the size threshold.
     pub(super) fn next_flush(&self) -> Option<Instant> {
         if self.pending.is_empty() {
-            return None;
+            None
+        } else {
+            self.deadline
         }
-        if self.linger.is_zero() {
-            // Immediate: schedule for "now" so tokio::select! fires instantly.
-            return Some(Instant::now());
-        }
-        self.deadline
     }
 
-    /// Drain all pending events into sorted table batches.
-    /// System tables (catalog, installations) are ordered first so that
-    /// table-creation events arrive before application events.
+    pub(super) fn is_due(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+    }
+
+    /// Drain pending serialized events into sorted table batches.
     pub(super) fn flush(&mut self) -> Vec<TableBatch> {
         self.deadline = None;
-        let mut batches: Vec<TableBatch> = self
-            .pending
-            .drain()
-            .map(|(table, events)| TableBatch { table, events })
+        self.pending_bytes = 0;
+        let pending = std::mem::take(&mut self.pending);
+        let mut batches: Vec<TableBatch> = pending
+            .into_iter()
+            .map(|(table, bytes)| {
+                let mut events = Vec::new();
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    let length = usize::try_from(u64::from_le_bytes(
+                        bytes[offset..offset + std::mem::size_of::<u64>()]
+                            .try_into()
+                            .expect("event length prefix is complete"),
+                    ))
+                    .expect("event length fits in memory");
+                    offset += std::mem::size_of::<u64>();
+                    let end = offset + length;
+                    let event: Event = deserialize_from(&bytes[offset..end])
+                        .expect("serialized replication event must be decodable");
+                    events.push(event);
+                    offset = end;
+                }
+                TableBatch { table, events }
+            })
             .collect();
-        batches.sort_unstable_by(|a, b| table_order(a.table.as_str()).cmp(&table_order(b.table.as_str())));
+        batches.sort_unstable_by(|a, b| {
+            table_order(a.table.as_str()).cmp(&table_order(b.table.as_str()))
+        });
         batches
     }
 

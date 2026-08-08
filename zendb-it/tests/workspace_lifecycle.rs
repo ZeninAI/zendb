@@ -62,7 +62,9 @@ fn workspace_data_survives_reopen_and_lifecycle_deletions() {
         )
         .expect("failed to write greeting");
 
-    workspace.sync().expect("failed to sync workspace");
+    workspace
+        .persist(zendb_workspace::Barrier::Sync)
+        .expect("failed to sync workspace");
     drop(users);
     drop(greetings);
     drop(workspace);
@@ -109,7 +111,9 @@ fn workspace_data_survives_reopen_and_lifecycle_deletions() {
         .states()
         .delete("greetings")
         .expect("failed to delete greetings state");
-    workspace.sync().expect("failed to sync deletions");
+    workspace
+        .persist(zendb_workspace::Barrier::Sync)
+        .expect("failed to sync deletions");
     assert!(!root.join("tables").join("users").exists());
     assert!(!root.join("states").join("greetings").exists());
     drop(workspace);

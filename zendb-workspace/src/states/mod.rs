@@ -12,19 +12,15 @@ use std::{
 };
 
 use bincode::{Decode, Encode};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use zendb_storage::{DurableStorage, ReadBackend, State, StateConfig, WriteBackend};
-use zendb_types::InstallationId;
 
 pub use handle::StateHandle;
 use handle::StateKind;
 
 use crate::{
     Error, Result,
-    causal::CausalState,
-    system::{
-        CAUSAL_STATE_NAME, STATE_CATALOG_NAME, STATES_DIR, SYSTEM_STATE_CONFIG, is_system_state,
-    },
+    system::{STATE_CATALOG_NAME, STATES_DIR, SYSTEM_STATE_CONFIG, is_system_state},
 };
 
 /// State catalog management: owns the `_catalog` State and the in-memory
@@ -32,9 +28,11 @@ use crate::{
 /// erased map entry share one `Arc<StateHandle<_, _>>`, so every catalog access is
 /// synchronized by the same lock.
 ///
-/// System states remain open for the workspace lifetime. Application states
-/// are lazy: a state may be declared in `_catalog` but not currently open, and
-/// `get` opens it on first access.
+/// The catalog remains open for the workspace lifetime. Application states are
+/// lazy: a state may be declared in `_catalog` but not currently open, and
+/// `get` opens it on first access. A separate lifecycle mutex serializes cold
+/// storage operations without holding the open-state registry write lock
+/// across filesystem I/O.
 ///
 /// Exposes lifecycle operations (upsert/get/list/contains/close/delete),
 /// durability barriers, and typed [`StateHandle`]s via [`States::get`]. State
@@ -42,12 +40,12 @@ use crate::{
 pub struct States {
     root: PathBuf,
     catalog_handle: Arc<StateHandle<String, StateConfig>>,
+    lifecycle: Mutex<()>,
     open_states: RwLock<HashMap<String, AnyStateHandle>>,
 }
 
 trait ErasedState: Any + Send + Sync {
-    fn flush(&self) -> Result<()>;
-    fn sync(&self) -> Result<()>;
+    fn persist(&self, barrier: zendb_types::Barrier) -> Result<()>;
 }
 
 impl<K, V> ErasedState for StateHandle<K, V>
@@ -55,13 +53,8 @@ where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
     V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
-    fn flush(&self) -> Result<()> {
-        self.state.write().flush()?;
-        Ok(())
-    }
-
-    fn sync(&self) -> Result<()> {
-        self.state.write().sync()?;
+    fn persist(&self, barrier: zendb_types::Barrier) -> Result<()> {
+        self.state.write().persist(barrier)?;
         Ok(())
     }
 }
@@ -69,43 +62,31 @@ where
 type AnyStateHandle = Arc<dyn ErasedState>;
 
 impl States {
-    pub(crate) fn create(root: &Path) -> Result<Arc<Self>> {
+    pub(crate) fn create(root: &Path) -> Result<Self> {
         let root = root.join(STATES_DIR);
         fs::create_dir_all(&root)?;
         let mut catalog =
             State::create(&root.join(STATE_CATALOG_NAME), SYSTEM_STATE_CONFIG.clone())?;
-        let causal_state = State::<InstallationId, CausalState>::create(
-            &root.join(CAUSAL_STATE_NAME),
-            SYSTEM_STATE_CONFIG.clone(),
-        )?;
-        // System declarations and handles are created together so catalog and
-        // causal state are available before any application state is requested.
         catalog.put(STATE_CATALOG_NAME.to_owned(), SYSTEM_STATE_CONFIG.clone())?;
-        catalog.put(CAUSAL_STATE_NAME.to_owned(), SYSTEM_STATE_CONFIG.clone())?;
         let catalog = Arc::new(StateHandle {
             name: STATE_CATALOG_NAME.to_owned(),
             state: RwLock::new(catalog),
             kind: StateKind::Catalog,
         });
         let erased_catalog: AnyStateHandle = catalog.clone();
-        let causal = Arc::new(StateHandle {
-            name: CAUSAL_STATE_NAME.to_owned(),
-            state: RwLock::new(causal_state),
-            kind: StateKind::Causal,
-        });
-        let erased_causal: AnyStateHandle = causal;
-        let states = Arc::new(Self {
+        let states = Self {
             root,
             catalog_handle: catalog,
-            open_states: RwLock::new(HashMap::from([
-                (STATE_CATALOG_NAME.to_owned(), erased_catalog),
-                (CAUSAL_STATE_NAME.to_owned(), erased_causal),
-            ])),
-        });
+            lifecycle: Mutex::new(()),
+            open_states: RwLock::new(HashMap::from([(
+                STATE_CATALOG_NAME.to_owned(),
+                erased_catalog,
+            )])),
+        };
         Ok(states)
     }
 
-    pub(crate) fn open(root: &Path) -> Result<Arc<Self>> {
+    pub(crate) fn open(root: &Path) -> Result<Self> {
         let root = root.join(STATES_DIR);
         let catalog = Arc::new(StateHandle {
             name: STATE_CATALOG_NAME.to_owned(),
@@ -115,27 +96,22 @@ impl States {
             )?),
             kind: StateKind::Catalog,
         });
-        let erased: AnyStateHandle = catalog.clone();
-        let causal = Arc::new(StateHandle {
-            name: CAUSAL_STATE_NAME.to_owned(),
-            state: RwLock::new(State::<InstallationId, CausalState>::open(
-                &root.join(CAUSAL_STATE_NAME),
-                SYSTEM_STATE_CONFIG.clone(),
-            )?),
-            kind: StateKind::Causal,
-        });
-        let erased_causal: AnyStateHandle = causal;
-        Ok(Arc::new(Self {
+        let erased_catalog: AnyStateHandle = catalog.clone();
+        Ok(Self {
             root,
             catalog_handle: catalog,
-            open_states: RwLock::new(HashMap::from([
-                (STATE_CATALOG_NAME.to_owned(), erased),
-                (CAUSAL_STATE_NAME.to_owned(), erased_causal),
-            ])),
-        }))
+            lifecycle: Mutex::new(()),
+            open_states: RwLock::new(HashMap::from([(
+                STATE_CATALOG_NAME.to_owned(),
+                erased_catalog,
+            )])),
+        })
     }
 
     pub fn contains(&self, name: &str) -> bool {
+        if self.open_states.read().contains_key(name) {
+            return true;
+        }
         self.catalog_handle.read().contains(&name.to_owned())
     }
 
@@ -147,16 +123,11 @@ impl States {
             .collect()
     }
 
-    pub(crate) fn flush(&self) -> Result<()> {
-        for state in self.open_states.read().values() {
-            state.flush()?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn sync(&self) -> Result<()> {
-        for state in self.open_states.read().values() {
-            state.sync()?;
+    pub(crate) fn persist(&self, barrier: zendb_types::Barrier) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock();
+        let open: Vec<_> = self.open_states.read().values().cloned().collect();
+        for state in open {
+            state.persist(barrier)?;
         }
         Ok(())
     }
@@ -171,19 +142,21 @@ impl States {
         if is_system_state(name) {
             return Err(Error::SystemStateReadOnly(name.to_owned()));
         }
+        let _lifecycle = self.lifecycle.lock();
+        let name = name.to_owned();
         let mut catalog = self.catalog_handle.write_internal();
-        if let Some(existing) = catalog.get(&name.to_owned()).map(|v| v.into_owned()) {
+        if let Some(existing) = catalog.get(&name).map(|v| v.into_owned()) {
             if existing == config {
                 return Ok(false);
             }
-            catalog.put(name.to_owned(), config)?;
+            catalog.put(name, config)?;
             return Ok(true);
         }
         // Not yet declared: write the declaration and materialize the physical
         // state so a subsequent `get` only needs to open it.
-        catalog.put(name.to_owned(), config.clone())?;
+        catalog.put(name.clone(), config.clone())?;
         drop(catalog);
-        let path = self.root.join(name);
+        let path = self.root.join(&name);
         // Do not hold the catalog lock across filesystem I/O. The declaration
         // intentionally exists before materialization, so a failed create is
         // reported to the caller rather than silently repaired here.
@@ -202,56 +175,54 @@ impl States {
         K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
         V: Encode + Decode<()> + Clone + Send + Sync + 'static,
     {
-        let mut open = self.open_states.write();
-        if let Some(erased) = open.get(name).cloned() {
+        if let Some(erased) = self.open_states.read().get(name).cloned() {
             let erased: Arc<dyn Any + Send + Sync> = erased;
             return Arc::downcast::<StateHandle<K, V>>(erased)
                 .map_err(|_| Error::StateTypeMismatch(name.to_owned()));
         }
-        // Not yet opened state handle
+
+        let _lifecycle = self.lifecycle.lock();
+        if let Some(erased) = self.open_states.read().get(name).cloned() {
+            let erased: Arc<dyn Any + Send + Sync> = erased;
+            return Arc::downcast::<StateHandle<K, V>>(erased)
+                .map_err(|_| Error::StateTypeMismatch(name.to_owned()));
+        }
+        // Lifecycle serialization prevents concurrent misses from opening
+        // distinct handles while leaving unrelated registry reads unblocked.
+        let name = name.to_owned();
         let saved = self
             .catalog_handle
             .read()
-            .get(&name.to_owned())
+            .get(&name)
             .map(|value| value.into_owned())
-            .ok_or_else(|| Error::StateNotFound(name.to_owned()))?;
-        let path = self.root.join(name);
-        // Keep the registry write lock through open and insertion so concurrent
-        // callers cannot create two handles for the same declared state.
+            .ok_or_else(|| Error::StateNotFound(name.clone()))?;
+        let path = self.root.join(&name);
         let state = <State<K, V> as DurableStorage>::open(&path, saved)?;
         let handle = Arc::new(StateHandle {
-            name: name.to_owned(),
+            name: name.clone(),
             state: RwLock::new(state),
             kind: StateKind::Application,
         });
         let erased: AnyStateHandle = handle.clone();
-        open.insert(name.to_owned(), erased);
+        self.open_states.write().insert(name, erased);
         Ok(handle)
+    }
+
+    pub fn contains_open(&self, name: &str) -> bool {
+        self.open_states.read().contains_key(name)
     }
 
     pub fn list_open(&self) -> Vec<String> {
         self.open_states.read().keys().cloned().collect()
     }
 
-    pub fn close(&self, name: &str) -> bool {
-        if is_system_state(name) {
-            return false;
-        }
-        let mut open = self.open_states.write();
-        if open
-            .get(name)
-            .is_none_or(|state| Arc::strong_count(state) != 1)
-        {
-            return false;
-        }
-        open.remove(name);
-        true
-    }
-
-    pub fn delete(&self, name: &str) -> Result<bool> {
+    /// Close an open application state without deleting its declaration or
+    /// physical storage. Returns `false` when the state is not open.
+    pub fn close(&self, name: &str) -> Result<bool> {
         if is_system_state(name) {
             return Err(Error::SystemStateReadOnly(name.to_owned()));
         }
+        let _lifecycle = self.lifecycle.lock();
         let mut open = self.open_states.write();
         if open
             .get(name)
@@ -259,18 +230,39 @@ impl States {
         {
             return Err(Error::StateInUse(name.to_owned()));
         }
-        open.remove(name);
+        let removed = open.remove(name);
+        drop(open);
+        let was_open = removed.is_some();
+        drop(removed);
+        Ok(was_open)
+    }
+
+    pub fn delete(&self, name: &str) -> Result<bool> {
+        if is_system_state(name) {
+            return Err(Error::SystemStateReadOnly(name.to_owned()));
+        }
+        let _lifecycle = self.lifecycle.lock();
+        let mut open = self.open_states.write();
+        if open
+            .get(name)
+            .is_some_and(|state| Arc::strong_count(state) > 1)
+        {
+            return Err(Error::StateInUse(name.to_owned()));
+        }
+        let removed = open.remove(name);
+        drop(open);
+        drop(removed);
         let mut catalog = self.catalog_handle.write_internal();
         if !catalog.delete(&name.to_owned())? {
             return Ok(false);
         }
         drop(catalog);
-        drop(open);
 
         let path = self.root.join(name);
-        // Remove the physical state only after all registry locks and the last
-        // internal handle have been released.
-        fs::remove_dir_all(path)?;
+        if path.exists() {
+            // Guard against in-memory state
+            fs::remove_file(path)?;
+        }
         Ok(true)
     }
 }

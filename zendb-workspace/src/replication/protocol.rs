@@ -19,8 +19,8 @@ use libp2p::{
     PeerId, Stream, StreamProtocol,
     core::{Endpoint, transport::PortUse, upgrade::ReadyUpgrade},
     swarm::{
-        ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, THandler, THandlerInEvent,
-        THandlerOutEvent, ToSwarm,
+        CloseConnection, ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, THandler,
+        THandlerInEvent, THandlerOutEvent, ToSwarm,
         handler::{
             ConnectionEvent, ConnectionHandler, ConnectionHandlerEvent, FullyNegotiatedInbound,
             FullyNegotiatedOutbound, SubstreamProtocol,
@@ -44,7 +44,6 @@ type WriteFuture = Pin<Box<dyn Future<Output = (Stream, Message, io::Result<()>)
 /// (outbound). The handler is agnostic to replication semantics; it simply
 /// serializes outbound `Message` values and deserializes inbound ones.
 pub(super) struct ZeninHandler {
-    max_frame_bytes: usize,
     local_handshake: Message,
     outbound_requested: bool,
     reader_stream: Option<Stream>,
@@ -57,9 +56,8 @@ pub(super) struct ZeninHandler {
 }
 
 impl ZeninHandler {
-    fn new(local_handshake: Message, max_frame_bytes: usize) -> Self {
+    fn new(local_handshake: Message) -> Self {
         Self {
-            max_frame_bytes,
             local_handshake,
             outbound_requested: false,
             reader_stream: None,
@@ -148,10 +146,9 @@ impl ConnectionHandler for ZeninHandler {
         if self.reader.is_none()
             && let Some(stream) = self.reader_stream.take()
         {
-            let max = self.max_frame_bytes;
             self.reader = Some(Box::pin(async move {
                 let mut s = stream;
-                let result = read_message(&mut s, max).await;
+                let result = read_message(&mut s).await;
                 (s, result)
             }));
         }
@@ -163,7 +160,8 @@ impl ConnectionHandler for ZeninHandler {
                     self.events
                         .push_back(HandlerEvent::MessageReceived { message });
                 }
-                Poll::Ready((_stream, Err(_))) => {
+                Poll::Ready((_stream, Err(error))) => {
+                    tracing::error!(%error, "replication frame read failed");
                     self.reader = None;
                 }
                 Poll::Pending => {}
@@ -180,12 +178,11 @@ impl ConnectionHandler for ZeninHandler {
                 self.outbound.pop_front()
             };
             if let Some(message) = message {
-                let max = self.max_frame_bytes;
                 self.writer = Some(Box::pin(async move {
                     let mut s = stream;
                     let result = {
                         use futures::AsyncWriteExt;
-                        let r = write_message(&mut s, &message, max).await;
+                        let r = write_message(&mut s, &message).await;
                         if r.is_ok() { s.flush().await } else { r }
                     };
                     (s, message, result)
@@ -201,7 +198,8 @@ impl ConnectionHandler for ZeninHandler {
                     self.writer = None;
                     self.writer_stream = Some(stream);
                 }
-                Poll::Ready((_stream, _message, Err(_))) => {
+                Poll::Ready((_stream, _message, Err(error))) => {
+                    tracing::error!(%error, "replication frame write failed");
                     self.writer = None;
                     self.handshake_sent = false;
                 }
@@ -253,24 +251,28 @@ pub(super) enum BehaviourEvent {
 /// - Queues outbound messages for peers (even before connection is established).
 /// - Tracks logical sessions independently of physical connection count.
 pub(super) struct ZeninBehaviour {
+    local_peer_id: PeerId,
     local_handshake: Message,
-    max_frame_bytes: usize,
     outbound: VecDeque<(PeerId, Message)>,
     events: VecDeque<ToSwarm<BehaviourEvent, Message>>,
     sessions: HashMap<PeerId, InstallationId>,
-    connected: HashMap<PeerId, Vec<ConnectionId>>,
+    connected: HashMap<PeerId, HashMap<ConnectionId, Endpoint>>,
+    active: HashMap<PeerId, ConnectionId>,
+    closing: std::collections::HashSet<(PeerId, ConnectionId)>,
     pending: HashMap<PeerId, VecDeque<Message>>,
 }
 
 impl ZeninBehaviour {
-    pub(super) fn new(local_handshake: Message, max_frame_bytes: usize) -> Self {
+    pub(super) fn new(local_peer_id: PeerId, local_handshake: Message) -> Self {
         Self {
+            local_peer_id,
             local_handshake,
-            max_frame_bytes,
             outbound: VecDeque::new(),
             events: VecDeque::new(),
             sessions: HashMap::new(),
             connected: HashMap::new(),
+            active: HashMap::new(),
+            closing: std::collections::HashSet::new(),
             pending: HashMap::new(),
         }
     }
@@ -293,7 +295,7 @@ impl ZeninBehaviour {
     }
 
     fn flush_peer(&mut self, peer_id: PeerId) {
-        if !self.connected.contains_key(&peer_id) {
+        if !self.active.contains_key(&peer_id) {
             return;
         }
         if let Some(pending) = self.pending.get_mut(&peer_id) {
@@ -304,6 +306,80 @@ impl ZeninBehaviour {
         if self.pending.get(&peer_id).is_some_and(|p| p.is_empty()) {
             self.pending.remove(&peer_id);
         }
+    }
+
+    fn register_connection(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        endpoint: Endpoint,
+    ) {
+        self.connected
+            .entry(peer_id)
+            .or_default()
+            .insert(connection_id, endpoint);
+
+        let Some(active) = self.choose_connection(peer_id) else {
+            return;
+        };
+        self.active.insert(peer_id, active);
+
+        let has_dialer = self.connected.get(&peer_id).is_some_and(|connections| {
+            connections
+                .values()
+                .any(|endpoint| *endpoint == Endpoint::Dialer)
+        });
+        let has_listener = self.connected.get(&peer_id).is_some_and(|connections| {
+            connections
+                .values()
+                .any(|endpoint| *endpoint == Endpoint::Listener)
+        });
+        if has_dialer
+            && has_listener
+            && let Some(connections) = self.connected.get(&peer_id)
+        {
+            for &connection_id in connections.keys() {
+                if connection_id != active && self.closing.insert((peer_id, connection_id)) {
+                    self.events.push_back(ToSwarm::CloseConnection {
+                        peer_id,
+                        connection: CloseConnection::One(connection_id),
+                    });
+                }
+            }
+        }
+        self.flush_peer(peer_id);
+    }
+
+    fn choose_connection(&self, peer_id: PeerId) -> Option<ConnectionId> {
+        let connections = self.connected.get(&peer_id)?;
+        if connections.len() == 1 {
+            return connections.keys().next().copied();
+        }
+
+        let has_dialer = connections
+            .values()
+            .any(|endpoint| *endpoint == Endpoint::Dialer);
+        let has_listener = connections
+            .values()
+            .any(|endpoint| *endpoint == Endpoint::Listener);
+        if has_dialer && has_listener {
+            let preferred = if self.local_peer_id.to_bytes() < peer_id.to_bytes() {
+                Endpoint::Dialer
+            } else {
+                Endpoint::Listener
+            };
+            return connections
+                .iter()
+                .filter(|(_, endpoint)| **endpoint == preferred)
+                .map(|(connection_id, _)| *connection_id)
+                .min();
+        }
+
+        self.active
+            .get(&peer_id)
+            .copied()
+            .filter(|connection_id| connections.contains_key(connection_id))
+            .or_else(|| connections.keys().min().copied())
     }
 }
 
@@ -327,12 +403,8 @@ impl NetworkBehaviour for ZeninBehaviour {
         _: &libp2p::Multiaddr,
         _: &libp2p::Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        self.connected.entry(peer).or_default().push(connection_id);
-        self.flush_peer(peer);
-        Ok(ZeninHandler::new(
-            self.local_handshake.clone(),
-            self.max_frame_bytes,
-        ))
+        self.register_connection(peer, connection_id, Endpoint::Listener);
+        Ok(ZeninHandler::new(self.local_handshake.clone()))
     }
 
     fn handle_pending_outbound_connection(
@@ -350,29 +422,32 @@ impl NetworkBehaviour for ZeninBehaviour {
         connection_id: ConnectionId,
         peer: PeerId,
         _: &libp2p::Multiaddr,
-        _: Endpoint,
+        endpoint: Endpoint,
         _: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        self.connected.entry(peer).or_default().push(connection_id);
-        self.flush_peer(peer);
-        Ok(ZeninHandler::new(
-            self.local_handshake.clone(),
-            self.max_frame_bytes,
-        ))
+        self.register_connection(peer, connection_id, endpoint);
+        Ok(ZeninHandler::new(self.local_handshake.clone()))
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm<'_>) {
         if let FromSwarm::ConnectionClosed(event) = event {
             if let Some(connections) = self.connected.get_mut(&event.peer_id) {
-                connections.retain(|id| *id != event.connection_id);
+                connections.remove(&event.connection_id);
+                self.closing.remove(&(event.peer_id, event.connection_id));
+                if self.active.get(&event.peer_id) == Some(&event.connection_id) {
+                    self.active.remove(&event.peer_id);
+                }
                 if connections.is_empty() {
                     self.connected.remove(&event.peer_id);
+                    self.active.remove(&event.peer_id);
                     self.sessions.remove(&event.peer_id);
-                    self.events.push_back(ToSwarm::GenerateEvent(
-                        BehaviourEvent::SessionClosed {
+                    self.events
+                        .push_back(ToSwarm::GenerateEvent(BehaviourEvent::SessionClosed {
                             peer_id: event.peer_id,
-                        },
-                    ));
+                        }));
+                } else if let Some(active) = self.choose_connection(event.peer_id) {
+                    self.active.insert(event.peer_id, active);
+                    self.flush_peer(event.peer_id);
                 }
             }
         }
@@ -381,7 +456,7 @@ impl NetworkBehaviour for ZeninBehaviour {
     fn on_connection_handler_event(
         &mut self,
         peer_id: PeerId,
-        _: ConnectionId,
+        connection_id: ConnectionId,
         event: THandlerOutEvent<Self>,
     ) {
         let HandlerEvent::MessageReceived { message } = event;
@@ -411,38 +486,41 @@ impl NetworkBehaviour for ZeninBehaviour {
             }
             if self.sessions.get(&peer_id) != Some(&installation_id) {
                 self.sessions.insert(peer_id, installation_id);
-                self.events.push_back(ToSwarm::GenerateEvent(
-                    BehaviourEvent::SessionEstablished {
+                self.events
+                    .push_back(ToSwarm::GenerateEvent(BehaviourEvent::SessionEstablished {
                         peer_id,
                         installation_id,
                         display_name,
                         public_key,
                         addresses,
-                    },
-                ));
+                    }));
             }
             return;
         }
 
         // Non-handshake messages are only accepted after a valid session.
-        if self.sessions.contains_key(&peer_id) {
-            self.events.push_back(ToSwarm::GenerateEvent(
-                BehaviourEvent::MessageReceived { peer_id, message },
-            ));
+        if self.active.get(&peer_id) == Some(&connection_id) && self.sessions.contains_key(&peer_id)
+        {
+            self.events
+                .push_back(ToSwarm::GenerateEvent(BehaviourEvent::MessageReceived {
+                    peer_id,
+                    message,
+                }));
         }
     }
 
-    fn poll(
-        &mut self,
-        _: &mut Context<'_>,
-    ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+    fn poll(&mut self, _: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         if let Some(event) = self.events.pop_front() {
             return Poll::Ready(event);
         }
         if let Some((peer_id, message)) = self.outbound.pop_front() {
+            let handler = self.active.get(&peer_id).copied().map_or(
+                libp2p::swarm::NotifyHandler::Any,
+                libp2p::swarm::NotifyHandler::One,
+            );
             return Poll::Ready(ToSwarm::NotifyHandler {
                 peer_id,
-                handler: libp2p::swarm::NotifyHandler::Any,
+                handler,
                 event: message,
             });
         }

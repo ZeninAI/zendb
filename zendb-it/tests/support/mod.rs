@@ -1,18 +1,26 @@
-//! Fixtures for exercising two live workspaces in one test process.
+//! Fixtures for exercising a parent workspace with a separate worker process.
 
 use std::{
     fs,
     net::TcpListener,
     path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     sync::Arc,
+    thread,
+    time::{Duration, Instant},
 };
 
 use zendb_it::{TestPeerIdentity, offline_workspace_config};
 use zendb_storage::TableConfig;
-use zendb_types::{Multiaddr, PublicKey};
-use zendb_workspace::{
-    Installation, InstallationState, Permissions, Workspace, derive_workspace_keypair,
-};
+use zendb_types::{Multiaddr, PeerIdentity};
+use zendb_workspace::Workspace;
+
+pub const WORKER_MODE: &str = "ZENDB_REPLICATION_WORKER";
+pub const WORKER_ROOT: &str = "ZENDB_REPLICATION_WORKER_ROOT";
+pub const WORKER_KEYPAIR: &str = "ZENDB_REPLICATION_WORKER_KEYPAIR";
+pub const WORKER_PORT: &str = "ZENDB_REPLICATION_WORKER_PORT";
+pub const WORKER_READY: &str = "ZENDB_REPLICATION_WORKER_READY";
+pub const WORKER_STOP: &str = "ZENDB_REPLICATION_WORKER_STOP";
 
 pub struct WorkspacePair {
     _temp: tempfile::TempDir,
@@ -30,53 +38,45 @@ impl WorkspacePair {
         let a_root = temp.path().join("workspace-a");
         let b_root = temp.path().join("workspace-b");
         let [a_port, b_port] = available_ports();
-        let a_identity = Arc::new(TestPeerIdentity::generate("installation-a"));
-        let b_identity = Arc::new(TestPeerIdentity::generate("installation-b"));
+        let a_identity = Arc::new(
+            TestPeerIdentity::generate("installation-a")
+                .with_addresses(vec![loopback_address(a_port)]),
+        );
+        let b_identity = Arc::new(
+            TestPeerIdentity::generate("installation-b")
+                .with_addresses(vec![loopback_address(b_port)]),
+        );
 
-        let workspace = Workspace::create(&a_root, a_identity.clone(), offline_workspace_config())
+        let mut seed_config = offline_workspace_config();
+        seed_config.replication.enabled = false;
+        let workspace_a = Workspace::create(&a_root, a_identity.clone(), seed_config.clone())
             .expect("failed to create seed workspace");
-        let workspace_id = workspace.workspace_id();
-        let installation_a = workspace.installations().local_installation_id();
-        let mut b_config = offline_workspace_config();
-        b_config.workspace_id = Some(workspace_id);
-        let b_workspace = Workspace::create(&b_root, b_identity.clone(), b_config)
+        let workspace_id = workspace_a.workspace_id();
+        let mut workspace_b_config = seed_config;
+        workspace_b_config.workspace_id = Some(workspace_id);
+        let workspace_b = Workspace::create(&b_root, b_identity.clone(), workspace_b_config)
             .expect("failed to create workspace B fixture");
-        let installation_b = b_workspace.installations().local_installation_id();
-        drop(b_workspace);
+        let installation_b = workspace_b.installations().local_installation_id();
+        let installation_b_value = workspace_b
+            .installations()
+            .get(&installation_b)
+            .expect("local installation B is enrolled");
+        drop(workspace_b);
 
-        let mut installation_a_value = workspace
+        workspace_a
             .installations()
-            .get(&installation_a)
-            .expect("local installation is enrolled");
-        installation_a_value.addresses = vec![loopback_address(a_port)];
-        workspace
-            .installations()
-            .upsert(installation_a, installation_a_value)
-            .expect("failed to store installation A route");
-        workspace
-            .installations()
-            .upsert(
-                installation_b,
-                Installation {
-                    display_name: "installation-b".to_owned(),
-                    public_key: PublicKey::from_libp2p(
-                        derive_workspace_keypair(b_identity.as_ref(), workspace_id, installation_b)
-                            .expect("failed to derive installation B workspace key")
-                            .public(),
-                    ),
-                    addresses: vec![loopback_address(b_port)],
-                    state: InstallationState::Active(Permissions::CONTRIBUTOR),
-                },
-            )
+            .upsert(installation_b, installation_b_value)
             .expect("failed to enroll installation B");
         for name in table_names {
-            workspace
+            workspace_a
                 .tables()
                 .upsert(name, TableConfig::default())
                 .expect("failed to create fixture table");
         }
-        workspace.sync().expect("failed to sync seed workspace");
-        drop(workspace);
+        workspace_a
+            .persist(zendb_workspace::Barrier::Sync)
+            .expect("failed to sync seed workspace");
+        drop(workspace_a);
 
         // Only the trusted table history is copied from A; copying A's states
         // would leave B without the causal row keyed by its own installation.
@@ -91,6 +91,93 @@ impl WorkspacePair {
             a_port,
             b_port,
         }
+    }
+}
+
+pub struct WorkspaceWorker {
+    child: Child,
+    stop_path: PathBuf,
+    finished: bool,
+}
+
+impl WorkspaceWorker {
+    pub fn spawn(fixture: &WorkspacePair) -> Self {
+        let keypair_path = fixture._temp.path().join("worker-keypair");
+        let ready_path = fixture._temp.path().join("worker-ready");
+        let stop_path = fixture._temp.path().join("worker-stop");
+        fs::write(
+            &keypair_path,
+            fixture
+                .b_identity
+                .keypair()
+                .to_protobuf_encoding()
+                .expect("test keypair can be encoded"),
+        )
+        .expect("failed to write worker keypair");
+
+        let mut child = Command::new(std::env::current_exe().expect("test executable exists"))
+            .args([
+                "--exact",
+                "workspaces_replicate_events_and_table_lifecycle",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(WORKER_MODE, "1")
+            .env(WORKER_ROOT, &fixture.b_root)
+            .env(WORKER_KEYPAIR, &keypair_path)
+            .env(WORKER_PORT, fixture.b_port.to_string())
+            .env(WORKER_READY, &ready_path)
+            .env(WORKER_STOP, &stop_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn replication worker");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if ready_path.exists() {
+                break;
+            }
+            if let Some(status) = child
+                .try_wait()
+                .expect("failed to inspect replication worker")
+            {
+                panic!("replication worker exited before opening workspace: {status}");
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("timed out waiting for replication worker");
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        Self {
+            child,
+            stop_path,
+            finished: false,
+        }
+    }
+
+    pub fn finish(mut self) {
+        fs::write(&self.stop_path, b"stop").expect("failed to signal replication worker");
+        let status = self
+            .child
+            .wait()
+            .expect("failed to wait for replication worker");
+        assert!(status.success(), "replication worker exited with {status}");
+        self.finished = true;
+    }
+}
+
+impl Drop for WorkspaceWorker {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let _ = fs::write(&self.stop_path, b"stop");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

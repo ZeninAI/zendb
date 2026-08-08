@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
 use zendb_storage::InsertOutcome;
-use zendb_types::{Event, InstallationId, InstallationState, Op, Path, PrimaryKey, Value};
+use zendb_types::{Event, InstallationId, Op, Path, PrimaryKey};
 
 use crate::{
     Error, Result,
-    causal::CausalTracker,
+    clock::HybridClock,
     installations::Membership,
     replication::ReplicationNotification,
     states::States,
@@ -19,8 +19,8 @@ pub(crate) struct WorkspaceCore {
     pub(crate) table_store: TableStore,
     pub(crate) states: States,
     pub(crate) membership: Membership,
-    pub(crate) causal: CausalTracker,
-    pub(crate) replication_notifications: UnboundedSender<ReplicationNotification>,
+    pub(crate) clock: HybridClock,
+    pub(crate) replication_notifications: Option<UnboundedSender<ReplicationNotification>>,
 }
 
 impl WorkspaceCore {
@@ -31,43 +31,46 @@ impl WorkspaceCore {
         path: Path,
         op: Op,
     ) -> Result<InsertOutcome> {
-        let stamp = self.causal.mint()?;
+        let stamp = zendb_types::EventStamp {
+            id: zendb_types::EventId {
+                author: self.membership.local_installation_id(),
+                sequence: 0,
+            },
+            time: self.clock.mint()?,
+        };
         let event = Event {
             primary_key,
             path,
             op,
             stamp,
         };
-        let replicated = event.clone();
         let outcome = table.insert_event(event)?;
-        let _ = self.causal.observe(stamp)?;
         if let InsertOutcome::Applied(change) = &outcome {
             self.project_change(table, change)?;
+            if let Some(sender) = &self.replication_notifications {
+                sender
+                    .send(ReplicationNotification::Event {
+                        table: table.name().to_owned(),
+                        event: change.event.clone(),
+                    })
+                    .map_err(|_| Error::Replication("replication runtime stopped".into()))?;
+            }
         }
-        self.replication_notifications
-            .send(ReplicationNotification::Event {
-                table: table.name().to_owned(),
-                event: replicated,
-            })
-            .map_err(|_| Error::Replication("replication runtime stopped".into()))?;
         Ok(outcome)
     }
 
     /// Apply a remotely produced event to its target table. Returns `true` if
     /// the event was novel, `false` if it was already present.
     pub(crate) fn commit_replication_event(&self, table_name: &str, event: Event) -> Result<bool> {
-        let event_id = event.stamp.id;
         let table = self.table_store.get(table_name)?;
-        if self.causal.contains(event_id) {
-            return Ok(false);
-        }
         let stamp = event.stamp;
-        let outcome = table.insert_event(event)?;
-        let _ = self.causal.observe(stamp)?;
+        let outcome = table.observe_event(event)?;
+        self.clock.observe(stamp)?;
         if let InsertOutcome::Applied(change) = &outcome {
             self.project_change(&table, change)?;
+            return Ok(true);
         }
-        Ok(true)
+        Ok(false)
     }
 
     fn project_change(&self, table: &OpenTable, change: &zendb_storage::Change) -> Result<()> {
@@ -85,26 +88,14 @@ impl WorkspaceCore {
         Ok(())
     }
 
-    /// Emit a granular Admitted or Rejected notification based on the
-    /// installation's new materialized state.
+    /// Notify replication after every materialized installation update so its
+    /// route and local handshake views stay current.
     fn emit_membership_notification(&self, change: &zendb_storage::Change) {
         let Ok(installation_id) = InstallationId::try_from(&change.event.primary_key) else {
             return;
         };
-        // Determine the new state from the materialized cell.
-        let new_state = change.current.as_ref().and_then(|cell| match &cell.value {
-            Some(Value::Installation(i)) => Some(i.state),
-            _ => None,
-        });
-        let notification = match new_state {
-            Some(state) if state.is_active() => {
-                ReplicationNotification::Admitted { installation_id }
-            }
-            Some(InstallationState::Rejected) => {
-                ReplicationNotification::Rejected { installation_id }
-            }
-            _ => return,
-        };
-        let _ = self.replication_notifications.send(notification);
+        if let Some(sender) = &self.replication_notifications {
+            let _ = sender.send(ReplicationNotification::InstallationChanged { installation_id });
+        }
     }
 }

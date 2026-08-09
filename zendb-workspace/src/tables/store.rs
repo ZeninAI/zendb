@@ -192,11 +192,7 @@ impl TableStore {
                     return;
                 };
                 let path = self.root.join(name);
-                let table = if path.exists() {
-                    Table::open(&path, config)
-                } else {
-                    Table::create(&path, config)
-                };
+                let table = Table::create(&path, config);
                 // Catalog projection is post-commit and best effort; the event
                 // remains durable even when its physical table cannot be opened.
                 if let Ok(table) = table {
@@ -213,6 +209,7 @@ impl TableStore {
                     drop(table);
                     let path = self.root.join(name);
                     if path.exists() {
+                        // might be in-memory table
                         let _ = fs::remove_dir_all(path);
                     }
                 }

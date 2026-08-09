@@ -2,9 +2,9 @@
 //! cache, and range-based fetch from durable topics.
 //!
 //! The sync subsystem provides eventual consistency by periodically exchanging
-//! receipt summaries with mesh neighbours, computing which event sequences we
-//! are missing, and fetching them. A bounded in-memory cache of recent events
-//! avoids scanning durable storage for common hot-path fetches.
+//! receipt summaries with connected installations, computing which event
+//! sequences we are missing, and fetching them. A bounded in-memory cache of
+//! recent events avoids scanning durable storage for common hot-path fetches.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

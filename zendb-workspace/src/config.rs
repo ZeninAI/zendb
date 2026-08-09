@@ -1,4 +1,4 @@
-//! Runtime configuration for a workspace and its replication controller.
+//! Runtime configuration for a workspace and its direct replication controller.
 
 use std::time::Duration;
 
@@ -7,7 +7,7 @@ use zendb_types::{Multiaddr, WorkspaceId};
 /// Replication cadence and bounded range bookkeeping.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
-    /// How often anti-entropy summaries are exchanged with mesh neighbours.
+    /// How often anti-entropy summaries are exchanged and ready peers are retried.
     pub interval: Duration,
     /// Maximum number of event ranges in a single Fetch request.
     pub max_ranges: usize,
@@ -42,28 +42,7 @@ impl Default for BatchConfig {
     fn default() -> Self {
         Self {
             batch_size: 1024 * 1024,
-            linger: None,
-        }
-    }
-}
-
-/// Mesh topology parameters.
-#[derive(Debug, Clone, Copy)]
-pub struct MeshConfig {
-    /// How often the active neighbour set is maintained.
-    pub maintenance_interval: Duration,
-    /// Target number of active forwarding neighbours.
-    pub target_neighbors: usize,
-    /// Maximum peers accepted into the mesh before incoming grafts are refused.
-    pub max_neighbors: usize,
-}
-
-impl Default for MeshConfig {
-    fn default() -> Self {
-        Self {
-            maintenance_interval: Duration::from_millis(250),
-            target_neighbors: 6,
-            max_neighbors: 12,
+            linger: Some(Duration::from_millis(250)),
         }
     }
 }
@@ -115,7 +94,6 @@ pub struct ReplicationConfig {
     pub transport: TransportConfig,
     pub sync: SyncConfig,
     pub batch: BatchConfig,
-    pub mesh: MeshConfig,
 }
 
 impl Default for ReplicationConfig {
@@ -125,7 +103,6 @@ impl Default for ReplicationConfig {
             transport: TransportConfig::default(),
             sync: SyncConfig::default(),
             batch: BatchConfig::default(),
-            mesh: MeshConfig::default(),
         }
     }
 }

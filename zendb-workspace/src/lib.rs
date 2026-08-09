@@ -11,9 +11,7 @@ mod system;
 mod tables;
 mod workspace;
 
-pub use config::{
-    BatchConfig, MeshConfig, ReplicationConfig, SyncConfig, TransportConfig, WorkspaceConfig,
-};
+pub use config::{BatchConfig, ReplicationConfig, SyncConfig, TransportConfig, WorkspaceConfig};
 pub use error::{Error, Result};
 pub use installations::Installations;
 pub use states::{StateHandle, States};

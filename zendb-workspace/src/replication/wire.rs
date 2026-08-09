@@ -68,12 +68,8 @@ pub enum Message {
         public_key: PublicKey,
         addresses: Vec<Multiaddr>,
     },
-    /// Fire-and-forget event push to mesh neighbours.
+    /// Fire-and-forget event push to every ready installation.
     Push { batches: Vec<TableBatch> },
-    /// Request inclusion in the sender's forwarding mesh.
-    Graft,
-    /// Withdraw from the sender's forwarding mesh.
-    Prune,
     /// Anti-entropy: local receipt summaries. Peer responds with SummaryResponse.
     Summary { receipts: Vec<ReceiptSummary> },
     /// Anti-entropy: peer's receipt summaries in reply to Summary.

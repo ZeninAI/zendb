@@ -8,7 +8,7 @@
 //! - Only peers whose installation is Active locally are accepted.
 //! - Unknown or Pending peers are recorded as Pending in the installations
 //!   table and immediately rejected with `Error(NotAdmitted)`.
-//! - Once an installation transitions to Active, the mesh dials it.
+//! - Once an installation transitions to Active, the runtime dials it.
 
 use std::sync::Weak;
 
@@ -18,10 +18,9 @@ use zendb_types::{
 };
 
 use super::batcher::table_order;
-use super::mesh::{Mesh, MeshAction};
 use super::sync::{self, RecentCache};
 use super::wire::{EventRange, Message, ProtocolError, ReceiptSummary, TableBatch};
-use crate::config::{MeshConfig, SyncConfig};
+use crate::config::SyncConfig;
 use crate::core::WorkspaceCore;
 use crate::system::INSTALLATIONS_TABLE_NAME;
 use crate::{Error, Result};
@@ -30,8 +29,8 @@ use crate::{Error, Result};
 
 pub(super) struct Engine {
     core: Weak<WorkspaceCore>,
+    local_peer_id: PeerId,
     config: SyncConfig,
-    pub(super) mesh: Mesh,
     pub(super) cache: RecentCache,
 }
 
@@ -40,63 +39,69 @@ impl Engine {
         core: Weak<WorkspaceCore>,
         local_peer_id: PeerId,
         config: SyncConfig,
-        mesh_config: MeshConfig,
     ) -> Self {
         let cache_cap = config.recent_cache_capacity;
         Self {
             core,
+            local_peer_id,
             config,
-            mesh: Mesh::new(local_peer_id, mesh_config),
             cache: RecentCache::new(cache_cap),
         }
     }
 
     // ── Startup ──────────────────────────────────────────────────────────
 
-    /// Populate mesh routes from the current membership snapshot.
-    /// Called once at startup before the event loop begins.
-    pub(super) fn initialize_mesh(&mut self) {
+    /// Return every active remote installation and its current route hints.
+    pub(super) fn active_peer_routes(&self) -> Vec<(PeerId, Vec<libp2p::Multiaddr>)> {
         let Some(core) = self.core.upgrade() else {
-            return;
+            return Vec::new();
         };
-        for (_, installation) in core.membership.list() {
-            if installation.state.is_active() {
-                self.mesh.add(&installation);
-            }
-        }
+        core.membership
+            .list()
+            .into_iter()
+            .filter_map(|(_, installation)| {
+                if !installation.state.is_active() {
+                    return None;
+                }
+                let peer_id = installation.public_key.as_libp2p().to_peer_id();
+                (peer_id != self.local_peer_id).then(|| {
+                    (
+                        peer_id,
+                        installation
+                            .addresses
+                            .iter()
+                            .map(|address| address.as_libp2p().clone())
+                            .collect(),
+                    )
+                })
+            })
+            .collect()
     }
 
-    // ── Mesh maintenance ─────────────────────────────────────────────────
+    pub(super) fn is_active_peer(&self, peer_id: PeerId) -> bool {
+        self.active_peer_routes()
+            .into_iter()
+            .any(|(candidate, _)| candidate == peer_id)
+    }
 
-    /// Evaluate mesh topology and return Graft/Prune messages.
-    pub(super) fn maintain_mesh(&mut self) -> Vec<(PeerId, Message)> {
-        let mut outbound = Vec::new();
-        for action in self.mesh.maintain() {
-            match action {
-                MeshAction::Graft { peer_id } => {
-                    self.mesh.graft(peer_id);
-                    outbound.push((peer_id, Message::Graft));
-                }
-                MeshAction::Prune { peer_id } => {
-                    self.mesh.prune(peer_id);
-                    outbound.push((peer_id, Message::Prune));
-                }
-            }
-        }
-        outbound
+    pub(super) fn addresses(&self, peer_id: PeerId) -> Vec<libp2p::Multiaddr> {
+        self.active_peer_routes()
+            .into_iter()
+            .find_map(|(candidate, addresses)| (candidate == peer_id).then_some(addresses))
+            .unwrap_or_default()
     }
 
     // ── Anti-entropy ─────────────────────────────────────────────────────
 
-    /// Send receipt summaries to all mesh neighbours.
+    /// Send receipt summaries to every active remote installation.
     pub(super) fn send_summaries(&self) -> Vec<(PeerId, Message)> {
         let Some(core) = self.core.upgrade() else {
             return Vec::new();
         };
         let receipts = sync::receipt_summaries(&core);
-        self.mesh
-            .neighbours(None)
+        self.active_peer_routes()
             .into_iter()
+            .map(|(peer_id, _)| peer_id)
             .map(|peer_id| {
                 (
                     peer_id,
@@ -165,22 +170,12 @@ impl Engine {
         let Some(core) = self.core.upgrade() else {
             return Vec::new();
         };
-        if !self.mesh.is_active(peer_id) {
+        if !self.is_active_peer(peer_id) {
             return vec![(peer_id, Message::Error(ProtocolError::Unauthorized))];
         }
 
         match msg {
             Message::Push { batches } => self.handle_push(&core, peer_id, batches),
-            Message::Graft => {
-                if self.mesh.accepts(peer_id) {
-                    self.mesh.graft(peer_id);
-                }
-                Vec::new()
-            }
-            Message::Prune => {
-                self.mesh.prune(peer_id);
-                Vec::new()
-            }
             Message::Summary { receipts } => self.handle_summary(&core, peer_id, receipts),
             Message::SummaryResponse { receipts } => {
                 self.handle_summary_response(&core, peer_id, receipts)
@@ -193,7 +188,8 @@ impl Engine {
 
     // ── Broadcast ────────────────────────────────────────────────────────
 
-    /// Broadcast table batches to mesh neighbours, excluding one peer.
+    /// Broadcast table batches to every active remote installation, excluding
+    /// one peer when forwarding received batches.
     pub(super) fn broadcast(
         &self,
         batches: &[TableBatch],
@@ -202,9 +198,10 @@ impl Engine {
         if batches.is_empty() {
             return Vec::new();
         }
-        self.mesh
-            .neighbours(exclude)
+        self.active_peer_routes()
             .into_iter()
+            .map(|(peer_id, _)| peer_id)
+            .filter(|peer_id| Some(*peer_id) != exclude)
             .map(|peer_id| {
                 (
                     peer_id,
@@ -214,22 +211,6 @@ impl Engine {
                 )
             })
             .collect()
-    }
-
-    // ── Membership events ────────────────────────────────────────────────
-
-    /// Refresh the mesh route after an installation changes.
-    pub(super) fn installation_changed(&mut self, installation_id: InstallationId) {
-        let Some(core) = self.core.upgrade() else {
-            return;
-        };
-        if let Some(installation) = core.membership.get(&installation_id) {
-            if installation.state.is_active() {
-                self.mesh.add(&installation);
-            } else {
-                self.mesh.remove(&installation);
-            }
-        }
     }
 
     // ── Private helpers ──────────────────────────────────────────────────

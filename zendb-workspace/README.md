@@ -68,10 +68,11 @@ threshold is crossed or its optional `BatchConfig::linger` duration expires,
 whichever comes first. With no linger, size is the only completion trigger.
 
 `ReplicationConfig` is grouped by responsibility: `transport` owns listener
-bindings, `mesh` owns neighbour topology and maintenance cadence, `sync` owns
-anti-entropy cadence and range/cache counts, and `batch` owns outbound
-accumulation. The default batch size is 1 MiB. Wire-frame and sync-response
-byte ceilings are not public configuration settings.
+bindings, `sync` owns anti-entropy cadence, ready-peer retry cadence, and
+range/cache counts, and `batch` owns outbound accumulation. Every active
+installation is a replication peer; there is no bounded neighbour set or
+topology rotation. The default batch size is 1 MiB. Wire-frame and
+sync-response byte ceilings are not public configuration settings.
 
 ## Network Admission
 
@@ -100,8 +101,9 @@ all of which default to `true`.
 than `Pending` and `Rejected`, so discovery races cannot demote an active
 installation. Applications list pending installations and use
 `Installations::upsert` to store `Active(permissions)` or `Rejected`. When an
-installation is Active, the mesh automatically dials the peer using its current
-durable route hints. The runtime binds only the configured
+installation is Active, the runtime automatically dials the peer using its
+current durable route hints and maintains a direct connection to every other
+active installation. The runtime binds only the configured
 `ReplicationConfig::transport.listener_addresses`; listener bindings are not copied into
 installation metadata. A local installation change also updates the handshake
 used for future sessions. There is no temporary join swarm, join claim, or

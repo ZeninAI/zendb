@@ -37,8 +37,7 @@ clock is stored in `_identity` alongside the workspace and installation IDs.
 
 Every open workspace owns a private libp2p swarm. A single custom `/zenin/1`
 session protocol carries authenticated handshakes, admission notifications,
-live pushes, mesh graft/prune, and table-scoped anti-entropy summaries and
-fetches.
+live pushes, and table-scoped anti-entropy summaries and fetches.
 When replication is enabled, local commits wake the replication runtime through
 an unbounded Tokio channel. Disabled replication has no controller and local
 commits use a no-op notification path.
@@ -48,9 +47,10 @@ admitted, every committed event is trusted; there is no per-event signature or
 RBAC re-check in the network. RBAC is enforced only by the producing device
 before local insertion.
 
-Pending installations remain dialable route candidates but do not enter the
-replication mesh. Active installations exchange receipt summaries per table;
-each table owns an independent per-installation sequence stream.
+Pending installations remain stored route candidates but are not dialed. Every
+active installation has a direct replication connection to every other active
+installation and exchanges receipt summaries per table; each table owns an
+independent per-installation sequence stream.
 
 ## Network Admission And Workspace Merge
 

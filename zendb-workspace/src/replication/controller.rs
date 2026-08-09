@@ -5,7 +5,7 @@
 //! - Shutdown signal
 //! - Workspace notifications (events and membership changes)
 //! - Linger-based batcher flush timer
-//! - Periodic heartbeat (mesh maintenance + anti-entropy)
+//! - Periodic heartbeat (ready-peer retries + anti-entropy)
 //! - Swarm network events
 
 use std::{
@@ -201,7 +201,7 @@ fn build_runtime(
             .map_err(|e| e.to_string())?;
     }
 
-    let engine = Engine::new(core, local_peer_id, config.sync.clone(), config.mesh);
+    let engine = Engine::new(core, local_peer_id, config.sync.clone());
     Ok((swarm, engine))
 }
 
@@ -217,26 +217,15 @@ async fn run(
     mut notifications: UnboundedReceiver<ReplicationNotification>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
-    let mut heartbeat = tokio::time::interval(config.mesh.maintenance_interval);
+    let mut heartbeat = tokio::time::interval(config.sync.interval);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let mut sync_deadline = Instant::now() + config.sync.interval;
     let mut batcher = Batcher::new(config.batch.clone());
     let mut batch_sleep = Box::pin(tokio::time::sleep(Duration::from_secs(3600)));
     let mut dialing = HashSet::new();
     let enable_port_reuse = config.transport.enable_port_reuse;
 
-    // Initialize mesh from current membership.
-    engine.initialize_mesh();
-    let outbound = engine.maintain_mesh();
-    dispatch(
-        &mut swarm,
-        &engine.mesh,
-        &mut dialing,
-        enable_port_reuse,
-        outbound,
-    );
-    connect_active(&mut swarm, &engine.mesh, &mut dialing, enable_port_reuse);
+    connect_ready(&mut swarm, &engine, &mut dialing, enable_port_reuse);
 
     loop {
         let sleep_until = batcher
@@ -330,7 +319,7 @@ async fn run(
                 }
             }
 
-            // ── Heartbeat: mesh maintenance + anti-entropy ───────────────
+            // ── Heartbeat: retry ready peers and run anti-entropy ─────────
             _ = heartbeat.tick() => {
                 if batcher.is_due() {
                     flush_batcher(
@@ -341,28 +330,15 @@ async fn run(
                         enable_port_reuse,
                     );
                 }
-                let outbound = engine.maintain_mesh();
+                connect_ready(&mut swarm, &engine, &mut dialing, enable_port_reuse);
+                let outbound = engine.send_summaries();
                 dispatch(
                     &mut swarm,
-                    &engine.mesh,
+                    &engine,
                     &mut dialing,
                     enable_port_reuse,
                     outbound,
                 );
-                connect_active(&mut swarm, &engine.mesh, &mut dialing, enable_port_reuse);
-
-                let now = Instant::now();
-                if now >= sync_deadline {
-                    sync_deadline = now + config.sync.interval;
-                    let outbound = engine.send_summaries();
-                    dispatch(
-                        &mut swarm,
-                        &engine.mesh,
-                        &mut dialing,
-                        enable_port_reuse,
-                        outbound,
-                    );
-                }
             }
 
             // ── Swarm events ─────────────────────────────────────────────
@@ -409,8 +385,7 @@ fn process_notification(
                     &installation,
                 ));
             }
-            engine.installation_changed(installation_id);
-            connect_active(swarm, &engine.mesh, dialing, enable_port_reuse);
+            connect_ready(swarm, engine, dialing, enable_port_reuse);
             false
         }
     }
@@ -439,7 +414,7 @@ fn flush_batcher(
 ) {
     let batches = batcher.flush();
     let outbound = engine.broadcast(&batches, None);
-    dispatch(swarm, &engine.mesh, dialing, enable_port_reuse, outbound);
+    dispatch(swarm, engine, dialing, enable_port_reuse, outbound);
 }
 
 // ─── Swarm event handling ────────────────────────────────────────────────────
@@ -470,7 +445,7 @@ fn handle_swarm_event(
             // If the engine returned an error (e.g. NotAdmitted), send it and
             // close the logical session in the behaviour.
             let has_error = outbound.iter().any(|(_, m)| matches!(m, Message::Error(_)));
-            dispatch(swarm, &engine.mesh, dialing, enable_port_reuse, outbound);
+            dispatch(swarm, engine, dialing, enable_port_reuse, outbound);
             if has_error {
                 swarm.behaviour_mut().zenin.close_session(peer_id);
             }
@@ -480,17 +455,16 @@ fn handle_swarm_event(
             message,
         })) => {
             let outbound = engine.receive(peer_id, message);
-            dispatch(swarm, &engine.mesh, dialing, enable_port_reuse, outbound);
+            dispatch(swarm, engine, dialing, enable_port_reuse, outbound);
         }
         SwarmEvent::Behaviour(SwarmBehaviourEvent::Zenin(BehaviourEvent::SessionClosed {
             peer_id,
         })) => {
             dialing.remove(&peer_id);
-            engine.mesh.disconnected(peer_id);
         }
         SwarmEvent::Behaviour(SwarmBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
             for (peer_id, address) in list {
-                if engine.mesh.is_active(peer_id)
+                if engine.is_active_peer(peer_id)
                     && !swarm.is_connected(&peer_id)
                     && dialing.insert(peer_id)
                     && swarm
@@ -515,37 +489,37 @@ fn handle_swarm_event(
 
 fn dispatch(
     swarm: &mut Swarm<SwarmBehaviour>,
-    mesh: &super::mesh::Mesh,
+    engine: &Engine,
     dialing: &mut HashSet<PeerId>,
     enable_port_reuse: bool,
     outbound: Vec<(PeerId, Message)>,
 ) {
     for (peer_id, message) in outbound {
-        dial_if_needed(swarm, mesh, dialing, peer_id, enable_port_reuse);
+        dial_if_needed(swarm, engine, dialing, peer_id, enable_port_reuse);
         swarm.behaviour_mut().zenin.send(peer_id, message);
     }
 }
 
-/// Dial active peers that we are not already connected to.
-fn connect_active(
+/// Dial every active peer that we are not already connected to.
+fn connect_ready(
     swarm: &mut Swarm<SwarmBehaviour>,
-    mesh: &super::mesh::Mesh,
+    engine: &Engine,
     dialing: &mut HashSet<PeerId>,
     enable_port_reuse: bool,
 ) {
-    for peer_id in mesh.known_peers() {
-        dial_if_needed(swarm, mesh, dialing, peer_id, enable_port_reuse);
+    for (peer_id, _) in engine.active_peer_routes() {
+        dial_if_needed(swarm, engine, dialing, peer_id, enable_port_reuse);
     }
 }
 
 fn dial_if_needed(
     swarm: &mut Swarm<SwarmBehaviour>,
-    mesh: &super::mesh::Mesh,
+    engine: &Engine,
     dialing: &mut HashSet<PeerId>,
     peer_id: PeerId,
     enable_port_reuse: bool,
 ) {
-    let addresses = mesh.addresses(peer_id);
+    let addresses = engine.addresses(peer_id);
     if !swarm.is_connected(&peer_id)
         && !addresses.is_empty()
         && dialing.insert(peer_id)

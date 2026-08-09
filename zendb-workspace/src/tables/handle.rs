@@ -23,7 +23,7 @@ pub(crate) enum TableKind {
 pub(crate) struct OpenTable {
     name: String,
     pub(super) table: RwLock<Table>,
-    listeners: RwLock<Arc<Vec<Arc<dyn ChangeListener>>>>,
+    listeners: RwLock<Vec<Arc<dyn ChangeListener>>>,
     kind: TableKind,
 }
 
@@ -32,7 +32,7 @@ impl OpenTable {
         Arc::new(Self {
             name,
             table: RwLock::new(table),
-            listeners: RwLock::new(Arc::new(Vec::new())),
+            listeners: RwLock::new(Vec::new()),
             kind,
         })
     }
@@ -58,9 +58,7 @@ impl OpenTable {
     }
 
     pub(crate) fn notify_listeners(&self, change: &Change) {
-        // Release the listener lock before callbacks so a listener can add,
-        // remove, or re-enter workspace operations without deadlocking.
-        let listeners = Arc::clone(&self.listeners.read());
+        let listeners = self.listeners.read();
         for listener in listeners.iter() {
             listener.on_change(change);
         }
@@ -106,10 +104,10 @@ impl TableHandle {
     }
 
     pub fn add_listener(&self, listener: Arc<dyn ChangeListener>) {
-        Arc::make_mut(&mut self.table.listeners.write()).push(listener);
+        self.table.listeners.write().push(listener);
     }
 
     pub fn pop_listener(&self) -> Option<Arc<dyn ChangeListener>> {
-        Arc::make_mut(&mut self.table.listeners.write()).pop()
+        self.table.listeners.write().pop()
     }
 }

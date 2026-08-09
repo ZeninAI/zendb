@@ -4,7 +4,6 @@
 //! - `wire`       -- `/zenin/1` protocol messages and framing
 //! - `transport`  -- TCP + QUIC + Noise + Yamux swarm construction
 //! - `protocol`   -- ConnectionHandler and NetworkBehaviour (libp2p glue)
-//! - `mesh`       -- event-driven peer selection and forwarding topology
 //! - `batcher`    -- serialized per-table event accumulation
 //! - `sync`       -- anti-entropy: receipts, ranges, recent cache, fetch
 //! - `engine`     -- replication logic: admission, routing, commit, broadcast
@@ -13,7 +12,6 @@
 mod batcher;
 mod controller;
 mod engine;
-mod mesh;
 mod protocol;
 mod sync;
 mod transport;

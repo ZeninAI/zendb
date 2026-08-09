@@ -62,7 +62,6 @@ pub fn loopback_workspace_config(port: u16) -> WorkspaceConfig {
             .parse()
             .expect("the loopback test address is valid"),
     ];
-    config.replication.mesh.maintenance_interval = Duration::from_millis(50);
     config.replication.sync.interval = Duration::from_millis(250);
     config.replication.batch.linger = Some(Duration::from_millis(50));
     config
@@ -72,7 +71,6 @@ pub fn offline_workspace_config() -> WorkspaceConfig {
     let mut config = WorkspaceConfig::default();
     config.replication.transport.enable_port_reuse = false;
     config.replication.transport.listener_addresses.clear();
-    config.replication.mesh.maintenance_interval = Duration::from_millis(50);
     config.replication.sync.interval = Duration::from_millis(250);
     config
 }

@@ -50,10 +50,10 @@ pub struct Topic<T> {
 }
 
 impl<T> Topic<T> {
-    fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()> {
+    fn persist(&mut self, barrier: crate::backend::Barrier) -> io::Result<()> {
         match barrier {
-            zendb_types::Barrier::Flush => self.active.flush()?,
-            zendb_types::Barrier::Sync => self.active.sync_all()?,
+            crate::backend::Barrier::Flush => self.active.flush()?,
+            crate::backend::Barrier::Sync => self.active.sync_all()?,
         }
         self.shared.offsets.lock().persist(barrier)
     }
@@ -345,14 +345,14 @@ where
         Ok(())
     }
 
-    fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()> {
+    fn persist(&mut self, barrier: crate::backend::Barrier) -> io::Result<()> {
         Topic::persist(self, barrier)
     }
 }
 
 impl<T> Drop for Topic<T> {
     fn drop(&mut self) {
-        let _ = Topic::persist(self, zendb_types::Barrier::Flush);
+        let _ = Topic::persist(self, crate::backend::Barrier::Flush);
     }
 }
 
@@ -439,7 +439,7 @@ mod tests {
             reader.commit().unwrap();
         }
 
-        topic.persist(zendb_types::Barrier::Sync).unwrap();
+        topic.persist(crate::backend::Barrier::Sync).unwrap();
         drop(topic);
 
         let topic = Topic::<u64>::open(&path, TopicConfig::default()).unwrap();
@@ -638,7 +638,7 @@ mod tests {
             let before = topic.segments.len();
             topic.compact().unwrap();
             assert!(topic.segments.len() < before);
-            topic.persist(zendb_types::Barrier::Sync).unwrap();
+            topic.persist(crate::backend::Barrier::Sync).unwrap();
         }
 
         let mut topic = Topic::<u64>::open(&path, config).unwrap();
@@ -653,7 +653,7 @@ mod tests {
         {
             let mut topic = Topic::<u64>::create(&path, TopicConfig::default()).unwrap();
             topic.append(&1).unwrap();
-            topic.persist(zendb_types::Barrier::Sync).unwrap();
+            topic.persist(crate::backend::Barrier::Sync).unwrap();
         }
         let active_path = path.join(segment_name(0));
         let mut file = OpenOptions::new().append(true).open(&active_path).unwrap();

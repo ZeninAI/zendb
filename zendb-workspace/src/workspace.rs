@@ -14,15 +14,13 @@ use bincode::{Decode, Encode};
 use libp2p_identity::Keypair;
 use tokio::sync::mpsc::unbounded_channel;
 use zendb_types::{
-    Event, EventId, EventStamp, EventTime, Installation, InstallationId, InstallationState,
-    Multiaddr, Op, Path as CrdtPath, PeerIdentity, Permissions, PublicKey, TypeOp, WorkspaceId,
-    utils::time::physical_ms,
+    Event, EventId, EventTime, Installation, InstallationId, InstallationOp, InstallationState,
+    Multiaddr, PathOp, PeerIdentity, Permissions, PublicKey, TypeOp, WorkspaceId, global_clock,
     utils::{deserialize_from, serialize_to_vec},
 };
 
 use crate::{
     Error, Result,
-    clock::HybridClock,
     config::{ReplicationConfig, WorkspaceConfig},
     core::WorkspaceCore,
     installations::{Installations, Membership},
@@ -76,7 +74,7 @@ impl Workspace {
         let state = WorkspaceState {
             workspace_id: config.workspace_id.unwrap_or_else(WorkspaceId::generate),
             installation_id: InstallationId::generate(),
-            clock: EventTime::default(),
+            clock: EventTime::ZERO,
         };
         let keypair = derive_workspace_keypair(
             peer_identity.as_ref(),
@@ -98,7 +96,7 @@ impl Workspace {
 
         // System storage must be durable before the identity becomes visible;
         // otherwise a later open could accept state for incomplete storage.
-        workspace.persist(zendb_types::Barrier::Sync)?;
+        workspace.persist(zendb_storage::Barrier::Sync)?;
         Ok(workspace)
     }
 
@@ -159,38 +157,33 @@ impl Workspace {
         let catalog_table = table_store.get(TABLE_CATALOG_NAME)?;
         let installations_table = table_store.get(INSTALLATIONS_TABLE_NAME)?;
         let public_key = PublicKey::from_libp2p(keypair.public());
-        let (membership, clock) = match mode {
+        let membership = match mode {
             AssemblyMode::Create => {
                 // The installations table owns its sequence stream, so the
                 // initial local installation event starts at sequence 1 there.
-                let installation = Installation {
-                    display_name: display_name.clone(),
-                    public_key,
-                    addresses: addresses.clone(),
-                    state: InstallationState::Active(Permissions::FULL),
-                };
-                let stamp = EventStamp {
+                let mut installation = Installation::default();
+                installation.display_name = display_name.clone();
+                installation.public_key = public_key;
+                installation.addresses = addresses.clone();
+                installation.state = InstallationState::Active(Permissions::FULL);
+                let time = global_clock().mint();
+                let installation_event = Event {
                     id: EventId {
                         author: state.installation_id,
                         sequence: 0,
                     },
-                    time: EventTime {
-                        physical_ms: physical_ms().ok_or(Error::ClockExhausted)?,
-                        logical: 0,
-                    },
-                };
-                let installation_event = Event {
                     primary_key: state.installation_id.into(),
-                    path: CrdtPath::new(),
-                    op: Op::Type(TypeOp::Installation(installation.set())),
-                    stamp,
+                    operations: vec![PathOp {
+                        path: Vec::new(),
+                        time,
+                        op: TypeOp::Installation(InstallationOp::Set {
+                            incoming: installation.clone(),
+                        }),
+                    }],
                 };
                 installations_table.insert_event(installation_event)?;
-                state.clock = stamp.time;
-                (
-                    Membership::create(state.installation_id, installation),
-                    HybridClock::new(state.clock),
-                )
+                state.clock = time;
+                Membership::create(state.installation_id, installation)
             }
             AssemblyMode::Open => {
                 // Opening validates membership and restores the last durable
@@ -199,7 +192,8 @@ impl Workspace {
                     let installations = installations_table.read();
                     Membership::open(&installations, state.installation_id, &public_key)?
                 };
-                (membership, HybridClock::new(state.clock))
+                global_clock().observe(state.clock);
+                membership
             }
         };
         let (replication_tx, replication_rx) = if replication_config.enabled {
@@ -212,7 +206,6 @@ impl Workspace {
             table_store,
             states,
             membership,
-            clock,
             replication_notifications: replication_tx,
         });
         if matches!(mode, AssemblyMode::Open) {
@@ -227,8 +220,13 @@ impl Workspace {
                 core.commit_change(
                     &installations_table,
                     local_installation_id.into(),
-                    CrdtPath::new(),
-                    Op::Type(TypeOp::Installation(installation.set())),
+                    vec![PathOp {
+                        path: Vec::new(),
+                        time: global_clock().mint(),
+                        op: TypeOp::Installation(InstallationOp::Set {
+                            incoming: installation.clone(),
+                        }),
+                    }],
                 )?;
             }
         }
@@ -257,13 +255,13 @@ impl Workspace {
         })
     }
 
-    pub fn persist(&self, barrier: zendb_types::Barrier) -> Result<()> {
+    pub fn persist(&self, barrier: zendb_storage::Barrier) -> Result<()> {
         self.core.table_store.persist(barrier)?;
         self.core.states.persist(barrier)?;
         let state = WorkspaceState {
             workspace_id: self.workspace_id,
             installation_id: self.core.membership.local_installation_id(),
-            clock: self.core.clock.snapshot(),
+            clock: zendb_types::global_clock().snapshot(),
         };
         let bytes = serialize_to_vec(&state)?;
         let mut file = OpenOptions::new()
@@ -273,8 +271,8 @@ impl Workspace {
             .open(self.root.join(IDENTITY_FILE))?;
         file.write_all(&bytes)?;
         match barrier {
-            zendb_types::Barrier::Flush => file.flush()?,
-            zendb_types::Barrier::Sync => file.sync_all()?,
+            zendb_storage::Barrier::Flush => file.flush()?,
+            zendb_storage::Barrier::Sync => file.sync_all()?,
         }
         Ok(())
     }
@@ -307,7 +305,7 @@ impl Drop for Workspace {
         if let Some(replication) = &mut self.replication {
             replication.shutdown();
         }
-        let _ = self.persist(zendb_types::Barrier::Flush);
+        let _ = self.persist(zendb_storage::Barrier::Flush);
     }
 }
 

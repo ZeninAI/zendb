@@ -8,6 +8,15 @@ use std::{borrow::Cow, fmt::Debug, hash::Hash, io, path::Path};
 
 use bincode::{Decode, Encode};
 
+/// Selects the durability guarantee for a persist operation.
+#[derive(Clone, Copy)]
+pub enum Barrier {
+    /// Write dirty data to the OS page cache.
+    Flush,
+    /// Write dirty data and fsync to stable storage.
+    Sync,
+}
+
 pub trait Storage {
     type Stats: Clone + Encode + Decode<()> + Debug;
     type Config: Clone + Debug;
@@ -33,7 +42,7 @@ pub trait DurableStorage: Storage {
         Ok(())
     }
 
-    fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()>;
+    fn persist(&mut self, barrier: Barrier) -> io::Result<()>;
 }
 
 /// Read-only key/value access shared by raw backends and higher-level tables.

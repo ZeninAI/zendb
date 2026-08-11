@@ -4,9 +4,7 @@
 use std::{borrow::Cow, fs, io, path::Path};
 
 use bincode::{Decode, Encode};
-use zendb_types::{
-    Cell, ContainerType, Event, EventId, EventStamp, InstallationId, MergeStamps, PrimaryKey,
-};
+use zendb_types::{Event, EventId, InstallationId, PrimaryKey, Value, ValueSlot};
 
 use crate::{
     DurableStorage, OrderedReadBackend, ReadBackend, SeekTarget, State, StateConfig, StateStats,
@@ -18,7 +16,7 @@ use super::receipt::ReceiptWindow;
 
 const RECOVERY_CONSUMER: &str = "__zendb_table_recovery";
 
-type TableEntry<'a> = (Cow<'a, PrimaryKey>, Cow<'a, Cell>);
+type TableEntry<'a> = (Cow<'a, PrimaryKey>, Cow<'a, Value>);
 
 #[derive(Debug, Clone)]
 pub enum InsertOutcome {
@@ -52,7 +50,7 @@ pub struct TableStats {
 
 pub struct Table {
     config: TableConfig,
-    state: State<PrimaryKey, Cell>,
+    state: State<PrimaryKey, Value>,
     causal: State<InstallationId, ReceiptWindow>,
     topic: Topic<Change>,
     recovery: TopicConsumer<Change>,
@@ -74,13 +72,13 @@ impl Table {
     /// A sequence is committed only when the event changes materialized state.
     /// A CRDT no-op therefore remains invisible to the topic and causal state.
     pub fn insert(&mut self, mut event: Event) -> io::Result<InsertOutcome> {
-        let author = event.stamp.id.author;
+        let author = event.id.author;
         let mut receipt = self
             .causal
             .get(&author)
             .map(Cow::into_owned)
             .unwrap_or_default();
-        event.stamp.id.sequence = receipt.max_seen.checked_add(1).ok_or_else(|| {
+        event.id.sequence = receipt.max_seen.checked_add(1).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Other,
                 "table installation sequence exhausted",
@@ -100,7 +98,7 @@ impl Table {
                 .clone()
                 .expect("applied changes always carry current state"),
         )?;
-        receipt.observe(change.event.stamp.id.sequence)?;
+        receipt.observe(change.event.id.sequence)?;
         self.causal.put(author, receipt)?;
         Ok(InsertOutcome::Applied(Box::new(change)))
     }
@@ -111,8 +109,8 @@ impl Table {
     /// not change this table still advances the receipt window, but is not
     /// appended to the materialized-change topic.
     pub fn observe(&mut self, event: Event) -> io::Result<InsertOutcome> {
-        let author = event.stamp.id.author;
-        let sequence = event.stamp.id.sequence;
+        let author = event.id.author;
+        let sequence = event.id.sequence;
         if sequence == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -167,24 +165,21 @@ impl Table {
 
     fn prepare_change(&self, event: Event) -> io::Result<Option<Change>> {
         let previous = self.get(&event.primary_key).map(Cow::into_owned);
-        let mut current = previous.clone().unwrap_or_else(|| Cell::dummy(None));
-        let current_stamp = previous
-            .as_ref()
-            .map_or_else(EventStamp::default, |cell| cell.stamp);
-        let changed = current
-            .apply_walk(
-                &event.op,
-                MergeStamps::new(current_stamp, event.stamp),
-                &event.path,
-            )
-            .map_err(io::Error::other)?;
+        let mut current = previous.clone();
+        let mut changed = false;
+        for operation in &event.operations {
+            zendb_types::global_clock().observe(operation.time);
+            changed |= current
+                .apply_path(operation.time, &operation.path, &operation.op)
+                .map_err(io::Error::other)?;
+        }
         if !changed {
             return Ok(None);
         }
         Ok(Some(Change {
             event,
             previous,
-            current: Some(current),
+            current,
         }))
     }
 
@@ -192,20 +187,20 @@ impl Table {
         for change in self.recovery.by_ref() {
             let change = change?;
             match change.current {
-                Some(cell) => {
-                    WriteBackend::put(&mut self.state, change.event.primary_key, cell)?;
+                Some(value) => {
+                    WriteBackend::put(&mut self.state, change.event.primary_key, value)?;
                 }
                 None => {
                     WriteBackend::delete(&mut self.state, &change.event.primary_key)?;
                 }
             }
         }
-        self.state.persist(zendb_types::Barrier::Sync)?;
+        self.state.persist(crate::backend::Barrier::Sync)?;
         self.commit_recovery()?;
-        self.topic.persist(zendb_types::Barrier::Sync)
+        self.topic.persist(crate::backend::Barrier::Sync)
     }
 
-    fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()> {
+    fn persist(&mut self, barrier: crate::backend::Barrier) -> io::Result<()> {
         self.state.persist(barrier)?;
         self.causal.persist(barrier)?;
         self.commit_recovery()?;
@@ -277,19 +272,19 @@ impl DurableStorage for Table {
         self.causal.compact()
     }
 
-    fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()> {
+    fn persist(&mut self, barrier: crate::backend::Barrier) -> io::Result<()> {
         Table::persist(self, barrier)
     }
 }
 
 impl Drop for Table {
     fn drop(&mut self) {
-        let _ = Table::persist(self, zendb_types::Barrier::Flush);
+        let _ = Table::persist(self, crate::backend::Barrier::Flush);
     }
 }
 
-impl ReadBackend<PrimaryKey, Cell> for Table {
-    fn get(&self, key: &PrimaryKey) -> Option<Cow<'_, Cell>> {
+impl ReadBackend<PrimaryKey, Value> for Table {
+    fn get(&self, key: &PrimaryKey) -> Option<Cow<'_, Value>> {
         ReadBackend::get(&self.state, key)
     }
 
@@ -304,17 +299,17 @@ impl ReadBackend<PrimaryKey, Cell> for Table {
         Box::new(ReadBackend::entries(self).map(|(key, _)| key))
     }
 
-    fn values<'a>(&'a self) -> impl Iterator<Item = Cow<'a, Cell>> + 'a
+    fn values<'a>(&'a self) -> impl Iterator<Item = Cow<'a, Value>> + 'a
     where
-        Cell: 'a,
+        Value: 'a,
     {
         Box::new(ReadBackend::entries(self).map(|(_, value)| value))
     }
 
-    fn entries<'a>(&'a self) -> impl Iterator<Item = (Cow<'a, PrimaryKey>, Cow<'a, Cell>)> + 'a
+    fn entries<'a>(&'a self) -> impl Iterator<Item = (Cow<'a, PrimaryKey>, Cow<'a, Value>)> + 'a
     where
         PrimaryKey: 'a,
-        Cell: 'a,
+        Value: 'a,
     {
         Box::new(ReadBackend::entries(&self.state))
     }
@@ -328,15 +323,15 @@ impl ReadBackend<PrimaryKey, Cell> for Table {
     }
 }
 
-impl OrderedReadBackend<PrimaryKey, Cell> for Table {
+impl OrderedReadBackend<PrimaryKey, Value> for Table {
     fn range<'a>(
         &'a self,
         start: &'a PrimaryKey,
         end: &'a PrimaryKey,
-    ) -> impl Iterator<Item = (Cow<'a, PrimaryKey>, Cow<'a, Cell>)> + 'a
+    ) -> impl Iterator<Item = (Cow<'a, PrimaryKey>, Cow<'a, Value>)> + 'a
     where
         PrimaryKey: 'a,
-        Cell: 'a,
+        Value: 'a,
     {
         OrderedReadBackend::range(&self.state, start, end)
     }
@@ -344,7 +339,7 @@ impl OrderedReadBackend<PrimaryKey, Cell> for Table {
     fn first<'a>(&'a self) -> Option<TableEntry<'a>>
     where
         PrimaryKey: 'a,
-        Cell: 'a,
+        Value: 'a,
     {
         OrderedReadBackend::first(&self.state)
     }
@@ -352,7 +347,7 @@ impl OrderedReadBackend<PrimaryKey, Cell> for Table {
     fn last<'a>(&'a self) -> Option<TableEntry<'a>>
     where
         PrimaryKey: 'a,
-        Cell: 'a,
+        Value: 'a,
     {
         OrderedReadBackend::last(&self.state)
     }
@@ -360,7 +355,7 @@ impl OrderedReadBackend<PrimaryKey, Cell> for Table {
     fn entries_rev<'a>(&'a self) -> impl Iterator<Item = TableEntry<'a>> + 'a
     where
         PrimaryKey: 'a,
-        Cell: 'a,
+        Value: 'a,
     {
         OrderedReadBackend::entries_rev(&self.state)
     }
@@ -372,7 +367,7 @@ impl OrderedReadBackend<PrimaryKey, Cell> for Table {
     ) -> impl Iterator<Item = TableEntry<'a>> + 'a
     where
         PrimaryKey: 'a,
-        Cell: 'a,
+        Value: 'a,
     {
         OrderedReadBackend::range_rev(&self.state, start, end)
     }

@@ -9,9 +9,9 @@ pub mod table;
 pub mod topic;
 
 pub use backend::{
-    BPlusTree, BPlusTreeConfig, BPlusTreeStats, DurableStorage, KeyDir, KeyDirConfig, KeyDirStats,
-    OrderedReadBackend, ReadBackend, SkipList, SkipListCapacity, SkipListConfig, SkipListStats,
-    State, StateConfig, StateStats, Storage, WriteBackend,
+    BPlusTree, BPlusTreeConfig, BPlusTreeStats, Barrier, DurableStorage, KeyDir, KeyDirConfig,
+    KeyDirStats, OrderedReadBackend, ReadBackend, SkipList, SkipListCapacity, SkipListConfig,
+    SkipListStats, State, StateConfig, StateStats, Storage, WriteBackend,
 };
 pub use table::{Change, InsertOutcome, ReceiptWindow, Table, TableConfig, TableStats};
 pub use topic::{

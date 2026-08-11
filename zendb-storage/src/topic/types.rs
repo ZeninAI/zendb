@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use bincode::{Decode, Encode};
 use hashbrown::HashMap;
 use parking_lot::Mutex;
-use zendb_types::EventStamp;
+use zendb_types::EventId;
 
 use crate::backend::keydir::{KeyDir, KeyDirConfig};
 
@@ -51,7 +51,7 @@ pub enum SeekTarget<'a> {
     /// Jump directly to a topic offset.
     Offset(TopicOffset),
     /// Scan from the earliest retained offset until the predicate returns true.
-    StampPredicate(Box<dyn FnMut(&EventStamp) -> bool + 'a>),
+    EventPredicate(Box<dyn FnMut(&EventId) -> bool + 'a>),
     /// Jump to the earliest retained topic offset.
     Earliest,
     /// Jump to the current topic tail.
@@ -59,9 +59,9 @@ pub enum SeekTarget<'a> {
 }
 
 impl<'a> SeekTarget<'a> {
-    /// Create a stamp-predicate target without explicitly boxing the closure.
-    pub fn stamp_predicate(predicate: impl FnMut(&EventStamp) -> bool + 'a) -> Self {
-        Self::StampPredicate(Box::new(predicate))
+    /// Create an event-identity predicate without explicitly boxing the closure.
+    pub fn event_predicate(predicate: impl FnMut(&EventId) -> bool + 'a) -> Self {
+        Self::EventPredicate(Box::new(predicate))
     }
 }
 

@@ -6,10 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Portable identifiers, event stamps, and CRDT values for ZenDB"
+description = "Portable identifiers, per-operation CRDT time, and values for ZenDB"
 
 [dependencies]
 bincode.workspace = true
+portable-atomic.workspace = true
 libp2p-identity.workspace = true
 multiaddr.workspace = true
 rand.workspace = true
+parking_lot.workspace = true
+zendb-macros = { path = "../zendb-macros", version = "0.1.0" }

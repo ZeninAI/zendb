@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use arc_swap::ArcSwap;
 use zendb_storage::{Change, ReadBackend, Table};
-use zendb_types::{Installation, InstallationId, Op, Permission, PublicKey, TypeOp, Value};
+use zendb_types::{Installation, InstallationId, Permission, PublicKey, Type, TypeOp, Value};
 
 use crate::{Error, Result};
 
@@ -40,15 +40,15 @@ impl Membership {
         expected_public_key: &PublicKey,
     ) -> Result<Self> {
         let mut installations = BTreeMap::new();
-        for (key, cell) in installations_table.entries() {
+        for (key, value) in installations_table.entries() {
             let key = key.into_owned();
             let installation_id = InstallationId::try_from(&key).map_err(|error| {
                 Error::CorruptInstallations(format!("invalid installation key: {error}"))
             })?;
-            let installation = match cell.into_owned().value {
-                Some(Value::Installation(installation)) => installation,
-                None => continue,
-                Some(_) => {
+            let installation = match value.into_owned() {
+                Value::Installation(installation) if !installation.is_tombstone() => installation,
+                Value::Installation(_) => continue,
+                _ => {
                     return Err(Error::CorruptInstallations(format!(
                         "installation {installation_id} has the wrong value type"
                     )));
@@ -132,16 +132,15 @@ impl Membership {
         let Ok(installation_id) = InstallationId::try_from(&change.event.primary_key) else {
             return;
         };
-        if !change.event.path.is_empty() {
+        if change.event.operations.len() != 1 || !change.event.operations[0].path.is_empty() {
             return;
         }
-        let installation = match &change.event.op {
-            Op::Type(TypeOp::Installation(_)) => match &change.current {
-                Some(cell) => match &cell.value {
-                    Some(Value::Installation(installation)) => Arc::new(installation.clone()),
-                    _ => return,
-                },
-                None => return,
+        let installation = match &change.event.operations[0].op {
+            TypeOp::Installation(_) => match &change.current {
+                Some(Value::Installation(installation)) if !installation.is_tombstone() => {
+                    Arc::new(installation.clone())
+                }
+                _ => return,
             },
             _ => return,
         };

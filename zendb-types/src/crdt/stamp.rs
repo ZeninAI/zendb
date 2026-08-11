@@ -1,4 +1,4 @@
-//! Stable event identity and hybrid logical time.
+//! Stable event identity and hybrid logical CRDT operation time.
 
 use bincode::{Decode, Encode};
 
@@ -10,57 +10,37 @@ pub struct EventId {
     pub sequence: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+impl EventId {
+    pub const ENCODED_SIZE: usize = 16;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct EventTime {
     pub physical_ms: u64,
     pub logical: u32,
 }
 
-/// A globally ordered event stamp.
-///
-/// Ordering is time first and identity second:
-/// `(physical_ms, logical, author, sequence)`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Encode, Decode)]
-pub struct EventStamp {
-    pub time: EventTime,
-    pub id: EventId,
+impl EventTime {
+    pub const ZERO: Self = Self {
+        physical_ms: 0,
+        logical: 0,
+    };
 }
 
-impl PartialOrd for EventStamp {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+impl Default for EventTime {
+    fn default() -> Self {
+        crate::global_clock().mint()
     }
 }
 
-impl Ord for EventStamp {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (
-            self.time.physical_ms,
-            self.time.logical,
-            self.id.author,
-            self.id.sequence,
-        )
-            .cmp(&(
-                other.time.physical_ms,
-                other.time.logical,
-                other.id.author,
-                other.id.sequence,
-            ))
-    }
-}
-
-impl EventStamp {
-    /// Fixed encoded size under bincode's fixed-int little-endian config:
-    /// EventId(16) + EventTime(12) = 28 bytes.
-    pub const ENCODED_SIZE: usize = 28;
-}
-
-impl std::fmt::Display for EventStamp {
+impl std::fmt::Display for EventTime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "{}:{}:{}:{}",
-            self.time.physical_ms, self.time.logical, self.id.author, self.id.sequence
-        )
+        write!(formatter, "{}:{}", self.physical_ms, self.logical)
+    }
+}
+
+impl std::fmt::Display for EventId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}:{}", self.author, self.sequence)
     }
 }

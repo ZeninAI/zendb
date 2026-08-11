@@ -2,6 +2,7 @@
 resolver = "2"
 
 members = [
+    "zendb-macros",
     "zendb-types",
     "zendb-storage",
     "zendb-workspace",
@@ -27,6 +28,7 @@ memmap2 = "0.9.11"
 hashbrown = "0.17.1"
 
 bincode = { version = "2.0.1", features = ["derive"] }
+portable-atomic = "1.14.0"
 
 
 libp2p-identity = { version = "0.2.14", features = ["ed25519", "peerid", "rand"] }

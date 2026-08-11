@@ -5,7 +5,9 @@ mod membership;
 use std::sync::Arc;
 
 use zendb_storage::InsertOutcome;
-use zendb_types::{Installation, InstallationId, Op, Path, Permission, TypeOp};
+use zendb_types::{
+    Installation, InstallationId, InstallationOp, PathOp, Permission, TypeOp, global_clock,
+};
 
 pub(crate) use membership::Membership;
 
@@ -51,8 +53,13 @@ impl Installations {
         let outcome = self.core.commit_change(
             &self.table,
             installation_id.into(),
-            Path::new(),
-            Op::Type(TypeOp::Installation(installation.set())),
+            vec![PathOp {
+                path: Vec::new(),
+                time: global_clock().mint(),
+                op: TypeOp::Installation(InstallationOp::Set {
+                    incoming: installation,
+                }),
+            }],
         )?;
         Ok(matches!(outcome, InsertOutcome::Applied(_)))
     }
@@ -72,8 +79,13 @@ impl Installations {
         let outcome = self.core.commit_change(
             &self.table,
             installation_id.into(),
-            Path::new(),
-            Op::Type(TypeOp::Installation(installation.set())),
+            vec![PathOp {
+                path: Vec::new(),
+                time: global_clock().mint(),
+                op: TypeOp::Installation(InstallationOp::Set {
+                    incoming: installation,
+                }),
+            }],
         )?;
         Ok(matches!(outcome, InsertOutcome::Applied(_)))
     }

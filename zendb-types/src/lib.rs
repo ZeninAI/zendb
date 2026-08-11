@@ -1,15 +1,20 @@
-//! Portable identifiers, event stamps, and CRDT values used by ZenDB.
+//! Portable identifiers, per-operation CRDT time, and metadata-owning values.
+
+extern crate self as zendb_types;
 
 #[macro_use]
 pub mod crdt;
 
+mod clock;
 pub mod replication;
 pub mod utils;
 
+pub use clock::{HybridClock, global_clock};
+
 register_types! {
-    key Bool => crate::crdt::values::bool::Bool,
-    key Int => crate::crdt::values::int::Int,
-    key String => crate::crdt::values::string::String,
+    key Bool => bool,
+    key Int => i64,
+    key String => std::string::String,
     key Timestamp => crate::crdt::values::timestamp::Timestamp,
     key Blob => crate::crdt::values::blob::Blob,
     leaf Bool => crate::crdt::values::bool::Bool,
@@ -18,16 +23,9 @@ register_types! {
     leaf Timestamp => crate::crdt::values::timestamp::Timestamp,
     leaf Blob => crate::crdt::values::blob::Blob,
     leaf Installation => crate::crdt::values::installation::Installation,
-    leaf Float32 => crate::crdt::values::float::Float32,
-    leaf Float64 => crate::crdt::values::float::Float64,
-    leaf Counter => crate::crdt::values::counter::Counter,
-    leaf MvRegister => crate::crdt::values::mv_register::MvRegister,
-    leaf OrSet => crate::crdt::values::or_set::OrSet,
-    leaf PriorityQueue => crate::crdt::values::priority_queue::PriorityQueue,
-    leaf Set => crate::crdt::values::set::Set,
+    leaf Float => crate::crdt::values::float::Float,
     leaf Text => crate::crdt::values::text::Text,
-    container Record(crate::crdt::values::record::RecordSegment) => crate::crdt::values::record::Record,
-    container List(crate::crdt::values::list::ListSegment) => crate::crdt::values::list::List,
+    container Record => crate::crdt::values::record::Record,
 }
 
 pub use crdt::*;
@@ -35,12 +33,4 @@ pub use replication::{
     IdFromPrimaryKeyError, InstallationId, InstallationIdParseError, Multiaddr, MultiaddrError,
     PeerIdentity, Permission, Permissions, PublicKey, WorkspaceId, WorkspaceIdParseError,
 };
-
-/// Selects the durability guarantee for a persist operation.
-#[derive(Clone, Copy)]
-pub enum Barrier {
-    /// Write dirty data to the OS page cache.
-    Flush,
-    /// Write dirty data and fsync to stable storage.
-    Sync,
-}
+pub use zendb_macros::{zendb_container_type, zendb_type};

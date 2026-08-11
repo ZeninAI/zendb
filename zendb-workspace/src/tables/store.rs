@@ -12,8 +12,8 @@ use std::{
 use parking_lot::{Mutex, RwLock};
 use zendb_storage::{Change, DurableStorage, ReadBackend, Table, TableConfig};
 use zendb_types::{
-    Blob, Cell, Event, EventId, EventStamp, EventTime, InstallationId, Op, Path as CrdtPath,
-    PrimaryKey, Value, utils::time::physical_ms,
+    Blob, BlobOp, Event, EventId, InstallationId, PathOp, PrimaryKey, Type, TypeOp, Value,
+    global_clock,
 };
 
 use super::{OpenTable, TableKind};
@@ -52,38 +52,32 @@ impl TableStore {
         // owns its own local sequence stream, so the first declaration starts
         // at sequence 1 on the catalog table.
         catalog.insert(Event {
+            id: EventId {
+                author: local_installation_id,
+                sequence: 0,
+            },
             primary_key: PrimaryKey::String(TABLE_CATALOG_NAME.to_owned()),
-            path: CrdtPath::new(),
-            op: Op::Upsert {
-                value: Value::Blob(Blob::encode(&*SYSTEM_TABLE_CONFIG)?),
-            },
-            stamp: EventStamp {
-                id: EventId {
-                    author: local_installation_id,
-                    sequence: 0,
-                },
-                time: EventTime {
-                    physical_ms: physical_ms().ok_or(Error::ClockExhausted)?,
-                    logical: 0,
-                },
-            },
+            operations: vec![PathOp {
+                path: Vec::new(),
+                time: global_clock().mint(),
+                op: TypeOp::Blob(BlobOp::Set {
+                    bytes: Blob::encode(&*SYSTEM_TABLE_CONFIG)?.as_slice().to_vec(),
+                }),
+            }],
         })?;
         catalog.insert(Event {
+            id: EventId {
+                author: local_installation_id,
+                sequence: 0,
+            },
             primary_key: PrimaryKey::String(INSTALLATIONS_TABLE_NAME.to_owned()),
-            path: CrdtPath::new(),
-            op: Op::Upsert {
-                value: Value::Blob(Blob::encode(&*SYSTEM_TABLE_CONFIG)?),
-            },
-            stamp: EventStamp {
-                id: EventId {
-                    author: local_installation_id,
-                    sequence: 0,
-                },
-                time: EventTime {
-                    physical_ms: physical_ms().ok_or(Error::ClockExhausted)?,
-                    logical: 0,
-                },
-            },
+            operations: vec![PathOp {
+                path: Vec::new(),
+                time: global_clock().mint(),
+                op: TypeOp::Blob(BlobOp::Set {
+                    bytes: Blob::encode(&*SYSTEM_TABLE_CONFIG)?.as_slice().to_vec(),
+                }),
+            }],
         })?;
         Self::from_system_tables(root, catalog, installations)
     }
@@ -156,7 +150,7 @@ impl TableStore {
         }
     }
 
-    pub(crate) fn persist(&self, barrier: zendb_types::Barrier) -> Result<()> {
+    pub(crate) fn persist(&self, barrier: zendb_storage::Barrier) -> Result<()> {
         let _lifecycle = self.lifecycle.lock();
         let tables: Vec<_> = self.tables.read().values().cloned().collect();
         for table in tables {
@@ -177,18 +171,16 @@ impl TableStore {
         let PrimaryKey::String(name) = &change.event.primary_key else {
             return;
         };
-        if !change.event.path.is_empty() {
+        if change.event.operations.len() != 1 || !change.event.operations[0].path.is_empty() {
             return;
         }
         let _lifecycle = self.lifecycle.lock();
-        match &change.event.op {
-            Op::Upsert {
-                value: Value::Blob(blob),
-            } => {
+        match &change.event.operations[0].op {
+            TypeOp::Blob(BlobOp::Set { bytes }) => {
                 if self.tables.read().contains_key(name) {
                     return;
                 }
-                let Ok(config) = blob.decode::<TableConfig>() else {
+                let Ok(config) = Blob::from(bytes.clone()).decode::<TableConfig>() else {
                     return;
                 };
                 let path = self.root.join(name);
@@ -202,7 +194,7 @@ impl TableStore {
                     );
                 }
             }
-            Op::Delete => {
+            TypeOp::Blob(BlobOp::Delete {}) => {
                 if let Some(table) = self.tables.write().remove(name) {
                     // Drop the shared handle before removing its directory so
                     // the storage file is no longer owned by the workspace.
@@ -219,16 +211,16 @@ impl TableStore {
     }
 }
 
-fn decode_catalog_row(key: PrimaryKey, cell: Cell) -> Result<Option<(String, TableConfig)>> {
+fn decode_catalog_row(key: PrimaryKey, value: Value) -> Result<Option<(String, TableConfig)>> {
     let PrimaryKey::String(name) = key else {
         return Err(Error::CorruptTableCatalog(
             "table catalog key is not a String".to_owned(),
         ));
     };
-    let blob = match cell.value {
-        Some(Value::Blob(blob)) => blob,
-        None => return Ok(None),
-        Some(_) => {
+    let blob = match value {
+        Value::Blob(blob) if blob.is_tombstone() => return Ok(None),
+        Value::Blob(blob) => blob,
+        _ => {
             return Err(Error::CorruptTableCatalog(format!(
                 "table catalog row {name:?} is not a Blob"
             )));

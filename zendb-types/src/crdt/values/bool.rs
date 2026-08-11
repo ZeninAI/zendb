@@ -1,55 +1,36 @@
-//! Boolean scalar type.
+//! Boolean scalar CRDT.
 
 use bincode::{Decode, Encode};
 
-use crate::{Cell, CellProxy, CellProxyError, EventStamp, Type, Value};
+use crate::zendb_type;
 
-pub type Bool = bool;
+zendb_type! {
+    #[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
+    pub struct Bool { pub value: bool }
 
-impl CellProxy for bool {
-    fn from_cell(cell: &Cell) -> Result<Self, CellProxyError> {
-        match &cell.value {
-            Some(Value::Bool(value)) => Ok(*value),
-            _ => Err(CellProxyError::expected("Bool Cell")),
+    impl Bool {
+        pub fn op_set(&mut self, remote: crate::EventTime, value: bool) -> bool {
+            if remote <= self.__event_time { return false; }
+            self.value = value;
+            self.__is_tombstone = false;
+            self.__event_time = remote;
+            true
+        }
+
+        pub fn op_delete(&mut self, remote: crate::EventTime) -> bool {
+            if remote <= self.__event_time { return false; }
+            self.__is_tombstone = true;
+            self.__event_time = remote;
+            true
         }
     }
-
-    fn to_cell(&self, stamp: EventStamp) -> Result<Cell, CellProxyError> {
-        Ok(Cell {
-            value: Some(Value::Bool(*self)),
-            stamp,
-        })
-    }
 }
 
-#[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub enum BoolOp {}
-
-#[derive(Debug)]
-pub enum BoolError {}
-
-impl std::fmt::Display for BoolError {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {}
-    }
-}
-
-impl std::error::Error for BoolError {}
-
-impl Type for Bool {
-    type Op = BoolOp;
-    type Error = BoolError;
-
-    fn apply(&mut self, op: &BoolOp, _stamps: crate::MergeStamps) -> Result<bool, BoolError> {
-        match *op {}
-    }
-
-    fn merge(&mut self, remote: &Bool, stamps: crate::MergeStamps) -> Result<bool, BoolError> {
-        if stamps.incoming > stamps.current {
-            *self = *remote;
-            Ok(true)
-        } else {
-            Ok(false)
+impl From<bool> for Bool {
+    fn from(value: bool) -> Self {
+        Self {
+            value,
+            ..Self::default()
         }
     }
 }

@@ -7,9 +7,10 @@ workspace authorization, and workspace-owned peer-to-peer replication.
 
 | Crate | Responsibility |
 |---|---|
+| `zendb-macros` | Procedural macros for metadata-owning CRDT types and operation facades |
 | `zendb-types` | IDs, installations, permissions, CRDT values, and binary utilities |
 | `zendb-storage` | B+ tree, KeyDir, SkipList, State, segmented Topic, indexed topics, and Table |
-| `zendb-workspace` | Workspace lifecycle, catalogs, membership, workspace clock, network admission, and the Zenin libp2p runtime |
+| `zendb-workspace` | Workspace lifecycle, catalogs, membership, global CRDT clock, network admission, and the Zenin libp2p runtime |
 | `zendb-it` | Integration coverage for workspace lifecycle and replication |
 
 Applications provide an account-root libp2p keypair, display name, and optional
@@ -18,20 +19,23 @@ route hints through `PeerIdentity`. ZenDB derives a distinct Ed25519 installatio
 
 ## Storage
 
-A `Table` combines materialized `PrimaryKey -> Cell` state, per-installation
-causal state, and a `Topic<Change>`. The table writes applied cells directly to
-State. Local CRDT no-ops are not appended to the topic; remote observations
-that do not change local state update causal receipt state without entering the
-topic until the later no-op replication response is implemented.
+A `Table` combines materialized `PrimaryKey -> Value` state, per-installation
+causal state, and a `Topic<Change>`. Each `Event` carries one primary key and a
+vector of `PathOp` values. The table assigns one event identity to the batch,
+while each `PathOp` carries its own `EventTime` for CRDT conflict resolution.
+Operations are applied atomically to one working row. Local CRDT no-ops are not
+appended to the topic; remote observations that do not change local state still
+advance causal receipt state.
 
-Because `Event` starts with `stamp` and bincode uses fixed-int encoding, the
-first 28 bytes of every record are the `EventStamp`. Topic readers can filter
-by installation or time by scanning only this prefix.
+Because `Event` starts with `EventId` and bincode uses fixed-int encoding, the
+first 16 bytes of every record are the event identity. Topic readers can filter
+by installation by scanning only this prefix. CRDT `EventTime` values remain in
+the operation payload and are not network identities.
 Topic segments maintain a sparse byte-position index for bounded local seeks.
 
 A `State` is caller-typed local storage without a change topic. The system
-state catalog remains open for the workspace lifetime; the workspace hybrid
-clock is stored in `_identity` alongside the workspace and installation IDs.
+state catalog remains open for the workspace lifetime; the process-wide hybrid
+clock is checkpointed in `_identity` alongside the workspace and installation IDs.
 
 ## Zenin Protocol
 

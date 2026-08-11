@@ -11,12 +11,12 @@ use std::{path::Path, sync::Arc, time::Instant};
 
 use zendb_it::{TestPeerIdentity, offline_workspace_config};
 use zendb_storage::{
-    BPlusTreeConfig, Change, DurableStorage, InsertOutcome, KeyDirConfig, ReadBackend, SeekTarget,
-    SkipListConfig, State, StateConfig, Table, TableConfig, Topic, TopicConfig, WriteBackend,
+    BPlusTreeConfig, Barrier, Change, DurableStorage, InsertOutcome, KeyDirConfig, ReadBackend,
+    SeekTarget, SkipListConfig, State, StateConfig, Table, TableConfig, Topic, TopicConfig,
+    WriteBackend,
 };
 use zendb_types::{
-    Barrier, Cell, Event, EventId, EventStamp, EventTime, InstallationId, Op, Path as CellPath,
-    PrimaryKey, Value,
+    Event, EventId, EventTime, InstallationId, PathOp, PrimaryKey, StringOp, TypeOp, Value,
 };
 use zendb_workspace::Workspace;
 
@@ -34,7 +34,7 @@ const TABLE_EVENTS: u64 = 20_000;
 const TOPIC_RECORDS: u64 = 50_000;
 /// Randomized `SeekTarget::Offset` probes against a populated topic.
 const TOPIC_OFFSET_SEEKS: u64 = 5_000;
-/// `SeekTarget::StampPredicate` probes. Each one scans stamp prefixes from the
+/// Event-identity predicate probes. Each one scans identity prefixes from the
 /// earliest retained offset, so this stays far below the offset-seek count.
 const TOPIC_STAMP_SEEKS: u64 = 200;
 /// Payload bytes carried by every benchmarked cell value.
@@ -68,34 +68,27 @@ fn payload() -> String {
     "x".repeat(PAYLOAD_BYTES)
 }
 
-fn stamp(sequence: u64) -> EventStamp {
-    EventStamp {
-        time: EventTime {
-            physical_ms: sequence,
-            logical: 0,
-        },
-        id: EventId {
-            author: InstallationId::from_bytes([7; 8]),
-            sequence,
-        },
-    }
-}
-
-fn cell(sequence: u64, payload: &str) -> Cell {
-    Cell {
-        value: Some(Value::String(payload.to_owned())),
-        stamp: stamp(sequence),
-    }
+fn value(payload: &str) -> Value {
+    Value::String(payload.to_owned().into())
 }
 
 fn event(sequence: u64, key: i64, payload: &str) -> Event {
     Event {
-        stamp: stamp(sequence),
-        primary_key: PrimaryKey::Int(key),
-        path: CellPath::new(),
-        op: Op::Upsert {
-            value: Value::String(payload.to_owned()),
+        id: EventId {
+            author: InstallationId::from_bytes([7; 8]),
+            sequence,
         },
+        primary_key: PrimaryKey::Int(key),
+        operations: vec![PathOp {
+            path: Vec::new(),
+            time: EventTime {
+                physical_ms: sequence,
+                logical: 0,
+            },
+            op: TypeOp::String(StringOp::Set {
+                value: payload.to_owned(),
+            }),
+        }],
     }
 }
 
@@ -103,7 +96,7 @@ fn change(sequence: u64, key: i64, payload: &str) -> Change {
     Change {
         event: event(sequence, key, payload),
         previous: None,
-        current: Some(cell(sequence, payload)),
+        current: Some(value(payload)),
     }
 }
 
@@ -166,7 +159,7 @@ fn bench_state() {
     let payload = payload();
     for (name, config) in state_backends() {
         let temp = temp_root();
-        let mut state: State<PrimaryKey, Cell> =
+        let mut state: State<PrimaryKey, Value> =
             State::create(&temp.path().join("state"), config).expect("failed to create state");
 
         let started = Instant::now();
@@ -174,7 +167,7 @@ fn bench_state() {
             WriteBackend::put(
                 &mut state,
                 PrimaryKey::Int(sequence as i64),
-                cell(sequence, &payload),
+                value(&payload),
             )
             .expect("failed to write state record");
         }
@@ -272,10 +265,13 @@ fn bench_workspace_table_handle() {
             if let InsertOutcome::Applied(_) = table
                 .insert(
                     PrimaryKey::Int(sequence as i64),
-                    CellPath::new(),
-                    Op::Upsert {
-                        value: Value::String(payload.clone()),
-                    },
+                    vec![PathOp {
+                        path: Vec::new(),
+                        time: zendb_types::global_clock().mint(),
+                        op: TypeOp::String(StringOp::Set {
+                            value: payload.clone(),
+                        }),
+                    }],
                 )
                 .expect("failed to insert workspace table event")
             {
@@ -368,9 +364,7 @@ fn bench_topic_seek() {
     for probe in 0..TOPIC_STAMP_SEEKS {
         let target = (probe * TOPIC_RECORDS) / TOPIC_STAMP_SEEKS;
         reader
-            .seek(SeekTarget::stamp_predicate(|stamp| {
-                stamp.id.sequence >= target
-            }))
+            .seek(SeekTarget::event_predicate(|id| id.sequence >= target))
             .expect("failed to seek topic stamp");
     }
     report(

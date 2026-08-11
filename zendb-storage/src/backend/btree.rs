@@ -309,10 +309,10 @@ pub struct BPlusTree<K, V> {
 }
 
 impl<K, V> BPlusTree<K, V> {
-    pub(crate) fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()> {
+    pub(crate) fn persist(&mut self, barrier: crate::backend::Barrier) -> io::Result<()> {
         match barrier {
-            zendb_types::Barrier::Flush => self.mmap.flush_async(),
-            zendb_types::Barrier::Sync => self.mmap.flush(),
+            crate::backend::Barrier::Flush => self.mmap.flush_async(),
+            crate::backend::Barrier::Sync => self.mmap.flush(),
         }
     }
 }
@@ -2201,7 +2201,7 @@ where
         Ok(())
     }
 
-    fn persist(&mut self, barrier: zendb_types::Barrier) -> io::Result<()> {
+    fn persist(&mut self, barrier: crate::backend::Barrier) -> io::Result<()> {
         BPlusTree::persist(self, barrier)
     }
 }
@@ -2949,10 +2949,10 @@ where
 impl<K, V> Drop for BPlusTree<K, V> {
     /// Schedule a final writeback without blocking. We don't promise
     /// crash recovery; callers that need durability should call
-    /// `DurableStorage::persist(zendb_types::Barrier::Sync)` explicitly
+    /// `DurableStorage::persist(crate::backend::Barrier::Sync)` explicitly
     /// before dropping.
     fn drop(&mut self) {
-        let _ = BPlusTree::persist(self, zendb_types::Barrier::Flush);
+        let _ = BPlusTree::persist(self, crate::backend::Barrier::Flush);
     }
 }
 
@@ -3024,7 +3024,7 @@ mod tests {
     #[test]
     fn create_and_open() {
         let p = tmp("co");
-        create(&p).persist(zendb_types::Barrier::Flush).unwrap();
+        create(&p).persist(crate::backend::Barrier::Flush).unwrap();
         open(&p);
     }
 
@@ -3034,7 +3034,7 @@ mod tests {
         let mut t = create(&p);
         t.put(k("hello"), vbytes("world")).unwrap();
         t.put(k("foo"), vbytes("bar")).unwrap();
-        t.persist(zendb_types::Barrier::Flush).unwrap();
+        t.persist(crate::backend::Barrier::Flush).unwrap();
         assert_eq!(vget(&t, &k("hello")), Some(vbytes("world")));
         assert_eq!(vget(&t, &k("foo")), Some(vbytes("bar")));
         assert_eq!(vget(&t, &k("nope")), None);
@@ -3118,7 +3118,7 @@ mod tests {
         {
             let mut t = create(&p);
             t.put(k("p"), vbytes("d")).unwrap();
-            t.persist(zendb_types::Barrier::Flush).unwrap();
+            t.persist(crate::backend::Barrier::Flush).unwrap();
         }
         let t: BPlusTree<TestKey, TestVal> = open(&p);
         assert_eq!(vget(&t, &k("p")), Some(vbytes("d")));
@@ -3147,7 +3147,7 @@ mod tests {
         let mut t = create(&p);
         let big = vec![0xABu8; 10_000];
         t.put(k("big"), big.clone()).unwrap();
-        t.persist(zendb_types::Barrier::Flush).unwrap();
+        t.persist(crate::backend::Barrier::Flush).unwrap();
         assert_eq!(vget(&t, &k("big")), Some(big));
         let bigger = vec![0xCDu8; 15_000];
         t.put(k("big"), bigger.clone()).unwrap();
@@ -3165,7 +3165,7 @@ mod tests {
             let mut t = create(&p);
             t.put(k("a"), big.clone()).unwrap();
             t.put(k("b"), vbytes("inline")).unwrap();
-            t.persist(zendb_types::Barrier::Flush).unwrap();
+            t.persist(crate::backend::Barrier::Flush).unwrap();
         }
         let t: BPlusTree<TestKey, TestVal> = open(&p);
         assert_eq!(vget(&t, &k("a")), Some(big));
@@ -3208,7 +3208,7 @@ mod tests {
             for i in 0u32..50 {
                 assert!(t.delete(&format!("k{:04}", i).into_bytes()).unwrap());
             }
-            t.persist(zendb_types::Barrier::Flush).unwrap();
+            t.persist(crate::backend::Barrier::Flush).unwrap();
             t.stats()
         };
         let t: BPlusTree<TestKey, TestVal> = open(&p);
@@ -3423,7 +3423,7 @@ mod tests {
                 .map(|i| (format!("k{:04}", i).into_bytes(), vbytes("v")))
                 .collect();
             WriteBackend::bulk_put_sorted(&mut t, items).unwrap();
-            t.persist(zendb_types::Barrier::Flush).unwrap();
+            t.persist(crate::backend::Barrier::Flush).unwrap();
         }
         let t: BPlusTree<TestKey, TestVal> = open(&p);
         assert_eq!(t.size(), 200);
@@ -3677,7 +3677,7 @@ mod tests {
         {
             let mut t = create(&p);
             t.put(k("a"), vbytes("v")).unwrap();
-            t.persist(zendb_types::Barrier::Sync).unwrap();
+            t.persist(crate::backend::Barrier::Sync).unwrap();
         }
         let t: BPlusTree<TestKey, TestVal> = open(&p);
         assert_eq!(vget(&t, &k("a")), Some(vbytes("v")));

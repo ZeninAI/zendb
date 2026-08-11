@@ -14,7 +14,7 @@ use std::sync::Weak;
 
 use libp2p::PeerId;
 use zendb_types::{
-    Installation, InstallationId, InstallationState, Multiaddr, Op, Path, PublicKey, TypeOp,
+    Installation, InstallationId, InstallationState, Multiaddr, PathOp, PublicKey, TypeOp,
 };
 
 use super::batcher::table_order;
@@ -143,12 +143,11 @@ impl Engine {
             }
             None => {
                 // Unknown peer. Record as Pending and reject.
-                let pending = Installation {
-                    display_name,
-                    public_key,
-                    addresses,
-                    state: InstallationState::Pending,
-                };
+                let mut pending = Installation::default();
+                pending.display_name = display_name;
+                pending.public_key = public_key;
+                pending.addresses = addresses;
+                pending.state = InstallationState::Pending;
                 let _ = core
                     .table_store
                     .get(INSTALLATIONS_TABLE_NAME)
@@ -156,8 +155,13 @@ impl Engine {
                         core.commit_change(
                             &table,
                             installation_id.into(),
-                            Path::new(),
-                            Op::Type(TypeOp::Installation(pending.set())),
+                            vec![PathOp {
+                                path: Vec::new(),
+                                time: zendb_types::global_clock().mint(),
+                                op: TypeOp::Installation(zendb_types::InstallationOp::Set {
+                                    incoming: pending,
+                                }),
+                            }],
                         )
                     });
                 return vec![(peer_id, Message::Error(ProtocolError::NotAdmitted))];

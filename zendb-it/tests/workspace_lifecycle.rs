@@ -7,7 +7,7 @@ use std::sync::Arc;
 use bincode::{Decode, Encode};
 use zendb_it::TestPeerIdentity;
 use zendb_storage::{ReadBackend, StateConfig, TableConfig, WriteBackend};
-use zendb_types::{Op, Path, PrimaryKey, Value};
+use zendb_types::{PathOp, PrimaryKey, Value};
 use zendb_workspace::{Workspace, WorkspaceConfig};
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
@@ -36,10 +36,13 @@ fn workspace_data_survives_reopen_and_lifecycle_deletions() {
     users
         .insert(
             PrimaryKey::String("alice".to_owned()),
-            Path::new(),
-            Op::Upsert {
-                value: Value::String("Alice".to_owned()),
-            },
+            vec![PathOp {
+                path: Vec::new(),
+                time: zendb_types::global_clock().mint(),
+                op: zendb_types::TypeOp::String(zendb_types::StringOp::Set {
+                    value: "Alice".to_owned(),
+                }),
+            }],
         )
         .expect("failed to insert user");
 
@@ -79,13 +82,11 @@ fn workspace_data_survives_reopen_and_lifecycle_deletions() {
         .tables()
         .get("users")
         .expect("durable users table is present");
-    assert_eq!(
-        users
-            .read()
-            .get(&PrimaryKey::String("alice".to_owned()))
-            .and_then(|cell| cell.value.clone()),
-        Some(Value::String("Alice".to_owned()))
-    );
+    let user_value = users
+        .read()
+        .get(&PrimaryKey::String("alice".to_owned()))
+        .map(|value| value.into_owned());
+    assert!(matches!(user_value, Some(Value::String(string)) if string.value == "Alice"));
     let greetings = workspace
         .states()
         .get::<String, Greeting>("greetings")

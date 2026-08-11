@@ -11,7 +11,7 @@ use support::{
 };
 use zendb_it::{TestPeerIdentity, loopback_workspace_config, offline_workspace_config};
 use zendb_storage::{ReadBackend, TableConfig};
-use zendb_types::{Op, Path, PrimaryKey, Value};
+use zendb_types::{PathOp, PrimaryKey, Value};
 use zendb_workspace::{TableHandle, Workspace};
 
 #[test]
@@ -91,10 +91,13 @@ fn insert_string(table: &TableHandle, key: &str, value: &str) {
     table
         .insert(
             PrimaryKey::String(key.to_owned()),
-            Path::new(),
-            Op::Upsert {
-                value: Value::String(value.to_owned()),
-            },
+            vec![PathOp {
+                path: Vec::new(),
+                time: zendb_types::global_clock().mint(),
+                op: zendb_types::TypeOp::String(zendb_types::StringOp::Set {
+                    value: value.to_owned(),
+                }),
+            }],
         )
         .expect("failed to insert test value");
 }
@@ -160,12 +163,12 @@ fn assert_durable_replica(
         .get("messages")
         .expect("durable messages table is present");
     for (key, value) in messages {
-        assert_eq!(
-            message_table
-                .read()
-                .get(&PrimaryKey::String((*key).to_owned()))
-                .and_then(|cell| cell.value.clone()),
-            Some(Value::String((*value).to_owned())),
+        let actual = message_table
+            .read()
+            .get(&PrimaryKey::String((*key).to_owned()))
+            .map(|value| value.into_owned());
+        assert!(
+            matches!(actual, Some(Value::String(string)) if string.value == *value),
             "missing {key} in {}",
             root.display()
         );
@@ -175,12 +178,12 @@ fn assert_durable_replica(
         .tables()
         .get("shared")
         .expect("durable replicated table is present");
-    assert_eq!(
-        shared
-            .read()
-            .get(&PrimaryKey::String("from-a".to_owned()))
-            .and_then(|cell| cell.value.clone()),
-        Some(Value::String("catalog-replicated".to_owned()))
+    let shared_value = shared
+        .read()
+        .get(&PrimaryKey::String("from-a".to_owned()))
+        .map(|value| value.into_owned());
+    assert!(
+        matches!(shared_value, Some(Value::String(string)) if string.value == "catalog-replicated")
     );
     assert!(!workspace.tables().contains("obsolete"));
 }

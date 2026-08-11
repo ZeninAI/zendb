@@ -37,7 +37,7 @@ impl RecentCache {
 
     /// Record an event. Evicts the oldest entry when at capacity.
     pub(super) fn insert(&mut self, table: &str, event: &Event) {
-        let id = event.stamp.id;
+        let id = event.id;
         let key = (table.to_owned(), id);
         if self.index.contains_key(&key) {
             return;
@@ -233,9 +233,9 @@ pub(super) fn fetch_ranges(core: &WorkspaceCore, ranges: &[EventRange]) -> Resul
             let event = change.event;
             let matches = ranges.iter().any(|r| {
                 r.table == table_name
-                    && r.author == event.stamp.id.author
-                    && event.stamp.id.sequence >= r.start
-                    && event.stamp.id.sequence <= r.end
+                    && r.author == event.id.author
+                    && event.id.sequence >= r.start
+                    && event.id.sequence <= r.end
             });
             if !matches {
                 continue;

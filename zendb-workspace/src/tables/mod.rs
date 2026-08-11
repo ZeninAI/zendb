@@ -6,7 +6,7 @@ mod store;
 use std::sync::Arc;
 
 use zendb_storage::{Storage, TableConfig};
-use zendb_types::{Blob, Op, Path, Permission, PrimaryKey, Value};
+use zendb_types::{Blob, BlobOp, PathOp, Permission, PrimaryKey, TypeOp, global_clock};
 
 pub use handle::{ChangeListener, TableHandle};
 pub(crate) use handle::{OpenTable, TableKind};
@@ -54,10 +54,13 @@ impl Tables {
         self.core.commit_change(
             &self.catalog,
             PrimaryKey::String(name.to_owned()),
-            Path::new(),
-            Op::Upsert {
-                value: Value::Blob(Blob::encode(&config)?),
-            },
+            vec![PathOp {
+                path: Vec::new(),
+                time: global_clock().mint(),
+                op: TypeOp::Blob(BlobOp::Set {
+                    bytes: Blob::encode(&config)?.as_slice().to_vec(),
+                }),
+            }],
         )?;
         Ok(true)
     }
@@ -91,8 +94,11 @@ impl Tables {
         self.core.commit_change(
             &self.catalog,
             PrimaryKey::String(name.to_owned()),
-            Path::new(),
-            Op::Delete,
+            vec![PathOp {
+                path: Vec::new(),
+                time: global_clock().mint(),
+                op: TypeOp::Blob(BlobOp::Delete {}),
+            }],
         )?;
         Ok(true)
     }

@@ -45,7 +45,7 @@ pub struct States {
 }
 
 trait ErasedState: Any + Send + Sync {
-    fn persist(&self, barrier: zendb_types::Barrier) -> Result<()>;
+    fn persist(&self, barrier: zendb_storage::Barrier) -> Result<()>;
 }
 
 impl<K, V> ErasedState for StateHandle<K, V>
@@ -53,7 +53,7 @@ where
     K: Encode + Decode<()> + Hash + Eq + Clone + Ord + Send + Sync + 'static,
     V: Encode + Decode<()> + Clone + Send + Sync + 'static,
 {
-    fn persist(&self, barrier: zendb_types::Barrier) -> Result<()> {
+    fn persist(&self, barrier: zendb_storage::Barrier) -> Result<()> {
         self.state.write().persist(barrier)?;
         Ok(())
     }
@@ -123,7 +123,7 @@ impl States {
             .collect()
     }
 
-    pub(crate) fn persist(&self, barrier: zendb_types::Barrier) -> Result<()> {
+    pub(crate) fn persist(&self, barrier: zendb_storage::Barrier) -> Result<()> {
         let _lifecycle = self.lifecycle.lock();
         let open: Vec<_> = self.open_states.read().values().cloned().collect();
         for state in open {

@@ -1,6 +1,5 @@
 //! Synchronous workspace lifecycle and mutation orchestration.
 
-mod clock;
 mod config;
 mod core;
 mod error;
@@ -19,7 +18,8 @@ pub use tables::{ChangeListener, TableHandle, Tables};
 pub use workspace::Workspace;
 #[cfg(any(test, feature = "test-support"))]
 pub use workspace::derive_workspace_keypair;
+pub use zendb_storage::Barrier;
 pub use zendb_types::{
-    Barrier, Installation, InstallationState, Multiaddr, MultiaddrError, Permission, Permissions,
-    PublicKey, WorkspaceId,
+    Installation, InstallationState, Multiaddr, MultiaddrError, Permission, Permissions, PublicKey,
+    WorkspaceId,
 };

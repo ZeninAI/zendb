@@ -1,55 +1,51 @@
-//! String scalar type.
+//! UTF-8 string scalar CRDT.
+
+use std::ops::Deref;
 
 use bincode::{Decode, Encode};
 
-use crate::{Cell, CellProxy, CellProxyError, EventStamp, Type, Value};
+use crate::zendb_type;
 
-pub type String = std::string::String;
+zendb_type! {
+    #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+    pub struct String { pub value: std::string::String }
 
-impl CellProxy for std::string::String {
-    fn from_cell(cell: &Cell) -> Result<Self, CellProxyError> {
-        match &cell.value {
-            Some(Value::String(value)) => Ok(value.clone()),
-            _ => Err(CellProxyError::expected("String Cell")),
+    impl String {
+        pub fn op_set(&mut self, remote: crate::EventTime, value: std::string::String) -> bool {
+            if remote <= self.__event_time { return false; }
+            self.value = value;
+            self.__is_tombstone = false;
+            self.__event_time = remote;
+            true
         }
-    }
 
-    fn to_cell(&self, stamp: EventStamp) -> Result<Cell, CellProxyError> {
-        Ok(Cell {
-            value: Some(Value::String(self.clone())),
-            stamp,
-        })
+        pub fn op_delete(&mut self, remote: crate::EventTime) -> bool {
+            if remote <= self.__event_time { return false; }
+            self.__is_tombstone = true;
+            self.__event_time = remote;
+            true
+        }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub enum StringOp {}
-
-#[derive(Debug)]
-pub enum StringError {}
-
-impl std::fmt::Display for StringError {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {}
+impl From<std::string::String> for String {
+    fn from(value: std::string::String) -> Self {
+        Self {
+            value,
+            ..Self::default()
+        }
     }
 }
 
-impl std::error::Error for StringError {}
-
-impl Type for String {
-    type Op = StringOp;
-    type Error = StringError;
-
-    fn apply(&mut self, op: &StringOp, _stamps: crate::MergeStamps) -> Result<bool, StringError> {
-        match *op {}
+impl From<&str> for String {
+    fn from(value: &str) -> Self {
+        Self::from(value.to_owned())
     }
+}
 
-    fn merge(&mut self, remote: &String, stamps: crate::MergeStamps) -> Result<bool, StringError> {
-        if stamps.incoming > stamps.current {
-            *self = remote.clone();
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+impl Deref for String {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        &self.value
     }
 }

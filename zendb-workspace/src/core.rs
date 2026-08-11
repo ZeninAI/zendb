@@ -4,11 +4,10 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
 use zendb_storage::InsertOutcome;
-use zendb_types::{Event, InstallationId, Op, Path, PrimaryKey};
+use zendb_types::{Event, InstallationId, PathOp, PrimaryKey};
 
 use crate::{
     Error, Result,
-    clock::HybridClock,
     installations::Membership,
     replication::ReplicationNotification,
     states::States,
@@ -19,7 +18,6 @@ pub(crate) struct WorkspaceCore {
     pub(crate) table_store: TableStore,
     pub(crate) states: States,
     pub(crate) membership: Membership,
-    pub(crate) clock: HybridClock,
     pub(crate) replication_notifications: Option<UnboundedSender<ReplicationNotification>>,
 }
 
@@ -28,21 +26,15 @@ impl WorkspaceCore {
         &self,
         table: &Arc<OpenTable>,
         primary_key: PrimaryKey,
-        path: Path,
-        op: Op,
+        operations: Vec<PathOp>,
     ) -> Result<InsertOutcome> {
-        let stamp = zendb_types::EventStamp {
+        let event = Event {
             id: zendb_types::EventId {
                 author: self.membership.local_installation_id(),
                 sequence: 0,
             },
-            time: self.clock.mint()?,
-        };
-        let event = Event {
             primary_key,
-            path,
-            op,
-            stamp,
+            operations,
         };
         let outcome = table.insert_event(event)?;
         if let InsertOutcome::Applied(change) = &outcome {
@@ -63,9 +55,7 @@ impl WorkspaceCore {
     /// the event was novel, `false` if it was already present.
     pub(crate) fn commit_replication_event(&self, table_name: &str, event: Event) -> Result<bool> {
         let table = self.table_store.get(table_name)?;
-        let stamp = event.stamp;
         let outcome = table.observe_event(event)?;
-        self.clock.observe(stamp)?;
         if let InsertOutcome::Applied(change) = &outcome {
             self.project_change(&table, change)?;
             return Ok(true);

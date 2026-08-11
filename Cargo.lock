@@ -3496,6 +3496,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zendb-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "zendb-storage"
 version = "0.1.0"
 dependencies = [
@@ -3515,7 +3524,10 @@ dependencies = [
  "bincode",
  "libp2p-identity",
  "multiaddr",
+ "parking_lot",
+ "portable-atomic",
  "rand 0.8.7",
+ "zendb-macros",
 ]
 
 [[package]]

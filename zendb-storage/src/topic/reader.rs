@@ -7,7 +7,7 @@ use std::{
 };
 
 use bincode::Decode;
-use zendb_types::EventStamp;
+use zendb_types::EventId;
 use zendb_types::utils::{reusables::PooledBuf, serdes::deserialize_from};
 
 use super::{
@@ -42,8 +42,8 @@ impl<T> TopicReader<T> {
                 self.set_offset(offset);
                 Ok(offset < self.topic.next_offset.load(Ordering::Acquire))
             }
-            SeekTarget::StampPredicate(predicate) => {
-                let Some(offset) = scan_offset_by_stamp(&self.topic, predicate)? else {
+            SeekTarget::EventPredicate(predicate) => {
+                let Some(offset) = scan_offset_by_event(&self.topic, predicate)? else {
                     self.set_offset(self.topic.next_offset.load(Ordering::Acquire));
                     return Ok(false);
                 };
@@ -167,12 +167,12 @@ where
     }
 }
 
-pub(super) fn scan_offset_by_stamp<T, F>(
+pub(super) fn scan_offset_by_event<T, F>(
     topic: &Arc<TopicShared<T>>,
     mut predicate: F,
 ) -> io::Result<Option<TopicOffset>>
 where
-    F: FnMut(&EventStamp) -> bool,
+    F: FnMut(&EventId) -> bool,
 {
     let segments = topic.segments.load_full();
     for segment in segments.iter() {
@@ -193,10 +193,10 @@ where
             let mut size = [0; 4];
             file.read_exact(&mut size)?;
             let next_byte_offset = byte_offset + 4 + u32::from_le_bytes(size) as u64;
-            let mut buf = [0; EventStamp::ENCODED_SIZE];
+            let mut buf = [0; EventId::ENCODED_SIZE];
             file.read_exact(&mut buf)?;
-            let stamp: EventStamp = deserialize_from(&buf)?;
-            if predicate(&stamp) {
+            let id: EventId = deserialize_from(&buf)?;
+            if predicate(&id) {
                 return Ok(Some(offset));
             }
             byte_offset = next_byte_offset;

@@ -28,9 +28,13 @@ register_types! {
     container Record => crate::crdt::values::record::Record,
 }
 
+pub(crate) use crdt::TypeMetadata;
 pub use crdt::*;
 pub use replication::{
     IdFromPrimaryKeyError, InstallationId, InstallationIdParseError, Multiaddr, MultiaddrError,
     PeerIdentity, Permission, Permissions, PublicKey, WorkspaceId, WorkspaceIdParseError,
 };
 pub use zendb_macros::{zendb_container_type, zendb_type};
+
+#[cfg(test)]
+mod tests;

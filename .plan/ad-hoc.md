@@ -14,6 +14,7 @@
 - Review `Arc` strong-reference counts and ownership across table/state close and delete paths.
 - Define post-commit causal and system-projection failure handling; unapplied events must never enter the topic.
 - Add replication configuration for enabling and disabling protocol features.
+- Add a `ZenDbValue` derive: CRDT types declare native Rust conversions, while the registry bridges them into `Value` for arbitrary application structs.
 
 ### Dependency and serialization
 - Keep direct dependencies in root workspace declarations and upgrade compatible versions without forcing incompatible major transitive updates.

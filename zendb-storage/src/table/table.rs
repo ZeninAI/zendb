@@ -4,7 +4,7 @@
 use std::{borrow::Cow, fs, io, path::Path};
 
 use bincode::{Decode, Encode};
-use zendb_types::{Event, EventId, InstallationId, PrimaryKey, Value, ValueSlot};
+use zendb_types::{Event, EventId, InstallationId, OpDispatcher, PrimaryKey, Value};
 
 use crate::{
     DurableStorage, OrderedReadBackend, ReadBackend, SeekTarget, State, StateConfig, StateStats,

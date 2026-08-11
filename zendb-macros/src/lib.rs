@@ -34,6 +34,14 @@ struct Operation {
     error: Option<Type>,
 }
 
+struct BuildOperation {
+    method: ImplItemFn,
+    facade: Ident,
+    variant: Ident,
+    args: Vec<(Ident, Type)>,
+    error: Option<Type>,
+}
+
 struct EnsureChild {
     method: ImplItemFn,
     segment: Type,
@@ -166,6 +174,122 @@ fn operation(method: &ImplItemFn, prefix: &str) -> syn::Result<Option<Operation>
         variant,
         args,
         output: method.sig.output.clone(),
+        error,
+    }))
+}
+
+fn build_operation(method: &ImplItemFn, op_name: &Ident) -> syn::Result<Option<BuildOperation>> {
+    let Some(name) = method
+        .sig
+        .ident
+        .to_string()
+        .strip_prefix("build_")
+        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+    if name.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "CRDT builder name must contain a suffix after build_",
+        ));
+    }
+    if !matches!(method.sig.inputs.first(), Some(FnArg::Receiver(receiver)) if receiver.reference.is_some() && receiver.mutability.is_none())
+    {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "CRDT builders must take &self",
+        ));
+    }
+    let mut args = Vec::new();
+    for input in method.sig.inputs.iter().skip(1) {
+        let FnArg::Typed(argument) = input else {
+            return Err(syn::Error::new_spanned(
+                input,
+                "CRDT builder arguments must be named values",
+            ));
+        };
+        if !matches!(&*argument.pat, Pat::Ident(_)) {
+            return Err(syn::Error::new_spanned(
+                &argument.pat,
+                "CRDT builder arguments must be named values",
+            ));
+        }
+        let Pat::Ident(pattern) = &*argument.pat else {
+            unreachable!();
+        };
+        args.push((pattern.ident.clone(), (*argument.ty).clone()));
+    }
+
+    let valid_output = |output: &Type| {
+        matches!(
+            output,
+            Type::Path(TypePath { path, .. })
+                if path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == *op_name)
+        )
+    };
+    let error = match &method.sig.output {
+        ReturnType::Type(_, output) if valid_output(output) => None,
+        ReturnType::Type(_, output) => {
+            let Type::Path(TypePath { path, .. }) = &**output else {
+                return Err(syn::Error::new_spanned(
+                    output,
+                    "CRDT builders must return Op or Result<Op, Error>",
+                ));
+            };
+            let Some(result) = path.segments.last() else {
+                return Err(syn::Error::new_spanned(
+                    output,
+                    "CRDT builders must return Op or Result<Op, Error>",
+                ));
+            };
+            if result.ident != "Result" {
+                return Err(syn::Error::new_spanned(
+                    output,
+                    "CRDT builders must return Op or Result<Op, Error>",
+                ));
+            }
+            let syn::PathArguments::AngleBracketed(arguments) = &result.arguments else {
+                return Err(syn::Error::new_spanned(
+                    output,
+                    "CRDT builder Result must be Result<Op, Error>",
+                ));
+            };
+            let Some(GenericArgument::Type(operation)) = arguments.args.first() else {
+                return Err(syn::Error::new_spanned(
+                    output,
+                    "CRDT builder Result must be Result<Op, Error>",
+                ));
+            };
+            if !valid_output(operation) {
+                return Err(syn::Error::new_spanned(
+                    operation,
+                    "CRDT builder Result must contain this type's operation enum",
+                ));
+            }
+            let Some(GenericArgument::Type(error)) = arguments.args.iter().nth(1) else {
+                return Err(syn::Error::new_spanned(
+                    output,
+                    "CRDT builder Result must be Result<Op, Error>",
+                ));
+            };
+            Some(error.clone())
+        }
+        ReturnType::Default => {
+            return Err(syn::Error::new_spanned(
+                &method.sig,
+                "CRDT builders must return Op or Result<Op, Error>",
+            ));
+        }
+    };
+    Ok(Some(BuildOperation {
+        method: method.clone(),
+        facade: format_ident!("{}", name),
+        variant: format_ident!("{}", pascal_case(&name)),
+        args,
         error,
     }))
 }
@@ -404,11 +528,15 @@ fn expand(input: TypeInput, container: bool) -> syn::Result<proc_macro2::TokenSt
     });
 
     let mut operations = Vec::new();
+    let mut build_operations = Vec::new();
     let mut ensure_children = Vec::new();
     for item in &implementation.items {
         let ImplItem::Fn(method) = item else { continue };
         if let Some(operation) = operation(method, "op_")? {
             operations.push(operation);
+        }
+        if let Some(build) = build_operation(method, &op_name)? {
+            build_operations.push(build);
         }
         if let Some(ensure_child) = ensure_child(method)? {
             ensure_children.push(ensure_child);
@@ -430,6 +558,11 @@ fn expand(input: TypeInput, container: bool) -> syn::Result<proc_macro2::TokenSt
                 .iter()
                 .filter_map(|ensure_child| ensure_child.error.as_ref()),
         )
+        .chain(
+            build_operations
+                .iter()
+                .filter_map(|build| build.error.as_ref()),
+        )
     {
         let key = error_key(error);
         if !error_variants.iter().any(|(known, _, _)| *known == key) {
@@ -440,16 +573,23 @@ fn expand(input: TypeInput, container: bool) -> syn::Result<proc_macro2::TokenSt
                     .is_some_and(|known| error_key(known) == key)
             }) {
                 format_ident!("EnsureChild")
+            } else if let Some(operation) = operations.iter().find(|operation| {
+                operation
+                    .error
+                    .as_ref()
+                    .is_some_and(|known| error_key(known) == key)
+            }) {
+                operation.variant.clone()
             } else {
-                operations
+                build_operations
                     .iter()
-                    .find(|operation| {
-                        operation
+                    .find(|build| {
+                        build
                             .error
                             .as_ref()
                             .is_some_and(|known| error_key(known) == key)
                     })
-                    .expect("operation error variant was registered")
+                    .expect("builder error variant was registered")
                     .variant
                     .clone()
             };
@@ -553,6 +693,89 @@ fn expand(input: TypeInput, container: bool) -> syn::Result<proc_macro2::TokenSt
             }
         }
     });
+    let build_facades = build_operations.iter().map(|build| {
+        let method_name = &build.method.sig.ident;
+        let facade_name = &build.facade;
+        let args = build.args.iter().map(|(name, ty)| quote! { #name: #ty });
+        let names: Vec<_> = build.args.iter().map(|(name, _)| name.clone()).collect();
+        let output = if error_variants.is_empty() {
+            quote! { bool }
+        } else {
+            quote! { Result<bool, #error_name> }
+        };
+        let build_call = if let Some(error) = &build.error {
+            let error_variant = error_variants
+                .iter()
+                .find(|(key, _, _)| *key == error_key(error))
+                .map(|(_, variant, _)| variant)
+                .expect("builder error variant was registered");
+            quote! {
+                let op = self.#method_name(#(#names),*)
+                    .map_err(#error_name::#error_variant)?;
+            }
+        } else {
+            quote! {
+                let op = self.#method_name(#(#names),*);
+            }
+        };
+        let apply = if error_variants.is_empty() {
+            quote! {
+                match <Self as ::zendb_types::Type>::apply(self, remote, &op) {
+                    Ok(changed) => changed,
+                    Err(error) => match error {},
+                }
+            }
+        } else {
+            quote! {
+                <Self as ::zendb_types::Type>::apply(self, remote, &op)
+            }
+        };
+        quote! {
+            pub fn #facade_name(&mut self, #(#args),*) -> #output {
+                #build_call
+                let remote = ::zendb_types::global_clock().mint();
+                #apply
+            }
+        }
+    });
+    let edit_facades = operations.iter().map(|operation| {
+        let method_name = &operation.method.sig.ident;
+        let facade_name = format_ident!("{}", method_name.to_string().trim_start_matches("op_"));
+        let args = operation
+            .args
+            .iter()
+            .map(|(name, ty)| quote! { #name: #ty });
+        let names: Vec<_> = operation
+            .args
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        let variant = &operation.variant;
+        quote! {
+            pub fn #facade_name(
+                &mut self,
+                #(#args),*
+            ) -> Result<bool, ::zendb_types::TypeError> {
+                let remote = ::zendb_types::global_clock().mint();
+                let op = ::zendb_types::TypeOp::#name(
+                    #op_name::#variant { #(#names),* },
+                );
+                self.apply_operation(remote, op)
+            }
+        }
+    });
+    let edit_apply = quote! {
+        pub fn apply(
+            &mut self,
+            op: #op_name,
+        ) -> Result<bool, ::zendb_types::TypeError> {
+            let remote = ::zendb_types::global_clock().mint();
+            self.apply_operation(
+                remote,
+                ::zendb_types::TypeOp::#name(op),
+            )
+        }
+    };
     let container_impl = if container {
         if ensure_children.len() != 1 {
             return Err(syn::Error::new_spanned(
@@ -606,6 +829,12 @@ fn expand(input: TypeInput, container: bool) -> syn::Result<proc_macro2::TokenSt
 
         impl #name {
             #(#facades)*
+            #(#build_facades)*
+        }
+
+        impl<'a> ::zendb_types::TypedEdit<'a, #name> {
+            #(#edit_facades)*
+            #edit_apply
         }
 
         impl ::zendb_types::Type for #name {
@@ -626,12 +855,14 @@ fn expand(input: TypeInput, container: bool) -> syn::Result<proc_macro2::TokenSt
                 self.__event_time
             }
 
-            fn set_event_time(&mut self, time: ::zendb_types::EventTime) {
-                self.__event_time = time;
-            }
-
             fn is_tombstone(&self) -> bool {
                 self.__is_tombstone
+            }
+        }
+
+        impl ::zendb_types::TypeMetadata for #name {
+            fn set_event_time(&mut self, time: ::zendb_types::EventTime) {
+                self.__event_time = time;
             }
 
             fn set_tombstone(&mut self, tombstone: bool) {
@@ -644,6 +875,9 @@ fn expand(input: TypeInput, container: bool) -> syn::Result<proc_macro2::TokenSt
 }
 
 /// Declare a metadata-owning leaf CRDT type and generate its operation enum and facades.
+/// Methods named `build_*` are validated as local operation builders. Their
+/// errors are deduplicated into the generated CRDT error type, and matching
+/// applying facades are generated without changing the builder methods.
 #[proc_macro]
 pub fn zendb_type(input: TokenStream) -> TokenStream {
     match expand(parse_macro_input!(input as TypeInput), false) {

@@ -25,7 +25,7 @@ macro_rules! register_types {
                     $(Self::$leaf_var => Value::$leaf_var(Default::default()),)*
                     $(Self::$cont_var => Value::$cont_var(Default::default()),)*
                 };
-                <$crate::Value as $crate::Type>::set_event_time(
+                <$crate::Value as $crate::TypeMetadata>::set_event_time(
                     &mut value,
                     $crate::EventTime::ZERO,
                 );
@@ -84,8 +84,15 @@ macro_rules! register_types {
                     $(Self::$cont_var(_) => TypeTag::$cont_var,)*
                 }
             }
+        }
 
-            pub fn apply_path(&mut self, remote: $crate::EventTime, path: &[$crate::Segment], op: &TypeOp) -> Result<bool, TypeError> {
+        impl $crate::OpDispatcher for Value {
+            fn apply_path(
+                &mut self,
+                remote: $crate::EventTime,
+                path: &[$crate::Segment],
+                op: &TypeOp,
+            ) -> Result<bool, TypeError> {
                 let Some((segment, remaining)) = path.split_first() else {
                     return <$crate::Value as $crate::Type>::apply(self, remote, op);
                 };
@@ -102,21 +109,17 @@ macro_rules! register_types {
                     )? else {
                         return Ok(false);
                     };
-                    child.apply_path(remote, remaining, op)
+                    <$crate::Value as $crate::OpDispatcher>::apply_path(
+                        child,
+                        remote,
+                        remaining,
+                        op,
+                    )
                 }
             }
         }
 
-        pub trait ValueSlot {
-            fn apply_path(
-                &mut self,
-                remote: $crate::EventTime,
-                path: &[$crate::Segment],
-                op: &TypeOp,
-            ) -> Result<bool, TypeError>;
-        }
-
-        impl ValueSlot for Option<Value> {
+        impl $crate::OpDispatcher for Option<Value> {
             fn apply_path(
                 &mut self,
                 remote: $crate::EventTime,
@@ -128,7 +131,7 @@ macro_rules! register_types {
                     .map($crate::Segment::type_tag)
                     .unwrap_or_else(|| op.type_tag());
                 let value = self.get_or_insert_with(|| expected.empty_value());
-                value.apply_path(remote, path, op)
+                <$crate::Value as $crate::OpDispatcher>::apply_path(value, remote, path, op)
             }
         }
 
@@ -219,13 +222,6 @@ macro_rules! register_types {
                 }
             }
 
-            fn set_event_time(&mut self, time: $crate::EventTime) {
-                match self {
-                    $(Self::$leaf_var(value) => <$leaf_ty as $crate::Type>::set_event_time(value, time),)*
-                    $(Self::$cont_var(value) => <$cont_ty as $crate::Type>::set_event_time(value, time),)*
-                }
-            }
-
             fn is_tombstone(&self) -> bool {
                 match self {
                     $(Self::$leaf_var(value) => <$leaf_ty as $crate::Type>::is_tombstone(value),)*
@@ -233,10 +229,20 @@ macro_rules! register_types {
                 }
             }
 
+        }
+
+        impl $crate::TypeMetadata for Value {
+            fn set_event_time(&mut self, time: $crate::EventTime) {
+                match self {
+                    $(Self::$leaf_var(value) => <$leaf_ty as $crate::TypeMetadata>::set_event_time(value, time),)*
+                    $(Self::$cont_var(value) => <$cont_ty as $crate::TypeMetadata>::set_event_time(value, time),)*
+                }
+            }
+
             fn set_tombstone(&mut self, tombstone: bool) {
                 match self {
-                    $(Self::$leaf_var(value) => <$leaf_ty as $crate::Type>::set_tombstone(value, tombstone),)*
-                    $(Self::$cont_var(value) => <$cont_ty as $crate::Type>::set_tombstone(value, tombstone),)*
+                    $(Self::$leaf_var(value) => <$leaf_ty as $crate::TypeMetadata>::set_tombstone(value, tombstone),)*
+                    $(Self::$cont_var(value) => <$cont_ty as $crate::TypeMetadata>::set_tombstone(value, tombstone),)*
                 }
             }
         }

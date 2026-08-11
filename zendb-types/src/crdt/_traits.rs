@@ -1,4 +1,4 @@
-//! Core traits for metadata-owning ZenDB CRDT values.
+//! Public CRDT contracts and internal metadata mutation support.
 
 use bincode::{Decode, Encode};
 
@@ -34,8 +34,20 @@ pub trait Type: Sized + Encode + Decode<()> + Clone {
 
     fn apply(&mut self, remote: crate::EventTime, op: &Self::Op) -> Result<bool, Self::Error>;
     fn event_time(&self) -> crate::EventTime;
-    fn set_event_time(&mut self, time: crate::EventTime);
     fn is_tombstone(&self) -> bool;
+}
+
+pub trait OpDispatcher {
+    fn apply_path(
+        &mut self,
+        remote: crate::EventTime,
+        path: &[crate::Segment],
+        op: &crate::TypeOp,
+    ) -> Result<bool, crate::TypeError>;
+}
+
+pub(crate) trait TypeMetadata {
+    fn set_event_time(&mut self, time: crate::EventTime);
     fn set_tombstone(&mut self, tombstone: bool);
 }
 

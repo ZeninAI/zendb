@@ -4,11 +4,14 @@
 mod _macros;
 
 pub mod _traits;
+pub mod edit;
 pub mod event;
 pub mod stamp;
 pub mod values;
 
-pub use _traits::{ContainerType, Type, TypeMismatch};
+pub(crate) use _traits::TypeMetadata;
+pub use _traits::{ContainerType, OpDispatcher, Type, TypeMismatch};
+pub use edit::{Edit, EditCursor, TypedEdit};
 pub use event::{Event, PathOp};
 pub use stamp::{EventId, EventTime};
 pub use values::*;

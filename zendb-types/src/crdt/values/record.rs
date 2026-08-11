@@ -1,6 +1,6 @@
 //! Movable-tree record container with self-healing child lookup.
 
-use crate::{EventTime, Type, TypeTag, Value, zendb_container_type};
+use crate::{EventTime, Type, TypeMetadata, TypeTag, Value, zendb_container_type};
 use bincode::{Decode, Encode};
 use std::collections::BTreeMap;
 

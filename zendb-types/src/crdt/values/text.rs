@@ -23,6 +23,7 @@ pub enum TextError {
     ZeroId,
     SelfAnchor,
     TooLong,
+    InvalidPosition,
 }
 impl std::fmt::Display for TextError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -30,6 +31,7 @@ impl std::fmt::Display for TextError {
             Self::ZeroId => f.write_str("text character ID cannot be zero"),
             Self::SelfAnchor => f.write_str("text insert cannot anchor to itself"),
             Self::TooLong => f.write_str("text insert exceeds u32::MAX characters"),
+            Self::InvalidPosition => f.write_str("text position is outside the visible text"),
         }
     }
 }
@@ -81,6 +83,14 @@ zendb_type! {
             }
             if changed { self.__event_time = self.__event_time.max(remote); }
             Ok(changed)
+        }
+
+        pub fn build_insert_at(&self, position: usize, text: std::string::String) -> Result<TextOp, TextError> {
+            if position > self.visible_ids().len() {
+                return Err(TextError::InvalidPosition);
+            }
+            let after = if position == 0 { None } else { self.id_at(position - 1) };
+            Ok(TextOp::Insert { after, text })
         }
     }
 }

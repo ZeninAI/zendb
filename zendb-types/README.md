@@ -24,7 +24,9 @@ those inferred types into the global `Segment` enum. `ensure_child` returns an
 optional mutable child `Value`; `None` means the incoming path was stale and must
 be ignored.
 
-`Type::apply` only dispatches an operation enum to its `op_*` method. The
+`Type` exposes operation application and read-only metadata access. Metadata
+mutation is kept behind the crate-private generated `TypeMetadata` support
+trait. `Type::apply` only dispatches an operation enum to its `op_*` method. The
 operation implementation owns conflict acceptance, timestamp advancement, and
 tombstone changes. Empty values created for self-healing paths are reset to
 `EventTime::ZERO` before the incoming operation is applied.
@@ -40,6 +42,24 @@ underlying error type gets one aggregate variant, so operations sharing an
 error type are deduplicated. The registry then wraps those per-type errors in
 its global `TypeError` enum.
 
+Methods named `build_*` are local operation builders. They must take `&self`
+and return either the generated operation enum or `Result<Operation, Error>`.
+Builders translate ergonomic arguments into a low-level operation without
+minting time or mutating state. Their error types are deduplicated with the
+errors from `op_*` and `ensure_child` methods in the generated `<Type>OpError`.
+The macro also generates an applying facade with the `build_` prefix removed;
+for example, `build_insert_at` produces `insert_at`, which builds the
+operation, mints its `EventTime`, and applies it. The applying facade returns
+the aggregate type error, while the `build_*` method itself retains its
+declared error type. Generated typed edit facades expose `apply(Operation)` so
+callers can build an operation against a concrete value and then apply and
+record it through the normal `TypeError` path.
+
+`Edit` does not expose mutable access to its materialized value. All mutations
+must go through operation facades so the corresponding `PathOp` is recorded.
+Use `into_parts()` when consuming an edit; it returns both the materialized
+value and its accumulated operations.
+
 The closed registry generates `Value`, `TypeOp`, `TypeTag`, `Segment`, primary
 keys, type dispatch, and `From`/`TryFrom` conversions. `Value` itself implements
 both `Type` and `ContainerType`, so heterogeneous values use the same operation
@@ -48,9 +68,10 @@ new values use the type's default metadata clock; conversions from an existing
 `Value` preserve its metadata. Applying an operation with a different type tag
 self-heals the value when the operation's `EventTime` is newer; stale operations
 are ignored. `TypeMismatch` remains the error for explicit typed conversions.
-The generated `ValueSlot` trait applies the same path operation to an
-`Option<Value>`, creating the root value from the path or operation type when
-the slot is empty.
+The `OpDispatcher` trait applies the same path operation to both a `Value` and
+an `Option<Value>`. Its implementations are generated with the registry; the
+option implementation creates the root value from the path or operation type
+when the slot is empty.
 
 Registered values currently include scalar types, Installation, Text, Float,
 and Record. The deferred priority queue, set, multi-value register,

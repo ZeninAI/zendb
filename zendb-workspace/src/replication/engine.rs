@@ -10,16 +10,19 @@
 //!   table and immediately rejected with `Error(NotAdmitted)`.
 //! - Once an installation transitions to Active, the runtime dials it.
 
-use std::sync::Weak;
+use std::{io, sync::Weak};
 
 use libp2p::PeerId;
 use zendb_types::{
-    Installation, InstallationId, InstallationState, Multiaddr, PathOp, PublicKey, TypeOp,
+    Edit, Event, EventId, Installation, InstallationId, InstallationState, Multiaddr, PublicKey,
 };
 
 use super::batcher::table_order;
 use super::sync::{self, RecentCache};
-use super::wire::{EventRange, Message, ProtocolError, ReceiptSummary, TableBatch};
+use super::wire::{
+    EventRange, Message, ProtocolError, ReceiptSummary, TableBatch, decode_table_batch,
+    encode_table_batch,
+};
 use crate::config::SyncConfig;
 use crate::core::WorkspaceCore;
 use crate::system::INSTALLATIONS_TABLE_NAME;
@@ -152,16 +155,20 @@ impl Engine {
                     .table_store
                     .get(INSTALLATIONS_TABLE_NAME)
                     .and_then(|table| {
+                        let mut edit = Edit::empty();
+                        edit.typed::<Installation>()
+                            .set(pending)
+                            .expect("Installation set is infallible");
                         core.commit_change(
                             &table,
-                            installation_id.into(),
-                            vec![PathOp {
-                                path: Vec::new(),
-                                time: zendb_types::global_clock().mint(),
-                                op: TypeOp::Installation(zendb_types::InstallationOp::Set {
-                                    incoming: pending,
-                                }),
-                            }],
+                            Event {
+                                id: EventId {
+                                    author: core.membership.local_installation_id(),
+                                    sequence: 0,
+                                },
+                                primary_key: installation_id.into(),
+                                operations: edit.take_changes(),
+                            },
                         )
                     });
                 return vec![(peer_id, Message::Error(ProtocolError::NotAdmitted))];
@@ -196,7 +203,7 @@ impl Engine {
     /// one peer when forwarding received batches.
     pub(super) fn broadcast(
         &self,
-        batches: &[TableBatch],
+        batches: &[Vec<u8>],
         exclude: Option<PeerId>,
     ) -> Vec<(PeerId, Message)> {
         if batches.is_empty() {
@@ -223,8 +230,16 @@ impl Engine {
         &mut self,
         core: &WorkspaceCore,
         peer_id: PeerId,
-        batches: Vec<TableBatch>,
+        batches: Vec<Vec<u8>>,
     ) -> Vec<(PeerId, Message)> {
+        let batches = match batches
+            .iter()
+            .map(|batch| decode_table_batch(batch))
+            .collect::<io::Result<Vec<_>>>()
+        {
+            Ok(batches) => batches,
+            Err(_) => return vec![(peer_id, Message::Error(ProtocolError::InvalidRequest))],
+        };
         match commit_batches(core, batches) {
             Ok(novel) => {
                 // Cache novel events for fast future fetch responses.
@@ -233,7 +248,10 @@ impl Engine {
                         self.cache.insert(&batch.table, event);
                     }
                 }
-                self.broadcast(&novel, Some(peer_id))
+                match encode_batches(&novel) {
+                    Ok(batches) => self.broadcast(&batches, Some(peer_id)),
+                    Err(_) => vec![(peer_id, Message::Error(ProtocolError::Internal))],
+                }
             }
             Err(_) => vec![(peer_id, Message::Error(ProtocolError::Internal))],
         }
@@ -281,12 +299,10 @@ impl Engine {
         // Try serving from the recent cache first.
         let (cached_batches, remaining) = self.cache.fetch(&ranges);
         if remaining.is_empty() && !cached_batches.is_empty() {
-            return vec![(
-                peer_id,
-                Message::FetchResponse {
-                    batches: cached_batches,
-                },
-            )];
+            return match encode_batches(&cached_batches) {
+                Ok(batches) => vec![(peer_id, Message::FetchResponse { batches })],
+                Err(_) => vec![(peer_id, Message::Error(ProtocolError::Internal))],
+            };
         }
 
         // Fall through to durable topic scan for remaining ranges.
@@ -303,7 +319,10 @@ impl Engine {
                     batches
                         .sort_unstable_by(|a, b| table_order(&a.table).cmp(&table_order(&b.table)));
                 }
-                vec![(peer_id, Message::FetchResponse { batches })]
+                match encode_batches(&batches) {
+                    Ok(batches) => vec![(peer_id, Message::FetchResponse { batches })],
+                    Err(_) => vec![(peer_id, Message::Error(ProtocolError::Internal))],
+                }
             }
             Err(_) => vec![(peer_id, Message::Error(ProtocolError::Internal))],
         }
@@ -311,6 +330,10 @@ impl Engine {
 }
 
 // ─── Free functions ──────────────────────────────────────────────────────────
+
+fn encode_batches(batches: &[TableBatch]) -> io::Result<Vec<Vec<u8>>> {
+    batches.iter().map(encode_table_batch).collect()
+}
 
 /// Commit received batches to the workspace. Returns only novel events.
 fn commit_batches(core: &WorkspaceCore, mut batches: Vec<TableBatch>) -> Result<Vec<TableBatch>> {

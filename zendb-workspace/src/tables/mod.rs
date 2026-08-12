@@ -6,7 +6,7 @@ mod store;
 use std::sync::Arc;
 
 use zendb_storage::{Storage, TableConfig};
-use zendb_types::{Blob, BlobOp, PathOp, Permission, PrimaryKey, TypeOp, global_clock};
+use zendb_types::{Blob, Edit, Event, EventId, Permission, PrimaryKey};
 
 pub use handle::{ChangeListener, TableHandle};
 pub(crate) use handle::{OpenTable, TableKind};
@@ -51,16 +51,20 @@ impl Tables {
         }
         // The catalog event is authoritative; WorkspaceCore materializes the
         // physical table only after this event has applied successfully.
+        let mut edit = Edit::empty();
+        edit.typed::<Blob>()
+            .set(Blob::encode(&config)?.as_slice().to_vec())
+            .expect("Blob set is infallible");
         self.core.commit_change(
             &self.catalog,
-            PrimaryKey::String(name.to_owned()),
-            vec![PathOp {
-                path: Vec::new(),
-                time: global_clock().mint(),
-                op: TypeOp::Blob(BlobOp::Set {
-                    bytes: Blob::encode(&config)?.as_slice().to_vec(),
-                }),
-            }],
+            Event {
+                id: EventId {
+                    author: self.core.membership.local_installation_id(),
+                    sequence: 0,
+                },
+                primary_key: PrimaryKey::String(name.to_owned()),
+                operations: edit.take_changes(),
+            },
         )?;
         Ok(true)
     }
@@ -91,14 +95,20 @@ impl Tables {
             return Err(Error::TableInUse(name.to_owned()));
         }
         drop(table);
+        let mut edit = Edit::empty();
+        edit.typed::<Blob>()
+            .delete()
+            .expect("Blob delete is infallible");
         self.core.commit_change(
             &self.catalog,
-            PrimaryKey::String(name.to_owned()),
-            vec![PathOp {
-                path: Vec::new(),
-                time: global_clock().mint(),
-                op: TypeOp::Blob(BlobOp::Delete {}),
-            }],
+            Event {
+                id: EventId {
+                    author: self.core.membership.local_installation_id(),
+                    sequence: 0,
+                },
+                primary_key: PrimaryKey::String(name.to_owned()),
+                operations: edit.take_changes(),
+            },
         )?;
         Ok(true)
     }

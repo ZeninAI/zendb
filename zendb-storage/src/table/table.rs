@@ -73,7 +73,7 @@ impl Table {
     /// A CRDT no-op therefore remains invisible to the topic and causal state.
     pub fn insert(&mut self, mut event: Event) -> io::Result<InsertOutcome> {
         let author = event.id.author;
-        let mut receipt = self
+        let receipt = self
             .causal
             .get(&author)
             .map(Cow::into_owned)
@@ -89,18 +89,7 @@ impl Table {
             return Ok(InsertOutcome::Ignored);
         };
 
-        self.topic.append(&change)?;
-        WriteBackend::put(
-            &mut self.state,
-            change.event.primary_key.clone(),
-            change
-                .current
-                .clone()
-                .expect("applied changes always carry current state"),
-        )?;
-        receipt.observe(change.event.id.sequence)?;
-        self.causal.put(author, receipt)?;
-        Ok(InsertOutcome::Applied(Box::new(change)))
+        self.commit_change(change, receipt)
     }
 
     /// Observe a remotely authored event using its existing sequence number.
@@ -131,21 +120,7 @@ impl Table {
             self.causal.put(author, receipt)?;
             return Ok(InsertOutcome::Ignored);
         };
-        {
-            self.topic.append(&change)?;
-            WriteBackend::put(
-                &mut self.state,
-                change.event.primary_key.clone(),
-                change
-                    .current
-                    .clone()
-                    .expect("applied changes always carry current state"),
-            )?;
-        }
-
-        receipt.observe(sequence)?;
-        self.causal.put(author, receipt)?;
-        Ok(InsertOutcome::Applied(Box::new(change)))
+        self.commit_change(change, receipt)
     }
 
     /// Return whether this table has already observed an event identity.
@@ -163,19 +138,37 @@ impl Table {
             .collect()
     }
 
+    fn commit_change(
+        &mut self,
+        change: Change,
+        mut receipt: ReceiptWindow,
+    ) -> io::Result<InsertOutcome> {
+        self.topic.append(&change)?;
+        WriteBackend::put(
+            &mut self.state,
+            change.event.primary_key.clone(),
+            change
+                .current
+                .clone()
+                .expect("applied changes always carry current state"),
+        )?;
+        receipt.observe(change.event.id.sequence)?;
+        self.causal.put(change.event.id.author, receipt)?;
+        Ok(InsertOutcome::Applied(Box::new(change)))
+    }
+
     fn prepare_change(&self, event: Event) -> io::Result<Option<Change>> {
-        let previous = self.get(&event.primary_key).map(Cow::into_owned);
-        let mut current = previous.clone();
+        let mut current = self.get(&event.primary_key).map(Cow::into_owned);
         let mut changed = false;
         for operation in &event.operations {
-            zendb_types::global_clock().observe(operation.time);
             changed |= current
-                .apply_path(operation.time, &operation.path, &operation.op)
+                .dispatch(operation.time, &operation.path, &operation.op)
                 .map_err(io::Error::other)?;
         }
         if !changed {
             return Ok(None);
         }
+        let previous = self.get(&event.primary_key).map(Cow::into_owned);
         Ok(Some(Change {
             event,
             previous,

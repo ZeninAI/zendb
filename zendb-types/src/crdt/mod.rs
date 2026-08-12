@@ -11,7 +11,7 @@ pub mod values;
 
 pub(crate) use _traits::TypeMetadata;
 pub use _traits::{ContainerType, OpDispatcher, Type, TypeMismatch};
-pub use edit::{Edit, EditCursor, TypedEdit};
+pub use edit::{Edit, TypedEdit};
 pub use event::{Event, PathOp};
 pub use stamp::{EventId, EventTime};
 pub use values::*;

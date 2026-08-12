@@ -21,14 +21,14 @@ Each open workspace owns a flat `WorkspaceCore` containing `TableStore`,
 The local mutation pipeline is:
 
 ```text
-typed operation facade or manual TypeOp -> PathOp with EventTime
+typed edit facade or manual PathOp -> Event with operation EventTime
     -> authorize -> table::insert batch -> project -> notify
 ```
 
-`TableHandle::insert(primary_key, operations)` accepts a batch of manually
-constructed `PathOp` values. There are no edit cursors or cell editors in the
-API. Public generated methods are dispatch helpers only: they mint a clock and
-call their matching `op_*` implementation.
+`TableHandle::insert(primary_key, operations)` accepts a batch of `PathOp`
+values. The workspace system mutations use the generated typed edit facades to
+produce those operations, while the public table handle still accepts batches
+directly. There are no edit cursors or cell editors in the workspace API.
 
 Remote events enter through `table::observe`, which owns duplicate detection,
 receipt updates, and operation application. Local commits notify replication
@@ -38,8 +38,9 @@ after durable insertion.
 
 Every ready `Active` installation is a direct replication peer. There is no
 mesh rotation, neighbour set, join swarm, or topology election. Anti-entropy
-uses `EventId` receipt ranges and network batches; `EventTime` is used only by
-the CRDT types. Catalog, installation, and application topics are fetched in
+uses `EventId` receipt ranges and opaque serialized network batches;
+`EventTime` is used only by the CRDT types and workspace clock boundary.
+Catalog, installation, and application topics are fetched in
 catalog-first order so missing application tables can be opened before their
 history is applied.
 

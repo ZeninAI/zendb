@@ -14,8 +14,8 @@ use bincode::{Decode, Encode};
 use libp2p_identity::Keypair;
 use tokio::sync::mpsc::unbounded_channel;
 use zendb_types::{
-    Event, EventId, EventTime, Installation, InstallationId, InstallationOp, InstallationState,
-    Multiaddr, PathOp, PeerIdentity, Permissions, PublicKey, TypeOp, WorkspaceId, global_clock,
+    Edit, Event, EventId, EventTime, Installation, InstallationId, InstallationState, Multiaddr,
+    PeerIdentity, Permissions, PublicKey, WorkspaceId, global_clock,
     utils::{deserialize_from, serialize_to_vec},
 };
 
@@ -166,20 +166,19 @@ impl Workspace {
                 installation.public_key = public_key;
                 installation.addresses = addresses.clone();
                 installation.state = InstallationState::Active(Permissions::FULL);
-                let time = global_clock().mint();
+                let mut edit = Edit::empty();
+                edit.typed::<Installation>()
+                    .set(installation.clone())
+                    .expect("Installation set is infallible");
+                let operations = edit.take_changes();
+                let time = operations[0].time;
                 let installation_event = Event {
                     id: EventId {
                         author: state.installation_id,
                         sequence: 0,
                     },
                     primary_key: state.installation_id.into(),
-                    operations: vec![PathOp {
-                        path: Vec::new(),
-                        time,
-                        op: TypeOp::Installation(InstallationOp::Set {
-                            incoming: installation.clone(),
-                        }),
-                    }],
+                    operations,
                 };
                 installations_table.insert_event(installation_event)?;
                 state.clock = time;
@@ -217,16 +216,20 @@ impl Workspace {
             if installation.display_name != display_name || installation.addresses != addresses {
                 installation.display_name = display_name;
                 installation.addresses = addresses;
+                let mut edit = Edit::empty();
+                edit.typed::<Installation>()
+                    .set(installation.clone())
+                    .expect("Installation set is infallible");
                 core.commit_change(
                     &installations_table,
-                    local_installation_id.into(),
-                    vec![PathOp {
-                        path: Vec::new(),
-                        time: global_clock().mint(),
-                        op: TypeOp::Installation(InstallationOp::Set {
-                            incoming: installation.clone(),
-                        }),
-                    }],
+                    Event {
+                        id: EventId {
+                            author: local_installation_id,
+                            sequence: 0,
+                        },
+                        primary_key: local_installation_id.into(),
+                        operations: edit.take_changes(),
+                    },
                 )?;
             }
         }

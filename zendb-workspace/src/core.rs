@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
 use zendb_storage::InsertOutcome;
-use zendb_types::{Event, InstallationId, PathOp, PrimaryKey};
+use zendb_types::{Event, InstallationId, global_clock};
 
 use crate::{
-    Error, Result,
+    Result,
     installations::Membership,
     replication::ReplicationNotification,
     states::States,
@@ -25,27 +25,16 @@ impl WorkspaceCore {
     pub(crate) fn commit_change(
         &self,
         table: &Arc<OpenTable>,
-        primary_key: PrimaryKey,
-        operations: Vec<PathOp>,
+        event: Event,
     ) -> Result<InsertOutcome> {
-        let event = Event {
-            id: zendb_types::EventId {
-                author: self.membership.local_installation_id(),
-                sequence: 0,
-            },
-            primary_key,
-            operations,
-        };
         let outcome = table.insert_event(event)?;
         if let InsertOutcome::Applied(change) = &outcome {
             self.project_change(table, change)?;
             if let Some(sender) = &self.replication_notifications {
-                sender
-                    .send(ReplicationNotification::Event {
-                        table: table.name().to_owned(),
-                        event: change.event.clone(),
-                    })
-                    .map_err(|_| Error::Replication("replication runtime stopped".into()))?;
+                let _ = sender.send(ReplicationNotification::Event {
+                    table: table.name().to_owned(),
+                    event: change.event.clone(),
+                });
             }
         }
         Ok(outcome)
@@ -54,6 +43,10 @@ impl WorkspaceCore {
     /// Apply a remotely produced event to its target table. Returns `true` if
     /// the event was novel, `false` if it was already present.
     pub(crate) fn commit_replication_event(&self, table_name: &str, event: Event) -> Result<bool> {
+        for operation in &event.operations {
+            global_clock().observe(operation.time);
+        }
+
         let table = self.table_store.get(table_name)?;
         let outcome = table.observe_event(event)?;
         if let InsertOutcome::Applied(change) = &outcome {

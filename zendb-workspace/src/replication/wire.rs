@@ -4,16 +4,110 @@
 //! The format is a 4-byte little-endian length prefix followed by a bincode
 //! payload. Any language with a bincode reader can participate.
 
+use std::io;
+
 use bincode::{Decode, Encode};
 use zendb_types::{Event, InstallationId, Multiaddr, PublicKey, WorkspaceId};
 
 // ─── Batching ────────────────────────────────────────────────────────────────
 
-/// A batch of events belonging to one table, sent in order.
+/// Decoded batch of events belonging to one table, sent in order.
+///
+/// Protocol messages carry the custom serialized form of this value as raw
+/// bytes so events are not serialized again after batching.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct TableBatch {
     pub table: String,
     pub events: Vec<Event>,
+}
+
+pub(super) fn encode_table_batch(batch: &TableBatch) -> io::Result<Vec<u8>> {
+    let mut event_bytes = Vec::new();
+    for event in &batch.events {
+        let encoded = zendb_types::utils::serdes::serialize_to_vec(event)?;
+        event_bytes.extend_from_slice(
+            &u32::try_from(encoded.len())
+                .expect("serialized event exceeds the wire batch size")
+                .to_le_bytes(),
+        );
+        event_bytes.extend_from_slice(&encoded);
+    }
+    Ok(encode_serialized_table_batch(
+        &batch.table,
+        batch.events.len(),
+        &event_bytes,
+    ))
+}
+
+pub(super) fn encode_serialized_table_batch(
+    table: &str,
+    event_count: usize,
+    event_bytes: &[u8],
+) -> Vec<u8> {
+    let table_bytes = table.as_bytes();
+    let mut encoded = Vec::with_capacity(12 + table_bytes.len() + event_bytes.len());
+    encoded.extend_from_slice(
+        &u32::try_from(table_bytes.len())
+            .expect("table name exceeds the wire batch size")
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(table_bytes);
+    encoded.extend_from_slice(
+        &u32::try_from(event_count)
+            .expect("table batch contains too many events")
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(event_bytes);
+    encoded
+}
+
+pub(super) fn decode_table_batch(bytes: &[u8]) -> io::Result<TableBatch> {
+    let mut cursor = 0;
+    let table_length = read_u32(bytes, &mut cursor)? as usize;
+    let table_end = cursor
+        .checked_add(table_length)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "table name length overflow"))?;
+    let table = String::from_utf8(
+        bytes
+            .get(cursor..table_end)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing table name"))?
+            .to_vec(),
+    )
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "table name is not UTF-8"))?;
+    cursor = table_end;
+
+    let event_count = read_u32(bytes, &mut cursor)? as usize;
+    let mut events = Vec::with_capacity(event_count);
+    for _ in 0..event_count {
+        let event_length = read_u32(bytes, &mut cursor)? as usize;
+        let event_end = cursor
+            .checked_add(event_length)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "event length overflow"))?;
+        let event_bytes = bytes
+            .get(cursor..event_end)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing event"))?;
+        events.push(zendb_types::utils::serdes::deserialize_from(event_bytes)?);
+        cursor = event_end;
+    }
+    if cursor != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing bytes in table batch",
+        ));
+    }
+
+    Ok(TableBatch { table, events })
+}
+
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> io::Result<u32> {
+    let end = cursor
+        .checked_add(4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "batch cursor overflow"))?;
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing batch length"))?;
+    *cursor = end;
+    Ok(u32::from_le_bytes(value.try_into().unwrap()))
 }
 
 // ─── Receipt types for anti-entropy ──────────────────────────────────────────
@@ -69,7 +163,7 @@ pub enum Message {
         addresses: Vec<Multiaddr>,
     },
     /// Fire-and-forget event push to every ready installation.
-    Push { batches: Vec<TableBatch> },
+    Push { batches: Vec<Vec<u8>> },
     /// Anti-entropy: local receipt summaries. Peer responds with SummaryResponse.
     Summary { receipts: Vec<ReceiptSummary> },
     /// Anti-entropy: peer's receipt summaries in reply to Summary.
@@ -77,7 +171,7 @@ pub enum Message {
     /// Request specific event ranges by author and sequence.
     Fetch { ranges: Vec<EventRange> },
     /// Response to a Fetch request.
-    FetchResponse { batches: Vec<TableBatch> },
+    FetchResponse { batches: Vec<Vec<u8>> },
     /// Protocol-level error. The sender may close the session after this.
     Error(ProtocolError),
 }

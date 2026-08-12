@@ -60,6 +60,11 @@ must go through operation facades so the corresponding `PathOp` is recorded.
 Use `into_parts()` when consuming an edit; it returns both the materialized
 value and its accumulated operations.
 
+Editing enters through `Edit::typed::<T>()`. Container facades generate
+type-named descent methods such as `TypedEdit<Record>::record("field")`; the
+result is re-typed explicitly before applying operations to a heterogeneous
+child value.
+
 The closed registry generates `Value`, `TypeOp`, `TypeTag`, `Segment`, primary
 keys, type dispatch, and `From`/`TryFrom` conversions. `Value` itself implements
 both `Type` and `ContainerType`, so heterogeneous values use the same operation

@@ -12,8 +12,7 @@ use std::{
 use parking_lot::{Mutex, RwLock};
 use zendb_storage::{Change, DurableStorage, ReadBackend, Table, TableConfig};
 use zendb_types::{
-    Blob, BlobOp, Event, EventId, InstallationId, PathOp, PrimaryKey, Type, TypeOp, Value,
-    global_clock,
+    Blob, BlobOp, Edit, Event, EventId, InstallationId, PrimaryKey, Type, TypeOp, Value,
 };
 
 use super::{OpenTable, TableKind};
@@ -51,33 +50,33 @@ impl TableStore {
         // These declarations are authored directly by the store. Each table
         // owns its own local sequence stream, so the first declaration starts
         // at sequence 1 on the catalog table.
+        let encoded_config = Blob::encode(&*SYSTEM_TABLE_CONFIG)?.as_slice().to_vec();
+        let mut catalog_edit = Edit::empty();
+        catalog_edit
+            .typed::<Blob>()
+            .set(encoded_config.clone())
+            .expect("Blob set is infallible");
         catalog.insert(Event {
             id: EventId {
                 author: local_installation_id,
                 sequence: 0,
             },
             primary_key: PrimaryKey::String(TABLE_CATALOG_NAME.to_owned()),
-            operations: vec![PathOp {
-                path: Vec::new(),
-                time: global_clock().mint(),
-                op: TypeOp::Blob(BlobOp::Set {
-                    bytes: Blob::encode(&*SYSTEM_TABLE_CONFIG)?.as_slice().to_vec(),
-                }),
-            }],
+            operations: catalog_edit.take_changes(),
         })?;
+
+        let mut installations_edit = Edit::empty();
+        installations_edit
+            .typed::<Blob>()
+            .set(encoded_config)
+            .expect("Blob set is infallible");
         catalog.insert(Event {
             id: EventId {
                 author: local_installation_id,
                 sequence: 0,
             },
             primary_key: PrimaryKey::String(INSTALLATIONS_TABLE_NAME.to_owned()),
-            operations: vec![PathOp {
-                path: Vec::new(),
-                time: global_clock().mint(),
-                op: TypeOp::Blob(BlobOp::Set {
-                    bytes: Blob::encode(&*SYSTEM_TABLE_CONFIG)?.as_slice().to_vec(),
-                }),
-            }],
+            operations: installations_edit.take_changes(),
         })?;
         Self::from_system_tables(root, catalog, installations)
     }

@@ -1,25 +1,26 @@
 //! Serialized event batching for outbound Push messages.
 //!
 //! Events are encoded once when admitted and stored as length-delimited bytes
-//! per table. The batch size is therefore measured from the bytes already
-//! produced, without a separate sizing pass.
+//! per table. The resulting payloads are passed directly to the wire message.
 
 use std::collections::HashMap;
 use tokio::time::Instant;
-use zendb_types::{
-    Event,
-    utils::{deserialize_from, serialize_to_vec},
-};
+use zendb_types::{Event, utils::serialize_to_vec};
 
-use super::wire::TableBatch;
+use super::wire::encode_serialized_table_batch;
 use crate::config::BatchConfig;
 use crate::system::{INSTALLATIONS_TABLE_NAME, TABLE_CATALOG_NAME};
 
 pub(super) struct Batcher {
     config: BatchConfig,
-    pending: HashMap<String, Vec<u8>>,
+    pending: HashMap<String, PendingBatch>,
     pending_bytes: usize,
     deadline: Option<Instant>,
+}
+
+struct PendingBatch {
+    event_count: usize,
+    event_bytes: Vec<u8>,
 }
 
 impl Batcher {
@@ -36,10 +37,16 @@ impl Batcher {
     /// soft size threshold.
     pub(super) fn push(&mut self, table: String, event: Event) -> bool {
         let encoded = serialize_to_vec(&event).expect("replication events must be serializable");
-        let encoded_len = encoded.len() + std::mem::size_of::<u64>();
-        let entry = self.pending.entry(table).or_default();
-        entry.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
-        entry.extend_from_slice(&encoded);
+        let encoded_len = encoded.len() + std::mem::size_of::<u32>();
+        let entry = self.pending.entry(table).or_insert_with(|| PendingBatch {
+            event_count: 0,
+            event_bytes: Vec::new(),
+        });
+        entry.event_count += 1;
+        entry
+            .event_bytes
+            .extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        entry.event_bytes.extend_from_slice(&encoded);
         self.pending_bytes = self.pending_bytes.saturating_add(encoded_len);
 
         if self.pending_bytes == encoded_len {
@@ -65,37 +72,19 @@ impl Batcher {
             .is_some_and(|deadline| deadline <= Instant::now())
     }
 
-    /// Drain pending serialized events into sorted table batches.
-    pub(super) fn flush(&mut self) -> Vec<TableBatch> {
+    /// Drain pending serialized events into sorted table payloads.
+    pub(super) fn flush(&mut self) -> Vec<Vec<u8>> {
         self.deadline = None;
         self.pending_bytes = 0;
-        let pending = std::mem::take(&mut self.pending);
-        let mut batches: Vec<TableBatch> = pending
+        let mut pending: Vec<_> = std::mem::take(&mut self.pending).into_iter().collect();
+        pending
+            .sort_unstable_by(|(left, _), (right, _)| table_order(left).cmp(&table_order(right)));
+        pending
             .into_iter()
-            .map(|(table, bytes)| {
-                let mut events = Vec::new();
-                let mut offset = 0;
-                while offset < bytes.len() {
-                    let length = usize::try_from(u64::from_le_bytes(
-                        bytes[offset..offset + std::mem::size_of::<u64>()]
-                            .try_into()
-                            .expect("event length prefix is complete"),
-                    ))
-                    .expect("event length fits in memory");
-                    offset += std::mem::size_of::<u64>();
-                    let end = offset + length;
-                    let event: Event = deserialize_from(&bytes[offset..end])
-                        .expect("serialized replication event must be decodable");
-                    events.push(event);
-                    offset = end;
-                }
-                TableBatch { table, events }
+            .map(|(table, batch)| {
+                encode_serialized_table_batch(&table, batch.event_count, &batch.event_bytes)
             })
-            .collect();
-        batches.sort_unstable_by(|a, b| {
-            table_order(a.table.as_str()).cmp(&table_order(b.table.as_str()))
-        });
-        batches
+            .collect()
     }
 
     pub(super) fn is_empty(&self) -> bool {

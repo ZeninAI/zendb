@@ -5,9 +5,7 @@ mod membership;
 use std::sync::Arc;
 
 use zendb_storage::InsertOutcome;
-use zendb_types::{
-    Installation, InstallationId, InstallationOp, PathOp, Permission, TypeOp, global_clock,
-};
+use zendb_types::{Edit, Event, EventId, Installation, InstallationId, Permission, PrimaryKey};
 
 pub(crate) use membership::Membership;
 
@@ -50,16 +48,20 @@ impl Installations {
         }
         // Registry changes are written through WorkspaceCore so membership,
         // replication routes, causal state, and listeners update together.
+        let mut edit = Edit::empty();
+        edit.typed::<Installation>()
+            .set(installation)
+            .expect("Installation set is infallible");
         let outcome = self.core.commit_change(
             &self.table,
-            installation_id.into(),
-            vec![PathOp {
-                path: Vec::new(),
-                time: global_clock().mint(),
-                op: TypeOp::Installation(InstallationOp::Set {
-                    incoming: installation,
-                }),
-            }],
+            Event {
+                id: EventId {
+                    author: self.core.membership.local_installation_id(),
+                    sequence: 0,
+                },
+                primary_key: PrimaryKey::from(installation_id),
+                operations: edit.take_changes(),
+            },
         )?;
         Ok(matches!(outcome, InsertOutcome::Applied(_)))
     }
@@ -76,16 +78,20 @@ impl Installations {
             return Ok(false);
         }
         installation.state = zendb_types::InstallationState::Rejected;
+        let mut edit = Edit::empty();
+        edit.typed::<Installation>()
+            .set(installation)
+            .expect("Installation set is infallible");
         let outcome = self.core.commit_change(
             &self.table,
-            installation_id.into(),
-            vec![PathOp {
-                path: Vec::new(),
-                time: global_clock().mint(),
-                op: TypeOp::Installation(InstallationOp::Set {
-                    incoming: installation,
-                }),
-            }],
+            Event {
+                id: EventId {
+                    author: self.core.membership.local_installation_id(),
+                    sequence: 0,
+                },
+                primary_key: PrimaryKey::from(installation_id),
+                operations: edit.take_changes(),
+            },
         )?;
         Ok(matches!(outcome, InsertOutcome::Applied(_)))
     }

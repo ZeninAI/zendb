@@ -501,6 +501,17 @@ fn pascal_case(name: &str) -> String {
     output
 }
 
+fn snake_case(name: &str) -> String {
+    let mut output = String::new();
+    for (index, character) in name.chars().enumerate() {
+        if character.is_uppercase() && index > 0 {
+            output.push('_');
+        }
+        output.extend(character.to_lowercase());
+    }
+    output
+}
+
 fn expand(input: TypeInput, container: bool) -> syn::Result<proc_macro2::TokenStream> {
     let TypeInput {
         mut item,
@@ -815,6 +826,23 @@ fn expand(input: TypeInput, container: bool) -> syn::Result<proc_macro2::TokenSt
     } else {
         quote! {}
     };
+    let container_edit = if container {
+        let ensure_child = &ensure_children[0];
+        let segment_type = &ensure_child.segment;
+        let method = format_ident!("{}", snake_case(&name.to_string()));
+        quote! {
+            impl<'a> ::zendb_types::TypedEdit<'a, #name> {
+                pub fn #method(
+                    self,
+                    segment: impl Into<#segment_type>,
+                ) -> ::zendb_types::TypedEdit<'a, ::zendb_types::Value> {
+                    self.descend(::zendb_types::Segment::#name(segment.into()))
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
 
     Ok(quote! {
         #item
@@ -871,6 +899,8 @@ fn expand(input: TypeInput, container: bool) -> syn::Result<proc_macro2::TokenSt
         }
 
         #container_impl
+
+        #container_edit
     })
 }
 

@@ -46,13 +46,6 @@ impl Edit {
         (self.value, self.changes)
     }
 
-    pub fn at(&mut self, segment: Segment) -> EditCursor<'_> {
-        EditCursor {
-            edit: self,
-            path: vec![segment],
-        }
-    }
-
     pub fn typed<T>(&mut self) -> TypedEdit<'_, T> {
         TypedEdit {
             edit: self,
@@ -67,7 +60,7 @@ impl Edit {
         path: &[Segment],
         op: TypeOp,
     ) -> Result<bool, TypeError> {
-        let changed = self.value.apply_path(remote, path, &op)?;
+        let changed = self.value.dispatch(remote, path, &op)?;
         if changed {
             self.changes.push(PathOp {
                 path: path.to_vec(),
@@ -85,27 +78,6 @@ impl From<Value> for Edit {
     }
 }
 
-/// A path-building cursor into an edit session.
-pub struct EditCursor<'a> {
-    edit: &'a mut Edit,
-    path: Vec<Segment>,
-}
-
-impl<'a> EditCursor<'a> {
-    pub fn at(mut self, segment: Segment) -> Self {
-        self.path.push(segment);
-        self
-    }
-
-    pub fn typed<T>(self) -> TypedEdit<'a, T> {
-        TypedEdit {
-            edit: self.edit,
-            path: self.path,
-            marker: PhantomData,
-        }
-    }
-}
-
 /// A type-specific edit facade generated with the operations of `T`.
 pub struct TypedEdit<'a, T> {
     edit: &'a mut Edit,
@@ -114,12 +86,16 @@ pub struct TypedEdit<'a, T> {
 }
 
 impl<'a, T> TypedEdit<'a, T> {
-    pub fn at(mut self, segment: Segment) -> Self {
-        self.path.push(segment);
-        self
+    pub fn typed<U>(self) -> TypedEdit<'a, U> {
+        TypedEdit {
+            edit: self.edit,
+            path: self.path,
+            marker: PhantomData,
+        }
     }
 
-    pub fn typed<U>(self) -> TypedEdit<'a, U> {
+    pub(crate) fn descend(mut self, segment: Segment) -> TypedEdit<'a, Value> {
+        self.path.push(segment);
         TypedEdit {
             edit: self.edit,
             path: self.path,

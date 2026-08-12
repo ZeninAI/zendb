@@ -87,7 +87,7 @@ macro_rules! register_types {
         }
 
         impl $crate::OpDispatcher for Value {
-            fn apply_path(
+            fn dispatch(
                 &mut self,
                 remote: $crate::EventTime,
                 path: &[$crate::Segment],
@@ -109,7 +109,7 @@ macro_rules! register_types {
                     )? else {
                         return Ok(false);
                     };
-                    <$crate::Value as $crate::OpDispatcher>::apply_path(
+                    <$crate::Value as $crate::OpDispatcher>::dispatch(
                         child,
                         remote,
                         remaining,
@@ -120,7 +120,7 @@ macro_rules! register_types {
         }
 
         impl $crate::OpDispatcher for Option<Value> {
-            fn apply_path(
+            fn dispatch(
                 &mut self,
                 remote: $crate::EventTime,
                 path: &[$crate::Segment],
@@ -131,7 +131,7 @@ macro_rules! register_types {
                     .map($crate::Segment::type_tag)
                     .unwrap_or_else(|| op.type_tag());
                 let value = self.get_or_insert_with(|| expected.empty_value());
-                <$crate::Value as $crate::OpDispatcher>::apply_path(value, remote, path, op)
+                <$crate::Value as $crate::OpDispatcher>::dispatch(value, remote, path, op)
             }
         }
 

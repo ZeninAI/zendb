@@ -38,7 +38,7 @@ pub trait Type: Sized + Encode + Decode<()> + Clone {
 }
 
 pub trait OpDispatcher {
-    fn apply_path(
+    fn dispatch(
         &mut self,
         remote: crate::EventTime,
         path: &[crate::Segment],

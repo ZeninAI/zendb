@@ -11,7 +11,12 @@ zendb_container_type! {
     impl Record {
         pub fn op_clear(&mut self, remote: crate::EventTime) -> bool {
             if remote <= self.__event_time { return false; }
-            self.fields.clear();
+            for child in self.fields.values_mut() {
+                if child.event_time() < remote {
+                    child.set_event_time(remote);
+                    child.set_tombstone(true);
+                }
+            }
             self.__event_time = remote;
             true
         }

@@ -4,7 +4,7 @@ use std::sync::{Arc, Weak};
 
 use parking_lot::{RwLock, RwLockReadGuard};
 use zendb_storage::{Change, InsertOutcome, Table};
-use zendb_types::{Event, PathOp, Permission, PrimaryKey};
+use zendb_types::{Event, EventId, PathOp, Permission, PrimaryKey};
 
 use crate::{Error, Result, core::WorkspaceCore};
 
@@ -100,7 +100,17 @@ impl TableHandle {
             &core.membership.local_installation_id(),
             Permission::WriteData,
         )?;
-        core.commit_change(&self.table, primary_key, operations)
+        core.commit_change(
+            &self.table,
+            Event {
+                id: EventId {
+                    author: core.membership.local_installation_id(),
+                    sequence: 0,
+                },
+                primary_key,
+                operations,
+            },
+        )
     }
 
     pub fn read(&self) -> RwLockReadGuard<'_, Table> {

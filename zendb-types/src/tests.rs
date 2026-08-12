@@ -1,12 +1,14 @@
-use crate::{Edit, Segment, String, Text, TextError, TextOp, TextOpError, TypeOp, Value};
+use crate::{Edit, Record, Segment, String, Text, TextError, TextOp, TextOpError, TypeOp, Value};
 
 #[test]
 fn edit_records_a_nested_record_path() {
     let mut edit = Edit::empty();
 
     assert!(
-        edit.at(Segment::Record("profile".to_owned()))
-            .at(Segment::Record("name".to_owned()))
+        edit.typed::<Record>()
+            .record("profile")
+            .typed::<Record>()
+            .record("name")
             .typed::<String>()
             .set("Ada".to_owned())
             .expect("string edit should apply")

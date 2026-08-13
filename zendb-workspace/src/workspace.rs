@@ -24,7 +24,7 @@ use crate::{
     config::{ReplicationConfig, WorkspaceConfig},
     core::WorkspaceCore,
     installations::{Installations, Membership},
-    replication::ReplicationController,
+    replication::{DiscoveredPeer, ReplicationController},
     states::States,
     system::{
         IDENTITY_FILE, INSTALLATIONS_TABLE_NAME, LOCK_FILE, TABLE_CATALOG_NAME,
@@ -298,6 +298,16 @@ impl Workspace {
 
     pub fn states(&self) -> &States {
         &self.core.states
+    }
+
+    /// Returns the peers and addresses currently observed through mDNS.
+    ///
+    /// The result is empty when replication or mDNS is disabled. Discovery is
+    /// local and ephemeral; it is not persisted in the installations table.
+    pub fn discovered_peers(&self) -> Vec<DiscoveredPeer> {
+        self.replication
+            .as_ref()
+            .map_or_else(Vec::new, ReplicationController::discovered_peers)
     }
 }
 

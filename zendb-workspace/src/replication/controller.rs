@@ -9,7 +9,7 @@
 //! - Swarm network events
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Weak},
     thread,
     time::Duration,
@@ -17,11 +17,12 @@ use std::{
 
 use futures::StreamExt;
 use libp2p::{
-    PeerId, Swarm, mdns,
+    Multiaddr as Libp2pMultiaddr, PeerId, Swarm, mdns,
     swarm::behaviour::toggle::Toggle,
     swarm::{NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
 };
 use libp2p_identity::Keypair;
+use parking_lot::RwLock;
 use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
 use tokio::time::Instant;
 use zendb_types::{InstallationId, WorkspaceId};
@@ -63,6 +64,14 @@ pub(crate) enum ReplicationNotification {
 pub(crate) struct ReplicationController {
     shutdown: Option<oneshot::Sender<()>>,
     join: Option<thread::JoinHandle<()>>,
+    discovered_peers: Arc<RwLock<HashMap<PeerId, HashSet<Libp2pMultiaddr>>>>,
+}
+
+/// A peer and the addresses currently advertised for it through mDNS.
+#[derive(Clone, Debug)]
+pub struct DiscoveredPeer {
+    pub peer_id: PeerId,
+    pub addresses: Vec<Libp2pMultiaddr>,
 }
 
 impl ReplicationController {
@@ -83,6 +92,8 @@ impl ReplicationController {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = oneshot::channel();
         let thread_name = keypair.public().to_peer_id().to_base58();
+        let discovered_peers = Arc::new(RwLock::new(HashMap::new()));
+        let discovered_peers_runtime = discovered_peers.clone();
 
         let join = thread::Builder::new().name(thread_name).spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -114,6 +125,7 @@ impl ReplicationController {
                             local_installation_id,
                             config,
                             notifications,
+                            discovered_peers_runtime,
                             shutdown_rx,
                         )
                         .await;
@@ -129,6 +141,7 @@ impl ReplicationController {
             Ok(Ok(())) => Ok(Self {
                 shutdown: Some(shutdown_tx),
                 join: Some(join),
+                discovered_peers,
             }),
             Ok(Err(e)) => {
                 let _ = join.join();
@@ -148,6 +161,17 @@ impl ReplicationController {
         if let Some(handle) = self.join.take() {
             let _ = handle.join();
         }
+    }
+
+    pub(crate) fn discovered_peers(&self) -> Vec<DiscoveredPeer> {
+        self.discovered_peers
+            .read()
+            .iter()
+            .map(|(peer_id, addresses)| DiscoveredPeer {
+                peer_id: *peer_id,
+                addresses: addresses.iter().cloned().collect(),
+            })
+            .collect()
     }
 }
 
@@ -215,6 +239,7 @@ async fn run(
     local_installation_id: InstallationId,
     config: ReplicationConfig,
     mut notifications: UnboundedReceiver<ReplicationNotification>,
+    discovered_peers: Arc<RwLock<HashMap<PeerId, HashSet<Libp2pMultiaddr>>>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut heartbeat = tokio::time::interval(config.sync.interval);
@@ -349,6 +374,7 @@ async fn run(
                     &mut swarm,
                     &mut dialing,
                     enable_port_reuse,
+                    &discovered_peers,
                 );
             }
         }
@@ -425,6 +451,7 @@ fn handle_swarm_event(
     swarm: &mut Swarm<SwarmBehaviour>,
     dialing: &mut HashSet<PeerId>,
     enable_port_reuse: bool,
+    discovered_peers: &Arc<RwLock<HashMap<PeerId, HashSet<Libp2pMultiaddr>>>>,
 ) {
     match event {
         SwarmEvent::Behaviour(SwarmBehaviourEvent::Zenin(BehaviourEvent::SessionEstablished {
@@ -464,6 +491,11 @@ fn handle_swarm_event(
         }
         SwarmEvent::Behaviour(SwarmBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
             for (peer_id, address) in list {
+                discovered_peers
+                    .write()
+                    .entry(peer_id)
+                    .or_default()
+                    .insert(address.clone());
                 if engine.is_active_peer(peer_id)
                     && !swarm.is_connected(&peer_id)
                     && dialing.insert(peer_id)
@@ -472,6 +504,17 @@ fn handle_swarm_event(
                         .is_err()
                 {
                     dialing.remove(&peer_id);
+                }
+            }
+        }
+        SwarmEvent::Behaviour(SwarmBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+            let mut discovered_peers = discovered_peers.write();
+            for (peer_id, address) in list {
+                if let Some(addresses) = discovered_peers.get_mut(&peer_id) {
+                    addresses.remove(&address);
+                    if addresses.is_empty() {
+                        discovered_peers.remove(&peer_id);
+                    }
                 }
             }
         }

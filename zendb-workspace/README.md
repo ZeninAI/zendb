@@ -48,3 +48,7 @@ Unknown or pending installations are recorded as pending and rejected at the
 protocol boundary. Active installations are dialed directly using their
 durable route hints and maintain a connection to every other ready active
 installation.
+
+`Workspace::discovered_peers()` exposes the current ephemeral mDNS discovery
+snapshot, including each peer's observed network addresses. Entries are
+removed when mDNS reports them as expired and are not persisted.

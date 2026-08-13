@@ -65,6 +65,7 @@ pub(crate) struct ReplicationController {
     shutdown: Option<oneshot::Sender<()>>,
     join: Option<thread::JoinHandle<()>>,
     discovered_peers: Arc<RwLock<HashMap<PeerId, HashSet<Libp2pMultiaddr>>>>,
+    discovery_listeners: Arc<RwLock<Vec<Arc<dyn PeerDiscoveryListener>>>>,
 }
 
 /// A peer and the addresses currently advertised for it through mDNS.
@@ -72,6 +73,11 @@ pub(crate) struct ReplicationController {
 pub struct DiscoveredPeer {
     pub peer_id: PeerId,
     pub addresses: Vec<Libp2pMultiaddr>,
+}
+
+/// Receives edge-triggered notifications when the ephemeral mDNS peer set changes.
+pub trait PeerDiscoveryListener: Send + Sync {
+    fn on_discovery_changed(&self);
 }
 
 impl ReplicationController {
@@ -94,6 +100,8 @@ impl ReplicationController {
         let thread_name = keypair.public().to_peer_id().to_base58();
         let discovered_peers = Arc::new(RwLock::new(HashMap::new()));
         let discovered_peers_runtime = discovered_peers.clone();
+        let discovery_listeners = Arc::new(RwLock::new(Vec::new()));
+        let discovery_listeners_runtime = discovery_listeners.clone();
 
         let join = thread::Builder::new().name(thread_name).spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -126,6 +134,7 @@ impl ReplicationController {
                             config,
                             notifications,
                             discovered_peers_runtime,
+                            discovery_listeners_runtime,
                             shutdown_rx,
                         )
                         .await;
@@ -142,6 +151,7 @@ impl ReplicationController {
                 shutdown: Some(shutdown_tx),
                 join: Some(join),
                 discovered_peers,
+                discovery_listeners,
             }),
             Ok(Err(e)) => {
                 let _ = join.join();
@@ -172,6 +182,10 @@ impl ReplicationController {
                 addresses: addresses.iter().cloned().collect(),
             })
             .collect()
+    }
+
+    pub(crate) fn add_discovery_listener(&self, listener: Arc<dyn PeerDiscoveryListener>) {
+        self.discovery_listeners.write().push(listener);
     }
 }
 
@@ -240,6 +254,7 @@ async fn run(
     config: ReplicationConfig,
     mut notifications: UnboundedReceiver<ReplicationNotification>,
     discovered_peers: Arc<RwLock<HashMap<PeerId, HashSet<Libp2pMultiaddr>>>>,
+    discovery_listeners: Arc<RwLock<Vec<Arc<dyn PeerDiscoveryListener>>>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut heartbeat = tokio::time::interval(config.sync.interval);
@@ -250,7 +265,13 @@ async fn run(
     let mut dialing = HashSet::new();
     let enable_port_reuse = config.transport.enable_port_reuse;
 
-    connect_ready(&mut swarm, &engine, &mut dialing, enable_port_reuse);
+    connect_ready(
+        &mut swarm,
+        &engine,
+        &mut dialing,
+        enable_port_reuse,
+        &discovered_peers,
+    );
 
     loop {
         let sleep_until = batcher
@@ -286,6 +307,7 @@ async fn run(
                     &mut swarm,
                     &mut dialing,
                     enable_port_reuse,
+                    &discovered_peers,
                     notification,
                 );
                 if completed {
@@ -308,6 +330,7 @@ async fn run(
                         &mut swarm,
                         &mut dialing,
                         enable_port_reuse,
+                        &discovered_peers,
                         n,
                     );
                     if completed {
@@ -355,7 +378,13 @@ async fn run(
                         enable_port_reuse,
                     );
                 }
-                connect_ready(&mut swarm, &engine, &mut dialing, enable_port_reuse);
+                connect_ready(
+                    &mut swarm,
+                    &engine,
+                    &mut dialing,
+                    enable_port_reuse,
+                    &discovered_peers,
+                );
                 let outbound = engine.send_summaries();
                 dispatch(
                     &mut swarm,
@@ -375,6 +404,7 @@ async fn run(
                     &mut dialing,
                     enable_port_reuse,
                     &discovered_peers,
+                    &discovery_listeners,
                 );
             }
         }
@@ -392,6 +422,7 @@ fn process_notification(
     swarm: &mut Swarm<SwarmBehaviour>,
     dialing: &mut HashSet<PeerId>,
     enable_port_reuse: bool,
+    discovered_peers: &Arc<RwLock<HashMap<PeerId, HashSet<Libp2pMultiaddr>>>>,
     notification: ReplicationNotification,
 ) -> bool {
     match notification {
@@ -411,7 +442,7 @@ fn process_notification(
                     &installation,
                 ));
             }
-            connect_ready(swarm, engine, dialing, enable_port_reuse);
+            connect_ready(swarm, engine, dialing, enable_port_reuse, discovered_peers);
             false
         }
     }
@@ -452,6 +483,7 @@ fn handle_swarm_event(
     dialing: &mut HashSet<PeerId>,
     enable_port_reuse: bool,
     discovered_peers: &Arc<RwLock<HashMap<PeerId, HashSet<Libp2pMultiaddr>>>>,
+    discovery_listeners: &Arc<RwLock<Vec<Arc<dyn PeerDiscoveryListener>>>>,
 ) {
     match event {
         SwarmEvent::Behaviour(SwarmBehaviourEvent::Zenin(BehaviourEvent::SessionEstablished {
@@ -490,17 +522,32 @@ fn handle_swarm_event(
             dialing.remove(&peer_id);
         }
         SwarmEvent::Behaviour(SwarmBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-            for (peer_id, address) in list {
-                discovered_peers
-                    .write()
-                    .entry(peer_id)
-                    .or_default()
-                    .insert(address.clone());
+            let mut newly_discovered = HashMap::<PeerId, Vec<Libp2pMultiaddr>>::new();
+            let mut changed = false;
+            {
+                let mut discovered_peers = discovered_peers.write();
+                for (peer_id, address) in list {
+                    changed |= discovered_peers
+                        .entry(peer_id)
+                        .or_default()
+                        .insert(address.clone());
+                    newly_discovered
+                        .entry(peer_id)
+                        .or_default()
+                        .push(dial_address(peer_id, address));
+                }
+            }
+            if changed {
+                for listener in discovery_listeners.read().iter() {
+                    listener.on_discovery_changed();
+                }
+            }
+            for (peer_id, addresses) in newly_discovered {
                 if engine.is_active_peer(peer_id)
                     && !swarm.is_connected(&peer_id)
                     && dialing.insert(peer_id)
                     && swarm
-                        .dial(dial_opts(peer_id, vec![address], enable_port_reuse))
+                        .dial(dial_opts(peer_id, addresses, enable_port_reuse))
                         .is_err()
                 {
                     dialing.remove(&peer_id);
@@ -509,12 +556,19 @@ fn handle_swarm_event(
         }
         SwarmEvent::Behaviour(SwarmBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
             let mut discovered_peers = discovered_peers.write();
+            let mut changed = false;
             for (peer_id, address) in list {
                 if let Some(addresses) = discovered_peers.get_mut(&peer_id) {
-                    addresses.remove(&address);
+                    changed |= addresses.remove(&address);
                     if addresses.is_empty() {
                         discovered_peers.remove(&peer_id);
                     }
+                }
+            }
+            drop(discovered_peers);
+            if changed {
+                for listener in discovery_listeners.read().iter() {
+                    listener.on_discovery_changed();
                 }
             }
         }
@@ -538,7 +592,13 @@ fn dispatch(
     outbound: Vec<(PeerId, Message)>,
 ) {
     for (peer_id, message) in outbound {
-        dial_if_needed(swarm, engine, dialing, peer_id, enable_port_reuse);
+        dial_if_needed(
+            swarm,
+            dialing,
+            peer_id,
+            engine.addresses(peer_id),
+            enable_port_reuse,
+        );
         swarm.behaviour_mut().zenin.send(peer_id, message);
     }
 }
@@ -549,20 +609,32 @@ fn connect_ready(
     engine: &Engine,
     dialing: &mut HashSet<PeerId>,
     enable_port_reuse: bool,
+    discovered_peers: &Arc<RwLock<HashMap<PeerId, HashSet<Libp2pMultiaddr>>>>,
 ) {
-    for (peer_id, _) in engine.active_peer_routes() {
-        dial_if_needed(swarm, engine, dialing, peer_id, enable_port_reuse);
+    for (peer_id, route_hints) in engine.active_peer_routes() {
+        let addresses = if route_hints.is_empty() {
+            discovered_peers
+                .read()
+                .get(&peer_id)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .map(|address| dial_address(peer_id, address))
+                .collect()
+        } else {
+            route_hints
+        };
+        dial_if_needed(swarm, dialing, peer_id, addresses, enable_port_reuse);
     }
 }
 
 fn dial_if_needed(
     swarm: &mut Swarm<SwarmBehaviour>,
-    engine: &Engine,
     dialing: &mut HashSet<PeerId>,
     peer_id: PeerId,
+    addresses: Vec<Libp2pMultiaddr>,
     enable_port_reuse: bool,
 ) {
-    let addresses = engine.addresses(peer_id);
     if !swarm.is_connected(&peer_id)
         && !addresses.is_empty()
         && dialing.insert(peer_id)
@@ -585,4 +657,17 @@ fn dial_opts(
     } else {
         dial.allocate_new_port().build()
     }
+}
+
+/// mDNS appends the discovered peer ID to each advertised listen address.
+/// `DialOpts::peer_id` already pins the remote identity and expects transport
+/// addresses, so passing that suffix through prevents some transports from
+/// constructing a usable dial attempt.
+fn dial_address(peer_id: PeerId, mut address: Libp2pMultiaddr) -> Libp2pMultiaddr {
+    if address.iter().last().is_some_and(
+        |protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2p(id) if id == peer_id),
+    ) {
+        address.pop();
+    }
+    address
 }

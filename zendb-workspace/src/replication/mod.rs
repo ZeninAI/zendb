@@ -17,5 +17,5 @@ mod sync;
 mod transport;
 pub(crate) mod wire;
 
-pub use controller::DiscoveredPeer;
+pub use controller::{DiscoveredPeer, PeerDiscoveryListener};
 pub(crate) use controller::{ReplicationController, ReplicationNotification};

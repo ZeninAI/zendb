@@ -46,9 +46,14 @@ history is applied.
 
 Unknown or pending installations are recorded as pending and rejected at the
 protocol boundary. Active installations are dialed directly using their
-durable route hints and maintain a connection to every other ready active
-installation.
+durable route hints, falling back to the current mDNS routes when no durable
+hint exists. Discovery candidates are grouped into one TCP/QUIC dial and their
+terminal `/p2p` suffix is normalized before dialing. Activation and heartbeat
+retries consult the discovery cache, so discovery may happen before or after
+the membership transition without losing the connection attempt.
 
 `Workspace::discovered_peers()` exposes the current ephemeral mDNS discovery
 snapshot, including each peer's observed network addresses. Entries are
 removed when mDNS reports them as expired and are not persisted.
+`Workspace::add_peer_discovery_listener()` provides edge-triggered callbacks
+for applications that need an event-driven discovery UI.

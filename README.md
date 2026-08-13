@@ -56,6 +56,10 @@ active installation has a direct replication connection to every other active
 installation and exchanges receipt summaries per table; each table owns an
 independent per-installation sequence stream.
 
+When an installation has no durable route hints, activation and heartbeat
+retries use its current mDNS addresses. Applications can subscribe to
+edge-triggered discovery-set changes instead of polling the discovery snapshot.
+
 ## Network Admission And Workspace Merge
 
 `Workspace` exposes only `create` and `open`. `WorkspaceConfig::workspace_id`

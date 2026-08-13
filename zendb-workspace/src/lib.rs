@@ -13,7 +13,7 @@ mod workspace;
 pub use config::{BatchConfig, ReplicationConfig, SyncConfig, TransportConfig, WorkspaceConfig};
 pub use error::{Error, Result};
 pub use installations::Installations;
-pub use replication::DiscoveredPeer;
+pub use replication::{DiscoveredPeer, PeerDiscoveryListener};
 pub use states::{StateHandle, States};
 pub use tables::{ChangeListener, TableHandle, Tables};
 pub use workspace::Workspace;

@@ -42,6 +42,7 @@ publish_crate() {
 }
 
 # Workspace dependencies must be visible on crates.io before dependants publish.
+publish_crate zendb-macros
 publish_crate zendb-types
 publish_crate zendb-storage
 publish_crate zendb-workspace

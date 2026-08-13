@@ -24,7 +24,7 @@ use crate::{
     config::{ReplicationConfig, WorkspaceConfig},
     core::WorkspaceCore,
     installations::{Installations, Membership},
-    replication::{DiscoveredPeer, ReplicationController},
+    replication::{DiscoveredPeer, PeerDiscoveryListener, ReplicationController},
     states::States,
     system::{
         IDENTITY_FILE, INSTALLATIONS_TABLE_NAME, LOCK_FILE, TABLE_CATALOG_NAME,
@@ -308,6 +308,13 @@ impl Workspace {
         self.replication
             .as_ref()
             .map_or_else(Vec::new, ReplicationController::discovered_peers)
+    }
+
+    /// Registers a lightweight callback for mDNS discovery-set changes.
+    pub fn add_peer_discovery_listener(&self, listener: Arc<dyn PeerDiscoveryListener>) {
+        if let Some(replication) = &self.replication {
+            replication.add_discovery_listener(listener);
+        }
     }
 }
 

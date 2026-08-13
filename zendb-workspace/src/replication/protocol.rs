@@ -292,6 +292,24 @@ impl ZeninBehaviour {
     pub(super) fn close_session(&mut self, peer_id: PeerId) {
         self.sessions.remove(&peer_id);
         self.pending.remove(&peer_id);
+
+        let connections = self
+            .connected
+            .get(&peer_id)
+            .map(|connections| connections.keys().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for connection_id in connections {
+            self.close_connection(peer_id, connection_id);
+        }
+    }
+
+    fn close_connection(&mut self, peer_id: PeerId, connection_id: ConnectionId) {
+        if self.closing.insert((peer_id, connection_id)) {
+            self.events.push_back(ToSwarm::CloseConnection {
+                peer_id,
+                connection: CloseConnection::One(connection_id),
+            });
+        }
     }
 
     fn flush_peer(&mut self, peer_id: PeerId) {
@@ -338,13 +356,13 @@ impl ZeninBehaviour {
             && has_listener
             && let Some(connections) = self.connected.get(&peer_id)
         {
-            for &connection_id in connections.keys() {
-                if connection_id != active && self.closing.insert((peer_id, connection_id)) {
-                    self.events.push_back(ToSwarm::CloseConnection {
-                        peer_id,
-                        connection: CloseConnection::One(connection_id),
-                    });
-                }
+            let closing = connections
+                .keys()
+                .copied()
+                .filter(|connection_id| *connection_id != active)
+                .collect::<Vec<_>>();
+            for connection_id in closing {
+                self.close_connection(peer_id, connection_id);
             }
         }
         self.flush_peer(peer_id);
@@ -476,12 +494,15 @@ impl NetworkBehaviour for ZeninBehaviour {
                 ..
             } = &self.local_handshake
             else {
+                self.close_connection(peer_id, connection_id);
                 return;
             };
             if workspace_id != *our_workspace_id {
+                self.close_connection(peer_id, connection_id);
                 return;
             }
             if public_key.as_libp2p().to_peer_id() != peer_id {
+                self.close_connection(peer_id, connection_id);
                 return;
             }
             if self.sessions.get(&peer_id) != Some(&installation_id) {
